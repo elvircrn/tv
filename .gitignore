@@ -1,0 +1,11 @@
+target/
+fuzz/artifacts/
+fuzz/corpus/
+**/*.rs.bk
+*.pdb
+*.dSYM/
+*.labels.json
+imgui.ini
+CLAUDE.md
+.claude/
+.idea/
