@@ -11,7 +11,7 @@ use renderer::MetalRenderer;
 use state::*;
 use ui::*;
 
-use imgui::{Condition, InputTextCallback, InputTextCallbackHandler, StyleVar, TextCallbackData, WindowFlags};
+use imgui::{Condition, InputTextCallback, InputTextCallbackHandler, StyleColor, StyleVar, TextCallbackData, WindowFlags};
 use std::fmt::Write as FmtWrite;
 use std::io::Write as IoWrite;
 use std::time::Instant;
@@ -301,9 +301,11 @@ impl App {
         let status_h = if any_has_trace { STATUS_H } else { 0.0 };
 
         // ---- Drag handling (bottom divider, label divider, split divider) ----
+        let selecting = (shift && ui.io().mouse_down[0])
+            || (0..n_panes).any(|pi| state.panes[pi].selection_dirty);
         if any_has_trace && !state.diff_popup_open {
             let divider_y = display[1] - bottom_h - status_h;
-            let near_h = (mouse_pos[1] - divider_y).abs() < 4.0 && mouse_pos[1] > TOOLBAR_H;
+            let near_h = !selecting && (mouse_pos[1] - divider_y).abs() < 4.0 && mouse_pos[1] > TOOLBAR_H;
 
             if (near_h && !state.drag.is_active()) || state.drag == DragKind::BottomDivider {
                 ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeNS));
@@ -325,14 +327,16 @@ impl App {
         if !state.diff_popup_open {
             let divider_y = display[1] - bottom_h - status_h;
             let mut near_v = false;
-            for pi in 0..n_panes {
-                if !state.panes[pi].has_trace() { continue; }
-                let label_x = pane_xs[pi] + state.label_w;
-                let in_pane = mouse_pos[0] >= pane_xs[pi] && mouse_pos[0] < pane_xs[pi] + pane_ws[pi];
-                if in_pane && (mouse_pos[0] - label_x).abs() < 4.0
-                    && mouse_pos[1] > TOOLBAR_H && mouse_pos[1] < divider_y
-                {
-                    near_v = true;
+            if !selecting {
+                for pi in 0..n_panes {
+                    if !state.panes[pi].has_trace() { continue; }
+                    let label_x = pane_xs[pi] + state.label_w;
+                    let in_pane = mouse_pos[0] >= pane_xs[pi] && mouse_pos[0] < pane_xs[pi] + pane_ws[pi];
+                    if in_pane && (mouse_pos[0] - label_x).abs() < 4.0
+                        && mouse_pos[1] > TOOLBAR_H && mouse_pos[1] < divider_y
+                    {
+                        near_v = true;
+                    }
                 }
             }
 
@@ -353,7 +357,7 @@ impl App {
 
         // Split divider
         if state.split && !state.diff_popup_open {
-            let near_split = (mouse_pos[0] - state.split_x).abs() < 4.0
+            let near_split = !selecting && (mouse_pos[0] - state.split_x).abs() < 4.0
                 && mouse_pos[1] > TOOLBAR_H;
 
             if (near_split && !state.drag.is_active()) || state.drag == DragKind::SplitDivider {
@@ -414,6 +418,26 @@ impl App {
                             ui.same_line();
                             if ui.button("Diff") {
                                 diff_clicked = true;
+                            }
+                        }
+                        if pi == 0 {
+                            ui.same_line();
+                            let _dim = ui.push_style_color(StyleColor::Text, [0.5, 0.5, 0.5, 1.0]);
+                            ui.text("?");
+                            if ui.is_item_hovered() {
+                                ui.tooltip(|| {
+                                    ui.text("Keyboard shortcuts");
+                                    ui.separator();
+                                    ui.text("/            Focus search");
+                                    ui.text("Enter        Select all matches");
+                                    ui.text("Escape       Clear search & selection");
+                                    ui.text("Home         Fit timeline");
+                                    ui.text("Ctrl+Scroll  Zoom");
+                                    ui.text("Shift+Drag   Select region");
+                                    ui.text("Double-click Highlight all same-name");
+                                    ui.text("Right-click  Copy kernel name");
+                                    ui.text("Drop file    Open trace (2nd = split)");
+                                });
                             }
                         }
                         ui.same_line_with_spacing(0.0, 16.0);
@@ -503,13 +527,13 @@ impl App {
             if any_has_trace {
                 let divider_y = display[1] - bottom_h - status_h;
                 let dl = ui.get_foreground_draw_list();
-                let near = (mouse_pos[1] - divider_y).abs() < 4.0 || state.drag == DragKind::BottomDivider;
+                let near = !selecting && ((mouse_pos[1] - divider_y).abs() < 4.0 || state.drag == DragKind::BottomDivider);
                 let col = if near { col32(120, 120, 120, 255) } else { col32(60, 60, 60, 255) };
                 dl.add_line([0.0, divider_y], [display[0], divider_y], col).build();
             }
             if state.split {
                 let dl = ui.get_foreground_draw_list();
-                let near = (mouse_pos[0] - state.split_x).abs() < 4.0 || state.drag == DragKind::SplitDivider;
+                let near = !selecting && ((mouse_pos[0] - state.split_x).abs() < 4.0 || state.drag == DragKind::SplitDivider);
                 let col = if near { col32(120, 120, 120, 255) } else { col32(60, 60, 60, 255) };
                 dl.add_line([state.split_x, 0.0], [state.split_x, display[1]], col).build();
             }

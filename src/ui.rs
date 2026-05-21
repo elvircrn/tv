@@ -678,7 +678,8 @@ pub fn draw_timeline(
         if border_y < tracks_top || border_y > rect[3] { continue; }
         dl.add_line([rect[0], border_y], [rect[2], border_y], col32(50, 50, 50, 255)).build();
 
-        if !drag.is_active() && hovered && mouse_pos[1] > tracks_top {
+        // !shift: suppress resize affordance during shift-drag selection
+        if !shift && !drag.is_active() && hovered && mouse_pos[1] > tracks_top {
             if (mouse_pos[1] - border_y).abs() < RESIZE_GRAB_H {
                 hovered_border_y = Some(border_y);
                 near_border = true;
