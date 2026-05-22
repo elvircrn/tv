@@ -55,7 +55,7 @@ pub fn draw_selection_histogram(
     buf: &mut DrawBuf,
 ) {
     let avail_w = ui.window_size()[0] - 2.0 * ui.clone_style().window_padding[0];
-    let bar_h = 18.0;
+    let bar_h = HISTOGRAM_BAR_H;
     let win_x = ui.window_pos()[0] + ui.clone_style().window_padding[0];
     let cursor_y = ui.cursor_screen_pos()[1];
     let cursor = [win_x, cursor_y];
@@ -139,7 +139,7 @@ pub fn draw_stats_table(
     ui.child_window("##statstable")
         .size([avail[0], avail[1]])
         .build(|| {
-            let col_w = 80.0;
+            let col_w = STATS_COL_W;
             let swatch_w = 14.0;
             let name_w = avail[0] - col_w * 6.0 - swatch_w - 16.0;
             let headers = ["Name", "Count", "Total", "%", "Mean", "Median", "Max"];
@@ -179,7 +179,7 @@ pub fn draw_stats_table(
                 if *sort_asc { ord } else { ord.reverse() }
             });
 
-            let row_h = ui.current_font_size() + 4.0;
+            let row_h = ui.current_font_size() + ROW_PAD;
             let total_rows = buf.sort_idx.len();
             let scroll_y = ui.scroll_y();
             let content_h = ui.content_region_avail()[1];
@@ -205,8 +205,8 @@ pub fn draw_stats_table(
 
                 let cursor = ui.cursor_screen_pos();
                 let swatch_color = name_color(name);
-                dl.add_rect([cursor[0], cursor[1] + 2.0], [cursor[0] + 10.0, cursor[1] + row_h - 2.0], swatch_color)
-                    .filled(true).rounding(2.0).build();
+                dl.add_rect([cursor[0], cursor[1] + EV_INSET], [cursor[0] + SWATCH_W, cursor[1] + row_h - EV_INSET], swatch_color)
+                    .filled(true).rounding(EV_ROUNDING).build();
 
                 ui.set_cursor_pos([positions[0], ui.cursor_pos()[1]]);
                 if name.len() > max_name_chars && max_name_chars > 3 {
@@ -338,7 +338,7 @@ pub fn draw_timeline(
             if base_h > 0.0 {
                 let delta_scale = mouse_delta[1] / base_h;
                 if let Some(s) = track_scales.get_mut(ti) {
-                    *s = (*s + delta_scale).clamp(0.5, 5.0);
+                    *s = (*s + delta_scale).clamp(TRACK_SCALE_MIN, TRACK_SCALE_MAX);
                 }
             }
         } else {
@@ -381,7 +381,7 @@ pub fn draw_timeline(
         }
         if ctrl {
             if scroll[1] != 0.0 {
-                let factor = (scroll[1] as f64 / 200.0).exp();
+                let factor = (scroll[1] as f64 / SCROLL_ZOOM_SENSITIVITY).exp();
                 let ct = x2t(mouse_pos[0], view.t0, px_per_us, tl_left);
                 view.t0 = ct + (view.t0 - ct) / factor;
                 view.t1 = ct + (view.t1 - ct) / factor;
@@ -424,8 +424,8 @@ pub fn draw_timeline(
         sel_change = Some(None);
     }
 
-    let pad = trace.max_ts * 0.05;
-    let min_range = 0.001;
+    let pad = trace.max_ts * TIMELINE_PAD_FRAC;
+    let min_range = MIN_TIME_RANGE;
     let max_range = trace.max_ts + 2.0 * pad;
     let cur_range = view.t1 - view.t0;
     if cur_range < min_range {
@@ -505,7 +505,7 @@ pub fn draw_timeline(
             dl.add_rect([rect[0], y], [rect[2], y + track_h], bg).filled(true).build();
 
             let sub_h = track_h / track.max_depth.max(1) as f32;
-            let lane_h = sub_h - 4.0;
+            let lane_h = sub_h - LANE_GAP;
             let start = track.events.partition_point(|e| e.ts < view.t0 - track.max_dur);
             let end = track.events.partition_point(|e| e.ts <= view.t1);
 
@@ -528,7 +528,7 @@ pub fn draw_timeline(
                     let px = x0 as i32;
                     if px == buf.last_px[ev.depth as usize] { continue; }
                     buf.last_px[ev.depth as usize] = px;
-                    let ev_y = y + ev.depth as f32 * sub_h + 2.0;
+                    let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
                     let color = if matches {
                         event_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
                     } else {
@@ -538,7 +538,7 @@ pub fn draw_timeline(
                     continue;
                 }
 
-                let ev_y = y + ev.depth as f32 * sub_h + 2.0;
+                let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
                 let name = &trace.names[ev.name as usize];
                 let color = if matches {
                     event_color(orig_ti, ei, name, event_labels, labels)
@@ -562,23 +562,23 @@ pub fn draw_timeline(
 
                 let fill = if is_hovered { brighten(color, 30) } else if is_selected || is_sel_mask { brighten(color, 20) } else { color };
                 dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], fill)
-                    .filled(true).rounding(2.0).build();
+                    .filled(true).rounding(EV_ROUNDING).build();
 
                 if is_primary {
                     dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 220, 50, 255))
-                        .rounding(2.0).build();
+                        .rounding(EV_ROUNDING).build();
                 } else if is_hovered {
                     dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 255, 255, 255))
-                        .rounding(2.0).build();
+                        .rounding(EV_ROUNDING).build();
                 } else if is_selected || is_sel_mask {
                     dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
-                        .rounding(2.0).build();
+                        .rounding(EV_ROUNDING).build();
                 } else if is_multi {
                     dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 220, 50, 140))
-                        .rounding(2.0).build();
+                        .rounding(EV_ROUNDING).build();
                 } else if searching && matches {
                     dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
-                        .rounding(2.0).build();
+                        .rounding(EV_ROUNDING).build();
                 }
 
                 if is_hovered {
@@ -670,7 +670,6 @@ pub fn draw_timeline(
     let dl = ui.get_window_draw_list();
 
     // Track separator lines + resize drag
-    const RESIZE_GRAB_H: f32 = 6.0;
     let mut near_border = false;
     let mut hovered_border_y: Option<f32> = None;
     for vi in 0..buf.visible.len() {
@@ -794,9 +793,9 @@ pub fn draw_diff_popup(
     let label_h = font_h + 2.0;
     let style = ui.clone_style();
     let spacing = style.item_spacing[1];
-    let bar_h = 22.0f32;
-    let bar_gap = 4.0f32;
-    let bars_reserve = label_h + bar_h + bar_gap + label_h + bar_h + 4.0 + spacing * 2.0 + 2.0;
+    let bar_h = DIFF_BAR_H;
+    let bar_gap = DIFF_BAR_GAP;
+    let bars_reserve = label_h + bar_h + bar_gap + label_h + bar_h + DIFF_BAR_GAP + spacing * 2.0 + EV_INSET;
     let char_w = ui.calc_text_size("M")[0];
     let dur_w = 10.0 * char_w;
     let delta_w = 10.0 * char_w;
@@ -827,7 +826,7 @@ pub fn draw_diff_popup(
     ui.child_window("##diffscroll")
         .size([avail[0], -bars_reserve])
         .build(|| {
-            let row_h = ui.current_font_size() + 4.0;
+            let row_h = ui.current_font_size() + ROW_PAD;
             let total_rows = diff.lines.len();
             let scroll_y = ui.scroll_y();
             let content_h = ui.content_region_avail()[1];
@@ -843,9 +842,7 @@ pub fn draw_diff_popup(
             let dl = ui.get_window_draw_list();
             let win_pos = ui.window_pos();
 
-            let swatch_w = 10.0;
-            let swatch_pad = swatch_w + 4.0;
-            let name_chars_adj = ((name_w - swatch_pad - 8.0) / char_w).max(4.0) as usize;
+            let name_chars_adj = ((name_w - SWATCH_PAD - 8.0) / char_w).max(4.0) as usize;
             let text_col = [0.85, 0.85, 0.85, 1.0];
             let dur_col = [0.7, 0.7, 0.7, 1.0];
             let dim_col = [0.35, 0.35, 0.35, 1.0];
@@ -862,10 +859,10 @@ pub fn draw_diff_popup(
                 if has_left {
                     let sx = win_pos[0] + cx + left_name;
                     dl.add_rect(
-                        [sx, row_y + 2.0], [sx + swatch_w, row_y + row_h - 2.0],
+                        [sx, row_y + EV_INSET], [sx + SWATCH_W, row_y + row_h - EV_INSET],
                         swatch_color,
-                    ).filled(true).rounding(2.0).build();
-                    ui.dummy([swatch_pad, 1.0]);
+                    ).filled(true).rounding(EV_ROUNDING).build();
+                    ui.dummy([SWATCH_PAD, 1.0]);
                     ui.same_line();
                     truncated_text(ui, buf, &line.name, name_chars_adj, text_col);
                     ui.same_line_with_pos(cx + left_dur);
@@ -885,10 +882,10 @@ pub fn draw_diff_popup(
                     ui.same_line_with_pos(cx + right_name);
                     let sx = win_pos[0] + cx + right_name;
                     dl.add_rect(
-                        [sx, row_y + 2.0], [sx + swatch_w, row_y + row_h - 2.0],
+                        [sx, row_y + EV_INSET], [sx + SWATCH_W, row_y + row_h - EV_INSET],
                         swatch_color,
-                    ).filled(true).rounding(2.0).build();
-                    ui.dummy([swatch_pad, 1.0]);
+                    ).filled(true).rounding(EV_ROUNDING).build();
+                    ui.dummy([SWATCH_PAD, 1.0]);
                     ui.same_line();
                     truncated_text(ui, buf, &line.name, name_chars_adj, text_col);
                     ui.same_line_with_pos(cx + right_dur);
@@ -930,12 +927,12 @@ fn draw_diff_bars(
     ui: &imgui::Ui, diff: &DiffResult, buf: &mut DrawBuf, width: f32,
     name_a: &str, name_b: &str, mut scroll: f64, mut zoom: f64,
 ) -> (f64, f64) {
-    let bar_h = 22.0;
-    let gap = 4.0;
-    let label_h = ui.current_font_size() + 2.0;
+    let bar_h = DIFF_BAR_H;
+    let gap = DIFF_BAR_GAP;
+    let label_h = ui.current_font_size() + EV_INSET;
     let cursor = ui.cursor_screen_pos();
 
-    let total_h = label_h + bar_h + gap + label_h + bar_h + 4.0;
+    let total_h = label_h + bar_h + gap + label_h + bar_h + DIFF_BAR_GAP;
     let bar_x = cursor[0];
     let bar_w = width.max(1.0);
 
@@ -973,7 +970,7 @@ fn draw_diff_bars(
         return (scroll, zoom);
     }
 
-    let seg_gap = 3.0f32;
+    let seg_gap = DIFF_SEG_GAP;
 
     ui.invisible_button("##diffbar_area", [width, total_h]);
     let hovered = ui.is_item_hovered();
@@ -984,8 +981,8 @@ fn draw_diff_bars(
             let mouse_x = ui.io().mouse_pos[0];
             let frac = ((mouse_x - bar_x) as f64 / bar_w as f64).clamp(0.0, 1.0);
             let world_at_mouse = scroll + frac / zoom;
-            let factor = if wheel > 0.0 { 1.15 } else { 1.0 / 1.15 };
-            zoom = (zoom * factor).clamp(1.0, 200.0);
+            let factor = if wheel > 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
+            zoom = (zoom * factor).clamp(1.0, MAX_ZOOM);
             scroll = world_at_mouse - frac / zoom;
         }
         unsafe {

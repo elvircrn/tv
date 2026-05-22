@@ -12,6 +12,36 @@ pub const STATUS_H: f32 = TOOLBAR_ROW + 4.0;
 pub const DETAIL_H: f32 = 200.0;
 pub const INITIAL_BUF: usize = 256 * 1024;
 
+pub const INITIAL_WIN_W: f32 = 1400.0;
+pub const INITIAL_WIN_H: f32 = 800.0;
+pub const LINE_SCROLL_PX: f32 = 20.0;
+pub const SCROLL_ZOOM_SENSITIVITY: f64 = 200.0;
+pub const TIMELINE_PAD_FRAC: f64 = 0.05;
+pub const MIN_TIME_RANGE: f64 = 0.001;
+pub const FIT_PAD_FRAC: f64 = 0.02;
+pub const DIVIDER_GRAB_PX: f32 = 4.0;
+pub const MIN_BOTTOM_H: f32 = 60.0;
+pub const MIN_LABEL_W: f32 = 60.0;
+pub const MIN_SPLIT_W: f32 = 200.0;
+pub const LANE_GAP: f32 = 4.0;
+pub const EV_INSET: f32 = 2.0;
+pub const EV_ROUNDING: f32 = 2.0;
+pub const SWATCH_W: f32 = 10.0;
+pub const SWATCH_PAD: f32 = SWATCH_W + 4.0;
+pub const STATS_COL_W: f32 = 80.0;
+pub const SEARCH_W: f32 = 200.0;
+pub const DIFF_BAR_H: f32 = 22.0;
+pub const DIFF_BAR_GAP: f32 = 4.0;
+pub const DIFF_SEG_GAP: f32 = 3.0;
+pub const ZOOM_STEP: f64 = 1.15;
+pub const MAX_ZOOM: f64 = 200.0;
+pub const TRACK_SCALE_MIN: f32 = 0.5;
+pub const TRACK_SCALE_MAX: f32 = 5.0;
+pub const RESIZE_GRAB_H: f32 = 6.0;
+pub const ROW_PAD: f32 = 4.0;
+pub const HISTOGRAM_BAR_H: f32 = 18.0;
+pub const LABEL_NAME_W: f32 = 160.0;
+
 pub fn track_height(max_depth: u16, collapsed: bool, scale: f32) -> f32 {
     let base = if collapsed { SUB_LANE_H } else { max_depth.max(1) as f32 * SUB_LANE_H };
     base * scale

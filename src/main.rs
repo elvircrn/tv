@@ -99,7 +99,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("Trace Viewer")
-            .with_inner_size(winit::dpi::LogicalSize::new(1400.0, 800.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(INITIAL_WIN_W, INITIAL_WIN_H));
         let window = event_loop.create_window(attrs).unwrap();
         self.scale_factor = window.scale_factor();
 
@@ -163,12 +163,12 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 let (h, v) = match delta {
-                    MouseScrollDelta::LineDelta(h, v) => (h * 20.0, v * 20.0),
+                    MouseScrollDelta::LineDelta(h, v) => (h * LINE_SCROLL_PX, v * LINE_SCROLL_PX),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
                 };
                 self.scroll_accum[0] += h;
                 self.scroll_accum[1] += v;
-                io.add_mouse_wheel_event([h / 20.0, v / 20.0]);
+                io.add_mouse_wheel_event([h / LINE_SCROLL_PX, v / LINE_SCROLL_PX]);
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
@@ -305,7 +305,7 @@ impl App {
             || (0..n_panes).any(|pi| state.panes[pi].selection_dirty);
         if any_has_trace && !state.diff_popup_open {
             let divider_y = display[1] - bottom_h - status_h;
-            let near_h = !selecting && (mouse_pos[1] - divider_y).abs() < 4.0 && mouse_pos[1] > TOOLBAR_H;
+            let near_h = !selecting && (mouse_pos[1] - divider_y).abs() < DIVIDER_GRAB_PX && mouse_pos[1] > TOOLBAR_H;
 
             if (near_h && !state.drag.is_active()) || state.drag == DragKind::BottomDivider {
                 ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeNS));
@@ -317,7 +317,7 @@ impl App {
 
             if ui.io().mouse_down[0] && state.drag == DragKind::BottomDivider {
                 state.bottom_h -= mouse_delta[1];
-                state.bottom_h = state.bottom_h.clamp(60.0, display[1] - TOOLBAR_H - status_h - 60.0);
+                state.bottom_h = state.bottom_h.clamp(MIN_BOTTOM_H, display[1] - TOOLBAR_H - status_h - MIN_BOTTOM_H);
             } else if state.drag == DragKind::BottomDivider && !ui.io().mouse_down[0] {
                 state.drag = DragKind::None;
             }
@@ -332,7 +332,7 @@ impl App {
                     if !state.panes[pi].has_trace() { continue; }
                     let label_x = pane_xs[pi] + state.label_w;
                     let in_pane = mouse_pos[0] >= pane_xs[pi] && mouse_pos[0] < pane_xs[pi] + pane_ws[pi];
-                    if in_pane && (mouse_pos[0] - label_x).abs() < 4.0
+                    if in_pane && (mouse_pos[0] - label_x).abs() < DIVIDER_GRAB_PX
                         && mouse_pos[1] > TOOLBAR_H && mouse_pos[1] < divider_y
                     {
                         near_v = true;
@@ -349,7 +349,7 @@ impl App {
             if ui.io().mouse_down[0] && state.drag == DragKind::LabelDivider {
                 state.label_w += mouse_delta[0];
                 let max_w = if state.split { state.split_x * 0.5 } else { display[0] * 0.5 };
-                state.label_w = state.label_w.clamp(60.0, max_w);
+                state.label_w = state.label_w.clamp(MIN_LABEL_W, max_w);
             } else if state.drag == DragKind::LabelDivider && !ui.io().mouse_down[0] {
                 state.drag = DragKind::None;
             }
@@ -357,7 +357,7 @@ impl App {
 
         // Split divider
         if state.split && !state.diff_popup_open {
-            let near_split = !selecting && (mouse_pos[0] - state.split_x).abs() < 4.0
+            let near_split = !selecting && (mouse_pos[0] - state.split_x).abs() < DIVIDER_GRAB_PX
                 && mouse_pos[1] > TOOLBAR_H;
 
             if (near_split && !state.drag.is_active()) || state.drag == DragKind::SplitDivider {
@@ -368,7 +368,7 @@ impl App {
             }
             if ui.io().mouse_down[0] && state.drag == DragKind::SplitDivider {
                 state.split_x += mouse_delta[0];
-                state.split_x = state.split_x.clamp(200.0, display[0] - 200.0);
+                state.split_x = state.split_x.clamp(MIN_SPLIT_W, display[0] - MIN_SPLIT_W);
             } else if state.drag == DragKind::SplitDivider && !ui.io().mouse_down[0] {
                 state.drag = DragKind::None;
             }
@@ -409,7 +409,7 @@ impl App {
                         ui.checkbox("CPU", &mut pane.show_cpu);
                         ui.same_line();
                         if ui.button("Fit") {
-                            let pad = t.max_ts * 0.02;
+                            let pad = t.max_ts * FIT_PAD_FRAC;
                             pane.view.t0 = -pad;
                             pane.view.t1 = t.max_ts + pad;
                             pane.view.scroll_y = 0.0;
@@ -445,7 +445,7 @@ impl App {
                             ui.set_keyboard_focus_here();
                             pane.search_focus = false;
                         }
-                        ui.set_next_item_width(200.0);
+                        ui.set_next_item_width(SEARCH_W);
                         let prev_len = pane.prev_search.len();
                         struct SelectAllCb<'a>(&'a mut bool);
                         impl InputTextCallbackHandler for SelectAllCb<'_> {
@@ -527,13 +527,13 @@ impl App {
             if any_has_trace {
                 let divider_y = display[1] - bottom_h - status_h;
                 let dl = ui.get_foreground_draw_list();
-                let near = !selecting && ((mouse_pos[1] - divider_y).abs() < 4.0 || state.drag == DragKind::BottomDivider);
+                let near = !selecting && ((mouse_pos[1] - divider_y).abs() < DIVIDER_GRAB_PX || state.drag == DragKind::BottomDivider);
                 let col = if near { col32(120, 120, 120, 255) } else { col32(60, 60, 60, 255) };
                 dl.add_line([0.0, divider_y], [display[0], divider_y], col).build();
             }
             if state.split {
                 let dl = ui.get_foreground_draw_list();
-                let near = !selecting && ((mouse_pos[0] - state.split_x).abs() < 4.0 || state.drag == DragKind::SplitDivider);
+                let near = !selecting && ((mouse_pos[0] - state.split_x).abs() < DIVIDER_GRAB_PX || state.drag == DragKind::SplitDivider);
                 let col = if near { col32(120, 120, 120, 255) } else { col32(60, 60, 60, 255) };
                 dl.add_line([state.split_x, 0.0], [state.split_x, display[1]], col).build();
             }
@@ -672,7 +672,7 @@ impl App {
                         } else { imgui::TabItemFlags::empty() };
                         if let Some(_t) = imgui::TabItem::new("Labels").flags(labels_flags).begin(&ui) {
                             if pane.selection.is_some() || !pane.selection_stats.is_empty() {
-                                ui.set_next_item_width(160.0);
+                                ui.set_next_item_width(LABEL_NAME_W);
                                 let label_enter = ui.input_text("##labelinput", &mut pane.label_input)
                                     .hint("Label name")
                                     .flags(imgui::InputTextFlags::ENTER_RETURNS_TRUE)
@@ -698,15 +698,14 @@ impl App {
                                 ui.child_window("##labelstable")
                                     .size([avail[0], avail[1]])
                                     .build(|| {
-                                        let col_w = 80.0;
                                         ui.text_colored([0.55, 0.55, 0.55, 1.0], "Label");
-                                        ui.same_line_with_pos(160.0);
+                                        ui.same_line_with_pos(LABEL_NAME_W);
                                         ui.text_colored([0.55, 0.55, 0.55, 1.0], "Kernels");
-                                        ui.same_line_with_pos(160.0 + col_w);
+                                        ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W);
                                         ui.text_colored([0.55, 0.55, 0.55, 1.0], "Events");
-                                        ui.same_line_with_pos(160.0 + col_w * 2.0);
+                                        ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W * 2.0);
                                         ui.text_colored([0.55, 0.55, 0.55, 1.0], "Total");
-                                        ui.same_line_with_pos(160.0 + col_w * 3.0);
+                                        ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W * 3.0);
                                         ui.text_colored([0.55, 0.55, 0.55, 1.0], "%");
                                         ui.separator();
 
@@ -733,24 +732,24 @@ impl App {
                                                 pane.prev_search.clear();
                                                 pane.prev_search.push_str(&label.name);
                                             }
-                                            ui.same_line_with_pos(160.0);
+                                            ui.same_line_with_pos(LABEL_NAME_W);
                                             state.buf.fmt.clear();
                                             write!(state.buf.fmt, "{}", label.pattern.len()).unwrap();
                                             ui.text(&state.buf.fmt);
-                                            ui.same_line_with_pos(160.0 + col_w);
+                                            ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W);
                                             state.buf.fmt.clear();
                                             write!(state.buf.fmt, "{}", ls.count).unwrap();
                                             ui.text(&state.buf.fmt);
-                                            ui.same_line_with_pos(160.0 + col_w * 2.0);
+                                            ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W * 2.0);
                                             state.buf.fmt.clear();
                                             write_time(&mut state.buf.fmt, ls.total_dur);
                                             ui.text(&state.buf.fmt);
-                                            ui.same_line_with_pos(160.0 + col_w * 3.0);
+                                            ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W * 3.0);
                                             let pct = if total_trace_dur > 0.0 { ls.total_dur / total_trace_dur * 100.0 } else { 0.0 };
                                             state.buf.fmt.clear();
                                             write!(state.buf.fmt, "{:.1}%", pct).unwrap();
                                             ui.text(&state.buf.fmt);
-                                            ui.same_line_with_pos(160.0 + col_w * 4.0);
+                                            ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W * 4.0);
                                             state.buf.fmt.clear();
                                             write!(state.buf.fmt, "x##del{}", li).unwrap();
                                             if ui.small_button(&state.buf.fmt) {
@@ -1011,7 +1010,7 @@ impl App {
 
         if ui.is_key_pressed(imgui::Key::Home) {
             if let Some(t) = &state.panes[ai].trace {
-                let pad = t.max_ts * 0.02;
+                let pad = t.max_ts * FIT_PAD_FRAC;
                 state.panes[ai].view.t0 = -pad;
                 state.panes[ai].view.t1 = t.max_ts + pad;
                 state.panes[ai].view.scroll_y = 0.0;
