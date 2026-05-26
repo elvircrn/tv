@@ -192,12 +192,16 @@ impl Pane {
             let sub_h = track_h / track.max_depth.max(1) as f32;
             let track_top = cum_y;
             cum_y += track_h;
+            let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
             for ev in &track.events {
                 if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
                 let ev_top = track_top + ev.depth as f32 * sub_h;
                 let ev_bot = ev_top + sub_h;
+                for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
                 if ev_bot < y0 || ev_top > y1 { continue; }
                 if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
+                    ancestor_sel[ev.depth as usize] = true;
+                    if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
                     let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new()));
                     e.0 += 1;
                     e.1 += ev.dur;
@@ -240,12 +244,16 @@ impl Pane {
             let sub_h = track_h / track.max_depth.max(1) as f32;
             let track_top = cum_y;
             cum_y += track_h;
+            let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
             for ev in &track.events {
                 if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
                 let ev_top = track_top + ev.depth as f32 * sub_h;
                 let ev_bot = ev_top + sub_h;
+                for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
                 if ev_bot < y0 || ev_top > y1 { continue; }
                 if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
+                    ancestor_sel[ev.depth as usize] = true;
+                    if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
                     events.push((ev.ts, trace.names[ev.name as usize].clone(), ev.dur));
                 }
             }

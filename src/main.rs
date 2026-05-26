@@ -631,10 +631,17 @@ impl App {
                                 ui.same_line();
                                 let sel_total_count: u32 = pane.selection_stats.iter().map(|s| s.count).sum();
                                 let sel_total_dur: f64 = pane.selection_stats.iter().map(|s| s.total_dur).sum();
+                                let mut all_durs: Vec<f64> = pane.selection_stats.iter().flat_map(|s| s.durations.iter().copied()).collect();
+                                all_durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+                                let sel_median = if all_durs.is_empty() { 0.0 }
+                                    else if all_durs.len() % 2 == 1 { all_durs[all_durs.len() / 2] }
+                                    else { (all_durs[all_durs.len() / 2 - 1] + all_durs[all_durs.len() / 2]) / 2.0 };
                                 state.buf.fmt.clear();
                                 write!(state.buf.fmt, "{} events, ", sel_total_count).unwrap();
                                 write_time(&mut state.buf.fmt, sel_total_dur);
-                                write!(state.buf.fmt, " total").unwrap();
+                                write!(state.buf.fmt, " total, ").unwrap();
+                                write_time(&mut state.buf.fmt, sel_median);
+                                write!(state.buf.fmt, " median").unwrap();
                                 ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
                                 draw_selection_histogram(&ui, trace, &pane.selection_stats, pane.sel_aggregate, &mut state.buf);
                                 ui.separator();
