@@ -104,7 +104,7 @@ impl ApplicationHandler for App {
         self.scale_factor = window.scale_factor();
 
         let mut imgui = imgui::Context::create();
-        imgui.io_mut().config_mac_os_behaviors = false;
+        imgui.io_mut().config_mac_os_behaviors = true;
         imgui.set_clipboard_backend(MacClipboard);
         let renderer = MetalRenderer::new(&window, &mut imgui, self.scale_factor);
 
@@ -199,9 +199,13 @@ impl ApplicationHandler for App {
                 self.mod_super = s.super_key();
                 self.mod_shift = s.shift_key();
                 io.add_key_event(imgui::Key::LeftCtrl, s.control_key());
+                io.add_key_event(imgui::Key::ModCtrl, s.control_key());
                 io.add_key_event(imgui::Key::LeftShift, s.shift_key());
+                io.add_key_event(imgui::Key::ModShift, s.shift_key());
                 io.add_key_event(imgui::Key::LeftAlt, s.alt_key());
+                io.add_key_event(imgui::Key::ModAlt, s.alt_key());
                 io.add_key_event(imgui::Key::LeftSuper, s.super_key());
+                io.add_key_event(imgui::Key::ModSuper, s.super_key());
             }
 
             WindowEvent::Focused(_) => {}
@@ -1027,6 +1031,15 @@ impl App {
             state.panes[ai].search.clear();
             state.panes[ai].clear_selection();
             search_changed[ai] = true;
+        }
+        if !any_text_focused && ctrl && ui.is_key_pressed(imgui::Key::C) {
+            let pane = &state.panes[ai];
+            if let Some(sel) = &pane.selected {
+                if let Some(trace) = &pane.trace {
+                    let ev = &trace.tracks[sel.track_idx as usize].events[sel.event_idx as usize];
+                    ui.set_clipboard_text(&trace.names[ev.name as usize]);
+                }
+            }
         }
         if !any_text_focused {
             if ui.is_key_pressed(imgui::Key::Slash) || (ctrl && ui.is_key_pressed(imgui::Key::F)) {
