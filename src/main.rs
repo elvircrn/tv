@@ -400,7 +400,7 @@ impl App {
                 .build(|| {
                     let pane = &mut state.panes[pi];
                     if let Some(t) = &pane.trace {
-                        if state.split {
+                        {
                             let win_size = ui.window_size();
                             ui.set_cursor_pos([win_size[0] - 22.0, ui.cursor_pos()[1]]);
                             state.buf.fmt.clear();
@@ -508,12 +508,17 @@ impl App {
         }
 
         if let Some(pi) = close_pane {
-            if pi == 0 {
-                state.panes.swap(0, 1);
+            if state.split {
+                if pi == 0 {
+                    state.panes.swap(0, 1);
+                }
+                state.panes[1] = Pane::new();
+                state.split = false;
+            } else {
+                state.panes[pi] = Pane::new();
             }
-            state.panes[1] = Pane::new();
-            state.split = false;
             state.active = 0;
+            window.request_redraw();
         }
 
         // ---- Diff trigger ----
@@ -1084,9 +1089,15 @@ impl App {
 }
 
 fn main() {
-    let files: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|a| a.as_str()) == Some("--bench") {
+        for path in &args[1..] {
+            let _ = loader::load_trace(path);
+        }
+        return;
+    }
     let event_loop = EventLoop::new().unwrap();
-    let mut app = App::new(files);
+    let mut app = App::new(args);
     event_loop.run_app(&mut app).unwrap();
 }
 

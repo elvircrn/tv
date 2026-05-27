@@ -20,7 +20,7 @@ raw-window-metal = "1"
 raw-window-handle = "0.6"
 core-graphics-types = "0.2"
 memchr = "2"
-flate2 = "1"
+flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 tar = "0.4"
 memmap2 = "0.9"
 
