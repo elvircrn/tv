@@ -47,6 +47,19 @@ pub fn track_height(max_depth: u16, collapsed: bool, scale: f32) -> f32 {
     base * scale
 }
 
+pub fn bisect_overlap(events: &[Event], prefix_max_dur: &[f64], t: f64) -> usize {
+    let (mut lo, mut hi) = (0, events.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if events[mid].ts + prefix_max_dur[mid] < t {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 pub const PALETTE: &[u32] = &[
     0x4E79A7, 0xF28E2B, 0xE15759, 0x76B7B2, 0x59A14F, 0xEDC948, 0xB07AA1, 0xFF9DA7, 0x9C755F,
     0x86BCB6, 0x8CD17D, 0xB6992D, 0xF1CE63, 0xA0CBE8, 0xFFBE7D, 0xD4A6C8,
@@ -73,7 +86,7 @@ pub struct Track {
     pub gpu: bool,
     pub events: Vec<Event>,
     pub max_depth: u16,
-    pub max_dur: f64,
+    pub prefix_max_dur: Vec<f64>,
 }
 
 #[derive(Clone, Copy)]

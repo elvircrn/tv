@@ -506,7 +506,7 @@ pub fn draw_timeline(
 
             let sub_h = track_h / track.max_depth.max(1) as f32;
             let lane_h = sub_h - LANE_GAP;
-            let start = track.events.partition_point(|e| e.ts < view.t0 - track.max_dur);
+            let start = bisect_overlap(&track.events, &track.prefix_max_dur, view.t0);
             let end = track.events.partition_point(|e| e.ts <= view.t1);
 
             buf.last_px.clear();

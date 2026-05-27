@@ -355,14 +355,18 @@ pub fn load_trace(path: &str) -> Result<Trace, String> {
                     evs.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
                     let mut lanes: Vec<f64> = Vec::new();
                     let mut max_depth: u16 = 1;
-                    let mut max_dur: f64 = 0.0;
                     for ev in evs.iter_mut() {
                         let d = lanes.iter().position(|&end| end <= ev.ts)
                             .unwrap_or_else(|| { lanes.push(0.0); lanes.len() - 1 });
                         lanes[d] = ev.ts + ev.dur;
                         ev.depth = d as u16;
                         max_depth = max_depth.max(d as u16 + 1);
-                        if ev.dur > max_dur { max_dur = ev.dur; }
+                    }
+                    let mut prefix_max_dur = Vec::with_capacity(evs.len());
+                    let mut running_max = 0.0f64;
+                    for ev in &evs {
+                        running_max = running_max.max(ev.dur);
+                        prefix_max_dur.push(running_max);
                     }
                     let gpu_count = evs.iter().filter(|e| {
                         let c = &cat_ref[e.cat as usize];
@@ -373,7 +377,7 @@ pub fn load_trace(path: &str) -> Result<Trace, String> {
                         if gpu { format!("GPU {tid}") } else { format!("Thread {tid}") }
                     });
                     evs.shrink_to_fit();
-                    Track { label, gpu, events: evs, max_depth, max_dur }
+                    Track { label, gpu, events: evs, max_depth, prefix_max_dur }
                 })
             })
             .collect();

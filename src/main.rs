@@ -640,43 +640,19 @@ impl App {
                                 ui.same_line();
                                 let sel_total_count: u32 = pane.selection_stats.iter().map(|s| s.count).sum();
                                 let sel_total_dur: f64 = pane.selection_stats.iter().map(|s| s.total_dur).sum();
-                                let mut all_durs: Vec<f64> = pane.selection_stats.iter().flat_map(|s| s.durations.iter().copied()).collect();
-                                all_durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-                                let sel_median = if all_durs.is_empty() { 0.0 }
-                                    else if all_durs.len() % 2 == 1 { all_durs[all_durs.len() / 2] }
-                                    else { (all_durs[all_durs.len() / 2 - 1] + all_durs[all_durs.len() / 2]) / 2.0 };
                                 state.buf.fmt.clear();
                                 write!(state.buf.fmt, "{} events, ", sel_total_count).unwrap();
                                 write_time(&mut state.buf.fmt, sel_total_dur);
                                 write!(state.buf.fmt, " total, ").unwrap();
-                                write_time(&mut state.buf.fmt, sel_median);
+                                write_time(&mut state.buf.fmt, pane.sel_median);
                                 write!(state.buf.fmt, " median").unwrap();
                                 ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
                                 draw_selection_histogram(&ui, trace, &pane.selection_stats, pane.sel_aggregate, &mut state.buf);
                                 ui.separator();
                                 if pane.sel_aggregate {
-                                    let sel_entries: Vec<KernelStats> = pane.selection_stats.iter()
-                                        .map(|s| {
-                                            let mut sorted = s.durations.clone();
-                                            sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-                                            let n = sorted.len();
-                                            let median = if n == 0 { 0.0 } else if n % 2 == 1 { sorted[n / 2] } else { (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 };
-                                            KernelStats {
-                                                name: s.name, count: s.count, total_dur: s.total_dur,
-                                                median_dur: median,
-                                                max_dur: s.durations.iter().copied().fold(0.0f64, f64::max),
-                                            }
-                                        }).collect();
-                                    draw_stats_table(&ui, trace, &sel_entries, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf);
+                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf);
                                 } else {
-                                    let mut individual: Vec<KernelStats> = Vec::new();
-                                    for se in &pane.selection_stats {
-                                        for &d in &se.durations {
-                                            individual.push(KernelStats { name: se.name, count: 1, total_dur: d, median_dur: d, max_dur: d });
-                                        }
-                                    }
-                                    individual.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
-                                    draw_stats_table(&ui, trace, &individual, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf);
+                                    draw_stats_table(&ui, trace, &pane.sel_individual, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf);
                                 }
                             } else {
                                 ui.text_colored([0.5, 0.5, 0.5, 1.0], "Shift+drag to select a time range");
@@ -807,7 +783,7 @@ impl App {
 
                     state.buf.fmt.clear();
                     let fname = pane.trace_path.rsplit('/').next().unwrap_or(&pane.trace_path);
-                    write!(state.buf.fmt, "{} | {} events | {} tracks", fname, t.total_events, t.tracks.len()).unwrap();
+                    write!(state.buf.fmt, "{} | {} events | {} tracks | {:.1}ms", fname, t.total_events, t.tracks.len(), dt * 1000.0).unwrap();
                     dl.add_text([win_pos[0] + 8.0, cy], col32(153, 153, 153, 255), &state.buf.fmt);
 
                     let logo_scale = text_h / 16.0;
@@ -1084,6 +1060,10 @@ impl App {
         let draw_data = imgui.render();
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.render(draw_data);
+        }
+        let frame_ms = now.elapsed().as_secs_f64() * 1000.0;
+        if frame_ms > 50.0 {
+            eprintln!("  SLOW FRAME: {:.1}ms", frame_ms);
         }
     }
 }

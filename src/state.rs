@@ -37,6 +37,9 @@ pub struct Pane {
     pub sort_col: usize,
     pub sort_asc: bool,
     pub sel_aggregate: bool,
+    pub sel_median: f64,
+    pub sel_agg_stats: Vec<KernelStats>,
+    pub sel_individual: Vec<KernelStats>,
 }
 
 impl Pane {
@@ -73,6 +76,9 @@ impl Pane {
             sort_col: 2,
             sort_asc: false,
             sel_aggregate: true,
+            sel_median: 0.0,
+            sel_agg_stats: Vec::new(),
+            sel_individual: Vec::new(),
         }
     }
 
@@ -167,6 +173,7 @@ impl Pane {
     }
 
     pub fn rebuild_selection_stats(&mut self, buf: &mut DrawBuf) {
+        let t_start = std::time::Instant::now();
         let trace = match &self.trace {
             Some(t) => t,
             None => return,
@@ -182,6 +189,7 @@ impl Pane {
         for v in map.values_mut() { v.0 = 0; v.1 = 0.0; v.2.clear(); }
 
         let mut cum_y = 0.0f32;
+        let mut total_scanned = 0usize;
         for (ti, track) in trace.tracks.iter().enumerate() {
             if !self.show_cpu && !track.gpu { continue; }
             let track_h = track_height(
@@ -192,8 +200,13 @@ impl Pane {
             let sub_h = track_h / track.max_depth.max(1) as f32;
             let track_top = cum_y;
             cum_y += track_h;
+            let track_bot = cum_y;
+            if track_bot < y0 || track_top > y1 { continue; }
+            let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
+            let end = track.events.partition_point(|e| e.ts <= s1).max(start);
+            total_scanned += end - start;
             let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
-            for ev in &track.events {
+            for ev in &track.events[start..end] {
                 if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
                 let ev_top = track_top + ev.depth as f32 * sub_h;
                 let ev_bot = ev_top + sub_h;
@@ -218,6 +231,35 @@ impl Pane {
             });
         }
         self.selection_stats.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap().then(a.name.cmp(&b.name)));
+        let ev_count: u32 = self.selection_stats.iter().map(|e| e.count).sum();
+        eprintln!("  select: {:.1}ms ({} events, {} names, {} scanned)", t_start.elapsed().as_secs_f64() * 1000.0, ev_count, self.selection_stats.len(), total_scanned);
+
+        let t_agg = std::time::Instant::now();
+        let mut all_durs: Vec<f64> = self.selection_stats.iter().flat_map(|s| s.durations.iter().copied()).collect();
+        all_durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = all_durs.len();
+        self.sel_median = if n == 0 { 0.0 } else if n % 2 == 1 { all_durs[n / 2] } else { (all_durs[n / 2 - 1] + all_durs[n / 2]) / 2.0 };
+
+        self.sel_agg_stats = self.selection_stats.iter().map(|s| {
+            let mut sorted = s.durations.clone();
+            sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = sorted.len();
+            let median = if n == 0 { 0.0 } else if n % 2 == 1 { sorted[n / 2] } else { (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 };
+            KernelStats {
+                name: s.name, count: s.count, total_dur: s.total_dur,
+                median_dur: median,
+                max_dur: s.durations.iter().copied().fold(0.0f64, f64::max),
+            }
+        }).collect();
+
+        self.sel_individual.clear();
+        for se in &self.selection_stats {
+            for &d in &se.durations {
+                self.sel_individual.push(KernelStats { name: se.name, count: 1, total_dur: d, median_dur: d, max_dur: d });
+            }
+        }
+        self.sel_individual.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
+        eprintln!("  aggregate: {:.1}ms ({} agg, {} individual)", t_agg.elapsed().as_secs_f64() * 1000.0, self.sel_agg_stats.len(), self.sel_individual.len());
     }
 
     pub fn extract_selection_events(&self) -> Vec<(String, f64)> {
@@ -244,8 +286,10 @@ impl Pane {
             let sub_h = track_h / track.max_depth.max(1) as f32;
             let track_top = cum_y;
             cum_y += track_h;
+            let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
+            let end = track.events.partition_point(|e| e.ts <= s1).max(start);
             let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
-            for ev in &track.events {
+            for ev in &track.events[start..end] {
                 if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
                 let ev_top = track_top + ev.depth as f32 * sub_h;
                 let ev_bot = ev_top + sub_h;
