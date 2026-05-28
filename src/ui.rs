@@ -420,7 +420,7 @@ pub fn draw_timeline(
         }
     }
 
-    if clicked && !shift {
+    if clicked && !shift && !drag.is_active() {
         sel_change = Some(None);
     }
 

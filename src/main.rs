@@ -337,6 +337,15 @@ impl App {
         let bottom_h = if any_has_trace { state.bottom_h } else { 0.0 };
         let status_h = if any_has_trace { STATUS_H } else { 0.0 };
 
+        let mut t_section = Instant::now();
+        macro_rules! mark {
+            ($name:expr, $t:expr) => {
+                let e = $t.elapsed().as_secs_f64() * 1000.0;
+                if e > 20.0 { eprint!("  {}:{:.0} ", $name, e); }
+                $t = Instant::now();
+            }
+        }
+
         // ---- Drag handling (bottom divider, label divider, split divider) ----
         let selecting = (shift && ui.io().mouse_down[0])
             || (0..n_panes).any(|pi| state.panes[pi].selection_dirty);
@@ -411,6 +420,7 @@ impl App {
             }
         }
 
+        mark!("drag", t_section);
         // ---- Per-pane toolbars ----
         let mut search_changed = [false; 2];
         let mut close_pane: Option<usize> = None;
@@ -558,6 +568,7 @@ impl App {
             window.request_redraw();
         }
 
+        mark!("toolbar", t_section);
         // ---- Diff trigger ----
         if diff_clicked {
             let seq_a = state.panes[0].extract_selection_events();
@@ -585,6 +596,7 @@ impl App {
             }
         }
 
+        mark!("dividers", t_section);
         // ---- Per-pane bottom panels ----
         let mut labels_changed = [false; 2];
         let mut pending_delete_label: [Option<usize>; 2] = [None; 2];
@@ -795,6 +807,7 @@ impl App {
                 });
         }
 
+        mark!("bottom", t_section);
         // ---- Per-pane status bars ----
         let status_names = ["##status0", "##status1"];
         for pi in 0..n_panes {
@@ -841,6 +854,7 @@ impl App {
                 });
         }
 
+        mark!("status", t_section);
         // ---- Per-pane timelines ----
         let mut hover_results: [Option<EventRef>; 2] = [None; 2];
         let mut click_results: [Option<EventRef>; 2] = [None; 2];
@@ -918,6 +932,7 @@ impl App {
                 });
         }
 
+        mark!("timeline", t_section);
         // ---- Process click/selection results per pane ----
         for pi in 0..n_panes {
             if let Some(c) = click_results[pi] {
@@ -971,6 +986,7 @@ impl App {
             }
         }
 
+        mark!("clicks", t_section);
         // ---- Hover tooltip ----
         for pi in 0..n_panes {
             if state.diff_popup_open { break; }
@@ -999,6 +1015,7 @@ impl App {
             }
         }
 
+        mark!("tooltip", t_section);
         // ---- Diff window ----
         state.diff_popup_open = false;
         if state.show_diff {
@@ -1033,6 +1050,7 @@ impl App {
             }
         }
 
+        mark!("diff", t_section);
         // ---- Keybinds (active pane) ----
         let any_text_focused = ui.is_any_item_active();
         let ai = state.active;
@@ -1117,13 +1135,15 @@ impl App {
             }
         }
 
+        mark!("keybinds", t_section);
         let draw_data = imgui.render();
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.render(draw_data);
         }
+        mark!("render", t_section);
         let frame_ms = now.elapsed().as_secs_f64() * 1000.0;
         if frame_ms > 50.0 {
-            eprintln!("  SLOW FRAME: {:.1}ms", frame_ms);
+            eprintln!("\nSLOW FRAME: {:.0}ms", frame_ms);
         }
     }
 }
