@@ -89,6 +89,9 @@ impl Pane {
         self.finished_sel = None;
         self.selection_stats.clear();
         self.sel_mask.clear();
+        self.sel_median = 0.0;
+        self.sel_agg_stats.clear();
+        self.sel_individual.clear();
     }
 
     pub fn finish_selection(&mut self, buf: &mut DrawBuf) {
@@ -180,7 +183,7 @@ impl Pane {
         };
         let sel = match self.selection.or(self.finished_sel) {
             Some(s) => s,
-            None => { self.selection_stats.clear(); return; }
+            None => { self.selection_stats.clear(); self.sel_agg_stats.clear(); self.sel_individual.clear(); self.sel_median = 0.0; return; }
         };
         let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
         let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
@@ -235,30 +238,7 @@ impl Pane {
         eprintln!("  select: {:.1}ms ({} events, {} names, {} scanned)", t_start.elapsed().as_secs_f64() * 1000.0, ev_count, self.selection_stats.len(), total_scanned);
 
         let t_agg = std::time::Instant::now();
-        let mut all_durs: Vec<f64> = self.selection_stats.iter().flat_map(|s| s.durations.iter().copied()).collect();
-        all_durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = all_durs.len();
-        self.sel_median = if n == 0 { 0.0 } else if n % 2 == 1 { all_durs[n / 2] } else { (all_durs[n / 2 - 1] + all_durs[n / 2]) / 2.0 };
-
-        self.sel_agg_stats = self.selection_stats.iter().map(|s| {
-            let mut sorted = s.durations.clone();
-            sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-            let n = sorted.len();
-            let median = if n == 0 { 0.0 } else if n % 2 == 1 { sorted[n / 2] } else { (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 };
-            KernelStats {
-                name: s.name, count: s.count, total_dur: s.total_dur,
-                median_dur: median,
-                max_dur: s.durations.iter().copied().fold(0.0f64, f64::max),
-            }
-        }).collect();
-
-        self.sel_individual.clear();
-        for se in &self.selection_stats {
-            for &d in &se.durations {
-                self.sel_individual.push(KernelStats { name: se.name, count: 1, total_dur: d, median_dur: d, max_dur: d });
-            }
-        }
-        self.sel_individual.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
+        self.compute_aggregates();
         eprintln!("  aggregate: {:.1}ms ({} agg, {} individual)", t_agg.elapsed().as_secs_f64() * 1000.0, self.sel_agg_stats.len(), self.sel_individual.len());
     }
 
@@ -343,6 +323,34 @@ impl Pane {
             });
         }
         self.selection_stats.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap().then(a.name.cmp(&b.name)));
+        self.compute_aggregates();
+    }
+
+    fn compute_aggregates(&mut self) {
+        let mut all_durs: Vec<f64> = self.selection_stats.iter().flat_map(|s| s.durations.iter().copied()).collect();
+        all_durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = all_durs.len();
+        self.sel_median = if n == 0 { 0.0 } else if n % 2 == 1 { all_durs[n / 2] } else { (all_durs[n / 2 - 1] + all_durs[n / 2]) / 2.0 };
+
+        self.sel_agg_stats = self.selection_stats.iter().map(|s| {
+            let mut sorted = s.durations.clone();
+            sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = sorted.len();
+            let median = if n == 0 { 0.0 } else if n % 2 == 1 { sorted[n / 2] } else { (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 };
+            KernelStats {
+                name: s.name, count: s.count, total_dur: s.total_dur,
+                median_dur: median,
+                max_dur: s.durations.iter().copied().fold(0.0f64, f64::max),
+            }
+        }).collect();
+
+        self.sel_individual.clear();
+        for se in &self.selection_stats {
+            for &d in &se.durations {
+                self.sel_individual.push(KernelStats { name: se.name, count: 1, total_dur: d, median_dur: d, max_dur: d });
+            }
+        }
+        self.sel_individual.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
     }
 
     pub fn apply_label(&mut self, name: &str) {
