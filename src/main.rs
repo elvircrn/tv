@@ -1067,7 +1067,7 @@ impl App {
                 let zoom_out = nav_keys & (NAV_S | NAV_DOWN) != 0;
                 let zoom_dir = zoom_in as i32 - zoom_out as i32;
                 if zoom_dir != 0 {
-                    let factor = ZOOM_STEP.powf(dt as f64 * 6.0 * zoom_dir as f64);
+                    let factor = ZOOM_STEP.powf(dt as f64 * 20.0 * zoom_dir as f64);
                     let center = (pane.view.t0 + pane.view.t1) / 2.0;
                     pane.view.t0 = center + (pane.view.t0 - center) / factor;
                     pane.view.t1 = center + (pane.view.t1 - center) / factor;
