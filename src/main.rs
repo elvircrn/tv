@@ -40,6 +40,7 @@ struct App {
     mod_shift: bool,
     pending_files: Vec<String>,
     last_mouse_x: f32,
+    nav_keys: u8,
 }
 
 impl App {
@@ -72,9 +73,19 @@ impl App {
             mod_shift: false,
             pending_files: files,
             last_mouse_x: 0.0,
+            nav_keys: 0,
         }
     }
 }
+
+const NAV_W: u8 = 1;
+const NAV_A: u8 = 2;
+const NAV_S: u8 = 4;
+const NAV_D: u8 = 8;
+const NAV_UP: u8 = 16;
+const NAV_DOWN: u8 = 32;
+const NAV_LEFT: u8 = 64;
+const NAV_RIGHT: u8 = 128;
 
 struct MacClipboard;
 impl imgui::ClipboardBackend for MacClipboard {
@@ -176,6 +187,24 @@ impl ApplicationHandler for App {
                     if let Some(key) = winit_to_imgui(code) {
                         io.add_key_event(key, event.state == ElementState::Pressed);
                     }
+                    let nav_bit = match code {
+                        KeyCode::KeyW => NAV_W,
+                        KeyCode::KeyA => NAV_A,
+                        KeyCode::KeyS => NAV_S,
+                        KeyCode::KeyD => NAV_D,
+                        KeyCode::ArrowUp => NAV_UP,
+                        KeyCode::ArrowDown => NAV_DOWN,
+                        KeyCode::ArrowLeft => NAV_LEFT,
+                        KeyCode::ArrowRight => NAV_RIGHT,
+                        _ => 0,
+                    };
+                    if nav_bit != 0 {
+                        if event.state == ElementState::Pressed {
+                            self.nav_keys |= nav_bit;
+                        } else {
+                            self.nav_keys &= !nav_bit;
+                        }
+                    }
                     if event.state == ElementState::Pressed && self.mod_ctrl {
                         if code == KeyCode::KeyA {
                             self.state.panes[self.state.active].select_all_pending = true;
@@ -246,7 +275,10 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.panes[0].loading.is_some() || self.state.panes[1].loading.is_some() {
+        let needs_poll = self.state.panes[0].loading.is_some()
+            || self.state.panes[1].loading.is_some()
+            || self.nav_keys != 0;
+        if needs_poll {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -284,6 +316,7 @@ impl App {
         self.pinch_accum = 0.0;
         let ctrl = self.mod_ctrl || self.mod_super;
         let shift = self.mod_shift;
+        let nav_keys = self.nav_keys;
 
         let ui = imgui.new_frame();
         let display = ui.io().display_size;
@@ -432,6 +465,10 @@ impl App {
                                 ui.tooltip(|| {
                                     ui.text("Keyboard shortcuts");
                                     ui.separator();
+                                    ui.text("W / Up       Zoom in");
+                                    ui.text("S / Down     Zoom out");
+                                    ui.text("A / Left     Pan left");
+                                    ui.text("D / Right    Pan right");
                                     ui.text("/            Focus search");
                                     ui.text("Enter        Select all matches");
                                     ui.text("Escape       Clear search & selection");
@@ -1019,6 +1056,29 @@ impl App {
                 if let Some(trace) = &pane.trace {
                     let ev = &trace.tracks[sel.track_idx as usize].events[sel.event_idx as usize];
                     ui.set_clipboard_text(&trace.names[ev.name as usize]);
+                }
+            }
+        }
+        if !any_text_focused && nav_keys != 0 && !state.diff_popup_open {
+            let pane = &mut state.panes[ai];
+            if pane.trace.is_some() {
+                let range = pane.view.t1 - pane.view.t0;
+                let zoom_in = nav_keys & (NAV_W | NAV_UP) != 0;
+                let zoom_out = nav_keys & (NAV_S | NAV_DOWN) != 0;
+                let zoom_dir = zoom_in as i32 - zoom_out as i32;
+                if zoom_dir != 0 {
+                    let factor = ZOOM_STEP.powf(dt as f64 * 6.0 * zoom_dir as f64);
+                    let center = (pane.view.t0 + pane.view.t1) / 2.0;
+                    pane.view.t0 = center + (pane.view.t0 - center) / factor;
+                    pane.view.t1 = center + (pane.view.t1 - center) / factor;
+                }
+                let pan_right = nav_keys & (NAV_D | NAV_RIGHT) != 0;
+                let pan_left = nav_keys & (NAV_A | NAV_LEFT) != 0;
+                let pan_dir = pan_right as i32 - pan_left as i32;
+                if pan_dir != 0 {
+                    let dt_pan = range * 1.5 * dt as f64 * pan_dir as f64;
+                    pane.view.t0 += dt_pan;
+                    pane.view.t1 += dt_pan;
                 }
             }
         }

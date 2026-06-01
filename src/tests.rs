@@ -19,9 +19,14 @@ fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace 
             if end > max_ts { max_ts = end; }
         }
         let max_depth = events.iter().map(|e| e.depth + 1).max().unwrap_or(1);
-        let max_dur = events.iter().map(|e| e.dur).fold(0.0f64, f64::max);
+        let mut prefix_max_dur = Vec::with_capacity(events.len());
+        let mut running_max = 0.0f64;
+        for ev in &events {
+            running_max = running_max.max(ev.dur);
+            prefix_max_dur.push(running_max);
+        }
         total_events += events.len();
-        trs.push(Track { label: label.to_string(), gpu, events, max_depth, max_dur });
+        trs.push(Track { label: label.to_string(), gpu, events, max_depth, prefix_max_dur });
     }
     Trace {
         tracks: trs, names: name_strs, cats: vec![String::new()],
