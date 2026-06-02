@@ -1084,12 +1084,13 @@ impl App {
         if !any_text_focused && nav_keys != 0 && !state.diff_popup_open {
             let pane = &mut state.panes[ai];
             if pane.trace.is_some() {
+                let nav_dt = dt.min(0.05);
                 let range = pane.view.t1 - pane.view.t0;
                 let zoom_in = nav_keys & (NAV_W | NAV_UP) != 0;
                 let zoom_out = nav_keys & (NAV_S | NAV_DOWN) != 0;
                 let zoom_dir = zoom_in as i32 - zoom_out as i32;
                 if zoom_dir != 0 {
-                    let factor = ZOOM_STEP.powf(dt as f64 * 20.0 * zoom_dir as f64);
+                    let factor = ZOOM_STEP.powf(nav_dt as f64 * 20.0 * zoom_dir as f64);
                     let center = (pane.view.t0 + pane.view.t1) / 2.0;
                     pane.view.t0 = center + (pane.view.t0 - center) / factor;
                     pane.view.t1 = center + (pane.view.t1 - center) / factor;
@@ -1098,7 +1099,7 @@ impl App {
                 let pan_left = nav_keys & (NAV_A | NAV_LEFT) != 0;
                 let pan_dir = pan_right as i32 - pan_left as i32;
                 if pan_dir != 0 {
-                    let dt_pan = range * 1.5 * dt as f64 * pan_dir as f64;
+                    let dt_pan = range * 1.5 * nav_dt as f64 * pan_dir as f64;
                     pane.view.t0 += dt_pan;
                     pane.view.t1 += dt_pan;
                 }
