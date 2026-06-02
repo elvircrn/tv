@@ -305,6 +305,7 @@ pub fn draw_timeline(
     show_cpu: bool,
     buf: &mut DrawBuf,
     rect: [f32; 4],
+    pane_idx: usize,
     hovered: bool,
     clicked: bool,
     active: bool,
@@ -332,17 +333,19 @@ pub fn draw_timeline(
     let tl_left = rect[0] + label_w;
     let tl_w = (rect[2] - tl_left).max(1.0);
 
-    if let DragKind::TrackResize(ti) = *drag {
-        if ui.io().mouse_down[0] {
-            let base_h = track_height(trace.tracks[ti].max_depth, false, 1.0);
-            if base_h > 0.0 {
-                let delta_scale = mouse_delta[1] / base_h;
-                if let Some(s) = track_scales.get_mut(ti) {
-                    *s = (*s + delta_scale).clamp(TRACK_SCALE_MIN, TRACK_SCALE_MAX);
+    if let DragKind::TrackResize(pi, ti) = *drag {
+        if pi == pane_idx {
+            if ui.io().mouse_down[0] {
+                let base_h = track_height(trace.tracks[ti].max_depth, false, 1.0);
+                if base_h > 0.0 {
+                    let delta_scale = mouse_delta[1] / base_h;
+                    if let Some(s) = track_scales.get_mut(ti) {
+                        *s = (*s + delta_scale).clamp(TRACK_SCALE_MIN, TRACK_SCALE_MAX);
+                    }
                 }
+            } else {
+                *drag = DragKind::None;
             }
-        } else {
-            *drag = DragKind::None;
         }
     }
 
@@ -683,7 +686,7 @@ pub fn draw_timeline(
                 hovered_border_y = Some(border_y);
                 near_border = true;
                 if clicked {
-                    *drag = DragKind::TrackResize(buf.visible[vi]);
+                    *drag = DragKind::TrackResize(pane_idx, buf.visible[vi]);
                 }
             }
         }
@@ -692,11 +695,13 @@ pub fn draw_timeline(
         dl.add_line([rect[0], by], [rect[2], by], col32(100, 180, 255, 200)).thickness(2.0).build();
         ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeNS));
     }
-    if let DragKind::TrackResize(ti) = *drag {
-        ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeNS));
-        if let Some(vi) = buf.visible.iter().position(|&v| v == ti) {
-            let by = tracks_top + buf.y_offsets[vi] + buf.heights[vi] - view.scroll_y;
-            dl.add_line([rect[0], by], [rect[2], by], col32(100, 180, 255, 200)).thickness(2.0).build();
+    if let DragKind::TrackResize(pi, ti) = *drag {
+        if pi == pane_idx {
+            ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeNS));
+            if let Some(vi) = buf.visible.iter().position(|&v| v == ti) {
+                let by = tracks_top + buf.y_offsets[vi] + buf.heights[vi] - view.scroll_y;
+                dl.add_line([rect[0], by], [rect[2], by], col32(100, 180, 255, 200)).thickness(2.0).build();
+            }
         }
     }
 

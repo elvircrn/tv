@@ -56,7 +56,6 @@ impl App {
                 split_x: 0.0,
                 buf: DrawBuf::default(),
                 bottom_h: DETAIL_H,
-                label_w: LABEL_W,
                 drag: DragKind::None,
                 show_diff: false,
                 diff_popup_open: false,
@@ -372,32 +371,36 @@ impl App {
         // Label divider (check each pane)
         if !state.diff_popup_open {
             let divider_y = display[1] - bottom_h - status_h;
-            let mut near_v = false;
+            let mut near_v_pane: Option<usize> = None;
             if !selecting {
                 for pi in 0..n_panes {
                     if !state.panes[pi].has_trace() { continue; }
-                    let label_x = pane_xs[pi] + state.label_w;
+                    let label_x = pane_xs[pi] + state.panes[pi].label_w;
                     let in_pane = mouse_pos[0] >= pane_xs[pi] && mouse_pos[0] < pane_xs[pi] + pane_ws[pi];
                     if in_pane && (mouse_pos[0] - label_x).abs() < DIVIDER_GRAB_PX
                         && mouse_pos[1] > TOOLBAR_H && mouse_pos[1] < divider_y
                     {
-                        near_v = true;
+                        near_v_pane = Some(pi);
                     }
                 }
             }
 
-            if (near_v && !state.drag.is_active()) || state.drag == DragKind::LabelDivider {
+            if (near_v_pane.is_some() && !state.drag.is_active()) || matches!(state.drag, DragKind::LabelDivider(_)) {
                 ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeEW));
             }
-            if ui.io().mouse_down[0] && !state.drag.is_active() && near_v {
-                state.drag = DragKind::LabelDivider;
+            if ui.io().mouse_down[0] && !state.drag.is_active() {
+                if let Some(pi) = near_v_pane {
+                    state.drag = DragKind::LabelDivider(pi);
+                }
             }
-            if ui.io().mouse_down[0] && state.drag == DragKind::LabelDivider {
-                state.label_w += mouse_delta[0];
-                let max_w = if state.split { state.split_x * 0.5 } else { display[0] * 0.5 };
-                state.label_w = state.label_w.clamp(MIN_LABEL_W, max_w);
-            } else if state.drag == DragKind::LabelDivider && !ui.io().mouse_down[0] {
-                state.drag = DragKind::None;
+            if let DragKind::LabelDivider(pi) = state.drag {
+                if ui.io().mouse_down[0] {
+                    state.panes[pi].label_w += mouse_delta[0];
+                    let max_w = if state.split { state.split_x * 0.5 } else { display[0] * 0.5 };
+                    state.panes[pi].label_w = state.panes[pi].label_w.clamp(MIN_LABEL_W, max_w);
+                } else {
+                    state.drag = DragKind::None;
+                }
             }
         }
 
@@ -902,6 +905,7 @@ impl App {
                         pane.show_cpu,
                         &mut state.buf,
                         rect,
+                        pi,
                         hovered,
                         clicked,
                         active,
@@ -921,7 +925,7 @@ impl App {
                         pane.selected,
                         pane.multi_select_name,
                         &pane.sel_mask,
-                        state.label_w,
+                        pane.label_w,
                         &mut pane.track_scales,
                         &mut state.drag,
                     );

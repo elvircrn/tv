@@ -53,7 +53,6 @@ fn make_state(trace: Trace) -> AppState {
         split_x: 0.0,
         buf: DrawBuf::default(),
         bottom_h: DETAIL_H,
-        label_w: LABEL_W,
         drag: DragKind::None,
         show_diff: false,
         diff_popup_open: false,

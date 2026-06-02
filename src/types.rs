@@ -170,8 +170,8 @@ pub enum BottomTab { Detail, Stats, Selection, Labels }
 pub enum DragKind {
     None,
     BottomDivider,
-    LabelDivider,
-    TrackResize(usize),
+    LabelDivider(usize),
+    TrackResize(usize, usize),
     SplitDivider,
 }
 
