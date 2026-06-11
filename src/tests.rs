@@ -47,10 +47,9 @@ fn make_state(trace: Trace) -> AppState {
     pane.collapsed = collapsed;
     pane.trace = Some(trace);
     AppState {
-        panes: [pane, Pane::new()],
+        panes: vec![pane],
         active: 0,
-        split: false,
-        split_x: 0.0,
+        divider_xs: Vec::new(),
         buf: DrawBuf::default(),
         bottom_h: DETAIL_H,
         drag: DragKind::None,
@@ -59,6 +58,7 @@ fn make_state(trace: Trace) -> AppState {
         diff_result: None,
         diff_bar_scroll: 0.0,
         diff_bar_zoom: 1.0,
+        diff_pane_indices: None,
     }
 }
 

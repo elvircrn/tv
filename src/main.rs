@@ -50,10 +50,9 @@ impl App {
             imgui: None,
             renderer: None,
             state: AppState {
-                panes: [Pane::new(), Pane::new()],
+                panes: vec![Pane::new()],
                 active: 0,
-                split: false,
-                split_x: 0.0,
+                divider_xs: Vec::new(),
                 buf: DrawBuf::default(),
                 bottom_h: DETAIL_H,
                 drag: DragKind::None,
@@ -62,6 +61,7 @@ impl App {
                 diff_result: None,
                 diff_bar_scroll: 0.0,
                 diff_bar_zoom: 1.0,
+                diff_pane_indices: None,
             },
             last_frame: Instant::now(),
             scale_factor: 1.0,
@@ -122,12 +122,16 @@ impl ApplicationHandler for App {
         self.imgui = Some(imgui);
         self.renderer = Some(renderer);
 
-        if !self.pending_files.is_empty() {
-            self.state.panes[0].open(self.pending_files.remove(0));
-            if !self.pending_files.is_empty() {
-                self.state.panes[1].open(self.pending_files.remove(0));
-                self.state.split = true;
+        for i in 0..self.pending_files.len() {
+            if i >= self.state.panes.len() {
+                self.state.panes.push(Pane::new());
             }
+            self.state.panes[i].open(self.pending_files[i].clone());
+        }
+        self.pending_files.clear();
+        if self.state.panes.len() > 1 {
+            let size = self.window.as_ref().unwrap().inner_size();
+            self.state.recompute_dividers(size.width as f32 / self.scale_factor as f32);
         }
     }
 
@@ -244,18 +248,16 @@ impl ApplicationHandler for App {
 
             WindowEvent::DroppedFile(path) => {
                 let path_str: String = path.to_string_lossy().into();
-                let pane0_busy = self.state.panes[0].has_trace() || self.state.panes[0].loading.is_some();
-                if !self.state.split && pane0_busy {
-                    self.state.split = true;
-                    self.state.active = 1;
-                    self.state.panes[1].open(path_str);
-                } else if self.state.split {
-                    let target = if self.last_mouse_x < self.state.split_x { 0 } else { 1 };
-                    self.state.active = target;
-                    self.state.panes[target].open(path_str);
+                let display_w = self.window.as_ref().map_or(800.0, |w| w.inner_size().width as f32 / self.scale_factor as f32);
+                let empty_pane = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
+                let target = if let Some(i) = empty_pane {
+                    i
                 } else {
-                    self.state.panes[0].open(path_str);
-                }
+                    self.state.add_pane(display_w);
+                    self.state.panes.len() - 1
+                };
+                self.state.active = target;
+                self.state.panes[target].open(path_str);
             }
 
             WindowEvent::RedrawRequested => {
@@ -274,8 +276,7 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let needs_poll = self.state.panes[0].loading.is_some()
-            || self.state.panes[1].loading.is_some()
+        let needs_poll = self.state.panes.iter().any(|p| p.loading.is_some())
             || self.nav_keys != 0;
         if needs_poll {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -306,8 +307,7 @@ impl App {
         io.delta_time = dt;
         self.last_frame = now;
 
-        self.state.panes[0].poll_loading();
-        self.state.panes[1].poll_loading();
+        for p in &mut self.state.panes { p.poll_loading(); }
 
         let scroll = self.scroll_accum;
         self.scroll_accum = [0.0; 2];
@@ -324,13 +324,13 @@ impl App {
 
         let state = &mut self.state;
 
-        if state.split && state.split_x < 1.0 {
-            state.split_x = display[0] * 0.5;
+        if state.divider_xs.is_empty() && state.panes.len() > 1 {
+            state.recompute_dividers(display[0]);
         }
 
-        let n_panes = if state.split { 2 } else { 1 };
-        let pane_xs: [f32; 2] = if state.split { [0.0, state.split_x] } else { [0.0, 0.0] };
-        let pane_ws: [f32; 2] = if state.split { [state.split_x, display[0] - state.split_x] } else { [display[0], 0.0] };
+        let mut n_panes = state.panes.len();
+        let mut pane_xs: Vec<f32> = (0..n_panes).map(|pi| state.pane_x(pi, display[0])).collect();
+        let mut pane_ws: Vec<f32> = (0..n_panes).map(|pi| state.pane_w(pi, display[0])).collect();
 
         let any_has_trace = (0..n_panes).any(|pi| state.panes[pi].has_trace());
         let bottom_h = if any_has_trace { state.bottom_h } else { 0.0 };
@@ -340,7 +340,7 @@ impl App {
         macro_rules! mark {
             ($name:expr, $t:expr) => {
                 let e = $t.elapsed().as_secs_f64() * 1000.0;
-                if e > 20.0 { eprint!("  {}:{:.0} ", $name, e); }
+                if e > 20.0 { eprintln!("  {}:{:.0} ", $name, e); }
                 $t = Instant::now();
             }
         }
@@ -396,7 +396,7 @@ impl App {
             if let DragKind::LabelDivider(pi) = state.drag {
                 if ui.io().mouse_down[0] {
                     state.panes[pi].label_w += mouse_delta[0];
-                    let max_w = if state.split { state.split_x * 0.5 } else { display[0] * 0.5 };
+                    let max_w = pane_ws[pi] * 0.5;
                     state.panes[pi].label_w = state.panes[pi].label_w.clamp(MIN_LABEL_W, max_w);
                 } else {
                     state.drag = DragKind::None;
@@ -404,37 +404,50 @@ impl App {
             }
         }
 
-        // Split divider
-        if state.split && !state.diff_popup_open {
-            let near_split = !selecting && (mouse_pos[0] - state.split_x).abs() < DIVIDER_GRAB_PX
-                && mouse_pos[1] > TOOLBAR_H;
+        // Split dividers
+        if n_panes > 1 && !state.diff_popup_open {
+            let mut near_div: Option<usize> = None;
+            if !selecting {
+                for (i, &dx) in state.divider_xs.iter().enumerate() {
+                    if (mouse_pos[0] - dx).abs() < DIVIDER_GRAB_PX && mouse_pos[1] > TOOLBAR_H {
+                        near_div = Some(i);
+                        break;
+                    }
+                }
+            }
 
-            if (near_split && !state.drag.is_active()) || state.drag == DragKind::SplitDivider {
+            if (near_div.is_some() && !state.drag.is_active()) || matches!(state.drag, DragKind::SplitDivider(_)) {
                 ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeEW));
             }
-            if ui.io().mouse_down[0] && !state.drag.is_active() && near_split {
-                state.drag = DragKind::SplitDivider;
+            if ui.io().mouse_down[0] && !state.drag.is_active() {
+                if let Some(i) = near_div {
+                    state.drag = DragKind::SplitDivider(i);
+                }
             }
-            if ui.io().mouse_down[0] && state.drag == DragKind::SplitDivider {
-                state.split_x += mouse_delta[0];
-                state.split_x = state.split_x.clamp(MIN_SPLIT_W, display[0] - MIN_SPLIT_W);
-            } else if state.drag == DragKind::SplitDivider && !ui.io().mouse_down[0] {
-                state.drag = DragKind::None;
+            if let DragKind::SplitDivider(i) = state.drag {
+                if ui.io().mouse_down[0] {
+                    state.divider_xs[i] += mouse_delta[0];
+                    let lo = if i == 0 { MIN_SPLIT_W } else { state.divider_xs[i - 1] + MIN_SPLIT_W };
+                    let hi = if i + 1 < state.divider_xs.len() { state.divider_xs[i + 1] - MIN_SPLIT_W } else { display[0] - MIN_SPLIT_W };
+                    state.divider_xs[i] = state.divider_xs[i].clamp(lo, hi);
+                } else {
+                    state.drag = DragKind::None;
+                }
             }
         }
 
         mark!("drag", t_section);
         // ---- Per-pane toolbars ----
-        let mut search_changed = [false; 2];
+        let mut search_changed = vec![false; n_panes];
         let mut close_pane: Option<usize> = None;
-        let mut diff_clicked = false;
-        let can_diff = state.split
-            && !state.panes[0].selection_stats.is_empty()
-            && !state.panes[1].selection_stats.is_empty();
-        let toolbar_names = ["##toolbar0", "##toolbar1"];
+        let mut diff_clicked_against: Option<usize> = None;
+        let active_has_sel = !state.panes[state.active].selection_stats.is_empty();
         for pi in 0..n_panes {
+            state.buf.fmt.clear();
+            write!(state.buf.fmt, "##toolbar{}", pi).unwrap();
+            let toolbar_name = state.buf.fmt.clone();
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 6.0]));
-            ui.window(toolbar_names[pi])
+            ui.window(&toolbar_name)
                 .position([pane_xs[pi], 0.0], Condition::Always)
                 .size([pane_ws[pi], TOOLBAR_H], Condition::Always)
                 .flags(
@@ -464,10 +477,10 @@ impl App {
                             pane.view.t1 = t.max_ts + pad;
                             pane.view.scroll_y = 0.0;
                         }
-                        if can_diff {
+                        if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
                             ui.same_line();
                             if ui.button("Diff") {
-                                diff_clicked = true;
+                                diff_clicked_against = Some(pi);
                             }
                         }
                         if pi == 0 {
@@ -558,28 +571,27 @@ impl App {
         }
 
         if let Some(pi) = close_pane {
-            if state.split {
-                if pi == 0 {
-                    state.panes.swap(0, 1);
-                }
-                state.panes[1] = Pane::new();
-                state.split = false;
+            if n_panes > 1 {
+                state.remove_pane(pi, display[0]);
             } else {
-                state.panes[pi] = Pane::new();
+                state.panes[0] = Pane::new();
             }
-            state.active = 0;
+            n_panes = state.panes.len();
+            pane_xs = (0..n_panes).map(|pi| state.pane_x(pi, display[0])).collect();
+            pane_ws = (0..n_panes).map(|pi| state.pane_w(pi, display[0])).collect();
             window.request_redraw();
         }
 
         mark!("toolbar", t_section);
         // ---- Diff trigger ----
-        if diff_clicked {
-            let seq_a = state.panes[0].extract_selection_events();
-            let seq_b = state.panes[1].extract_selection_events();
+        if let Some(other) = diff_clicked_against {
+            let seq_a = state.panes[state.active].extract_selection_events();
+            let seq_b = state.panes[other].extract_selection_events();
             state.diff_result = Some(diff::compute_diff(&seq_a, &seq_b));
             state.diff_bar_scroll = 0.0;
             state.diff_bar_zoom = 1.0;
             state.show_diff = true;
+            state.diff_pane_indices = Some([state.active, other]);
         }
 
         // ---- Divider lines (skip when diff popup covers everything) ----
@@ -591,24 +603,23 @@ impl App {
                 let col = if near { col32(120, 120, 120, 255) } else { col32(60, 60, 60, 255) };
                 dl.add_line([0.0, divider_y], [display[0], divider_y], col).build();
             }
-            if state.split {
+            for (i, &dx) in state.divider_xs.iter().enumerate() {
                 let dl = ui.get_foreground_draw_list();
-                let near = !selecting && ((mouse_pos[0] - state.split_x).abs() < DIVIDER_GRAB_PX || state.drag == DragKind::SplitDivider);
+                let near = !selecting && ((mouse_pos[0] - dx).abs() < DIVIDER_GRAB_PX || state.drag == DragKind::SplitDivider(i));
                 let col = if near { col32(120, 120, 120, 255) } else { col32(60, 60, 60, 255) };
-                dl.add_line([state.split_x, 0.0], [state.split_x, display[1]], col).build();
+                dl.add_line([dx, 0.0], [dx, display[1]], col).build();
             }
         }
 
         mark!("dividers", t_section);
         // ---- Per-pane bottom panels ----
-        let mut labels_changed = [false; 2];
-        let mut pending_delete_label: [Option<usize>; 2] = [None; 2];
-        let bottom_names = ["##bottom0", "##bottom1"];
-        let bottom_tab_names = ["##bottomtabs0", "##bottomtabs1"];
+        let mut labels_changed = vec![false; n_panes];
+        let mut pending_delete_label: Vec<Option<usize>> = vec![None; n_panes];
         for pi in 0..n_panes {
             if !state.panes[pi].has_trace() { continue; }
+            let bottom_name = format!("##bottom{}", pi);
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 6.0]));
-            ui.window(bottom_names[pi])
+            ui.window(&bottom_name)
                 .position([pane_xs[pi], display[1] - bottom_h - status_h], Condition::Always)
                 .size([pane_ws[pi], bottom_h], Condition::Always)
                 .flags(
@@ -620,7 +631,8 @@ impl App {
                 .build(|| {
                     let pane = &mut state.panes[pi];
                     let trace = pane.trace.as_ref().unwrap();
-                    if let Some(_tab_bar) = ui.tab_bar(bottom_tab_names[pi]) {
+                    let tab_bar_name = format!("##bottomtabs{}", pi);
+                    if let Some(_tab_bar) = ui.tab_bar(&tab_bar_name) {
                         let pending = pane.pending_tab.take();
                         let detail_flags = if pending == Some(BottomTab::Detail) {
                             imgui::TabItemFlags::SET_SELECTED
@@ -812,13 +824,13 @@ impl App {
 
         mark!("bottom", t_section);
         // ---- Per-pane status bars ----
-        let status_names = ["##status0", "##status1"];
         for pi in 0..n_panes {
             if !state.panes[pi].has_trace() { continue; }
             let pane = &state.panes[pi];
             let t = pane.trace.as_ref().unwrap();
+            let status_name = format!("##status{}", pi);
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 2.0]));
-            ui.window(status_names[pi])
+            ui.window(&status_name)
                 .position([pane_xs[pi], display[1] - status_h], Condition::Always)
                 .size([pane_ws[pi], status_h], Condition::Always)
                 .flags(
@@ -859,20 +871,19 @@ impl App {
 
         mark!("status", t_section);
         // ---- Per-pane timelines ----
-        let mut hover_results: [Option<EventRef>; 2] = [None; 2];
-        let mut click_results: [Option<EventRef>; 2] = [None; 2];
-        let mut new_selections: [Option<Option<[f64; 4]>>; 2] = [None; 2];
-        let mut double_clicks: [bool; 2] = [false; 2];
+        let mut hover_results: Vec<Option<EventRef>> = vec![None; n_panes];
+        let mut click_results: Vec<Option<EventRef>> = vec![None; n_panes];
+        let mut new_selections: Vec<Option<Option<[f64; 4]>>> = vec![None; n_panes];
+        let mut double_clicks: Vec<bool> = vec![false; n_panes];
 
-        let timeline_names = ["##timeline0", "##timeline1"];
-        let canvas_names = ["##canvas0", "##canvas1"];
         for pi in 0..n_panes {
             if !state.panes[pi].has_trace() { continue; }
             let tl_top = TOOLBAR_H;
             let tl_h = display[1] - TOOLBAR_H - bottom_h - status_h;
 
+            let timeline_name = format!("##timeline{}", pi);
             let _pad = ui.push_style_var(StyleVar::WindowPadding([0.0, 0.0]));
-            ui.window(timeline_names[pi])
+            ui.window(&timeline_name)
                 .position([pane_xs[pi], tl_top], Condition::Always)
                 .size([pane_ws[pi], tl_h], Condition::Always)
                 .flags(
@@ -885,7 +896,8 @@ impl App {
                 .build(|| {
                     let pos = ui.cursor_screen_pos();
                     let avail = ui.content_region_avail();
-                    ui.invisible_button(canvas_names[pi], avail);
+                    let canvas_name = format!("##canvas{}", pi);
+                    ui.invisible_button(&canvas_name, avail);
                     let hovered = ui.is_item_hovered();
                     let clicked = ui.is_item_clicked();
                     let double_clicked = ui.is_mouse_double_clicked(imgui::MouseButton::Left) && hovered;
@@ -1036,10 +1048,11 @@ impl App {
             {
                 state.diff_popup_open = true;
                 if let Some(diff) = &state.diff_result {
-                    let na = std::path::Path::new(&state.panes[0].trace_path)
-                        .file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-                    let nb = std::path::Path::new(&state.panes[1].trace_path)
-                        .file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                    let [da, db] = state.diff_pane_indices.unwrap_or([0, 1]);
+                    let na = state.panes.get(da).map(|p| std::path::Path::new(&p.trace_path)
+                        .file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default();
+                    let nb = state.panes.get(db).map(|p| std::path::Path::new(&p.trace_path)
+                        .file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()).unwrap_or_default();
                     let (scroll, zoom) = draw_diff_popup(&ui, diff, &mut state.buf, display, &na, &nb,
                         state.diff_bar_scroll, state.diff_bar_zoom);
                     state.diff_bar_scroll = scroll;
@@ -1060,10 +1073,10 @@ impl App {
         let ai = state.active;
 
         if ui.is_key_pressed(imgui::Key::Home) {
-            if let Some(t) = &state.panes[ai].trace {
-                let pad = t.max_ts * FIT_PAD_FRAC;
+            if let Some(max_ts) = state.panes[ai].trace.as_ref().map(|t| t.max_ts) {
+                let pad = max_ts * FIT_PAD_FRAC;
                 state.panes[ai].view.t0 = -pad;
-                state.panes[ai].view.t1 = t.max_ts + pad;
+                state.panes[ai].view.t1 = max_ts + pad;
                 state.panes[ai].view.scroll_y = 0.0;
             }
         }

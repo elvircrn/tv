@@ -576,10 +576,9 @@ impl Pane {
 }
 
 pub struct AppState {
-    pub panes: [Pane; 2],
+    pub panes: Vec<Pane>,
     pub active: usize,
-    pub split: bool,
-    pub split_x: f32,
+    pub divider_xs: Vec<f32>,
     pub buf: DrawBuf,
     pub bottom_h: f32,
     pub drag: DragKind,
@@ -588,6 +587,50 @@ pub struct AppState {
     pub diff_result: Option<DiffResult>,
     pub diff_bar_scroll: f64,
     pub diff_bar_zoom: f64,
+    pub diff_pane_indices: Option<[usize; 2]>,
+}
+
+impl AppState {
+    pub fn recompute_dividers(&mut self, width: f32) {
+        let n = self.panes.len();
+        self.divider_xs.clear();
+        for i in 1..n {
+            self.divider_xs.push(width * i as f32 / n as f32);
+        }
+    }
+
+    pub fn pane_x(&self, pi: usize, _width: f32) -> f32 {
+        if pi == 0 { 0.0 } else { self.divider_xs[pi - 1] }
+    }
+
+    pub fn pane_w(&self, pi: usize, width: f32) -> f32 {
+        let x0 = if pi == 0 { 0.0 } else { self.divider_xs[pi - 1] };
+        let x1 = if pi < self.divider_xs.len() { self.divider_xs[pi] } else { width };
+        x1 - x0
+    }
+
+    pub fn add_pane(&mut self, width: f32) {
+        self.panes.push(Pane::new());
+        self.recompute_dividers(width);
+    }
+
+    pub fn remove_pane(&mut self, pi: usize, width: f32) {
+        self.panes.remove(pi);
+        if self.active > pi {
+            self.active -= 1;
+        } else if self.active >= self.panes.len() {
+            self.active = self.panes.len().saturating_sub(1);
+        }
+        self.drag = DragKind::None;
+        self.recompute_dividers(width);
+    }
+
+    pub fn pane_at_x(&self, x: f32) -> usize {
+        for (i, &dx) in self.divider_xs.iter().enumerate() {
+            if x < dx { return i; }
+        }
+        self.panes.len() - 1
+    }
 }
 
 pub fn json_escape(s: &str) -> String {

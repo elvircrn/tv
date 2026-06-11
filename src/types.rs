@@ -172,7 +172,7 @@ pub enum DragKind {
     BottomDivider,
     LabelDivider(usize),
     TrackResize(usize, usize),
-    SplitDivider,
+    SplitDivider(usize),
 }
 
 impl DragKind {
