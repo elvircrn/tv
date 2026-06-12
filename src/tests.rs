@@ -1,6 +1,7 @@
 use super::*;
 use crate::parse::*;
-use crate::loader::load_trace;
+use crate::loader::{load_trace, detect_rank_groups, merge_traces};
+use crate::state::parse_rank;
 use imgui::ImColor32;
 use std::collections::HashMap;
 
@@ -1172,6 +1173,244 @@ fn test_diff_both_sides_match_added_dur_fields() {
                 assert!(line.dur_a.is_some(), "Same line '{}' should have dur_a", line.name);
                 assert!(line.dur_b.is_some(), "Same line '{}' should have dur_b", line.name);
             }
+        }
+    }
+}
+
+// --- parse_rank ---
+
+#[test]
+fn test_parse_rank() {
+    assert_eq!(parse_rank("[rank 0] GPU 0"), Some(0));
+    assert_eq!(parse_rank("[rank 12] CPU"), Some(12));
+    assert_eq!(parse_rank("[rank 99]"), Some(99));
+    assert_eq!(parse_rank("GPU 0"), None);
+    assert_eq!(parse_rank(""), None);
+    assert_eq!(parse_rank("[rank abc]"), None);
+}
+
+// --- detect_rank_groups ---
+
+#[test]
+fn test_detect_rank_groups_basic() {
+    let paths = vec![
+        "trace-rank-0.json.gz".to_string(),
+        "trace-rank-1.json.gz".to_string(),
+        "trace-rank-2.json.gz".to_string(),
+        "standalone.json".to_string(),
+    ];
+    let (groups, standalone) = detect_rank_groups(&paths);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].len(), 3);
+    assert_eq!(groups[0][0].0, 0);
+    assert_eq!(groups[0][1].0, 1);
+    assert_eq!(groups[0][2].0, 2);
+    assert_eq!(standalone, vec!["standalone.json"]);
+}
+
+#[test]
+fn test_detect_rank_groups_no_ranks() {
+    let paths = vec![
+        "trace_a.json".to_string(),
+        "trace_b.json".to_string(),
+    ];
+    let (groups, standalone) = detect_rank_groups(&paths);
+    assert!(groups.is_empty());
+    assert_eq!(standalone.len(), 2);
+}
+
+// --- merge_traces ---
+
+#[test]
+fn test_merge_traces() {
+    let t0 = make_trace(
+        vec!["", "kern_a"],
+        vec![("GPU 0", true, vec![ev(100.0, 50.0, 1, 0)])],
+    );
+    let t1 = make_trace(
+        vec!["", "kern_b"],
+        vec![("GPU 0", true, vec![ev(200.0, 60.0, 1, 0)])],
+    );
+    let merged = merge_traces(vec![(0, t0), (1, t1)]);
+
+    assert_eq!(merged.tracks.len(), 2);
+    assert!(merged.tracks[0].label.contains("[rank 0]"));
+    assert!(merged.tracks[1].label.contains("[rank 1]"));
+    assert!(merged.names.contains(&"kern_a".to_string()));
+    assert!(merged.names.contains(&"kern_b".to_string()));
+    let r0_ev = &merged.tracks[0].events[0];
+    let r1_ev = &merged.tracks[1].events[0];
+    assert!(r0_ev.ts < r1_ev.ts, "rank 0 event should be earlier");
+}
+
+// --- align_rank_times / unalign_rank_times ---
+
+#[test]
+fn test_align_rank_times() {
+    let trace = make_trace(
+        vec!["", "kern"],
+        vec![
+            ("[rank 0] GPU 0", true, vec![ev(100.0, 10.0, 1, 0), ev(200.0, 10.0, 1, 0)]),
+            ("[rank 0] CPU",   false, vec![ev(90.0, 5.0, 1, 0)]),
+            ("[rank 1] GPU 0", true, vec![ev(300.0, 10.0, 1, 0), ev(400.0, 10.0, 1, 0)]),
+            ("[rank 1] CPU",   false, vec![ev(290.0, 5.0, 1, 0)]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    p.align_rank_times();
+
+    let r0_gpu = &p.trace.as_ref().unwrap().tracks[0];
+    let r1_gpu = &p.trace.as_ref().unwrap().tracks[2];
+    assert!((r0_gpu.events[0].ts - 0.0).abs() < 1e-9, "rank 0 GPU should start at 0");
+    assert!((r1_gpu.events[0].ts - 0.0).abs() < 1e-9, "rank 1 GPU should start at 0");
+
+    let r0_cpu = &p.trace.as_ref().unwrap().tracks[1];
+    assert!((r0_cpu.events[0].ts - (-10.0)).abs() < 1e-9,
+        "rank 0 CPU should shift by same offset as GPU (90 - 100 = -10)");
+}
+
+#[test]
+fn test_align_unalign_roundtrip() {
+    let trace = make_trace(
+        vec!["", "kern"],
+        vec![
+            ("[rank 0] GPU 0", true, vec![ev(100.0, 10.0, 1, 0)]),
+            ("[rank 1] GPU 0", true, vec![ev(300.0, 10.0, 1, 0)]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+
+    let orig_ts0 = p.trace.as_ref().unwrap().tracks[0].events[0].ts;
+    let orig_ts1 = p.trace.as_ref().unwrap().tracks[1].events[0].ts;
+
+    p.align_rank_times();
+    assert!((p.trace.as_ref().unwrap().tracks[0].events[0].ts - 0.0).abs() < 1e-9);
+
+    p.unalign_rank_times();
+    let restored0 = p.trace.as_ref().unwrap().tracks[0].events[0].ts;
+    let restored1 = p.trace.as_ref().unwrap().tracks[1].events[0].ts;
+    assert!((restored0 - orig_ts0).abs() < 1e-9, "rank 0 should restore to {orig_ts0}, got {restored0}");
+    assert!((restored1 - orig_ts1).abs() < 1e-9, "rank 1 should restore to {orig_ts1}, got {restored1}");
+}
+
+// --- align_per_step / unalign_per_step ---
+
+#[test]
+fn test_align_per_step() {
+    let trace = make_trace(
+        vec!["", "execute_model", "other_kern"],
+        vec![
+            ("[rank 0] GPU 0", true, vec![
+                ev(100.0, 50.0, 1, 0),
+                ev(200.0, 30.0, 2, 0),
+                ev(500.0, 50.0, 1, 0),
+            ]),
+            ("[rank 1] GPU 0", true, vec![
+                ev(110.0, 50.0, 1, 0),
+                ev(220.0, 30.0, 2, 0),
+                ev(520.0, 50.0, 1, 0),
+            ]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    p.align_per_step();
+
+    let r1 = &p.trace.as_ref().unwrap().tracks[1];
+    assert!((r1.events[0].ts - 100.0).abs() < 1e-9,
+        "rank 1 first execute should align to rank 0's 100.0, got {}", r1.events[0].ts);
+    assert!((r1.events[2].ts - 500.0).abs() < 1e-9,
+        "rank 1 second execute should align to rank 0's 500.0, got {}", r1.events[2].ts);
+
+    let mid = r1.events[1].ts;
+    assert!(mid > 100.0 && mid < 500.0, "interpolated event should be between boundaries, got {mid}");
+}
+
+#[test]
+fn test_align_per_step_roundtrip() {
+    let trace = make_trace(
+        vec!["", "execute_model", "other"],
+        vec![
+            ("[rank 0] GPU 0", true, vec![ev(100.0, 50.0, 1, 0), ev(500.0, 50.0, 1, 0)]),
+            ("[rank 1] GPU 0", true, vec![ev(110.0, 50.0, 1, 0), ev(520.0, 50.0, 1, 0)]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+
+    let orig: Vec<f64> = p.trace.as_ref().unwrap().tracks[1].events.iter().map(|e| e.ts).collect();
+
+    p.align_per_step();
+    p.unalign_per_step();
+
+    let restored: Vec<f64> = p.trace.as_ref().unwrap().tracks[1].events.iter().map(|e| e.ts).collect();
+    for (i, (o, r)) in orig.iter().zip(restored.iter()).enumerate() {
+        assert!((o - r).abs() < 1e-9, "event {i}: expected {o}, got {r}");
+    }
+}
+
+// --- detect_stragglers ---
+
+#[test]
+fn test_detect_stragglers_flags_slow() {
+    let trace = make_trace(
+        vec!["", "nccl_allreduce"],
+        vec![
+            ("[rank 0] GPU 0", true, vec![ev(100.0, 10.0, 1, 0)]),
+            ("[rank 1] GPU 0", true, vec![ev(100.0, 10.0, 1, 0)]),
+            ("[rank 2] GPU 0", true, vec![ev(100.0, 25.0, 1, 0)]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    p.detect_stragglers();
+
+    assert!(!p.straggler_mask[0][0], "rank 0 (dur=10) should not be flagged");
+    assert!(!p.straggler_mask[1][0], "rank 1 (dur=10) should not be flagged");
+    assert!(p.straggler_mask[2][0], "rank 2 (dur=25 > 2*median=10) should be flagged");
+}
+
+#[test]
+fn test_detect_stragglers_no_flag_when_close() {
+    let trace = make_trace(
+        vec!["", "collective"],
+        vec![
+            ("[rank 0] GPU 0", true, vec![ev(100.0, 10.0, 1, 0)]),
+            ("[rank 1] GPU 0", true, vec![ev(100.0, 12.0, 1, 0)]),
+            ("[rank 2] GPU 0", true, vec![ev(100.0, 15.0, 1, 0)]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    p.detect_stragglers();
+
+    for ti in 0..3 {
+        assert!(!p.straggler_mask[ti][0],
+            "track {ti} should not be flagged (all durs within 2x median)");
+    }
+}
+
+#[test]
+fn test_detect_stragglers_ignores_cpu() {
+    let trace = make_trace(
+        vec!["", "kern"],
+        vec![
+            ("[rank 0] GPU 0", true, vec![ev(100.0, 10.0, 1, 0)]),
+            ("[rank 1] GPU 0", true, vec![ev(100.0, 10.0, 1, 0)]),
+            ("[rank 0] CPU",   false, vec![ev(100.0, 100.0, 1, 0)]),
+            ("[rank 1] CPU",   false, vec![ev(100.0, 100.0, 1, 0)]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    p.detect_stragglers();
+
+    for ti in 0..4 {
+        for ei in 0..p.straggler_mask[ti].len() {
+            assert!(!p.straggler_mask[ti][ei],
+                "track {ti} event {ei} should not be flagged (CPU tracks ignored, GPU durs equal)");
         }
     }
 }

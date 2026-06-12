@@ -5,7 +5,7 @@ use imgui::ImColor32;
 use std::collections::HashMap;
 use std::sync::mpsc;
 
-fn parse_rank(label: &str) -> Option<usize> {
+pub(crate) fn parse_rank(label: &str) -> Option<usize> {
     if label.starts_with("[rank ") {
         label[6..].find(']').and_then(|p| label[6..6 + p].parse().ok())
     } else {
