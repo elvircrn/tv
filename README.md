@@ -14,7 +14,7 @@ cargo build --release
 
 Binary at `target/release/tv`.
 
-For development (faster incremental builds, ~1.3s vs ~7s):
+For development:
 
 ```
 cargo build --profile dev-release
