@@ -469,6 +469,7 @@ impl App {
         let mut diff_clicked_against: Option<usize> = None;
         let prev_align: Vec<bool> = state.panes.iter().map(|p| p.align_ranks).collect();
         let prev_time_aligned: Vec<bool> = state.panes.iter().map(|p| p.time_aligned).collect();
+        let prev_step_aligned: Vec<bool> = state.panes.iter().map(|p| p.step_aligned).collect();
         let active_has_sel = !state.panes[state.active].selection_stats.is_empty();
         for pi in 0..n_panes {
             state.buf.fmt.clear();
@@ -502,6 +503,8 @@ impl App {
                         if is_multi_rank {
                             ui.same_line();
                             ui.checkbox("Align", &mut pane.time_aligned);
+                            ui.same_line();
+                            ui.checkbox("Per-step", &mut pane.step_aligned);
                             ui.same_line();
                             ui.checkbox("Stragglers", &mut pane.align_ranks);
                         }
@@ -620,6 +623,15 @@ impl App {
                     state.panes[pi].align_rank_times();
                 } else {
                     state.panes[pi].unalign_rank_times();
+                }
+            }
+        }
+        for pi in 0..state.panes.len().min(prev_step_aligned.len()) {
+            if state.panes[pi].step_aligned != prev_step_aligned[pi] {
+                if state.panes[pi].step_aligned {
+                    state.panes[pi].align_per_step();
+                } else {
+                    state.panes[pi].unalign_per_step();
                 }
             }
         }

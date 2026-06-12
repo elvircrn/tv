@@ -53,6 +53,8 @@ pub struct Pane {
     pub straggler_mask: Vec<Vec<bool>>,
     pub time_aligned: bool,
     pub rank_time_offsets: Vec<f64>,
+    pub step_aligned: bool,
+    pub step_align_offsets: Vec<Vec<f64>>,
 }
 
 impl Pane {
@@ -97,6 +99,8 @@ impl Pane {
             straggler_mask: Vec::new(),
             time_aligned: false,
             rank_time_offsets: Vec::new(),
+            step_aligned: false,
+            step_align_offsets: Vec::new(),
         }
     }
 
@@ -451,6 +455,107 @@ impl Pane {
             }
         }
         self.rank_time_offsets.clear();
+        trace.max_ts = trace.tracks.iter()
+            .flat_map(|t| t.events.iter().map(|e| e.ts + e.dur))
+            .fold(0.0f64, f64::max);
+    }
+
+    pub fn align_per_step(&mut self) {
+        let trace = match &mut self.trace {
+            Some(t) => t,
+            None => return,
+        };
+
+        let mut rank_gpu_tracks: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (ti, track) in trace.tracks.iter().enumerate() {
+            if !track.gpu { continue; }
+            if let Some(r) = parse_rank(&track.label) {
+                rank_gpu_tracks.entry(r).or_default().push(ti);
+            }
+        }
+        if rank_gpu_tracks.len() < 2 { return; }
+
+        let mut ranks_sorted: Vec<usize> = rank_gpu_tracks.keys().copied().collect();
+        ranks_sorted.sort();
+
+        let mut exec_times: Vec<Vec<f64>> = Vec::new();
+        for &rank in &ranks_sorted {
+            let tis = &rank_gpu_tracks[&rank];
+            let mut execs: Vec<f64> = Vec::new();
+            for &ti in tis {
+                for ev in &trace.tracks[ti].events {
+                    if trace.names[ev.name as usize].starts_with("execute") {
+                        execs.push(ev.ts);
+                    }
+                }
+            }
+            execs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            exec_times.push(execs);
+        }
+
+        let min_count = exec_times.iter().map(|e| e.len()).min().unwrap_or(0);
+        if min_count == 0 { return; }
+
+        let ref_times: Vec<f64> = (0..min_count).map(|k| exec_times[0][k]).collect();
+
+        let mut rank_segments: Vec<Vec<(f64, f64)>> = Vec::new();
+        for (ri, _rank) in ranks_sorted.iter().enumerate() {
+            let mut segs = Vec::new();
+            for k in 0..min_count {
+                let offset = ref_times[k] - exec_times[ri][k];
+                segs.push((exec_times[ri][k], offset));
+            }
+            rank_segments.push(segs);
+        }
+
+        self.step_align_offsets = vec![Vec::new(); trace.tracks.len()];
+        for (ti, track) in trace.tracks.iter_mut().enumerate() {
+            let rank = match parse_rank(&track.label) {
+                Some(r) => r,
+                None => continue,
+            };
+            let ri = match ranks_sorted.iter().position(|&r| r == rank) {
+                Some(i) => i,
+                None => continue,
+            };
+            let segs = &rank_segments[ri];
+            let mut ev_offsets = Vec::with_capacity(track.events.len());
+            for ev in &mut track.events {
+                let offset = match segs.binary_search_by(|s| s.0.partial_cmp(&ev.ts).unwrap()) {
+                    Ok(i) => segs[i].1,
+                    Err(0) => segs[0].1,
+                    Err(i) if i >= segs.len() => segs[segs.len() - 1].1,
+                    Err(i) => {
+                        let (t0, o0) = segs[i - 1];
+                        let (t1, o1) = segs[i];
+                        let frac = (ev.ts - t0) / (t1 - t0);
+                        o0 + frac * (o1 - o0)
+                    }
+                };
+                ev_offsets.push(offset);
+                ev.ts += offset;
+            }
+            self.step_align_offsets[ti] = ev_offsets;
+        }
+
+        trace.max_ts = trace.tracks.iter()
+            .flat_map(|t| t.events.iter().map(|e| e.ts + e.dur))
+            .fold(0.0f64, f64::max);
+        eprintln!("  step-align: {} steps matched across {} ranks", min_count, ranks_sorted.len());
+    }
+
+    pub fn unalign_per_step(&mut self) {
+        let trace = match &mut self.trace {
+            Some(t) => t,
+            None => return,
+        };
+        for (ti, offsets) in self.step_align_offsets.iter().enumerate() {
+            if offsets.len() != trace.tracks[ti].events.len() { continue; }
+            for (ei, ev) in trace.tracks[ti].events.iter_mut().enumerate() {
+                ev.ts -= offsets[ei];
+            }
+        }
+        self.step_align_offsets.clear();
         trace.max_ts = trace.tracks.iter()
             .flat_map(|t| t.events.iter().map(|e| e.ts + e.dur))
             .fold(0.0f64, f64::max);
