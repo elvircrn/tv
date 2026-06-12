@@ -5,6 +5,14 @@ use imgui::ImColor32;
 use std::collections::HashMap;
 use std::sync::mpsc;
 
+fn parse_rank(label: &str) -> Option<usize> {
+    if label.starts_with("[rank ") {
+        label[6..].find(']').and_then(|p| label[6..6 + p].parse().ok())
+    } else {
+        None
+    }
+}
+
 pub struct Pane {
     pub trace: Option<Trace>,
     pub view: View,
@@ -41,6 +49,10 @@ pub struct Pane {
     pub sel_median: f64,
     pub sel_agg_stats: Vec<KernelStats>,
     pub sel_individual: Vec<KernelStats>,
+    pub align_ranks: bool,
+    pub straggler_mask: Vec<Vec<bool>>,
+    pub time_aligned: bool,
+    pub rank_time_offsets: Vec<f64>,
 }
 
 impl Pane {
@@ -81,6 +93,10 @@ impl Pane {
             sel_median: 0.0,
             sel_agg_stats: Vec::new(),
             sel_individual: Vec::new(),
+            align_ranks: false,
+            straggler_mask: Vec::new(),
+            time_aligned: false,
+            rank_time_offsets: Vec::new(),
         }
     }
 
@@ -387,6 +403,126 @@ impl Pane {
             }
         }
         self.sel_individual.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
+    }
+
+    pub fn align_rank_times(&mut self) {
+        let trace = match &mut self.trace {
+            Some(t) => t,
+            None => return,
+        };
+        let mut rank_min: HashMap<usize, f64> = HashMap::new();
+        let mut track_rank: Vec<Option<usize>> = Vec::new();
+        for track in trace.tracks.iter() {
+            let rank = parse_rank(&track.label);
+            if let Some(r) = rank {
+                if track.gpu {
+                    let min = track.events.iter().map(|e| e.ts).fold(f64::MAX, f64::min);
+                    let entry = rank_min.entry(r).or_insert(f64::MAX);
+                    *entry = entry.min(min);
+                }
+            }
+            track_rank.push(rank);
+        }
+        self.rank_time_offsets = vec![0.0; trace.tracks.len()];
+        for (ti, rank) in track_rank.iter().enumerate() {
+            if let Some(r) = rank {
+                let offset = rank_min[r];
+                self.rank_time_offsets[ti] = offset;
+                for ev in &mut trace.tracks[ti].events {
+                    ev.ts -= offset;
+                }
+            }
+        }
+        trace.max_ts = trace.tracks.iter()
+            .flat_map(|t| t.events.iter().map(|e| e.ts + e.dur))
+            .fold(0.0f64, f64::max);
+    }
+
+    pub fn unalign_rank_times(&mut self) {
+        let trace = match &mut self.trace {
+            Some(t) => t,
+            None => return,
+        };
+        for (ti, &offset) in self.rank_time_offsets.iter().enumerate() {
+            if offset != 0.0 {
+                for ev in &mut trace.tracks[ti].events {
+                    ev.ts += offset;
+                }
+            }
+        }
+        self.rank_time_offsets.clear();
+        trace.max_ts = trace.tracks.iter()
+            .flat_map(|t| t.events.iter().map(|e| e.ts + e.dur))
+            .fold(0.0f64, f64::max);
+    }
+
+    pub fn detect_stragglers(&mut self) {
+        let t0 = std::time::Instant::now();
+        let trace = match &self.trace {
+            Some(t) => t,
+            None => return,
+        };
+        self.straggler_mask = trace.tracks.iter()
+            .map(|t| vec![false; t.events.len()])
+            .collect();
+
+        let mut rank_tracks: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (ti, track) in trace.tracks.iter().enumerate() {
+            if !track.gpu { continue; }
+            if let Some(rank) = parse_rank(&track.label) {
+                rank_tracks.entry(rank).or_default().push(ti);
+            }
+        }
+        let n_ranks = rank_tracks.len();
+        if n_ranks < 2 { return; }
+
+        let mut ranks_sorted: Vec<usize> = rank_tracks.keys().copied().collect();
+        ranks_sorted.sort();
+
+        // Single pass: group events by (name, rank) → Vec<(ti, ei, dur)> sorted by ts
+        // Key: (event_name, rank_index_in_sorted_order)
+        let mut by_name_rank: HashMap<u32, Vec<Vec<(usize, usize, f64)>>> = HashMap::new();
+        for (ri, &rank) in ranks_sorted.iter().enumerate() {
+            let tis = &rank_tracks[&rank];
+            let mut events: Vec<(u32, usize, usize, f64, f64)> = Vec::new();
+            for &ti in tis {
+                for (ei, ev) in trace.tracks[ti].events.iter().enumerate() {
+                    events.push((ev.name, ti, ei, ev.dur, ev.ts));
+                }
+            }
+            events.sort_by(|a, b| a.4.partial_cmp(&b.4).unwrap());
+            for (name, ti, ei, dur, _ts) in events {
+                let entry = by_name_rank.entry(name).or_insert_with(|| vec![Vec::new(); n_ranks]);
+                entry[ri].push((ti, ei, dur));
+            }
+        }
+
+        let mut n_collectives = 0u32;
+        let mut flagged = 0usize;
+        for (_name, rank_seqs) in &by_name_rank {
+            if rank_seqs.iter().any(|s| s.is_empty()) { continue; }
+            let min_len = rank_seqs.iter().map(|s| s.len()).min().unwrap();
+            n_collectives += 1;
+
+            for k in 0..min_len {
+                let mut durs: Vec<f64> = rank_seqs.iter().map(|s| s[k].2).collect();
+                durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+                let n = durs.len();
+                let median = if n % 2 == 1 { durs[n / 2] } else { (durs[n / 2 - 1] + durs[n / 2]) / 2.0 };
+                let threshold = median * 2.0;
+
+                for seq in rank_seqs {
+                    let (ti, ei, dur) = seq[k];
+                    if dur > threshold {
+                        self.straggler_mask[ti][ei] = true;
+                        flagged += 1;
+                    }
+                }
+            }
+        }
+
+        eprintln!("  stragglers: {:.1}ms, {} flagged across {} collective names, {} ranks",
+            t0.elapsed().as_secs_f64() * 1000.0, flagged, n_collectives, n_ranks);
     }
 
     pub fn apply_label(&mut self, name: &str) {

@@ -328,6 +328,7 @@ pub fn draw_timeline(
     label_w: f32,
     track_scales: &mut Vec<f32>,
     drag: &mut DragKind,
+    straggler_mask: &[Vec<bool>],
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let dl = ui.get_window_draw_list();
     let tl_left = rect[0] + label_w;
@@ -532,7 +533,10 @@ pub fn draw_timeline(
                     if px == buf.last_px[ev.depth as usize] { continue; }
                     buf.last_px[ev.depth as usize] = px;
                     let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
-                    let color = if matches {
+                    let is_straggler = straggler_mask.get(orig_ti).and_then(|t| t.get(ei)).copied().unwrap_or(false);
+                    let color = if is_straggler {
+                        col32(220, 50, 50, 255)
+                    } else if matches {
                         event_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
                     } else {
                         event_dim_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
@@ -543,7 +547,10 @@ pub fn draw_timeline(
 
                 let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
                 let name = &trace.names[ev.name as usize];
-                let color = if matches {
+                let is_straggler = straggler_mask.get(orig_ti).and_then(|t| t.get(ei)).copied().unwrap_or(false);
+                let color = if is_straggler {
+                    col32(220, 50, 50, 255)
+                } else if matches {
                     event_color(orig_ti, ei, name, event_labels, labels)
                 } else {
                     event_dim_color(orig_ti, ei, name, event_labels, labels)

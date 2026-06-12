@@ -467,6 +467,8 @@ impl App {
         let mut search_changed = vec![false; n_panes];
         let mut close_pane: Option<usize> = None;
         let mut diff_clicked_against: Option<usize> = None;
+        let prev_align: Vec<bool> = state.panes.iter().map(|p| p.align_ranks).collect();
+        let prev_time_aligned: Vec<bool> = state.panes.iter().map(|p| p.time_aligned).collect();
         let active_has_sel = !state.panes[state.active].selection_stats.is_empty();
         for pi in 0..n_panes {
             state.buf.fmt.clear();
@@ -496,6 +498,13 @@ impl App {
                             ui.same_line_with_pos(ui.cursor_start_pos()[0]);
                         }
                         ui.checkbox("CPU", &mut pane.show_cpu);
+                        let is_multi_rank = t.tracks.iter().any(|tr| tr.label.starts_with("[rank "));
+                        if is_multi_rank {
+                            ui.same_line();
+                            ui.checkbox("Align", &mut pane.time_aligned);
+                            ui.same_line();
+                            ui.checkbox("Stragglers", &mut pane.align_ranks);
+                        }
                         ui.same_line();
                         if ui.button("Fit") {
                             let pad = t.max_ts * FIT_PAD_FRAC;
@@ -594,6 +603,25 @@ impl App {
                         ui.text_colored([1.0, 0.4, 0.4, 1.0], e);
                     }
                 });
+        }
+
+        for pi in 0..state.panes.len().min(prev_align.len()) {
+            if state.panes[pi].align_ranks != prev_align[pi] {
+                if state.panes[pi].align_ranks {
+                    state.panes[pi].detect_stragglers();
+                } else {
+                    state.panes[pi].straggler_mask.clear();
+                }
+            }
+        }
+        for pi in 0..state.panes.len().min(prev_time_aligned.len()) {
+            if state.panes[pi].time_aligned != prev_time_aligned[pi] {
+                if state.panes[pi].time_aligned {
+                    state.panes[pi].align_rank_times();
+                } else {
+                    state.panes[pi].unalign_rank_times();
+                }
+            }
         }
 
         if let Some(pi) = close_pane {
@@ -966,6 +994,7 @@ impl App {
                         pane.label_w,
                         &mut pane.track_scales,
                         &mut state.drag,
+                        &pane.straggler_mask,
                     );
                     hover_results[pi] = h;
                     click_results[pi] = c;
