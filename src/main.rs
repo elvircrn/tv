@@ -42,6 +42,8 @@ struct App {
     pending_drops: Vec<String>,
     last_mouse_x: f32,
     nav_keys: u8,
+    nav_pan_vel: f64,
+    nav_zoom_vel: f64,
 }
 
 impl App {
@@ -75,6 +77,8 @@ impl App {
             pending_drops: Vec::new(),
             last_mouse_x: 0.0,
             nav_keys: 0,
+            nav_pan_vel: 0.0,
+            nav_zoom_vel: 0.0,
         }
     }
 }
@@ -215,6 +219,9 @@ impl ApplicationHandler for App {
                     };
                     if nav_bit != 0 {
                         if event.state == ElementState::Pressed {
+                            if self.nav_keys == 0 {
+                                self.last_frame = Instant::now();
+                            }
                             self.nav_keys |= nav_bit;
                         } else {
                             self.nav_keys &= !nav_bit;
@@ -279,7 +286,9 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let needs_poll = self.state.panes.iter().any(|p| p.loading.is_some())
-            || self.nav_keys != 0;
+            || self.nav_keys != 0
+            || self.nav_pan_vel.abs() > 1e-6
+            || self.nav_zoom_vel.abs() > 1e-6;
         if needs_poll {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             if let Some(w) = &self.window {
@@ -1161,25 +1170,46 @@ impl App {
                 }
             }
         }
-        if !any_text_focused && nav_keys != 0 && !state.diff_popup_open {
+        {
+            let nav_dt = (dt.min(0.05)) as f64;
+            let accel = 40.0;
+            let decel = 40.0;
+
+            let zoom_in = nav_keys & (NAV_W | NAV_UP) != 0;
+            let zoom_out = nav_keys & (NAV_S | NAV_DOWN) != 0;
+            let zoom_target = if !any_text_focused && !state.diff_popup_open {
+                zoom_in as i32 - zoom_out as i32
+            } else { 0 } as f64;
+            if zoom_target != 0.0 {
+                self.nav_zoom_vel += (zoom_target - self.nav_zoom_vel) * (1.0 - (-accel * nav_dt).exp());
+            } else {
+                self.nav_zoom_vel *= (-decel * nav_dt).exp();
+                if self.nav_zoom_vel.abs() < 1e-6 { self.nav_zoom_vel = 0.0; }
+            }
+
+            let pan_right = nav_keys & (NAV_D | NAV_RIGHT) != 0;
+            let pan_left = nav_keys & (NAV_A | NAV_LEFT) != 0;
+            let pan_target = if !any_text_focused && !state.diff_popup_open {
+                pan_right as i32 - pan_left as i32
+            } else { 0 } as f64;
+            if pan_target != 0.0 {
+                self.nav_pan_vel += (pan_target - self.nav_pan_vel) * (1.0 - (-accel * nav_dt).exp());
+            } else {
+                self.nav_pan_vel *= (-decel * nav_dt).exp();
+                if self.nav_pan_vel.abs() < 1e-6 { self.nav_pan_vel = 0.0; }
+            }
+
             let pane = &mut state.panes[ai];
             if pane.trace.is_some() {
-                let nav_dt = dt.min(0.05);
                 let range = pane.view.t1 - pane.view.t0;
-                let zoom_in = nav_keys & (NAV_W | NAV_UP) != 0;
-                let zoom_out = nav_keys & (NAV_S | NAV_DOWN) != 0;
-                let zoom_dir = zoom_in as i32 - zoom_out as i32;
-                if zoom_dir != 0 {
-                    let factor = ZOOM_STEP.powf(nav_dt as f64 * 20.0 * zoom_dir as f64);
+                if self.nav_zoom_vel.abs() > 1e-6 {
+                    let factor = ZOOM_STEP.powf(nav_dt * 20.0 * self.nav_zoom_vel);
                     let center = (pane.view.t0 + pane.view.t1) / 2.0;
                     pane.view.t0 = center + (pane.view.t0 - center) / factor;
                     pane.view.t1 = center + (pane.view.t1 - center) / factor;
                 }
-                let pan_right = nav_keys & (NAV_D | NAV_RIGHT) != 0;
-                let pan_left = nav_keys & (NAV_A | NAV_LEFT) != 0;
-                let pan_dir = pan_right as i32 - pan_left as i32;
-                if pan_dir != 0 {
-                    let dt_pan = range * 1.5 * nav_dt as f64 * pan_dir as f64;
+                if self.nav_pan_vel.abs() > 1e-6 {
+                    let dt_pan = range * 1.5 * nav_dt * self.nav_pan_vel;
                     pane.view.t0 += dt_pan;
                     pane.view.t1 += dt_pan;
                 }
