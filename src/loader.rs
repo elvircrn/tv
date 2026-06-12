@@ -417,7 +417,143 @@ pub fn load_trace(path: &str) -> Result<Trace, String> {
         event_bytes / 1024 / 1024, str_bytes / 1024 / 1024, pair_bytes / 1024 / 1024,
         (event_bytes + str_bytes + pair_bytes) / 1024 / 1024);
     eprintln!("  total: {:.2}s", t0.elapsed().as_secs_f64());
-    Ok(Trace { tracks, names, cats, arg_strs, arg_pairs, stats, max_ts, total_events, device })
+    Ok(Trace { tracks, names, cats, arg_strs, arg_pairs, stats, max_ts, min_ts, total_events, device })
+}
+
+pub fn detect_rank_groups(paths: &[String]) -> (Vec<Vec<(usize, String)>>, Vec<String>) {
+    let mut groups: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+    let mut standalone = Vec::new();
+
+    for path in paths {
+        let fname = std::path::Path::new(path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(path);
+        if let Some(pos) = fname.find("-rank-") {
+            let prefix = &fname[..pos];
+            let after = &fname[pos + 6..];
+            if let Some(dot) = after.find('.') {
+                if let Ok(rank) = after[..dot].parse::<usize>() {
+                    groups.entry(prefix.to_string())
+                        .or_default()
+                        .push((rank, path.clone()));
+                    continue;
+                }
+            }
+        }
+        standalone.push(path.clone());
+    }
+
+    let mut rank_groups: Vec<Vec<(usize, String)>> = groups.into_values()
+        .filter(|g| g.len() > 1)
+        .collect();
+    for group in &mut rank_groups {
+        group.sort_by_key(|(rank, _)| *rank);
+    }
+    for group in rank_groups.iter() {
+        if group.len() == 1 {
+            standalone.push(group[0].1.clone());
+        }
+    }
+    rank_groups.retain(|g| g.len() > 1);
+
+    (rank_groups, standalone)
+}
+
+pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
+    let global_min = traces.iter().map(|(_, t)| t.min_ts).fold(f64::MAX, f64::min);
+
+    let mut names: Vec<String> = vec![String::new()];
+    let mut name_idx: HashMap<u64, u32> = HashMap::new();
+    name_idx.insert(0, 0);
+    let mut cats: Vec<String> = vec![String::new()];
+    let mut cat_idx: HashMap<u64, u32> = HashMap::new();
+    cat_idx.insert(0, 0);
+    let mut arg_strs: Vec<String> = vec![String::new()];
+    let mut arg_str_idx: HashMap<u64, u32> = HashMap::new();
+    arg_str_idx.insert(0, 0);
+    let mut arg_pairs: Vec<[u32; 2]> = Vec::new();
+    let mut all_tracks: Vec<Track> = Vec::new();
+    let mut total_events = 0;
+    let mut max_ts: f64 = 0.0;
+    let mut device = String::new();
+
+    for (rank, trace) in traces {
+        let time_offset = trace.min_ts - global_min;
+
+        let mut local_name_idx: HashMap<u64, u32> = HashMap::new();
+        for (i, s) in trace.names.iter().enumerate() {
+            local_name_idx.insert(crate::parse::fnv1a(s.as_bytes()), i as u32);
+        }
+        let name_remap = merge_intern_table(&mut names, &mut name_idx, &trace.names, &local_name_idx);
+
+        let mut local_cat_idx: HashMap<u64, u32> = HashMap::new();
+        for (i, s) in trace.cats.iter().enumerate() {
+            local_cat_idx.insert(crate::parse::fnv1a(s.as_bytes()), i as u32);
+        }
+        let cat_remap = merge_intern_table(&mut cats, &mut cat_idx, &trace.cats, &local_cat_idx);
+
+        let mut local_arg_str_idx: HashMap<u64, u32> = HashMap::new();
+        for (i, s) in trace.arg_strs.iter().enumerate() {
+            local_arg_str_idx.insert(crate::parse::fnv1a(s.as_bytes()), i as u32);
+        }
+        let arg_str_remap = merge_intern_table(&mut arg_strs, &mut arg_str_idx, &trace.arg_strs, &local_arg_str_idx);
+
+        let pair_offset = arg_pairs.len() as u32;
+        for &[k, v] in &trace.arg_pairs {
+            arg_pairs.push([arg_str_remap[k as usize], arg_str_remap[v as usize]]);
+        }
+
+        for mut track in trace.tracks {
+            track.label = format!("[rank {}] {}", rank, track.label);
+            for ev in &mut track.events {
+                ev.ts += time_offset;
+                ev.name = name_remap[ev.name as usize];
+                ev.cat = cat_remap[ev.cat as usize];
+                ev.args_start += pair_offset;
+            }
+            total_events += track.events.len();
+            for ev in &track.events {
+                max_ts = max_ts.max(ev.ts + ev.dur);
+            }
+            all_tracks.push(track);
+        }
+
+        if device.is_empty() && !trace.device.is_empty() {
+            device = trace.device;
+        }
+    }
+
+    all_tracks.sort_by(|a, b| {
+        a.label.cmp(&b.label)
+    });
+
+    let mut dur_map: HashMap<u32, Vec<f64>> = HashMap::new();
+    for t in &all_tracks {
+        for ev in &t.events {
+            dur_map.entry(ev.name).or_default().push(ev.dur);
+        }
+    }
+    let mut stats: Vec<KernelStats> = dur_map.into_iter().map(|(name, mut durs)| {
+        let count = durs.len() as u32;
+        let total_dur: f64 = durs.iter().sum();
+        let max_dur = durs.iter().copied().fold(0.0f64, f64::max);
+        durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = durs.len();
+        let median_dur = if n % 2 == 1 { durs[n / 2] } else { (durs[n / 2 - 1] + durs[n / 2]) / 2.0 };
+        KernelStats { name, count, total_dur, median_dur, max_dur }
+    }).collect();
+    stats.sort_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
+
+    names.shrink_to_fit();
+    cats.shrink_to_fit();
+    arg_strs.shrink_to_fit();
+    arg_pairs.shrink_to_fit();
+
+    Trace {
+        tracks: all_tracks, names, cats, arg_strs, arg_pairs, stats,
+        max_ts, min_ts: global_min, total_events, device,
+    }
 }
 
 pub fn read_bytes(path: &str) -> Result<RawData, String> {

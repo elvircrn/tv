@@ -1,4 +1,4 @@
-use crate::loader::load_trace;
+use crate::loader::{load_trace, merge_traces};
 use crate::parse::json_unescape;
 use crate::types::*;
 use imgui::ImColor32;
@@ -110,6 +110,40 @@ impl Pane {
         self.trace_path = path.clone();
         std::thread::spawn(move || {
             tx.send(load_trace(&path)).ok();
+        });
+    }
+
+    pub fn open_multi(&mut self, rank_paths: Vec<(usize, String)>) {
+        let (tx, rx) = mpsc::channel();
+        let n = rank_paths.len();
+        let prefix = std::path::Path::new(&rank_paths[0].1)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .and_then(|f| f.find("-rank-").map(|p| &f[..p]))
+            .unwrap_or("multi-rank")
+            .to_string();
+        self.trace_path = format!("{} ranks: {}", n, prefix);
+        self.loading = Some(rx);
+        self.error = None;
+        std::thread::spawn(move || {
+            let results: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = rank_paths.iter().map(|(rank, path)| {
+                    let r = *rank;
+                    s.spawn(move || (r, load_trace(path)))
+                }).collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let mut traces = Vec::new();
+            for (rank, result) in results {
+                match result {
+                    Ok(t) => traces.push((rank, t)),
+                    Err(e) => {
+                        tx.send(Err(format!("rank {rank}: {e}"))).ok();
+                        return;
+                    }
+                }
+            }
+            tx.send(Ok(merge_traces(traces))).ok();
         });
     }
 

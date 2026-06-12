@@ -77,6 +77,7 @@ pub struct Trace {
     pub arg_pairs: Vec<[u32; 2]>,
     pub stats: Vec<KernelStats>,
     pub max_ts: f64,
+    pub min_ts: f64,
     pub total_events: usize,
     pub device: String,
 }

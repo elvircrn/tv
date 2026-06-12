@@ -39,6 +39,7 @@ struct App {
     mod_ctrl: bool,
     mod_shift: bool,
     pending_files: Vec<String>,
+    pending_drops: Vec<String>,
     last_mouse_x: f32,
     nav_keys: u8,
 }
@@ -71,6 +72,7 @@ impl App {
             mod_ctrl: false,
             mod_shift: false,
             pending_files: files,
+            pending_drops: Vec::new(),
             last_mouse_x: 0.0,
             nav_keys: 0,
         }
@@ -122,11 +124,21 @@ impl ApplicationHandler for App {
         self.imgui = Some(imgui);
         self.renderer = Some(renderer);
 
-        for i in 0..self.pending_files.len() {
-            if i >= self.state.panes.len() {
+        let (rank_groups, standalone) = crate::loader::detect_rank_groups(&self.pending_files);
+        let mut pi = 0;
+        for group in rank_groups {
+            if pi >= self.state.panes.len() {
                 self.state.panes.push(Pane::new());
             }
-            self.state.panes[i].open(self.pending_files[i].clone());
+            self.state.panes[pi].open_multi(group);
+            pi += 1;
+        }
+        for path in standalone {
+            if pi >= self.state.panes.len() {
+                self.state.panes.push(Pane::new());
+            }
+            self.state.panes[pi].open(path);
+            pi += 1;
         }
         self.pending_files.clear();
         if self.state.panes.len() > 1 {
@@ -247,17 +259,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::DroppedFile(path) => {
-                let path_str: String = path.to_string_lossy().into();
-                let display_w = self.window.as_ref().map_or(800.0, |w| w.inner_size().width as f32 / self.scale_factor as f32);
-                let empty_pane = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
-                let target = if let Some(i) = empty_pane {
-                    i
-                } else {
-                    self.state.add_pane(display_w);
-                    self.state.panes.len() - 1
-                };
-                self.state.active = target;
-                self.state.panes[target].open(path_str);
+                self.pending_drops.push(path.to_string_lossy().into());
             }
 
             WindowEvent::RedrawRequested => {
@@ -306,6 +308,30 @@ impl App {
         let dt = self.last_frame.elapsed().as_secs_f32().max(0.0001);
         io.delta_time = dt;
         self.last_frame = now;
+
+        if !self.pending_drops.is_empty() {
+            let drops = std::mem::take(&mut self.pending_drops);
+            let display_w = phys.width as f32 / s;
+            let (rank_groups, standalone) = crate::loader::detect_rank_groups(&drops);
+            for group in rank_groups {
+                let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
+                let target = if let Some(i) = empty { i } else {
+                    self.state.add_pane(display_w);
+                    self.state.panes.len() - 1
+                };
+                self.state.active = target;
+                self.state.panes[target].open_multi(group);
+            }
+            for path in standalone {
+                let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
+                let target = if let Some(i) = empty { i } else {
+                    self.state.add_pane(display_w);
+                    self.state.panes.len() - 1
+                };
+                self.state.active = target;
+                self.state.panes[target].open(path);
+            }
+        }
 
         for p in &mut self.state.panes { p.poll_loading(); }
 
