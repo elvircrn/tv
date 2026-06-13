@@ -264,7 +264,7 @@ pub fn load_trace(path: &str) -> Result<Trace, String> {
                 state
             })
         }).collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
 
     let mut names: Vec<String> = vec![String::new()];

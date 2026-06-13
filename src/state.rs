@@ -157,17 +157,18 @@ impl Pane {
                     let r = *rank;
                     s.spawn(move || (r, load_trace(path)))
                 }).collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
+                handles.into_iter().filter_map(|h| h.join().ok()).collect()
             });
             let mut traces = Vec::new();
             for (rank, result) in results {
                 match result {
                     Ok(t) => traces.push((rank, t)),
-                    Err(e) => {
-                        tx.send(Err(format!("rank {rank}: {e}"))).ok();
-                        return;
-                    }
+                    Err(e) => { eprintln!("  rank {rank}: {e}"); }
                 }
+            }
+            if traces.is_empty() {
+                tx.send(Err("all ranks failed to load".into())).ok();
+                return;
             }
             tx.send(Ok(merge_traces(traces))).ok();
         });
@@ -188,14 +189,18 @@ impl Pane {
                         let r = *rank;
                         s.spawn(move || (r, load_trace(path)))
                     }).collect();
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    handles.into_iter().filter_map(|h| h.join().ok()).collect()
                 });
                 let mut traces = Vec::new();
                 for (rank, result) in results {
                     match result {
                         Ok(t) => traces.push((rank, t)),
-                        Err(e) => { tx.send(Err(format!("rank {rank}: {e}"))).ok(); return; }
+                        Err(e) => { eprintln!("  rank {rank}: {e}"); }
                     }
+                }
+                if traces.is_empty() {
+                    tx.send(Err("all ranks failed to load".into())).ok();
+                    return;
                 }
                 tx.send(Ok(merge_traces(traces))).ok();
             });

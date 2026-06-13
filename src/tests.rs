@@ -685,6 +685,51 @@ fn test_load_trace_depth_assignment() {
 // --- Label save/load roundtrip ---
 
 #[test]
+fn test_load_trace_truncated_json() {
+    let json = r#"{"traceEvents": [
+        {"ph":"X","ts":100,"dur":50,"pid":1,"tid":1,"name":"kern_a","cat":"kernel"},
+        {"ph":"X","ts":200,"dur":30,"pid":1,"tid":1,"name":"kern_b","cat":"kernel"},
+        {"ph":"X","ts":300,"dur":40,"pid":1,"tid":1,"name":"kern_c","cat":"ke"#;
+    let dir = std::env::temp_dir().join("tv_test_truncated");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("truncated.json");
+    std::fs::write(&path, json).unwrap();
+
+    let trace = load_trace(path.to_str().unwrap()).unwrap();
+    assert!(trace.total_events >= 2, "should parse complete events from truncated JSON, got {}", trace.total_events);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn test_load_trace_truncated_gz() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    let json = br#"{"traceEvents": [
+        {"ph":"X","ts":100,"dur":50,"pid":1,"tid":1,"name":"kern_a","cat":"kernel"},
+        {"ph":"X","ts":200,"dur":30,"pid":1,"tid":1,"name":"kern_b","cat":"kernel"},
+        {"ph":"X","ts":300,"dur":40,"pid":1,"tid":1,"name":"kern_c","cat":"kernel"}
+    ]}"#;
+    let dir = std::env::temp_dir().join("tv_test_truncgz");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("truncated.json.gz");
+
+    let mut buf = Vec::new();
+    {
+        let mut gz = GzEncoder::new(&mut buf, Compression::fast());
+        std::io::Write::write_all(&mut gz, json).unwrap();
+        gz.finish().unwrap();
+    }
+    std::fs::write(&path, &buf[..buf.len() - 10]).unwrap();
+
+    let trace = load_trace(path.to_str().unwrap()).unwrap();
+    assert!(trace.total_events >= 2, "should parse events from truncated gz, got {}", trace.total_events);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn test_label_save_load_roundtrip() {
     let (trace, _) = gpu_trace();
     let dir = std::env::temp_dir().join("tv_test_labels");
