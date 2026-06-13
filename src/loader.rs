@@ -556,6 +556,24 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     }
 }
 
+fn read_gz_tolerant<R: std::io::Read>(reader: R) -> Result<Vec<u8>, String> {
+    let mut decoder = flate2::read::GzDecoder::new(reader);
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 64 * 1024];
+    loop {
+        match decoder.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(e) if buf.is_empty() => return Err(format!("decompress: {e}")),
+            Err(e) => {
+                eprintln!("  truncated gz stream after {} bytes: {e}", buf.len());
+                break;
+            }
+        }
+    }
+    Ok(buf)
+}
+
 pub fn read_bytes(path: &str) -> Result<RawData, String> {
     if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
         let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
@@ -566,15 +584,17 @@ pub fn read_bytes(path: &str) -> Result<RawData, String> {
             let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
             let name = entry.path().map_err(|e| format!("tar path: {e}"))?.to_string_lossy().to_string();
             if name.ends_with(".json.gz") {
-                let mut buf = Vec::new();
-                flate2::read::GzDecoder::new(&mut entry)
-                    .read_to_end(&mut buf)
-                    .map_err(|e| format!("decompress {name}: {e}"))?;
+                let buf = read_gz_tolerant(&mut entry)
+                    .map_err(|e| format!("{name}: {e}"))?;
                 eprintln!("  extracted: {name}");
                 return Ok(RawData::Vec(buf));
             } else if name.ends_with(".json") {
                 let mut buf = Vec::new();
-                entry.read_to_end(&mut buf).map_err(|e| format!("read {name}: {e}"))?;
+                match entry.read_to_end(&mut buf) {
+                    Ok(_) => {}
+                    Err(e) if buf.is_empty() => return Err(format!("read {name}: {e}")),
+                    Err(e) => eprintln!("  truncated tar entry after {} bytes: {e}", buf.len()),
+                }
                 eprintln!("  extracted: {name}");
                 return Ok(RawData::Vec(buf));
             }
@@ -582,10 +602,8 @@ pub fn read_bytes(path: &str) -> Result<RawData, String> {
         Err(format!("no .json or .json.gz file found in {path}"))
     } else if path.ends_with(".gz") {
         let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
-        let mut buf = Vec::new();
-        flate2::read::GzDecoder::new(BufReader::new(file))
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("decompress {path}: {e}"))?;
+        let buf = read_gz_tolerant(BufReader::new(file))
+            .map_err(|e| format!("{path}: {e}"))?;
         Ok(RawData::Vec(buf))
     } else {
         let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
