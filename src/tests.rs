@@ -1209,6 +1209,22 @@ fn test_detect_rank_groups_basic() {
 }
 
 #[test]
+fn test_detect_rank_groups_ep_format() {
+    let paths = vec![
+        "dp0_pp0_tp0_dcp0_ep0_rank0.123.pt.trace.json.gz".to_string(),
+        "dp1_pp0_tp0_dcp0_ep1_rank0.456.pt.trace.json.gz".to_string(),
+        "dp2_pp0_tp0_dcp0_ep2_rank0.789.pt.trace.json.gz".to_string(),
+    ];
+    let (groups, standalone) = detect_rank_groups(&paths);
+    assert_eq!(groups.len(), 1, "should group all ep files together");
+    assert_eq!(groups[0].len(), 3);
+    assert_eq!(groups[0][0].0, 0);
+    assert_eq!(groups[0][1].0, 1);
+    assert_eq!(groups[0][2].0, 2);
+    assert!(standalone.is_empty());
+}
+
+#[test]
 fn test_detect_rank_groups_no_ranks() {
     let paths = vec![
         "trace_a.json".to_string(),

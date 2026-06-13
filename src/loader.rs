@@ -420,28 +420,66 @@ pub fn load_trace(path: &str) -> Result<Trace, String> {
     Ok(Trace { tracks, names, cats, arg_strs, arg_pairs, stats, max_ts, min_ts, total_events, device })
 }
 
+fn expand_dirs(paths: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for path in paths {
+        let p = std::path::Path::new(path);
+        if p.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(p) {
+                for entry in entries.flatten() {
+                    let ep = entry.path();
+                    if ep.is_file() {
+                        if let Some(name) = ep.file_name().and_then(|n| n.to_str()) {
+                            if name.ends_with(".json") || name.ends_with(".json.gz")
+                                || name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+                                out.push(ep.to_string_lossy().into());
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            out.push(path.clone());
+        }
+    }
+    out
+}
+
+fn extract_rank(fname: &str) -> Option<(String, usize)> {
+    if let Some(pos) = fname.find("-rank-") {
+        let prefix = &fname[..pos];
+        let after = &fname[pos + 6..];
+        if let Some(dot) = after.find('.') {
+            if let Ok(rank) = after[..dot].parse::<usize>() {
+                return Some((prefix.to_string(), rank));
+            }
+        }
+    }
+    for part in fname.split('_') {
+        if part.starts_with("ep") {
+            if let Ok(rank) = part[2..].parse::<usize>() {
+                return Some(("ep-group".to_string(), rank));
+            }
+        }
+    }
+    None
+}
+
 pub fn detect_rank_groups(paths: &[String]) -> (Vec<Vec<(usize, String)>>, Vec<String>) {
+    let expanded = expand_dirs(paths);
     let mut groups: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut standalone = Vec::new();
 
-    for path in paths {
+    for path in &expanded {
         let fname = std::path::Path::new(path)
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or(path);
-        if let Some(pos) = fname.find("-rank-") {
-            let prefix = &fname[..pos];
-            let after = &fname[pos + 6..];
-            if let Some(dot) = after.find('.') {
-                if let Ok(rank) = after[..dot].parse::<usize>() {
-                    groups.entry(prefix.to_string())
-                        .or_default()
-                        .push((rank, path.clone()));
-                    continue;
-                }
-            }
+        if let Some((key, rank)) = extract_rank(fname) {
+            groups.entry(key).or_default().push((rank, path.clone()));
+        } else {
+            standalone.push(path.clone());
         }
-        standalone.push(path.clone());
     }
 
     let mut rank_groups: Vec<Vec<(usize, String)>> = groups.into_values()
