@@ -1287,6 +1287,26 @@ fn test_align_rank_times() {
 }
 
 #[test]
+fn test_align_rank_times_cpu_only_rank() {
+    let trace = make_trace(
+        vec!["", "kern"],
+        vec![
+            ("[rank 0] GPU 0", true, vec![ev(100.0, 10.0, 1, 0)]),
+            ("[rank 0] CPU",   false, vec![ev(90.0, 5.0, 1, 0)]),
+            ("[rank 1] CPU",   false, vec![ev(200.0, 5.0, 1, 0)]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    p.align_rank_times();
+
+    let r0_gpu = &p.trace.as_ref().unwrap().tracks[0];
+    assert!((r0_gpu.events[0].ts - 0.0).abs() < 1e-9, "rank 0 GPU should align to 0");
+    let r1_cpu = &p.trace.as_ref().unwrap().tracks[2];
+    assert_eq!(r1_cpu.events[0].ts, 200.0, "rank 1 (CPU-only) should be untouched");
+}
+
+#[test]
 fn test_align_unalign_roundtrip() {
     let trace = make_trace(
         vec!["", "kern"],

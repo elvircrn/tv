@@ -493,7 +493,10 @@ impl Pane {
         self.rank_time_offsets = vec![0.0; trace.tracks.len()];
         for (ti, rank) in track_rank.iter().enumerate() {
             if let Some(r) = rank {
-                let offset = rank_min[r];
+                let offset = match rank_min.get(r) {
+                    Some(&o) => o,
+                    None => continue,
+                };
                 self.rank_time_offsets[ti] = offset;
                 for ev in &mut trace.tracks[ti].events {
                     ev.ts -= offset;
