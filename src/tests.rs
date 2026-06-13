@@ -1270,6 +1270,16 @@ fn test_detect_rank_groups_ep_format() {
 }
 
 #[test]
+fn test_detect_rank_groups_single_ep_file() {
+    let paths = vec![
+        "dp1_pp0_tp0_dcp0_ep1_rank0.123.pt.trace.json.gz".to_string(),
+    ];
+    let (groups, standalone) = detect_rank_groups(&paths);
+    assert!(groups.is_empty(), "single file should not form a group");
+    assert_eq!(standalone.len(), 1, "single ep file must end up in standalone");
+}
+
+#[test]
 fn test_detect_rank_groups_no_ranks() {
     let paths = vec![
         "trace_a.json".to_string(),

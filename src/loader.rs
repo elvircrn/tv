@@ -264,7 +264,16 @@ pub fn load_trace(path: &str) -> Result<Trace, String> {
                 state
             })
         }).collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        handles.into_iter().filter_map(|h| match h.join() {
+            Ok(state) => Some(state),
+            Err(e) => {
+                let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                eprintln!("  parse thread panicked: {msg}");
+                None
+            }
+        }).collect()
     });
 
     let mut names: Vec<String> = vec![String::new()];
@@ -482,18 +491,15 @@ pub fn detect_rank_groups(paths: &[String]) -> (Vec<Vec<(usize, String)>>, Vec<S
         }
     }
 
-    let mut rank_groups: Vec<Vec<(usize, String)>> = groups.into_values()
-        .filter(|g| g.len() > 1)
-        .collect();
-    for group in &mut rank_groups {
-        group.sort_by_key(|(rank, _)| *rank);
-    }
-    for group in rank_groups.iter() {
-        if group.len() == 1 {
-            standalone.push(group[0].1.clone());
+    let mut rank_groups: Vec<Vec<(usize, String)>> = Vec::new();
+    for mut group in groups.into_values() {
+        if group.len() > 1 {
+            group.sort_by_key(|(rank, _)| *rank);
+            rank_groups.push(group);
+        } else {
+            standalone.push(group.remove(0).1);
         }
     }
-    rank_groups.retain(|g| g.len() > 1);
 
     (rank_groups, standalone)
 }
