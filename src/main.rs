@@ -44,6 +44,7 @@ struct App {
     nav_keys: u8,
     nav_pan_vel: f64,
     nav_zoom_vel: f64,
+    last_reload: Instant,
 }
 
 impl App {
@@ -79,6 +80,7 @@ impl App {
             nav_keys: 0,
             nav_pan_vel: 0.0,
             nav_zoom_vel: 0.0,
+            last_reload: Instant::now(),
         }
     }
 }
@@ -285,10 +287,20 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let any_watching = self.state.panes.iter().any(|p| p.auto_reload);
+        if any_watching && self.last_reload.elapsed().as_secs_f32() >= 2.0 {
+            for p in &mut self.state.panes {
+                if p.auto_reload && p.loading.is_none() && p.trace.is_some() {
+                    p.reload();
+                }
+            }
+            self.last_reload = Instant::now();
+        }
         let needs_poll = self.state.panes.iter().any(|p| p.loading.is_some())
             || self.nav_keys != 0
             || self.nav_pan_vel.abs() > 1e-6
-            || self.nav_zoom_vel.abs() > 1e-6;
+            || self.nav_zoom_vel.abs() > 1e-6
+            || any_watching;
         if needs_poll {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             if let Some(w) = &self.window {
@@ -516,6 +528,10 @@ impl App {
                             ui.checkbox("Per-step", &mut pane.step_aligned);
                             ui.same_line();
                             ui.checkbox("Stragglers", &mut pane.align_ranks);
+                        }
+                        if !pane.reload_paths.is_empty() {
+                            ui.same_line();
+                            ui.checkbox("Watch", &mut pane.auto_reload);
                         }
                         ui.same_line();
                         if ui.button("Fit") {

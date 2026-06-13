@@ -55,6 +55,8 @@ pub struct Pane {
     pub rank_time_offsets: Vec<f64>,
     pub step_aligned: bool,
     pub step_align_offsets: Vec<Vec<f64>>,
+    pub auto_reload: bool,
+    pub reload_paths: Vec<(usize, String)>,
 }
 
 impl Pane {
@@ -101,6 +103,8 @@ impl Pane {
             rank_time_offsets: Vec::new(),
             step_aligned: false,
             step_align_offsets: Vec::new(),
+            auto_reload: false,
+            reload_paths: Vec::new(),
         }
     }
 
@@ -128,6 +132,7 @@ impl Pane {
         self.loading = Some(rx);
         self.error = None;
         self.trace_path = path.clone();
+        self.reload_paths = vec![(0, path.clone())];
         std::thread::spawn(move || {
             tx.send(load_trace(&path)).ok();
         });
@@ -143,6 +148,7 @@ impl Pane {
             .unwrap_or("multi-rank")
             .to_string();
         self.trace_path = format!("{} ranks: {}", n, prefix);
+        self.reload_paths = rank_paths.clone();
         self.loading = Some(rx);
         self.error = None;
         std::thread::spawn(move || {
@@ -167,6 +173,35 @@ impl Pane {
         });
     }
 
+    pub fn reload(&mut self) {
+        if self.reload_paths.is_empty() || self.loading.is_some() { return; }
+        let (tx, rx) = mpsc::channel();
+        self.loading = Some(rx);
+        let paths = self.reload_paths.clone();
+        if paths.len() == 1 {
+            let path = paths[0].1.clone();
+            std::thread::spawn(move || { tx.send(load_trace(&path)).ok(); });
+        } else {
+            std::thread::spawn(move || {
+                let results: Vec<_> = std::thread::scope(|s| {
+                    let handles: Vec<_> = paths.iter().map(|(rank, path)| {
+                        let r = *rank;
+                        s.spawn(move || (r, load_trace(path)))
+                    }).collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+                let mut traces = Vec::new();
+                for (rank, result) in results {
+                    match result {
+                        Ok(t) => traces.push((rank, t)),
+                        Err(e) => { tx.send(Err(format!("rank {rank}: {e}"))).ok(); return; }
+                    }
+                }
+                tx.send(Ok(merge_traces(traces))).ok();
+            });
+        }
+    }
+
     pub fn poll_loading(&mut self) {
         let rx = match &self.loading {
             Some(rx) => rx,
@@ -174,21 +209,49 @@ impl Pane {
         };
         match rx.try_recv() {
             Ok(Ok(trace)) => {
-                let pad = trace.max_ts * 0.02;
-                self.view.t0 = -pad;
-                self.view.t1 = trace.max_ts + pad;
-                self.view.scroll_y = 0.0;
-                self.collapsed = vec![false; trace.tracks.len()];
-                self.track_scales = vec![1.0; trace.tracks.len()];
-                self.event_labels = trace.tracks.iter()
-                    .map(|t| vec![None; t.events.len()])
-                    .collect();
-                self.labels.clear();
-                self.label_stats.clear();
-                self.hidden_names = vec![false; trace.names.len()];
-                self.trace = Some(trace);
-                self.loading = None;
-                self.load_labels();
+                let is_reload = self.trace.is_some();
+                if is_reload {
+                    let n_tracks = trace.tracks.len();
+                    let n_names = trace.names.len();
+                    self.collapsed.resize(n_tracks, false);
+                    self.track_scales.resize(n_tracks, 1.0);
+                    self.event_labels = trace.tracks.iter()
+                        .map(|t| vec![None; t.events.len()])
+                        .collect();
+                    self.hidden_names.resize(n_names, false);
+                    self.straggler_mask.clear();
+                    self.search_mask.clear();
+                    self.search_nav.clear();
+                    self.selected = None;
+                    self.multi_select_name = None;
+                    self.selection = None;
+                    self.finished_sel = None;
+                    self.selection_stats.clear();
+                    self.rank_time_offsets.clear();
+                    self.step_align_offsets.clear();
+                    self.trace = Some(trace);
+                    self.loading = None;
+                    if self.time_aligned { self.align_rank_times(); }
+                    if self.step_aligned { self.align_per_step(); }
+                    if self.align_ranks { self.detect_stragglers(); }
+                    if !self.search.is_empty() { self.rebuild_search(); }
+                } else {
+                    let pad = trace.max_ts * 0.02;
+                    self.view.t0 = -pad;
+                    self.view.t1 = trace.max_ts + pad;
+                    self.view.scroll_y = 0.0;
+                    self.collapsed = vec![false; trace.tracks.len()];
+                    self.track_scales = vec![1.0; trace.tracks.len()];
+                    self.event_labels = trace.tracks.iter()
+                        .map(|t| vec![None; t.events.len()])
+                        .collect();
+                    self.labels.clear();
+                    self.label_stats.clear();
+                    self.hidden_names = vec![false; trace.names.len()];
+                    self.trace = Some(trace);
+                    self.loading = None;
+                    self.load_labels();
+                }
             }
             Ok(Err(e)) => {
                 self.error = Some(e);
