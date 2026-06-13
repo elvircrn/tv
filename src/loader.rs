@@ -2,6 +2,8 @@ use crate::parse::*;
 use crate::types::*;
 use std::collections::HashMap;
 use std::io::{BufReader, Read};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub enum RawData {
@@ -63,7 +65,7 @@ impl ChunkState {
     }
 }
 
-fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkState) {
+fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkState, counter: &AtomicUsize) {
     let mut pos = start;
     loop {
         pos = skip_ws_comma(raw, pos);
@@ -187,6 +189,7 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
                 ts, dur, name, cat, args_start, args_count, depth: 0,
             }));
             state.total_events += 1;
+            counter.fetch_add(1, Ordering::Relaxed);
         } else if ph == b'M' {
             let name_str = &state.names[name as usize];
             if name_str == "thread_name" {
@@ -222,7 +225,7 @@ fn merge_intern_table(
     remap
 }
 
-pub fn load_trace(path: &str) -> Result<Trace, String> {
+pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>) -> Result<Trace, String> {
     let t0 = Instant::now();
     let raw = read_bytes(path)?;
     eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
@@ -258,9 +261,10 @@ pub fn load_trace(path: &str) -> Result<Trace, String> {
             let start = split_points[i];
             let end = split_points[i + 1];
             let raw_ref = &raw;
+            let ctr = &*counter;
             s.spawn(move || {
                 let mut state = ChunkState::new();
-                parse_chunk(raw_ref, start, end, &mut state);
+                parse_chunk(raw_ref, start, end, &mut state, ctr);
                 state
             })
         }).collect();
@@ -603,7 +607,7 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
 fn read_gz_tolerant<R: std::io::Read>(reader: R) -> Result<Vec<u8>, String> {
     let mut decoder = flate2::read::GzDecoder::new(reader);
     let mut buf = Vec::new();
-    let mut tmp = [0u8; 64 * 1024];
+    let mut tmp = vec![0u8; 1024 * 1024];
     loop {
         match decoder.read(&mut tmp) {
             Ok(0) => break,

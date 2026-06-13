@@ -3,7 +3,8 @@ use crate::parse::json_unescape;
 use crate::types::*;
 use imgui::ImColor32;
 use std::collections::HashMap;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 
 pub(crate) fn parse_rank(label: &str) -> Option<usize> {
     if label.starts_with("[rank ") {
@@ -57,6 +58,7 @@ pub struct Pane {
     pub step_align_offsets: Vec<Vec<f64>>,
     pub auto_reload: bool,
     pub reload_paths: Vec<(usize, String)>,
+    pub loading_events: Arc<AtomicUsize>,
 }
 
 impl Pane {
@@ -105,10 +107,24 @@ impl Pane {
             step_align_offsets: Vec::new(),
             auto_reload: false,
             reload_paths: Vec::new(),
+            loading_events: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub fn has_trace(&self) -> bool { self.trace.is_some() }
+
+    pub fn loading_progress_text(&self) -> String {
+        let n = self.loading_events.load(Ordering::Relaxed);
+        if n == 0 {
+            "Loading: reading file...".to_string()
+        } else if n < 1_000 {
+            format!("Loading: {} events...", n)
+        } else if n < 1_000_000 {
+            format!("Loading: {:.1}K events...", n as f64 / 1_000.0)
+        } else {
+            format!("Loading: {:.2}M events...", n as f64 / 1_000_000.0)
+        }
+    }
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
@@ -133,8 +149,10 @@ impl Pane {
         self.error = None;
         self.trace_path = path.clone();
         self.reload_paths = vec![(0, path.clone())];
+        self.loading_events = Arc::new(AtomicUsize::new(0));
+        let counter = self.loading_events.clone();
         std::thread::spawn(move || {
-            tx.send(load_trace(&path)).ok();
+            tx.send(load_trace(&path, &counter)).ok();
         });
     }
 
@@ -151,11 +169,14 @@ impl Pane {
         self.reload_paths = rank_paths.clone();
         self.loading = Some(rx);
         self.error = None;
+        self.loading_events = Arc::new(AtomicUsize::new(0));
+        let counter = self.loading_events.clone();
         std::thread::spawn(move || {
             let results: Vec<_> = std::thread::scope(|s| {
                 let handles: Vec<_> = rank_paths.iter().map(|(rank, path)| {
                     let r = *rank;
-                    s.spawn(move || (r, load_trace(path)))
+                    let ctr = counter.clone();
+                    s.spawn(move || (r, load_trace(path, &ctr)))
                 }).collect();
                 handles.into_iter().filter_map(|h| h.join().ok()).collect()
             });
@@ -178,16 +199,19 @@ impl Pane {
         if self.reload_paths.is_empty() || self.loading.is_some() { return; }
         let (tx, rx) = mpsc::channel();
         self.loading = Some(rx);
+        self.loading_events = Arc::new(AtomicUsize::new(0));
+        let counter = self.loading_events.clone();
         let paths = self.reload_paths.clone();
         if paths.len() == 1 {
             let path = paths[0].1.clone();
-            std::thread::spawn(move || { tx.send(load_trace(&path)).ok(); });
+            std::thread::spawn(move || { tx.send(load_trace(&path, &counter)).ok(); });
         } else {
             std::thread::spawn(move || {
                 let results: Vec<_> = std::thread::scope(|s| {
                     let handles: Vec<_> = paths.iter().map(|(rank, path)| {
                         let r = *rank;
-                        s.spawn(move || (r, load_trace(path)))
+                        let ctr = counter.clone();
+                        s.spawn(move || (r, load_trace(path, &ctr)))
                     }).collect();
                     handles.into_iter().filter_map(|h| h.join().ok()).collect()
                 });
@@ -227,11 +251,6 @@ impl Pane {
                     self.straggler_mask.clear();
                     self.search_mask.clear();
                     self.search_nav.clear();
-                    self.selected = None;
-                    self.multi_select_name = None;
-                    self.selection = None;
-                    self.finished_sel = None;
-                    self.selection_stats.clear();
                     self.rank_time_offsets.clear();
                     self.step_align_offsets.clear();
                     self.trace = Some(trace);

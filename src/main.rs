@@ -622,7 +622,7 @@ impl App {
                         }
 
                     } else if pane.loading.is_some() {
-                        ui.text("Loading...");
+                        ui.text(&pane.loading_progress_text());
                     } else {
                         ui.text("Drop a trace file here, or: tv <file.json[.gz]>");
                     }
@@ -1281,8 +1281,14 @@ impl App {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(|a| a.as_str()) == Some("--bench") {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for path in &args[1..] {
-            let _ = loader::load_trace(path);
+            eprintln!("bench: {path}");
+            counter.store(0, std::sync::atomic::Ordering::Relaxed);
+            match loader::load_trace(path, &counter) {
+                Ok(t) => eprintln!("  ok: {} events, {} tracks", t.total_events, t.tracks.len()),
+                Err(e) => eprintln!("  err: {e}"),
+            }
         }
         return;
     }

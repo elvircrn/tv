@@ -4,6 +4,12 @@ use crate::loader::{load_trace, detect_rank_groups, merge_traces};
 use crate::state::parse_rank;
 use imgui::ImColor32;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
+
+fn test_counter() -> Arc<AtomicUsize> {
+    Arc::new(AtomicUsize::new(0))
+}
 
 fn ev(ts: f64, dur: f64, name: u32, depth: u16) -> Event {
     Event { ts, dur, name, cat: 0, args_start: 0, args_count: 0, depth }
@@ -609,7 +615,7 @@ fn test_load_trace_json() {
     let path = dir.join("test.json");
     std::fs::write(&path, json).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap()).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
     assert_eq!(trace.tracks.len(), 2);
     assert!(trace.names.contains(&"kern_a".to_string()));
     assert!(trace.names.contains(&"kern_b".to_string()));
@@ -640,7 +646,7 @@ fn test_load_trace_gz() {
     std::io::Write::write_all(&mut gz, json).unwrap();
     gz.finish().unwrap();
 
-    let trace = load_trace(path.to_str().unwrap()).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
     assert_eq!(trace.total_events, 1);
 
     std::fs::remove_file(&path).ok();
@@ -654,7 +660,7 @@ fn test_load_trace_no_events() {
     let path = dir.join("empty.json");
     std::fs::write(&path, json).unwrap();
 
-    let result = load_trace(path.to_str().unwrap());
+    let result = load_trace(path.to_str().unwrap(), &test_counter());
     assert!(result.is_err());
 
     std::fs::remove_file(&path).ok();
@@ -672,7 +678,7 @@ fn test_load_trace_depth_assignment() {
     let path = dir.join("depth.json");
     std::fs::write(&path, json).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap()).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
     let track = &trace.tracks[0];
     assert_eq!(track.events.len(), 3);
     let depths: Vec<u16> = track.events.iter().map(|e| e.depth).collect();
@@ -695,7 +701,7 @@ fn test_load_trace_truncated_json() {
     let path = dir.join("truncated.json");
     std::fs::write(&path, json).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap()).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
     assert!(trace.total_events >= 2, "should parse complete events from truncated JSON, got {}", trace.total_events);
 
     std::fs::remove_file(&path).ok();
@@ -723,7 +729,7 @@ fn test_load_trace_truncated_gz() {
     }
     std::fs::write(&path, &buf[..buf.len() - 10]).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap()).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
     assert!(trace.total_events >= 2, "should parse events from truncated gz, got {}", trace.total_events);
 
     std::fs::remove_file(&path).ok();
