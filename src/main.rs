@@ -627,7 +627,6 @@ impl App {
                         ui.text("Drop a trace file here, or: tv <file.json[.gz]>");
                     }
                     if let Some(e) = &pane.error {
-                        ui.same_line();
                         ui.text_colored([1.0, 0.4, 0.4, 1.0], e);
                     }
                 });
