@@ -253,7 +253,9 @@ impl Pane {
                     self.search_nav.clear();
                     self.rank_time_offsets.clear();
                     self.step_align_offsets.clear();
+                    let old_stats = std::mem::take(&mut self.trace.as_mut().unwrap().stats);
                     self.trace = Some(trace);
+                    self.trace.as_mut().unwrap().stats = old_stats;
                     self.loading = None;
                     if self.time_aligned { self.align_rank_times(); }
                     if self.step_aligned { self.align_per_step(); }
