@@ -86,6 +86,7 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
         let mut name: u32 = 0;
         let mut cat: u32 = 0;
         let mut args_off: u32 = 0;
+        let mut args_len: u16 = 0;
 
         while depth > 0 && pos < raw.len() {
             match raw[pos] {
@@ -149,6 +150,8 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
                             (4, b'a') if raw[ks + 1] == b'r' => {
                                 args_off = pos as u32;
                                 pos = skip_value(raw, pos);
+                                let len = pos - args_off as usize;
+                                args_len = if len <= u16::MAX as usize { len as u16 } else { 0 };
                             }
                             (3, b'c') if raw[ks + 1] == b'a' => {
                                 if raw[pos] == b'"' {
@@ -172,7 +175,7 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
             state.min_ts = state.min_ts.min(ts);
             state.max_ts = state.max_ts.max(ts + dur);
             state.events.push((pid, tid, Event {
-                ts, dur, name, cat, args_off, depth: 0,
+                ts, dur, name, cat, args_off, args_len, depth: 0,
             }));
             state.total_events += 1;
             counter.fetch_add(1, Ordering::Relaxed);
@@ -785,10 +788,15 @@ fn compact_args(trace: &mut Trace) {
         for ev in &mut track.events {
             if ev.args_off > 0 {
                 let off = ev.args_off as usize;
-                let end = skip_value(raw, off);
+                let len = if ev.args_len > 0 {
+                    ev.args_len as usize
+                } else {
+                    skip_value(raw, off) - off
+                };
                 let new_off = compact.len();
-                compact.extend_from_slice(&raw[off..end]);
+                compact.extend_from_slice(&raw[off..off + len]);
                 ev.args_off = new_off as u32;
+                ev.args_len = len.min(u16::MAX as usize) as u16;
             }
         }
         track.raw_buf_idx = 0;

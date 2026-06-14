@@ -99,6 +99,7 @@ pub struct Event {
     pub cat: u32,
     pub args_off: u32,
     pub depth: u16,
+    pub args_len: u16,
 }
 
 #[derive(Clone, Copy)]

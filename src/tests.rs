@@ -12,7 +12,7 @@ fn test_counter() -> Arc<AtomicUsize> {
 }
 
 fn ev(ts: f64, dur: f64, name: u32, depth: u16) -> Event {
-    Event { ts, dur, name, cat: 0, args_off: 0, depth }
+    Event { ts, dur, name, cat: 0, args_off: 0, args_len: 0, depth }
 }
 
 fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace {
