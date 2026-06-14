@@ -12,7 +12,7 @@ fn test_counter() -> Arc<AtomicUsize> {
 }
 
 fn ev(ts: f64, dur: f64, name: u32, depth: u16) -> Event {
-    Event { ts, dur, name, cat: 0, args_start: 0, args_count: 0, depth }
+    Event { ts, dur, name, cat: 0, args_off: 0, depth }
 }
 
 fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace {
@@ -33,11 +33,11 @@ fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace 
             prefix_max_dur.push(running_max);
         }
         total_events += events.len();
-        trs.push(Track { label: label.to_string(), gpu, events, max_depth, prefix_max_dur });
+        trs.push(Track { label: label.to_string(), gpu, events, max_depth, prefix_max_dur, raw_buf_idx: 0 });
     }
     Trace {
         tracks: trs, names: name_strs, cats: vec![String::new()],
-        arg_strs: Vec::new(), arg_pairs: Vec::new(), stats: Vec::new(),
+        raw_bufs: Vec::new(), stats: Vec::new(),
         max_ts, min_ts: 0.0, total_events, device: String::new(),
     }
 }

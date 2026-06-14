@@ -2,7 +2,7 @@ use crate::parse::*;
 use crate::types::*;
 use std::collections::HashMap;
 use std::io::{BufReader, Read};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,15 +21,20 @@ impl std::ops::Deref for RawData {
     }
 }
 
+impl RawData {
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            RawData::Vec(v) => v,
+            RawData::Mmap(m) => m.to_vec(),
+        }
+    }
+}
+
 struct ChunkState {
     names: Vec<String>,
     name_idx: FnvMap<u32>,
     cats: Vec<String>,
     cat_idx: FnvMap<u32>,
-    arg_strs: Vec<String>,
-    arg_str_idx: FnvMap<u32>,
-    arg_pairs: Vec<[u32; 2]>,
-    arg_dedup: FnvMap<(u32, u16)>,
     events: Vec<(u64, u64, Event)>,
     thread_names: HashMap<(u64, u64), String>,
     min_ts: f64,
@@ -44,17 +49,11 @@ impl ChunkState {
         name_idx.insert(0, 0);
         let mut cat_idx = FnvMap::default();
         cat_idx.insert(0, 0);
-        let mut arg_str_idx = FnvMap::default();
-        arg_str_idx.insert(0, 0);
         Self {
             names: vec![String::new()],
             name_idx,
             cats: vec![String::new()],
             cat_idx,
-            arg_strs: vec![String::new()],
-            arg_str_idx,
-            arg_pairs: Vec::new(),
-            arg_dedup: FnvMap::default(),
             events: Vec::new(),
             thread_names: HashMap::new(),
             min_ts: f64::MAX,
@@ -86,8 +85,7 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
         let mut pid: u64 = 0;
         let mut name: u32 = 0;
         let mut cat: u32 = 0;
-        let mut args_start: u32 = 0;
-        let mut args_count: u16 = 0;
+        let mut args_off: u32 = 0;
 
         while depth > 0 && pos < raw.len() {
             match raw[pos] {
@@ -149,20 +147,8 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
                                 } else { pos = skip_value(raw, pos); }
                             }
                             (4, b'a') if raw[ks + 1] == b'r' => {
-                                let s = pos;
-                                let (end, hash) = skip_value_hashed(raw, pos);
-                                pos = end;
-                                if let Some(&(st, ct)) = state.arg_dedup.get(&hash) {
-                                    args_start = st;
-                                    args_count = ct;
-                                } else {
-                                    let pair_start = state.arg_pairs.len() as u32;
-                                    parse_args_flat(&raw[s..pos], &mut state.arg_strs, &mut state.arg_str_idx, &mut state.arg_pairs);
-                                    let ct = (state.arg_pairs.len() as u32 - pair_start) as u16;
-                                    state.arg_dedup.insert(hash, (pair_start, ct));
-                                    args_start = pair_start;
-                                    args_count = ct;
-                                }
+                                args_off = pos as u32;
+                                pos = skip_value(raw, pos);
                             }
                             (3, b'c') if raw[ks + 1] == b'a' => {
                                 if raw[pos] == b'"' {
@@ -186,17 +172,23 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
             state.min_ts = state.min_ts.min(ts);
             state.max_ts = state.max_ts.max(ts + dur);
             state.events.push((pid, tid, Event {
-                ts, dur, name, cat, args_start, args_count, depth: 0,
+                ts, dur, name, cat, args_off, depth: 0,
             }));
             state.total_events += 1;
             counter.fetch_add(1, Ordering::Relaxed);
         } else if ph == b'M' {
             let name_str = &state.names[name as usize];
-            if name_str == "thread_name" {
-                for i in args_start as usize..(args_start as usize + args_count as usize) {
-                    let [k, v] = state.arg_pairs[i];
-                    if state.arg_strs[k as usize] == "name" {
-                        state.thread_names.insert((pid, tid), state.arg_strs[v as usize].clone());
+            if name_str == "thread_name" && args_off > 0 {
+                let end = skip_value(raw, args_off as usize);
+                let mut tmp_strs = Vec::new();
+                let mut tmp_idx = FnvMap::default();
+                let mut tmp_pairs = Vec::new();
+                parse_args_flat(&raw[args_off as usize..end], &mut tmp_strs, &mut tmp_idx, &mut tmp_pairs);
+                for &[k, v] in &tmp_pairs {
+                    if tmp_strs.get(k as usize).map_or(false, |s| s == "name") {
+                        if let Some(s) = tmp_strs.get(v as usize) {
+                            state.thread_names.insert((pid, tid), s.clone());
+                        }
                         break;
                     }
                 }
@@ -225,8 +217,29 @@ fn merge_intern_table(
     remap
 }
 
-pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize) -> Result<Trace, String> {
-    let t0 = Instant::now();
+fn calc_n_threads(data_len: usize, max_parse_threads: usize) -> usize {
+    if max_parse_threads == 1 || data_len < 10 * 1024 * 1024 { return 1; }
+    let avail = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    let cap = if max_parse_threads > 1 { max_parse_threads } else { 8 };
+    avail.clamp(2, cap)
+}
+
+fn collect_chunks(handles: Vec<std::thread::ScopedJoinHandle<'_, ChunkState>>) -> Vec<ChunkState> {
+    handles.into_iter().filter_map(|h| match h.join() {
+        Ok(state) => Some(state),
+        Err(e) => {
+            let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            eprintln!("  parse thread panicked: {msg}");
+            None
+        }
+    }).collect()
+}
+
+fn decompress_parse_seq(
+    path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, t0: &Instant,
+) -> Result<(RawData, Vec<ChunkState>, usize), String> {
     let raw = read_bytes(path)?;
     eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
 
@@ -239,21 +252,10 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
         return Err("malformed traceEvents".into());
     }
     let array_start = pos + 1;
+    let n_threads = calc_n_threads(raw.len(), max_parse_threads);
 
-    let n_threads = if max_parse_threads == 1 || raw.len() < 10 * 1024 * 1024 {
-        1
-    } else {
-        let avail = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
-        let cap = if max_parse_threads > 1 { max_parse_threads } else { 8 };
-        avail.clamp(2, cap)
-    };
-
-    let t1 = Instant::now();
     let split_points = find_split_points(&raw, array_start, n_threads);
     let n_chunks = split_points.len() - 1;
-    if n_chunks > 1 {
-        eprintln!("  split: {} chunks in {:.3}s", n_chunks, t1.elapsed().as_secs_f64());
-    }
 
     let chunks: Vec<ChunkState> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..n_chunks).map(|i| {
@@ -267,17 +269,170 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
                 state
             })
         }).collect();
-        handles.into_iter().filter_map(|h| match h.join() {
-            Ok(state) => Some(state),
-            Err(e) => {
-                let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
-                    .or_else(|| e.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
-                eprintln!("  parse thread panicked: {msg}");
-                None
-            }
-        }).collect()
+        collect_chunks(handles)
     });
+
+    Ok((raw, chunks, n_chunks))
+}
+
+fn decompress_parse_streaming(
+    path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, t0: &Instant,
+) -> Result<(RawData, Vec<ChunkState>), String> {
+    let compressed = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+
+    let gz_isize = if compressed.len() >= 4 {
+        u32::from_le_bytes(compressed[compressed.len()-4..].try_into().unwrap()) as usize
+    } else { 0 };
+    let estimated = if gz_isize > compressed.len() {
+        gz_isize + gz_isize / 10
+    } else {
+        compressed.len() * 25
+    };
+
+    let n_threads = calc_n_threads(estimated, max_parse_threads);
+
+    let mut backing: Vec<u8> = Vec::with_capacity(estimated);
+    let backing_addr = backing.as_mut_ptr() as usize;
+    let backing_cap = backing.capacity();
+    let write_pos = AtomicUsize::new(0);
+    let decomp_done = AtomicBool::new(false);
+    let overflow = AtomicBool::new(false);
+
+    let result: Result<Vec<ChunkState>, String> = std::thread::scope(|s| {
+        let wp = &write_pos;
+        let dd = &decomp_done;
+        let ov = &overflow;
+
+        let decomp_addr = backing_addr;
+        s.spawn(move || {
+            let ptr = decomp_addr as *mut u8;
+            let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
+            let mut tmp = vec![0u8; 2 * 1024 * 1024];
+            let mut pos = 0usize;
+            loop {
+                match decoder.read(&mut tmp) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if pos + n > backing_cap {
+                            ov.store(true, Ordering::Release);
+                            break;
+                        }
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(tmp.as_ptr(), ptr.add(pos), n);
+                        }
+                        pos += n;
+                        wp.store(pos, Ordering::Release);
+                    }
+                    Err(e) => {
+                        if pos == 0 { ov.store(true, Ordering::Release); }
+                        else { eprintln!("  truncated gz: {e}"); }
+                        break;
+                    }
+                }
+            }
+            dd.store(true, Ordering::Release);
+        });
+
+        let wait_for = |target: usize| -> usize {
+            loop {
+                let avail = wp.load(Ordering::Acquire);
+                if avail >= target { return avail; }
+                if dd.load(Ordering::Acquire) || ov.load(Ordering::Acquire) { return avail; }
+                std::hint::spin_loop();
+            }
+        };
+
+        let avail = wait_for(64 * 1024);
+        if ov.load(Ordering::Acquire) { return Err("overflow".into()); }
+
+        let read_ptr = backing_addr as *const u8;
+        let slice = |len: usize| unsafe { std::slice::from_raw_parts(read_ptr, len) };
+
+        let te = find_key(slice(avail), b"traceEvents")
+            .ok_or_else(|| "no traceEvents found".to_string())?;
+        let mut hpos = te + "\"traceEvents\"".len();
+        let hdr = slice(avail);
+        hpos = skip_ws(hdr, hpos);
+        if hpos < hdr.len() && hdr[hpos] == b':' { hpos += 1; }
+        hpos = skip_ws(hdr, hpos);
+        if hpos >= hdr.len() || hdr[hpos] != b'[' {
+            return Err("malformed traceEvents".into());
+        }
+        let array_start = hpos + 1;
+
+        let chunk_size = (estimated - array_start) / n_threads;
+        let mut handles: Vec<std::thread::ScopedJoinHandle<'_, ChunkState>> = Vec::new();
+        let mut prev_start = array_start;
+
+        for i in 1..n_threads {
+            let target = array_start + i * chunk_size;
+            let search_end = target + 256 * 1024;
+            let avail = wait_for(search_end);
+            if ov.load(Ordering::Acquire) { return Err("overflow".into()); }
+            if let Some(bp) = find_event_start(slice(avail), target, avail) {
+                let start = prev_start;
+                let end = bp;
+                let ctr = &*counter;
+                let addr = backing_addr;
+                handles.push(s.spawn(move || {
+                    let sub = unsafe { std::slice::from_raw_parts((addr as *const u8).add(start), end - start) };
+                    let mut state = ChunkState::new();
+                    parse_chunk(sub, 0, sub.len(), &mut state, ctr);
+                    for (_, _, ev) in &mut state.events {
+                        if ev.args_off > 0 { ev.args_off += start as u32; }
+                    }
+                    state
+                }));
+                prev_start = bp;
+            }
+        }
+
+        while !dd.load(Ordering::Acquire) { std::hint::spin_loop(); }
+        if ov.load(Ordering::Acquire) { return Err("overflow".into()); }
+        let final_len = wp.load(Ordering::Acquire);
+        {
+            let start = prev_start;
+            let end = final_len;
+            let ctr = &*counter;
+            let addr = backing_addr;
+            handles.push(s.spawn(move || {
+                let sub = unsafe { std::slice::from_raw_parts((addr as *const u8).add(start), end - start) };
+                let mut state = ChunkState::new();
+                parse_chunk(sub, 0, sub.len(), &mut state, ctr);
+                for (_, _, ev) in &mut state.events {
+                    if ev.args_off > 0 { ev.args_off += start as u32; }
+                }
+                state
+            }));
+        }
+
+        eprintln!("  stream: {:.2}s ({}MB, {} chunks)",
+            t0.elapsed().as_secs_f64(), final_len / 1024 / 1024, handles.len());
+
+        Ok(collect_chunks(handles))
+    });
+
+    let chunks = result?;
+    let final_len = write_pos.load(Ordering::Acquire);
+    unsafe { backing.set_len(final_len); }
+    eprintln!("  scan: {:.2}s ({} events, streaming)",
+        t0.elapsed().as_secs_f64(), chunks.iter().map(|c| c.total_events).sum::<usize>());
+    Ok((RawData::Vec(backing), chunks))
+}
+
+pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize) -> Result<Trace, String> {
+    let t0 = Instant::now();
+
+    let use_streaming = path.ends_with(".json.gz") && max_parse_threads != 1;
+
+    let (raw, chunks, n_chunks) = if use_streaming {
+        match decompress_parse_streaming(path, counter, max_parse_threads, &t0) {
+            Ok((r, c)) => { let n = c.len(); (r, c, n) }
+            Err(_) => decompress_parse_seq(path, counter, max_parse_threads, &t0)?
+        }
+    } else {
+        decompress_parse_seq(path, counter, max_parse_threads, &t0)?
+    };
 
     let mut names: Vec<String> = vec![String::new()];
     let mut name_idx: FnvMap<u32> = FnvMap::default();
@@ -285,10 +440,6 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
     let mut cats: Vec<String> = vec![String::new()];
     let mut cat_idx: FnvMap<u32> = FnvMap::default();
     cat_idx.insert(0, 0);
-    let mut arg_strs: Vec<String> = vec![String::new()];
-    let mut arg_str_idx: FnvMap<u32> = FnvMap::default();
-    arg_str_idx.insert(0, 0);
-    let mut arg_pairs: Vec<[u32; 2]> = Vec::new();
 
     let mut track_map: HashMap<(u64, u64), Vec<Event>> = HashMap::new();
     let mut thread_names: HashMap<(u64, u64), String> = HashMap::new();
@@ -300,17 +451,10 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
     for chunk in chunks {
         let name_remap = merge_intern_table(&mut names, &mut name_idx, &chunk.names, &chunk.name_idx);
         let cat_remap = merge_intern_table(&mut cats, &mut cat_idx, &chunk.cats, &chunk.cat_idx);
-        let arg_str_remap = merge_intern_table(&mut arg_strs, &mut arg_str_idx, &chunk.arg_strs, &chunk.arg_str_idx);
-
-        let pair_offset = arg_pairs.len() as u32;
-        for &[k, v] in &chunk.arg_pairs {
-            arg_pairs.push([arg_str_remap[k as usize], arg_str_remap[v as usize]]);
-        }
 
         for (pid, tid, mut ev) in chunk.events {
             ev.name = name_remap[ev.name as usize];
             ev.cat = cat_remap[ev.cat as usize];
-            ev.args_start += pair_offset;
             track_map.entry((pid, tid)).or_default().push(ev);
         }
 
@@ -344,10 +488,10 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
 
     eprintln!("  scan: {:.2}s ({} objects, {} events, {} names, {}x parallel)",
         t0.elapsed().as_secs_f64(), scan_count, total_events, names.len(), n_chunks);
-    drop(raw);
     drop(name_idx);
     drop(cat_idx);
-    drop(arg_str_idx);
+
+    let raw_buf: Arc<Vec<u8>> = Arc::new(raw.into_vec());
 
     if min_ts == f64::MAX {
         return Err("no duration events found".into());
@@ -364,7 +508,7 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
             .map(|((pid, tid), mut evs)| {
                 s.spawn(move || {
                     for ev in evs.iter_mut() { ev.ts -= min_ts; }
-                    evs.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+                    evs.sort_unstable_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
                     let mut lanes: Vec<f64> = Vec::new();
                     let mut max_depth: u16 = 1;
                     for ev in evs.iter_mut() {
@@ -389,7 +533,7 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
                         if gpu { format!("GPU {tid}") } else { format!("Thread {tid}") }
                     });
                     evs.shrink_to_fit();
-                    Track { label, gpu, events: evs, max_depth, prefix_max_dur }
+                    Track { label, gpu, events: evs, max_depth, prefix_max_dur, raw_buf_idx: 0 }
                 })
             })
             .collect();
@@ -418,18 +562,19 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
 
     names.shrink_to_fit();
     cats.shrink_to_fit();
-    arg_strs.shrink_to_fit();
-    arg_pairs.shrink_to_fit();
 
-    let event_bytes: usize = tracks.iter().map(|t| t.events.len() * std::mem::size_of::<Event>()).sum();
-    let str_bytes: usize = names.iter().chain(cats.iter()).chain(arg_strs.iter()).map(|s| s.len() + std::mem::size_of::<String>()).sum();
-    let pair_bytes = arg_pairs.len() * std::mem::size_of::<[u32; 2]>();
-    eprintln!("  sort+lanes: {:.2}s ({} tracks)", t2.elapsed().as_secs_f64(), tracks.len());
+    let mut trace = Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device };
+    compact_args(&mut trace);
+
+    let event_bytes: usize = trace.tracks.iter().map(|t| t.events.len() * std::mem::size_of::<Event>()).sum();
+    let str_bytes: usize = trace.names.iter().chain(trace.cats.iter()).map(|s| s.len() + std::mem::size_of::<String>()).sum();
+    let args_bytes: usize = trace.raw_bufs.iter().map(|b| b.len()).sum();
+    eprintln!("  sort+lanes: {:.2}s ({} tracks)", t2.elapsed().as_secs_f64(), trace.tracks.len());
     eprintln!("  memory: events={}MB strings={}MB args={}MB total={}MB",
-        event_bytes / 1024 / 1024, str_bytes / 1024 / 1024, pair_bytes / 1024 / 1024,
-        (event_bytes + str_bytes + pair_bytes) / 1024 / 1024);
+        event_bytes / 1024 / 1024, str_bytes / 1024 / 1024, args_bytes / 1024 / 1024,
+        (event_bytes + str_bytes + args_bytes) / 1024 / 1024);
     eprintln!("  total: {:.2}s", t0.elapsed().as_secs_f64());
-    Ok(Trace { tracks, names, cats, arg_strs, arg_pairs, stats, max_ts, min_ts, total_events, device })
+    Ok(trace)
 }
 
 pub(crate) fn is_trace_file(name: &str) -> bool {
@@ -536,7 +681,6 @@ fn merge_intern_direct(
 pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     let global_min = traces.iter().map(|(_, t)| t.min_ts).fold(f64::MAX, f64::min);
 
-    let max_strs: usize = traces.iter().map(|(_, t)| t.arg_strs.len()).max().unwrap_or(0);
     let mut names: Vec<String> = vec![String::new()];
     let mut name_idx: FnvMap<u32> = FnvMap::with_capacity_and_hasher(
         traces.iter().map(|(_, t)| t.names.len()).max().unwrap_or(0) * 2,
@@ -549,72 +693,58 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
         Default::default(),
     );
     cat_idx.insert(0, 0);
-    let mut arg_strs: Vec<String> = vec![String::new()];
-    let mut arg_str_idx: FnvMap<u32> = FnvMap::with_capacity_and_hasher(max_strs * 2, Default::default());
-    arg_str_idx.insert(0, 0);
     let mut device = String::new();
 
-    // Phase 1: merge intern tables, compute remap info (sequential — only string tables)
-    let mut remap_info: Vec<(Vec<u32>, Vec<u32>, Vec<u32>, u32, f64)> = Vec::with_capacity(traces.len());
-    let mut cumulative_pairs: u32 = 0;
+    let mut remap_info: Vec<(Vec<u32>, Vec<u32>, f64)> = Vec::with_capacity(traces.len());
+    let mut all_raw_bufs: Vec<Arc<Vec<u8>>> = Vec::new();
 
     for (_, trace) in &traces {
         let time_offset = trace.min_ts - global_min;
 
         let name_remap = merge_intern_direct(&mut names, &mut name_idx, &trace.names);
         let cat_remap = merge_intern_direct(&mut cats, &mut cat_idx, &trace.cats);
-        let arg_str_remap = merge_intern_direct(&mut arg_strs, &mut arg_str_idx, &trace.arg_strs);
-
-        let pair_offset = cumulative_pairs;
-        cumulative_pairs += trace.arg_pairs.len() as u32;
 
         if device.is_empty() && !trace.device.is_empty() {
             device = trace.device.clone();
         }
 
-        remap_info.push((name_remap, cat_remap, arg_str_remap, pair_offset, time_offset));
+        remap_info.push((name_remap, cat_remap, time_offset));
     }
 
-    // Phase 2: parallel remap of events, arg_pairs, and per-trace stats
     let remapped: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = traces.into_iter().zip(remap_info).map(|((rank, mut trace), (name_remap, cat_remap, arg_str_remap, pair_offset, time_offset))| {
+        let handles: Vec<_> = traces.into_iter().zip(remap_info).enumerate().map(|(trace_idx, ((rank, mut trace), (name_remap, cat_remap, time_offset)))| {
             s.spawn(move || {
-                let pairs: Vec<[u32; 2]> = trace.arg_pairs.iter()
-                    .map(|&[k, v]| [arg_str_remap[k as usize], arg_str_remap[v as usize]])
-                    .collect();
-
+                let raw_buf_idx = trace_idx as u8;
                 let mut max_ts: f64 = 0.0;
                 let mut total_events = 0usize;
                 let mut local_dur: HashMap<u32, Vec<f64>> = HashMap::new();
                 for track in &mut trace.tracks {
                     track.label = format!("[rank {}] {}", rank, track.label);
+                    track.raw_buf_idx = raw_buf_idx;
                     for ev in &mut track.events {
                         ev.ts += time_offset;
                         ev.name = name_remap[ev.name as usize];
                         ev.cat = cat_remap[ev.cat as usize];
-                        ev.args_start += pair_offset;
                         max_ts = max_ts.max(ev.ts + ev.dur);
                         local_dur.entry(ev.name).or_default().push(ev.dur);
                     }
                     total_events += track.events.len();
                 }
 
-                (trace.tracks, pairs, max_ts, total_events, local_dur)
+                (trace.tracks, trace.raw_bufs, max_ts, total_events, local_dur)
             })
         }).collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
 
-    // Phase 3: concatenate and merge per-trace dur_maps
     let mut all_tracks: Vec<Track> = Vec::new();
-    let mut arg_pairs: Vec<[u32; 2]> = Vec::with_capacity(cumulative_pairs as usize);
     let mut total_events = 0;
     let mut max_ts: f64 = 0.0;
     let mut dur_map: HashMap<u32, Vec<f64>> = HashMap::new();
 
-    for (tracks, pairs, mt, te, local_dur) in remapped {
+    for (tracks, raw_bufs, mt, te, local_dur) in remapped {
         all_tracks.extend(tracks);
-        arg_pairs.extend(pairs);
+        all_raw_bufs.extend(raw_bufs);
         total_events += te;
         max_ts = max_ts.max(mt);
         for (name, durs) in local_dur {
@@ -637,13 +767,34 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
 
     names.shrink_to_fit();
     cats.shrink_to_fit();
-    arg_strs.shrink_to_fit();
-    arg_pairs.shrink_to_fit();
 
-    Trace {
-        tracks: all_tracks, names, cats, arg_strs, arg_pairs, stats,
+    let mut trace = Trace {
+        tracks: all_tracks, names, cats, raw_bufs: all_raw_bufs, stats,
         max_ts, min_ts: global_min, total_events, device,
+    };
+    compact_args(&mut trace);
+    trace
+}
+
+fn compact_args(trace: &mut Trace) {
+    if trace.raw_bufs.is_empty() { return; }
+    let mut compact = vec![0u8];
+    let raw_bufs: Vec<_> = trace.raw_bufs.iter().cloned().collect();
+    for track in &mut trace.tracks {
+        let raw = &raw_bufs[track.raw_buf_idx as usize];
+        for ev in &mut track.events {
+            if ev.args_off > 0 {
+                let off = ev.args_off as usize;
+                let end = skip_value(raw, off);
+                let new_off = compact.len();
+                compact.extend_from_slice(&raw[off..end]);
+                ev.args_off = new_off as u32;
+            }
+        }
+        track.raw_buf_idx = 0;
     }
+    compact.shrink_to_fit();
+    trace.raw_bufs = vec![Arc::new(compact)];
 }
 
 fn read_gz_tolerant<R: std::io::Read>(reader: R) -> Result<Vec<u8>, String> {

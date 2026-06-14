@@ -84,12 +84,6 @@ fn skip_container(raw: &[u8], pos: usize) -> usize {
     i
 }
 
-pub fn skip_value_hashed(raw: &[u8], pos: usize) -> (usize, u64) {
-    let end = skip_value(raw, pos);
-    let hash = fnv1a(&raw[pos..end]);
-    (end, hash)
-}
-
 pub fn skip_number(raw: &[u8], pos: usize) -> usize {
     let mut i = pos;
     while i < raw.len()
@@ -215,33 +209,42 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
+pub fn find_event_start(raw: &[u8], near: usize, limit: usize) -> Option<usize> {
+    let finder = memchr::memmem::Finder::new(b"\"ph\"");
+    let limit = limit.min(raw.len());
+    let mut pos = near;
+    while pos < limit {
+        match finder.find(&raw[pos..limit]) {
+            Some(off) => {
+                let ph_pos = pos + off;
+                let mut p = ph_pos;
+                while p > 0 && raw[p] != b'{' { p -= 1; }
+                if raw[p] == b'{' {
+                    if p == 0 { return Some(p); }
+                    let mut q = p - 1;
+                    while q > 0 && matches!(raw[q], b' ' | b'\t' | b'\r' | b'\n') { q -= 1; }
+                    if matches!(raw[q], b',' | b'[') {
+                        return Some(p);
+                    }
+                }
+                pos = ph_pos + 4;
+            }
+            None => break,
+        }
+    }
+    None
+}
+
 pub fn find_split_points(raw: &[u8], start: usize, n: usize) -> Vec<usize> {
     if n <= 1 { return vec![start, raw.len()]; }
     let remaining = raw.len().saturating_sub(start);
     let chunk_size = remaining / n;
     let mut points = vec![start];
-    let ph = memchr::memmem::Finder::new(b"\"ph\"");
-
     for t in 1..n {
         let target = start + t * chunk_size;
         let limit = raw.len().min(target + chunk_size);
-        let mut pos = target;
-        while pos < limit {
-            match memchr::memchr(b'\n', &raw[pos..limit]) {
-                Some(off) => {
-                    let mut p = pos + off + 1;
-                    while p < raw.len() && matches!(raw[p], b' ' | b'\t' | b'\r' | b'\n') { p += 1; }
-                    if p < raw.len() && raw[p] == b'{' {
-                        let check_end = raw.len().min(p + 500);
-                        if ph.find(&raw[p..check_end]).is_some() {
-                            points.push(p);
-                            break;
-                        }
-                    }
-                    pos += off + 1;
-                }
-                None => break,
-            }
+        if let Some(p) = find_event_start(raw, target, limit) {
+            points.push(p);
         }
     }
     points.push(raw.len());

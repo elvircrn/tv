@@ -1,5 +1,6 @@
 use imgui::ImColor32;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub const RULER_H: f32 = 28.0;
 pub const SUB_LANE_H: f32 = 20.0;
@@ -73,8 +74,7 @@ pub struct Trace {
     pub tracks: Vec<Track>,
     pub names: Vec<String>,
     pub cats: Vec<String>,
-    pub arg_strs: Vec<String>,
-    pub arg_pairs: Vec<[u32; 2]>,
+    pub raw_bufs: Vec<Arc<Vec<u8>>>,
     pub stats: Vec<KernelStats>,
     pub max_ts: f64,
     pub min_ts: f64,
@@ -88,6 +88,7 @@ pub struct Track {
     pub events: Vec<Event>,
     pub max_depth: u16,
     pub prefix_max_dur: Vec<f64>,
+    pub raw_buf_idx: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -96,8 +97,7 @@ pub struct Event {
     pub dur: f64,
     pub name: u32,
     pub cat: u32,
-    pub args_start: u32,
-    pub args_count: u16,
+    pub args_off: u32,
     pub depth: u16,
 }
 

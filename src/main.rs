@@ -6,6 +6,7 @@ mod state;
 mod ui;
 mod diff;
 
+use parse::{skip_value, parse_args_flat, FnvMap};
 use types::*;
 use renderer::MetalRenderer;
 use state::*;
@@ -773,12 +774,21 @@ impl App {
                                 state.buf.detail_buf.push_str("  |  Start: +");
                                 write_time(&mut state.buf.detail_buf, ev.ts);
                                 write!(state.buf.detail_buf, "\nCat: {}  |  Track: {}", trace.cats[ev.cat as usize], track.label).unwrap();
-                                if ev.args_count > 0 {
-                                    state.buf.detail_buf.push('\n');
-                                    let pairs = &trace.arg_pairs[ev.args_start as usize
-                                        ..(ev.args_start as usize + ev.args_count as usize)];
-                                    for &[k, v] in pairs {
-                                        write!(state.buf.detail_buf, "\n{}: {}", trace.arg_strs[k as usize], trace.arg_strs[v as usize]).unwrap();
+                                if ev.args_off > 0 {
+                                    let raw = &trace.raw_bufs[track.raw_buf_idx as usize];
+                                    let off = ev.args_off as usize;
+                                    if off < raw.len() {
+                                        let end = skip_value(raw, off);
+                                        let mut strs = Vec::new();
+                                        let mut idx = FnvMap::default();
+                                        let mut pairs = Vec::new();
+                                        parse_args_flat(&raw[off..end], &mut strs, &mut idx, &mut pairs);
+                                        if !pairs.is_empty() {
+                                            state.buf.detail_buf.push('\n');
+                                            for &[k, v] in &pairs {
+                                                write!(state.buf.detail_buf, "\n{}: {}", strs[k as usize], strs[v as usize]).unwrap();
+                                            }
+                                        }
                                     }
                                 }
                                 let avail = ui.content_region_avail();
