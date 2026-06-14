@@ -11,12 +11,12 @@ impl Hasher for IdentityHasher {
 pub type FnvMap<V> = HashMap<u64, V, BuildHasherDefault<IdentityHasher>>;
 
 pub fn find_key(raw: &[u8], key: &[u8]) -> Option<usize> {
-    let mut needle = Vec::with_capacity(key.len() + 2);
-    needle.push(b'"');
-    needle.extend_from_slice(key);
-    needle.push(b'"');
-    let finder = memchr::memmem::Finder::new(&needle);
-    finder.find(raw)
+    let mut buf = [0u8; 66];
+    let len = key.len() + 2;
+    buf[0] = b'"';
+    buf[1..1 + key.len()].copy_from_slice(key);
+    buf[1 + key.len()] = b'"';
+    memchr::memmem::find(raw, &buf[..len])
 }
 
 pub fn skip_string(raw: &[u8], pos: usize) -> usize {
@@ -197,7 +197,11 @@ pub fn intern(bytes: &[u8], table: &mut Vec<String>, index: &mut FnvMap<u32>) ->
     let hash = fnv1a(bytes);
     if let Some(&idx) = index.get(&hash) { return idx; }
     let idx = table.len() as u32;
-    table.push(String::from_utf8_lossy(bytes).into_owned());
+    let s = match String::from_utf8(bytes.to_vec()) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    };
+    table.push(s);
     index.insert(hash, idx);
     idx
 }
@@ -245,6 +249,7 @@ pub fn find_split_points(raw: &[u8], start: usize, n: usize) -> Vec<usize> {
 }
 
 pub fn json_unescape(s: &str) -> String {
+    if !s.contains('\\') { return s.to_string(); }
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
