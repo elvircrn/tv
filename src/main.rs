@@ -130,6 +130,9 @@ impl ApplicationHandler for App {
         self.imgui = Some(imgui);
         self.renderer = Some(renderer);
 
+        let cli_dirs: Vec<String> = self.pending_files.iter()
+            .filter(|p| std::path::Path::new(p).is_dir())
+            .cloned().collect();
         let (rank_groups, standalone) = crate::loader::detect_rank_groups(&self.pending_files);
         let mut pi = 0;
         for group in rank_groups {
@@ -137,6 +140,9 @@ impl ApplicationHandler for App {
                 self.state.panes.push(Pane::new());
             }
             self.state.panes[pi].open_multi(group);
+            if cli_dirs.len() == 1 {
+                self.state.panes[pi].reload_dir = Some(cli_dirs[0].clone());
+            }
             pi += 1;
         }
         for path in standalone {
@@ -144,6 +150,9 @@ impl ApplicationHandler for App {
                 self.state.panes.push(Pane::new());
             }
             self.state.panes[pi].open(path);
+            if cli_dirs.len() == 1 {
+                self.state.panes[pi].reload_dir = Some(cli_dirs[0].clone());
+            }
             pi += 1;
         }
         self.pending_files.clear();
@@ -333,6 +342,9 @@ impl App {
         if !self.pending_drops.is_empty() {
             let drops = std::mem::take(&mut self.pending_drops);
             let display_w = phys.width as f32 / s;
+            let dropped_dirs: Vec<String> = drops.iter()
+                .filter(|p| std::path::Path::new(p).is_dir())
+                .cloned().collect();
             let (rank_groups, standalone) = crate::loader::detect_rank_groups(&drops);
             for group in rank_groups {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
@@ -342,6 +354,9 @@ impl App {
                 };
                 self.state.active = target;
                 self.state.panes[target].open_multi(group);
+                if dropped_dirs.len() == 1 {
+                    self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
+                }
             }
             for path in standalone {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
@@ -351,6 +366,9 @@ impl App {
                 };
                 self.state.active = target;
                 self.state.panes[target].open(path);
+                if dropped_dirs.len() == 1 {
+                    self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
+                }
             }
         }
 
@@ -529,7 +547,7 @@ impl App {
                             ui.same_line();
                             ui.checkbox("Stragglers", &mut pane.align_ranks);
                         }
-                        if !pane.reload_paths.is_empty() {
+                        if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
                             ui.same_line();
                             ui.checkbox("Watch", &mut pane.auto_reload);
                         }
@@ -1281,14 +1299,69 @@ impl App {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(|a| a.as_str()) == Some("--bench") {
-        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        for path in &args[1..] {
-            eprintln!("bench: {path}");
-            counter.store(0, std::sync::atomic::Ordering::Relaxed);
-            match loader::load_trace(path, &counter) {
-                Ok(t) => eprintln!("  ok: {} events, {} tracks", t.total_events, t.tracks.len()),
+        let bench_args: Vec<String> = args[1..].to_vec();
+        let t0 = Instant::now();
+        let (rank_groups, standalone) = loader::detect_rank_groups(&bench_args);
+        let all_files: Vec<&str> = rank_groups.iter()
+            .flat_map(|g| g.iter().map(|(_, p)| p.as_str()))
+            .chain(standalone.iter().map(|p| p.as_str()))
+            .collect();
+        eprintln!("bench: {} files found in {:.3}s", all_files.len(), t0.elapsed().as_secs_f64());
+        for f in &all_files { eprintln!("  {f}"); }
+
+        if rank_groups.is_empty() && standalone.len() <= 1 {
+            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let path = standalone.first().map(|s| s.as_str()).unwrap_or(&bench_args[0]);
+            match loader::load_trace(path, &counter, 0) {
+                Ok(t) => eprintln!("  ok: {} events, {} tracks, {:.2}s", t.total_events, t.tracks.len(), t0.elapsed().as_secs_f64()),
                 Err(e) => eprintln!("  err: {e}"),
             }
+        } else {
+            let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut all_paths: Vec<(usize, String)> = Vec::new();
+            for group in &rank_groups { all_paths.extend(group.clone()); }
+            for (i, p) in standalone.iter().enumerate() { all_paths.push((all_paths.len() + i, p.clone())); }
+
+            let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len()).max(2);
+            eprintln!("bench: {} threads per file", tpf);
+            let t_load = Instant::now();
+            let results: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = all_paths.iter().map(|(rank, path)| {
+                    let r = *rank;
+                    let ctr = counter.clone();
+                    s.spawn(move || {
+                        let t = Instant::now();
+                        let res = loader::load_trace(path, &ctr, tpf);
+                        let elapsed = t.elapsed().as_secs_f64();
+                        (r, res, elapsed)
+                    })
+                }).collect();
+                handles.into_iter().filter_map(|h| h.join().ok()).collect()
+            });
+
+            let mut traces = Vec::new();
+            let mut max_file_time = 0.0f64;
+            for (rank, result, elapsed) in results {
+                match result {
+                    Ok(t) => {
+                        eprintln!("  rank {rank}: {:.2}s, {} events, {} tracks",
+                            elapsed, t.total_events, t.tracks.len());
+                        max_file_time = max_file_time.max(elapsed);
+                        traces.push((rank, t));
+                    }
+                    Err(e) => eprintln!("  rank {rank}: err: {e}"),
+                }
+            }
+            eprintln!("  parallel load: {:.2}s wall, {:.2}s slowest file",
+                t_load.elapsed().as_secs_f64(), max_file_time);
+
+            if !traces.is_empty() {
+                let t_merge = Instant::now();
+                let merged = loader::merge_traces(traces);
+                eprintln!("  merge: {:.2}s, {} events, {} tracks",
+                    t_merge.elapsed().as_secs_f64(), merged.total_events, merged.tracks.len());
+            }
+            eprintln!("  total: {:.2}s", t0.elapsed().as_secs_f64());
         }
         return;
     }

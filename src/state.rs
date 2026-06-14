@@ -58,6 +58,7 @@ pub struct Pane {
     pub step_align_offsets: Vec<Vec<f64>>,
     pub auto_reload: bool,
     pub reload_paths: Vec<(usize, String)>,
+    pub reload_dir: Option<String>,
     pub loading_events: Arc<AtomicUsize>,
 }
 
@@ -107,6 +108,7 @@ impl Pane {
             step_align_offsets: Vec::new(),
             auto_reload: false,
             reload_paths: Vec::new(),
+            reload_dir: None,
             loading_events: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -152,7 +154,7 @@ impl Pane {
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
         std::thread::spawn(move || {
-            tx.send(load_trace(&path, &counter)).ok();
+            tx.send(load_trace(&path, &counter, 0)).ok();
         });
     }
 
@@ -171,12 +173,13 @@ impl Pane {
         self.error = None;
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
+        let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / n).max(2);
         std::thread::spawn(move || {
             let results: Vec<_> = std::thread::scope(|s| {
                 let handles: Vec<_> = rank_paths.iter().map(|(rank, path)| {
                     let r = *rank;
                     let ctr = counter.clone();
-                    s.spawn(move || (r, load_trace(path, &ctr)))
+                    s.spawn(move || (r, load_trace(path, &ctr, tpf)))
                 }).collect();
                 handles.into_iter().filter_map(|h| h.join().ok()).collect()
             });
@@ -196,7 +199,21 @@ impl Pane {
     }
 
     pub fn reload(&mut self) {
-        if self.reload_paths.is_empty() || self.loading.is_some() { return; }
+        if self.loading.is_some() { return; }
+        if let Some(dir) = &self.reload_dir {
+            let (groups, standalone) = crate::loader::detect_rank_groups(&[dir.clone()]);
+            let mut all_paths: Vec<(usize, String)> = Vec::new();
+            for group in groups {
+                all_paths.extend(group);
+            }
+            for (i, path) in standalone.into_iter().enumerate() {
+                let rank = all_paths.len() + i;
+                all_paths.push((rank, path));
+            }
+            if all_paths.is_empty() { return; }
+            self.reload_paths = all_paths;
+        }
+        if self.reload_paths.is_empty() { return; }
         let (tx, rx) = mpsc::channel();
         self.loading = Some(rx);
         self.loading_events = Arc::new(AtomicUsize::new(0));
@@ -204,14 +221,15 @@ impl Pane {
         let paths = self.reload_paths.clone();
         if paths.len() == 1 {
             let path = paths[0].1.clone();
-            std::thread::spawn(move || { tx.send(load_trace(&path, &counter)).ok(); });
+            std::thread::spawn(move || { tx.send(load_trace(&path, &counter, 0)).ok(); });
         } else {
+            let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / paths.len()).max(1);
             std::thread::spawn(move || {
                 let results: Vec<_> = std::thread::scope(|s| {
                     let handles: Vec<_> = paths.iter().map(|(rank, path)| {
                         let r = *rank;
                         let ctr = counter.clone();
-                        s.spawn(move || (r, load_trace(path, &ctr)))
+                        s.spawn(move || (r, load_trace(path, &ctr, tpf)))
                     }).collect();
                     handles.into_iter().filter_map(|h| h.join().ok()).collect()
                 });

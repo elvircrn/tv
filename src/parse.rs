@@ -1,4 +1,14 @@
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+#[derive(Default)]
+pub struct IdentityHasher(u64);
+impl Hasher for IdentityHasher {
+    fn finish(&self) -> u64 { self.0 }
+    fn write(&mut self, _bytes: &[u8]) { unreachable!() }
+    fn write_u64(&mut self, i: u64) { self.0 = i; }
+}
+pub type FnvMap<V> = HashMap<u64, V, BuildHasherDefault<IdentityHasher>>;
 
 pub fn find_key(raw: &[u8], key: &[u8]) -> Option<usize> {
     let mut needle = Vec::with_capacity(key.len() + 2);
@@ -158,7 +168,7 @@ pub fn parse_f64(bytes: &[u8]) -> f64 {
 pub fn parse_args_flat(
     blob: &[u8],
     strs: &mut Vec<String>,
-    idx: &mut HashMap<u64, u32>,
+    idx: &mut FnvMap<u32>,
     pairs: &mut Vec<[u32; 2]>,
 ) {
     if blob.is_empty() || blob[0] != b'{' { return; }
@@ -183,7 +193,7 @@ pub fn parse_args_flat(
     }
 }
 
-pub fn intern(bytes: &[u8], table: &mut Vec<String>, index: &mut HashMap<u64, u32>) -> u32 {
+pub fn intern(bytes: &[u8], table: &mut Vec<String>, index: &mut FnvMap<u32>) -> u32 {
     let hash = fnv1a(bytes);
     if let Some(&idx) = index.get(&hash) { return idx; }
     let idx = table.len() as u32;

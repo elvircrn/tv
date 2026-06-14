@@ -165,7 +165,7 @@ fn test_fnv1a_empty() {
 #[test]
 fn test_intern_dedup() {
     let mut table = Vec::new();
-    let mut index = HashMap::new();
+    let mut index = FnvMap::default();
     let a = intern(b"kernel_a", &mut table, &mut index);
     let b = intern(b"kernel_b", &mut table, &mut index);
     let a2 = intern(b"kernel_a", &mut table, &mut index);
@@ -615,7 +615,7 @@ fn test_load_trace_json() {
     let path = dir.join("test.json");
     std::fs::write(&path, json).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0).unwrap();
     assert_eq!(trace.tracks.len(), 2);
     assert!(trace.names.contains(&"kern_a".to_string()));
     assert!(trace.names.contains(&"kern_b".to_string()));
@@ -646,7 +646,7 @@ fn test_load_trace_gz() {
     std::io::Write::write_all(&mut gz, json).unwrap();
     gz.finish().unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0).unwrap();
     assert_eq!(trace.total_events, 1);
 
     std::fs::remove_file(&path).ok();
@@ -660,7 +660,7 @@ fn test_load_trace_no_events() {
     let path = dir.join("empty.json");
     std::fs::write(&path, json).unwrap();
 
-    let result = load_trace(path.to_str().unwrap(), &test_counter());
+    let result = load_trace(path.to_str().unwrap(), &test_counter(), 0);
     assert!(result.is_err());
 
     std::fs::remove_file(&path).ok();
@@ -678,7 +678,7 @@ fn test_load_trace_depth_assignment() {
     let path = dir.join("depth.json");
     std::fs::write(&path, json).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0).unwrap();
     let track = &trace.tracks[0];
     assert_eq!(track.events.len(), 3);
     let depths: Vec<u16> = track.events.iter().map(|e| e.depth).collect();
@@ -701,7 +701,7 @@ fn test_load_trace_truncated_json() {
     let path = dir.join("truncated.json");
     std::fs::write(&path, json).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0).unwrap();
     assert!(trace.total_events >= 2, "should parse complete events from truncated JSON, got {}", trace.total_events);
 
     std::fs::remove_file(&path).ok();
@@ -729,7 +729,7 @@ fn test_load_trace_truncated_gz() {
     }
     std::fs::write(&path, &buf[..buf.len() - 10]).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0).unwrap();
     assert!(trace.total_events >= 2, "should parse events from truncated gz, got {}", trace.total_events);
 
     std::fs::remove_file(&path).ok();
@@ -773,7 +773,7 @@ fn test_label_save_load_roundtrip() {
 fn test_parse_args_flat() {
     let blob = br#"{"key1": "val1", "key2": 42}"#;
     let mut strs = Vec::new();
-    let mut idx = HashMap::new();
+    let mut idx = FnvMap::default();
     let mut pairs = Vec::new();
     parse_args_flat(blob, &mut strs, &mut idx, &mut pairs);
 
@@ -787,7 +787,7 @@ fn test_parse_args_flat() {
 #[test]
 fn test_parse_args_flat_empty() {
     let mut strs = Vec::new();
-    let mut idx = HashMap::new();
+    let mut idx = FnvMap::default();
     let mut pairs = Vec::new();
     parse_args_flat(b"{}", &mut strs, &mut idx, &mut pairs);
     assert!(pairs.is_empty());
@@ -1294,6 +1294,17 @@ fn test_detect_rank_groups_no_ranks() {
     let (groups, standalone) = detect_rank_groups(&paths);
     assert!(groups.is_empty());
     assert_eq!(standalone.len(), 2);
+}
+
+#[test]
+fn test_is_trace_file() {
+    assert!(crate::loader::is_trace_file("foo.json"));
+    assert!(crate::loader::is_trace_file("foo.json.gz"));
+    assert!(crate::loader::is_trace_file("foo.tar.gz"));
+    assert!(crate::loader::is_trace_file("foo.tgz"));
+    assert!(!crate::loader::is_trace_file("foo.txt"));
+    assert!(!crate::loader::is_trace_file("foo.csv"));
+    assert!(!crate::loader::is_trace_file("foo.gz"));
 }
 
 // --- merge_traces ---
