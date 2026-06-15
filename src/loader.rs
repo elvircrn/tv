@@ -698,7 +698,7 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, flow_pairs })
 }
 
-const CACHE_MAGIC: &[u8; 4] = b"TRV1";
+const CACHE_MAGIC: &[u8; 4] = b"TRV2";
 const CACHE_VERSION: u32 = 1;
 
 fn cache_path(source: &str, cache_dir: Option<&str>) -> String {
@@ -1411,6 +1411,11 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
                         local_dur.entry(ev.name).or_default().push(ev.dur);
                     }
                     total_events += track.events.len();
+                }
+
+                for f in &mut trace.flow_pairs {
+                    f.src_ts += time_offset;
+                    f.dst_ts += time_offset;
                 }
 
                 (trace.tracks, trace.raw_bufs, max_ts, total_events, local_dur, trace.flow_pairs)
