@@ -1280,9 +1280,11 @@ fn expand_dirs(paths: &[String]) -> Vec<String> {
             for entry in entries.flatten() {
                 let ep = entry.path();
                 if ep.is_dir() {
+                    let dirname = ep.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if dirname == ".tvcache" || dirname.ends_with(".tvcache") { continue; }
                     dirs.push(ep);
                 } else if let Some(name) = ep.file_name().and_then(|n| n.to_str()) {
-                    if is_trace_file(name) {
+                    if !name.ends_with(".tvcache") && is_trace_file(name) {
                         out.push(ep.to_string_lossy().into());
                     }
                 }
