@@ -885,22 +885,34 @@ fn load_cache_from_mmap(d: &[u8]) -> Option<Trace> {
     pos += stats_bytes;
 
     if pos + args_len > d.len() { return None; }
-    let args = d[pos..pos + args_len].to_vec();
+    let args_slice = &d[pos..pos + args_len];
 
-    let mut tracks = Vec::with_capacity(n_tracks);
+    let mut offsets = Vec::with_capacity(n_tracks);
     let mut ev_off = 0usize;
-    for hdr in track_hdrs {
-        let n = hdr.event_count;
-        tracks.push(Track {
-            label: hdr.label,
-            gpu: hdr.gpu,
-            events: all_events[ev_off..ev_off + n].to_vec(),
-            max_depth: hdr.max_depth,
-            prefix_max_dur: all_pmd[ev_off..ev_off + n].to_vec(),
-            raw_buf_idx: 0,
-        });
-        ev_off += n;
+    for hdr in &track_hdrs {
+        offsets.push(ev_off);
+        ev_off += hdr.event_count;
     }
+
+    let (tracks, args) = std::thread::scope(|s| {
+        let args_handle = s.spawn(|| args_slice.to_vec());
+        let track_handles: Vec<_> = track_hdrs.into_iter().zip(offsets).map(|(hdr, off)| {
+            s.spawn(move || {
+                let n = hdr.event_count;
+                Track {
+                    label: hdr.label,
+                    gpu: hdr.gpu,
+                    events: all_events[off..off + n].to_vec(),
+                    max_depth: hdr.max_depth,
+                    prefix_max_dur: all_pmd[off..off + n].to_vec(),
+                    raw_buf_idx: 0,
+                }
+            })
+        }).collect();
+        let tracks: Vec<Track> = track_handles.into_iter().filter_map(|h| h.join().ok()).collect();
+        let args = args_handle.join().unwrap_or_default();
+        (tracks, args)
+    });
 
     Some(Trace {
         tracks, names, cats,
@@ -918,6 +930,133 @@ fn load_cache_direct(cache_path: &str) -> Option<Trace> {
     let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
     if r32(4) != CACHE_VERSION { return None; }
     // Skip source validation (bytes 8..24) — we're loading the cache directly
+    load_cache_from_mmap(d)
+}
+
+fn merged_cache_hash(cache_dir: &str) -> u64 {
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    if let Ok(dir) = std::fs::read_dir(cache_dir) {
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".tvcache") && name != "_merged.tvcache" {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                entries.push((name, size));
+            }
+        }
+    }
+    entries.sort();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for (name, size) in &entries {
+        for &b in name.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        for &b in &size.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
+fn save_merged_cache(trace: &Trace, cache_dir: &str) {
+    let cp = format!("{cache_dir}/_merged.tvcache");
+    let hash = merged_cache_hash(cache_dir);
+    let tmp = format!("{cp}.tmp");
+    let file = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut w = BufWriter::new(file);
+
+    let total_events: u64 = trace.tracks.iter().map(|t| t.events.len() as u64).sum();
+    let args_buf = trace.raw_bufs.first().map(|b| &b[..]).unwrap_or(&[]);
+
+    w.write_all(CACHE_MAGIC).ok();
+    write_u32(&mut w, CACHE_VERSION);
+    write_u64(&mut w, hash);
+    write_u64(&mut w, 0);
+    write_f64(&mut w, trace.max_ts);
+    write_f64(&mut w, trace.min_ts);
+    write_u64(&mut w, total_events);
+    write_u32(&mut w, trace.tracks.len() as u32);
+    write_u32(&mut w, trace.names.len() as u32);
+    write_u32(&mut w, trace.cats.len() as u32);
+    write_u32(&mut w, trace.stats.len() as u32);
+    write_u32(&mut w, trace.device.len() as u32);
+    write_u64(&mut w, args_buf.len() as u64);
+    write_u32(&mut w, 0);
+
+    let mut written = 80usize;
+
+    write_strings(&mut w, &trace.names);
+    written += trace.names.iter().map(|s| 4 + s.len()).sum::<usize>();
+    write_strings(&mut w, &trace.cats);
+    written += trace.cats.iter().map(|s| 4 + s.len()).sum::<usize>();
+    write_u32(&mut w, trace.device.len() as u32);
+    w.write_all(trace.device.as_bytes()).ok();
+    written += 4 + trace.device.len();
+
+    for t in &trace.tracks {
+        let label = t.label.as_bytes();
+        let mut hdr = [0u8; 13];
+        hdr[0..2].copy_from_slice(&(label.len() as u16).to_le_bytes());
+        hdr[2] = t.gpu as u8;
+        hdr[3..5].copy_from_slice(&t.max_depth.to_le_bytes());
+        hdr[5..13].copy_from_slice(&(t.events.len() as u64).to_le_bytes());
+        w.write_all(&hdr).ok();
+        w.write_all(label).ok();
+        written += 13 + label.len();
+    }
+
+    pad_to_8(&mut w, written);
+
+    for t in &trace.tracks {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                t.events.as_ptr() as *const u8,
+                t.events.len() * std::mem::size_of::<Event>(),
+            )
+        };
+        w.write_all(bytes).ok();
+    }
+
+    for t in &trace.tracks {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                t.prefix_max_dur.as_ptr() as *const u8,
+                t.prefix_max_dur.len() * 8,
+            )
+        };
+        w.write_all(bytes).ok();
+    }
+
+    let stats_bytes = unsafe {
+        std::slice::from_raw_parts(
+            trace.stats.as_ptr() as *const u8,
+            trace.stats.len() * std::mem::size_of::<KernelStats>(),
+        )
+    };
+    w.write_all(stats_bytes).ok();
+
+    w.write_all(args_buf).ok();
+
+    drop(w);
+    std::fs::rename(&tmp, &cp).ok();
+}
+
+fn load_merged_cache(cache_dir: &str) -> Option<Trace> {
+    let cp = format!("{cache_dir}/_merged.tvcache");
+    let file = std::fs::File::open(&cp).ok()?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    let d = &mmap[..];
+    if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
+    let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
+    let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
+    if r32(4) != CACHE_VERSION { return None; }
+    let stored_hash = r64(8);
+    let current_hash = merged_cache_hash(cache_dir);
+    if stored_hash != current_hash { return None; }
     load_cache_from_mmap(d)
 }
 
@@ -1229,6 +1368,15 @@ pub fn load_multi_progressive(
     cache_dir: Option<&str>,
 ) {
     let t0 = Instant::now();
+
+    if let Some(cd) = cache_dir {
+        if let Some(trace) = load_merged_cache(cd) {
+            eprintln!("  merged cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+            let _ = tx.send(Ok(trace));
+            return;
+        }
+    }
+
     let cd = cache_dir.map(|s| s.to_string());
     let results: Vec<_> = std::thread::scope(|s| {
         let handles: Vec<_> = rank_paths.iter().map(|(rank, path)| {
@@ -1252,6 +1400,9 @@ pub fn load_multi_progressive(
     }
     let trace = merge_traces(traces);
     eprintln!("  merged: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+    if let Some(cd) = cache_dir {
+        save_merged_cache(&trace, cd);
+    }
     let _ = tx.send(Ok(trace));
 }
 
