@@ -647,23 +647,25 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     flow_events.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.3.partial_cmp(&b.3).unwrap()));
     let mut i = 0;
     while i < flow_events.len() {
-        let (id, s_pid, s_tid, s_ts, is_start) = flow_events[i];
-        if !is_start { i += 1; continue; }
-        let mut j = i + 1;
-        while j < flow_events.len() && flow_events[j].0 == id {
-            if !flow_events[j].4 { break; }
-            j += 1;
-        }
-        if j >= flow_events.len() || flow_events[j].0 != id { i = j; continue; }
-        let (_, f_pid, f_tid, f_ts, _) = flow_events[j];
-        i = j + 1;
+        let cur_id = flow_events[i].0;
+        let id_start = i;
+        while i < flow_events.len() && flow_events[i].0 == cur_id { i += 1; }
+        let id_end = i;
 
-        let src_ti = match ptid_to_track.get(&(s_pid, s_tid)) { Some(&v) => v, None => continue };
-        let dst_ti = match ptid_to_track.get(&(f_pid, f_tid)) { Some(&v) => v, None => continue };
-        let s_adj = s_ts - min_ts;
-        let f_adj = f_ts - min_ts;
-        flow_pairs.push(FlowPair { src_track: src_ti as u32, dst_track: dst_ti as u32, src_ts: s_adj, dst_ts: f_adj });
-        flow_pairs.push(FlowPair { src_track: dst_ti as u32, dst_track: src_ti as u32, src_ts: f_adj, dst_ts: s_adj });
+        let starts: Vec<_> = flow_events[id_start..id_end].iter().filter(|e| e.4).collect();
+        let ends: Vec<_> = flow_events[id_start..id_end].iter().filter(|e| !e.4).collect();
+        if starts.is_empty() || ends.is_empty() { continue; }
+
+        for s in &starts {
+            let src_ti = match ptid_to_track.get(&(s.1, s.2)) { Some(&v) => v, None => continue };
+            let s_adj = s.3 - min_ts;
+            for f in &ends {
+                let dst_ti = match ptid_to_track.get(&(f.1, f.2)) { Some(&v) => v, None => continue };
+                let f_adj = f.3 - min_ts;
+                flow_pairs.push(FlowPair { src_track: src_ti as u32, dst_track: dst_ti as u32, src_ts: s_adj, dst_ts: f_adj });
+                flow_pairs.push(FlowPair { src_track: dst_ti as u32, dst_track: src_ti as u32, src_ts: f_adj, dst_ts: s_adj });
+            }
+        }
     }
     drop(flow_events);
     flow_pairs.sort_unstable_by(|a, b| a.src_track.cmp(&b.src_track)
