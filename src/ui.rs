@@ -645,6 +645,74 @@ pub fn draw_timeline(
             }
         }
 
+        if !trace.flows.is_empty() {
+            if let Some(sel) = selected {
+                let key = [sel.track_idx, sel.event_idx];
+                let idx = trace.flows.partition_point(|f| (f[0], f[1]) < (key[0], key[1]));
+                if idx < trace.flows.len() && trace.flows[idx][0] == key[0] && trace.flows[idx][1] == key[1] {
+                    let dst_ti = trace.flows[idx][2] as usize;
+                    let dst_ei = trace.flows[idx][3] as usize;
+                    let sel_ti = sel.track_idx as usize;
+                    let sel_ei = sel.event_idx as usize;
+
+                    if let Some(sel_vi) = buf.visible.iter().position(|&v| v == sel_ti) {
+                        let sel_track = &trace.tracks[sel_ti];
+                        let sel_ev = sel_track.events[sel_ei];
+                        let sel_gpu = sel_track.gpu;
+                        let dst_ev = trace.tracks[dst_ti].events[dst_ei];
+
+                        let src_sub_h = buf.heights[sel_vi] / sel_track.max_depth.max(1) as f32;
+                        let src_lane_h = src_sub_h - LANE_GAP;
+                        let src_y = tracks_top + buf.y_offsets[sel_vi] - view.scroll_y
+                            + sel_ev.depth as f32 * src_sub_h + EV_INSET + src_lane_h / 2.0;
+                        let src_x = if sel_gpu {
+                            t2x(sel_ev.ts, view.t0, px_per_us, tl_left)
+                        } else {
+                            t2x(sel_ev.ts + sel_ev.dur, view.t0, px_per_us, tl_left)
+                        };
+
+                        let (dst_x, dst_y) = if let Some(dst_vi) = buf.visible.iter().position(|&v| v == dst_ti) {
+                            let dst_track = &trace.tracks[dst_ti];
+                            let dst_sub_h = buf.heights[dst_vi] / dst_track.max_depth.max(1) as f32;
+                            let dst_lane_h = dst_sub_h - LANE_GAP;
+                            let dy = tracks_top + buf.y_offsets[dst_vi] - view.scroll_y
+                                + dst_ev.depth as f32 * dst_sub_h + EV_INSET + dst_lane_h / 2.0;
+                            let dx = if sel_gpu {
+                                t2x(dst_ev.ts + dst_ev.dur, view.t0, px_per_us, tl_left)
+                            } else {
+                                t2x(dst_ev.ts, view.t0, px_per_us, tl_left)
+                            };
+                            (dx, dy)
+                        } else {
+                            let dx = if sel_gpu {
+                                t2x(dst_ev.ts + dst_ev.dur, view.t0, px_per_us, tl_left)
+                            } else {
+                                t2x(dst_ev.ts, view.t0, px_per_us, tl_left)
+                            };
+                            (dx, rect[3])
+                        };
+
+                        let arrow_col = col32(255, 180, 50, 200);
+                        dl.add_line([src_x, src_y], [dst_x, dst_y], arrow_col).thickness(2.0).build();
+
+                        let dx = dst_x - src_x;
+                        let dy = dst_y - src_y;
+                        let len = (dx * dx + dy * dy).sqrt();
+                        if len > 1.0 {
+                            let ux = dx / len;
+                            let uy = dy / len;
+                            let arrow_size = 8.0f32;
+                            let left = [dst_x - ux * arrow_size - uy * arrow_size * 0.5,
+                                        dst_y - uy * arrow_size + ux * arrow_size * 0.5];
+                            let right = [dst_x - ux * arrow_size + uy * arrow_size * 0.5,
+                                         dst_y - uy * arrow_size - ux * arrow_size * 0.5];
+                            dl.add_triangle([dst_x, dst_y], left, right, arrow_col).filled(true).build();
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some([s0, s1, y0, y1]) = active_sel {
             let (sa, sb) = if s0 <= s1 { (s0, s1) } else { (s1, s0) };
             let (ya, yb) = if y0 <= y1 { (y0 as f32, y1 as f32) } else { (y1 as f32, y0 as f32) };

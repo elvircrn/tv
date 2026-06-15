@@ -80,6 +80,7 @@ pub struct Trace {
     pub min_ts: f64,
     pub total_events: usize,
     pub device: String,
+    pub flows: Vec<[u32; 4]>,
 }
 
 #[derive(Clone)]
