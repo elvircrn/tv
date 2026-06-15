@@ -645,21 +645,58 @@ pub fn draw_timeline(
             }
         }
 
-        if !trace.flows.is_empty() {
+        if !trace.flow_pairs.is_empty() {
             if let Some(sel) = selected {
-                let key = [sel.track_idx, sel.event_idx];
-                let idx = trace.flows.partition_point(|f| (f[0], f[1]) < (key[0], key[1]));
-                if idx < trace.flows.len() && trace.flows[idx][0] == key[0] && trace.flows[idx][1] == key[1] {
-                    let dst_ti = trace.flows[idx][2] as usize;
-                    let dst_ei = trace.flows[idx][3] as usize;
-                    let sel_ti = sel.track_idx as usize;
-                    let sel_ei = sel.event_idx as usize;
+                let sel_ti = sel.track_idx as usize;
+                let sel_track = &trace.tracks[sel_ti];
+                let sel_ev = sel_track.events[sel.event_idx as usize];
 
-                    if let Some(sel_vi) = buf.visible.iter().position(|&v| v == sel_ti) {
-                        let sel_track = &trace.tracks[sel_ti];
-                        let sel_ev = sel_track.events[sel_ei];
+                let mut found_flow: Option<&FlowPair> = None;
+                let mut cur_ei = sel.event_idx as usize;
+                loop {
+                    let ev = &sel_track.events[cur_ei];
+                    let ti32 = sel_ti as u32;
+                    let idx = trace.flow_pairs.partition_point(|f|
+                        (f.src_track, f.src_ts) < (ti32, ev.ts - 0.001));
+                    for k in idx..trace.flow_pairs.len() {
+                        let f = &trace.flow_pairs[k];
+                        if f.src_track != ti32 || f.src_ts > ev.ts + ev.dur + 0.001 { break; }
+                        if f.src_ts >= ev.ts - 0.001 {
+                            found_flow = Some(f);
+                            break;
+                        }
+                    }
+                    if found_flow.is_some() { break; }
+                    if ev.depth == 0 { break; }
+                    let target_depth = ev.depth - 1;
+                    let mut parent = None;
+                    for i in (0..cur_ei).rev() {
+                        let pe = &sel_track.events[i];
+                        if pe.depth == target_depth && pe.ts <= ev.ts && pe.ts + pe.dur >= ev.ts + ev.dur {
+                            parent = Some(i);
+                            break;
+                        }
+                        if pe.depth < target_depth { break; }
+                    }
+                    match parent { Some(p) => cur_ei = p, None => break }
+                }
+
+                if let Some(fp) = found_flow {
+                    let dst_ti = fp.dst_track as usize;
+                    let dst_ts = fp.dst_ts;
+                    let dst_evs = &trace.tracks[dst_ti].events;
+                    let p = dst_evs.partition_point(|e| e.ts < dst_ts - 0.001);
+                    let mut dst_ei = None;
+                    for k in p..dst_evs.len().min(p + 10) {
+                        if (dst_evs[k].ts - dst_ts).abs() < 0.001 { dst_ei = Some(k); break; }
+                    }
+
+                    if let (Some(sel_vi), Some(dst_ei)) = (
+                        buf.visible.iter().position(|&v| v == sel_ti),
+                        dst_ei,
+                    ) {
                         let sel_gpu = sel_track.gpu;
-                        let dst_ev = trace.tracks[dst_ti].events[dst_ei];
+                        let dst_ev = dst_evs[dst_ei];
 
                         let src_sub_h = buf.heights[sel_vi] / sel_track.max_depth.max(1) as f32;
                         let src_lane_h = src_sub_h - LANE_GAP;

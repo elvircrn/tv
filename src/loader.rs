@@ -643,7 +643,7 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
 
     max_ts -= min_ts;
 
-    let mut flows: Vec<[u32; 4]> = Vec::new();
+    let mut flow_pairs: Vec<FlowPair> = Vec::new();
     flow_events.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.3.partial_cmp(&b.3).unwrap()));
     let mut i = 0;
     while i < flow_events.len() {
@@ -662,30 +662,14 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
         let dst_ti = match ptid_to_track.get(&(f_pid, f_tid)) { Some(&v) => v, None => continue };
         let s_adj = s_ts - min_ts;
         let f_adj = f_ts - min_ts;
-        let src_ei = {
-            let evs = &tracks[src_ti].events;
-            let p = evs.partition_point(|e| e.ts < s_adj - 0.001);
-            let mut found = None;
-            for k in p..evs.len().min(p + 10) {
-                if (evs[k].ts - s_adj).abs() < 0.001 { found = Some(k); break; }
-            }
-            match found { Some(v) => v, None => continue }
-        };
-        let dst_ei = {
-            let evs = &tracks[dst_ti].events;
-            let p = evs.partition_point(|e| e.ts < f_adj - 0.001);
-            let mut found = None;
-            for k in p..evs.len().min(p + 10) {
-                if (evs[k].ts - f_adj).abs() < 0.001 { found = Some(k); break; }
-            }
-            match found { Some(v) => v, None => continue }
-        };
-        flows.push([src_ti as u32, src_ei as u32, dst_ti as u32, dst_ei as u32]);
-        flows.push([dst_ti as u32, dst_ei as u32, src_ti as u32, src_ei as u32]);
+        flow_pairs.push(FlowPair { src_track: src_ti as u32, dst_track: dst_ti as u32, src_ts: s_adj, dst_ts: f_adj });
+        flow_pairs.push(FlowPair { src_track: dst_ti as u32, dst_track: src_ti as u32, src_ts: f_adj, dst_ts: s_adj });
     }
     drop(flow_events);
-    flows.sort_unstable();
-    flows.dedup();
+    flow_pairs.sort_unstable_by(|a, b| a.src_track.cmp(&b.src_track)
+        .then_with(|| a.src_ts.partial_cmp(&b.src_ts).unwrap()));
+    flow_pairs.dedup_by(|a, b| a.src_track == b.src_track && a.src_ts == b.src_ts
+        && a.dst_track == b.dst_track && a.dst_ts == b.dst_ts);
     drop(ptid_to_track);
 
     let mut dur_map: HashMap<u32, Vec<f64>> = HashMap::new();
@@ -708,8 +692,8 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     names.shrink_to_fit();
     cats.shrink_to_fit();
 
-    eprintln!("  lanes: {:.2}s ({} tracks, {} flows)", t2.elapsed().as_secs_f64(), tracks.len(), flows.len());
-    Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, flows })
+    eprintln!("  lanes: {:.2}s ({} tracks, {} flow_pairs)", t2.elapsed().as_secs_f64(), tracks.len(), flow_pairs.len());
+    Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, flow_pairs })
 }
 
 const CACHE_MAGIC: &[u8; 4] = b"TRV1";
@@ -848,12 +832,12 @@ pub fn save_cache(trace: &Trace, source_path: &str, cache_dir: Option<&str>) {
 
     w.write_all(args_buf).ok();
 
-    write_u32(&mut w, trace.flows.len() as u32);
-    if !trace.flows.is_empty() {
+    write_u32(&mut w, trace.flow_pairs.len() as u32);
+    if !trace.flow_pairs.is_empty() {
         let flow_bytes = unsafe {
             std::slice::from_raw_parts(
-                trace.flows.as_ptr() as *const u8,
-                trace.flows.len() * 16,
+                trace.flow_pairs.as_ptr() as *const u8,
+                trace.flow_pairs.len() * std::mem::size_of::<FlowPair>(),
             )
         };
         w.write_all(flow_bytes).ok();
@@ -993,20 +977,21 @@ fn load_cache_from_mmap(d: &[u8]) -> Option<Trace> {
         (tracks, args)
     });
 
-    let mut flows = Vec::new();
+    let fp_size = std::mem::size_of::<FlowPair>();
+    let mut flow_pairs = Vec::new();
     let mut fpos = after_args;
     if fpos + 4 <= d.len() {
         let n_flows = u32::from_le_bytes(d[fpos..fpos + 4].try_into().unwrap()) as usize;
         fpos += 4;
-        if fpos + n_flows * 16 <= d.len() {
-            flows.reserve(n_flows);
+        if fpos + n_flows * fp_size <= d.len() {
+            flow_pairs.reserve(n_flows);
             for i in 0..n_flows {
-                let off = fpos + i * 16;
-                let a = u32::from_le_bytes(d[off..off+4].try_into().unwrap());
-                let b = u32::from_le_bytes(d[off+4..off+8].try_into().unwrap());
-                let c = u32::from_le_bytes(d[off+8..off+12].try_into().unwrap());
-                let e = u32::from_le_bytes(d[off+12..off+16].try_into().unwrap());
-                flows.push([a, b, c, e]);
+                let off = fpos + i * fp_size;
+                let src_track = u32::from_le_bytes(d[off..off+4].try_into().unwrap());
+                let dst_track = u32::from_le_bytes(d[off+4..off+8].try_into().unwrap());
+                let src_ts = f64::from_le_bytes(d[off+8..off+16].try_into().unwrap());
+                let dst_ts = f64::from_le_bytes(d[off+16..off+24].try_into().unwrap());
+                flow_pairs.push(FlowPair { src_track, dst_track, src_ts, dst_ts });
             }
         }
     }
@@ -1014,7 +999,7 @@ fn load_cache_from_mmap(d: &[u8]) -> Option<Trace> {
     Some(Trace {
         tracks, names, cats,
         raw_bufs: vec![Arc::new(args)],
-        stats, max_ts, min_ts, total_events, device, flows,
+        stats, max_ts, min_ts, total_events, device, flow_pairs,
     })
 }
 
@@ -1138,12 +1123,12 @@ fn save_merged_cache(trace: &Trace, cache_dir: &str) {
 
     w.write_all(args_buf).ok();
 
-    write_u32(&mut w, trace.flows.len() as u32);
-    if !trace.flows.is_empty() {
+    write_u32(&mut w, trace.flow_pairs.len() as u32);
+    if !trace.flow_pairs.is_empty() {
         let flow_bytes = unsafe {
             std::slice::from_raw_parts(
-                trace.flows.as_ptr() as *const u8,
-                trace.flows.len() * 16,
+                trace.flow_pairs.as_ptr() as *const u8,
+                trace.flow_pairs.len() * std::mem::size_of::<FlowPair>(),
             )
         };
         w.write_all(flow_bytes).ok();
@@ -1221,7 +1206,7 @@ fn clone_trace(t: &Trace) -> Trace {
         min_ts: t.min_ts,
         total_events: t.total_events,
         device: t.device.clone(),
-        flows: t.flows.clone(),
+        flow_pairs: t.flow_pairs.clone(),
     }
 }
 
@@ -1426,25 +1411,25 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
                     total_events += track.events.len();
                 }
 
-                (trace.tracks, trace.raw_bufs, max_ts, total_events, local_dur, trace.flows)
+                (trace.tracks, trace.raw_bufs, max_ts, total_events, local_dur, trace.flow_pairs)
             })
         }).collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
 
     let mut all_tracks: Vec<Track> = Vec::new();
-    let mut all_flows: Vec<[u32; 4]> = Vec::new();
+    let mut all_flow_pairs: Vec<FlowPair> = Vec::new();
     let mut total_events = 0;
     let mut max_ts: f64 = 0.0;
     let mut dur_map: HashMap<u32, Vec<f64>> = HashMap::new();
 
-    for (tracks, raw_bufs, mt, te, local_dur, mut flows) in remapped {
+    for (tracks, raw_bufs, mt, te, local_dur, mut fps) in remapped {
         let offset = all_tracks.len() as u32;
-        for f in &mut flows {
-            f[0] += offset;
-            f[2] += offset;
+        for f in &mut fps {
+            f.src_track += offset;
+            f.dst_track += offset;
         }
-        all_flows.extend(flows);
+        all_flow_pairs.extend(fps);
         all_tracks.extend(tracks);
         all_raw_bufs.extend(raw_bufs);
         total_events += te;
@@ -1465,12 +1450,14 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
         prefix_max_dur: Vec::new(), raw_buf_idx: 0,
     })).collect();
 
-    for f in &mut all_flows {
-        f[0] = old_to_new[f[0] as usize];
-        f[2] = old_to_new[f[2] as usize];
+    for f in &mut all_flow_pairs {
+        f.src_track = old_to_new[f.src_track as usize];
+        f.dst_track = old_to_new[f.dst_track as usize];
     }
-    all_flows.sort_unstable();
-    all_flows.dedup();
+    all_flow_pairs.sort_unstable_by(|a, b| a.src_track.cmp(&b.src_track)
+        .then_with(|| a.src_ts.partial_cmp(&b.src_ts).unwrap()));
+    all_flow_pairs.dedup_by(|a, b| a.src_track == b.src_track && a.src_ts == b.src_ts
+        && a.dst_track == b.dst_track && a.dst_ts == b.dst_ts);
 
     let mut stats: Vec<KernelStats> = dur_map.into_iter().map(|(name, mut durs)| {
         let count = durs.len() as u32;
@@ -1488,7 +1475,7 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
 
     let mut trace = Trace {
         tracks: sorted_tracks, names, cats, raw_bufs: all_raw_bufs, stats,
-        max_ts, min_ts: global_min, total_events, device, flows: all_flows,
+        max_ts, min_ts: global_min, total_events, device, flow_pairs: all_flow_pairs,
     };
     compact_args(&mut trace);
     trace
@@ -1531,7 +1518,7 @@ pub fn load_multi_progressive(
         return;
     }
     let trace = merge_traces(traces);
-    eprintln!("  merged: {:.2}s ({} events, {} flows)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flows.len());
+    eprintln!("  merged: {:.2}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
     if let Some(cd) = cache_dir {
         save_merged_cache(&trace, cd);
     }

@@ -80,7 +80,16 @@ pub struct Trace {
     pub min_ts: f64,
     pub total_events: usize,
     pub device: String,
-    pub flows: Vec<[u32; 4]>,
+    pub flow_pairs: Vec<FlowPair>,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct FlowPair {
+    pub src_track: u32,
+    pub dst_track: u32,
+    pub src_ts: f64,
+    pub dst_ts: f64,
 }
 
 #[derive(Clone)]

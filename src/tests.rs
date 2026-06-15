@@ -39,7 +39,7 @@ fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace 
         tracks: trs, names: name_strs, cats: vec![String::new()],
         raw_bufs: Vec::new(), stats: Vec::new(),
         max_ts, min_ts: 0.0, total_events, device: String::new(),
-        flows: Vec::new(),
+        flow_pairs: Vec::new(),
     }
 }
 
