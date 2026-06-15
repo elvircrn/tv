@@ -93,6 +93,7 @@ pub struct Track {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct Event {
     pub ts: f64,
     pub dur: f64,
@@ -122,6 +123,7 @@ impl Default for View {
 }
 
 #[derive(Clone)]
+#[repr(C)]
 pub struct KernelStats {
     pub name: u32,
     pub count: u32,
@@ -176,6 +178,7 @@ pub enum DragKind {
     BottomDivider,
     LabelDivider(usize),
     TrackResize(usize, usize),
+    TrackDrag(usize, usize, f32),
     SplitDivider(usize),
 }
 

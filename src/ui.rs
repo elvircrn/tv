@@ -327,6 +327,7 @@ pub fn draw_timeline(
     sel_mask: &[bool],
     label_w: f32,
     track_scales: &mut Vec<f32>,
+    track_order: &mut Vec<usize>,
     drag: &mut DragKind,
     straggler_mask: &[Vec<bool>],
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
@@ -354,7 +355,8 @@ pub fn draw_timeline(
     buf.heights.clear();
     buf.y_offsets.clear();
     let mut cumulative = 0.0f32;
-    for (i, t) in trace.tracks.iter().enumerate() {
+    for &i in track_order.iter() {
+        let t = &trace.tracks[i];
         if !show_cpu && !t.gpu { continue; }
         buf.visible.push(i);
         let h = track_height(
@@ -367,6 +369,38 @@ pub fn draw_timeline(
         cumulative += h;
     }
     let total_h = cumulative;
+    let tracks_top = rect[1] + RULER_H;
+
+    if let DragKind::TrackDrag(pi, ref mut dragged_vi, _grab_off) = *drag {
+        if pi == pane_idx {
+            if ui.io().mouse_down[0] {
+                let rel_y = mouse_pos[1] - tracks_top + view.scroll_y;
+                let mut target_vi = buf.visible.len();
+                for vi in 0..buf.visible.len() {
+                    let mid = buf.y_offsets[vi] + buf.heights[vi] * 0.5;
+                    if rel_y < mid {
+                        target_vi = vi;
+                        break;
+                    }
+                }
+                if target_vi != *dragged_vi && !(target_vi == *dragged_vi + 1) {
+                    let ti = buf.visible[*dragged_vi];
+                    let order_pos = track_order.iter().position(|&x| x == ti).unwrap();
+                    track_order.remove(order_pos);
+                    let insert_order_pos = if target_vi < buf.visible.len() {
+                        let target_ti = buf.visible[target_vi];
+                        track_order.iter().position(|&x| x == target_ti).unwrap()
+                    } else {
+                        track_order.len()
+                    };
+                    track_order.insert(insert_order_pos, ti);
+                    *dragged_vi = if target_vi > *dragged_vi { target_vi - 1 } else { target_vi };
+                }
+            } else {
+                *drag = DragKind::None;
+            }
+        }
+    }
 
     let time_range = (view.t1 - view.t0).max(1e-9);
     let px_per_us = tl_w as f64 / time_range;
@@ -465,7 +499,6 @@ pub fn draw_timeline(
     dl.add_line([tl_left, rect[1]], [tl_left, rect[3]], col32(50, 50, 50, 255)).build();
     dl.add_line([rect[0], rect[1] + RULER_H], [rect[2], rect[1] + RULER_H], col32(50, 50, 50, 255)).build();
 
-    let tracks_top = rect[1] + RULER_H;
     let mut hover_result: Option<EventRef> = None;
     let mut click_result: Option<EventRef> = None;
     let hover_in_timeline = hovered && mouse_pos[1] > tracks_top;
@@ -713,6 +746,31 @@ pub fn draw_timeline(
     }
 
     if clicked && !near_border && !drag.is_active() && hovered && mouse_pos[0] < tl_left && mouse_pos[1] > tracks_top {
+        for vi in 0..buf.visible.len() {
+            let track_h = buf.heights[vi];
+            let y = tracks_top + buf.y_offsets[vi] - view.scroll_y;
+            if mouse_pos[1] >= y && mouse_pos[1] < y + track_h {
+                let grab_off = mouse_pos[1] - y;
+                *drag = DragKind::TrackDrag(pane_idx, vi, grab_off);
+                break;
+            }
+        }
+    }
+
+    if let DragKind::TrackDrag(pi, dragged_vi, _) = *drag {
+        if pi == pane_idx {
+            ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
+            let y = tracks_top + buf.y_offsets[dragged_vi] - view.scroll_y;
+            let h = buf.heights[dragged_vi];
+            dl.add_rect(
+                [rect[0], y.max(tracks_top)],
+                [tl_left - 4.0, (y + h).min(rect[3])],
+                col32(100, 180, 255, 80),
+            ).filled(true).build();
+        }
+    }
+
+    if ui.is_mouse_double_clicked(imgui::MouseButton::Left) && !drag.is_active() && hovered && mouse_pos[0] < tl_left && mouse_pos[1] > tracks_top {
         for vi in 0..buf.visible.len() {
             let orig_ti = buf.visible[vi];
             let track_h = buf.heights[vi];

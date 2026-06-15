@@ -143,6 +143,7 @@ impl ApplicationHandler for App {
             self.state.panes[pi].open_multi(group);
             if cli_dirs.len() == 1 {
                 self.state.panes[pi].reload_dir = Some(cli_dirs[0].clone());
+                self.state.panes[pi].cache_dir = Some(crate::loader::cache_dir_for_folder(&cli_dirs[0]));
             }
             pi += 1;
         }
@@ -153,6 +154,7 @@ impl ApplicationHandler for App {
             self.state.panes[pi].open(path);
             if cli_dirs.len() == 1 {
                 self.state.panes[pi].reload_dir = Some(cli_dirs[0].clone());
+                self.state.panes[pi].cache_dir = Some(crate::loader::cache_dir_for_folder(&cli_dirs[0]));
             }
             pi += 1;
         }
@@ -357,6 +359,7 @@ impl App {
                 self.state.panes[target].open_multi(group);
                 if dropped_dirs.len() == 1 {
                     self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
+                    self.state.panes[target].cache_dir = Some(crate::loader::cache_dir_for_folder(&dropped_dirs[0]));
                 }
             }
             for path in standalone {
@@ -369,6 +372,7 @@ impl App {
                 self.state.panes[target].open(path);
                 if dropped_dirs.len() == 1 {
                     self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
+                    self.state.panes[target].cache_dir = Some(crate::loader::cache_dir_for_folder(&dropped_dirs[0]));
                 }
             }
         }
@@ -646,7 +650,8 @@ impl App {
                         ui.text("Drop a trace file here, or: tv <file.json[.gz]>");
                     }
                     if let Some(e) = &pane.error {
-                        ui.text_colored([1.0, 0.4, 0.4, 1.0], e);
+                        let _c = ui.push_style_color(StyleColor::Text, [1.0, 0.4, 0.4, 1.0]);
+                        ui.text(e);
                     }
                 });
         }
@@ -995,7 +1000,46 @@ impl App {
         let mut double_clicks: Vec<bool> = vec![false; n_panes];
 
         for pi in 0..n_panes {
-            if !state.panes[pi].has_trace() { continue; }
+            if !state.panes[pi].has_trace() {
+                let tl_top = TOOLBAR_H;
+                let tl_h = display[1] - TOOLBAR_H;
+                let _pad = ui.push_style_var(StyleVar::WindowPadding([0.0, 0.0]));
+                ui.window(&format!("##splash{pi}"))
+                    .position([pane_xs[pi], tl_top], Condition::Always)
+                    .size([pane_ws[pi], tl_h], Condition::Always)
+                    .flags(
+                        WindowFlags::NO_DECORATION
+                            | WindowFlags::NO_MOVE
+                            | WindowFlags::NO_SAVED_SETTINGS
+                            | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS,
+                    )
+                    .build(|| {
+                        let dl = ui.get_window_draw_list();
+                        let win_pos = ui.window_pos();
+                        let avail = ui.content_region_avail();
+                        let logo_scale = 6.0;
+                        let logo_w = 16.0 * logo_scale;
+                        let logo_h = 16.0 * logo_scale;
+                        let cx = win_pos[0] + (avail[0] - logo_w) * 0.5;
+                        let mut cy = win_pos[1] + (avail[1] - logo_h) * 0.5;
+                        if state.panes[pi].error.is_some() {
+                            cy -= 30.0;
+                        }
+                        draw_vllm_logo(&dl, cx, cy, logo_scale);
+                        drop(dl);
+                        if let Some(e) = &state.panes[pi].error {
+                            let wrap_w = (avail[0] * 0.8).min(600.0);
+                            let text_size = ui.calc_text_size_with_opts(e, false, wrap_w);
+                            let tx = (avail[0] - text_size[0].min(wrap_w)) * 0.5;
+                            let ty = cy - win_pos[1] + logo_h + 16.0;
+                            ui.set_cursor_pos([tx, ty]);
+                            let _c = ui.push_style_color(StyleColor::Text, [1.0, 0.4, 0.4, 1.0]);
+                            let _wrap = ui.push_text_wrap_pos_with_pos(ui.cursor_pos()[0] + wrap_w);
+                            ui.text_wrapped(e);
+                        }
+                    });
+                continue;
+            }
             let tl_top = TOOLBAR_H;
             let tl_h = display[1] - TOOLBAR_H - bottom_h - status_h;
 
@@ -1057,6 +1101,7 @@ impl App {
                         &pane.sel_mask,
                         pane.label_w,
                         &mut pane.track_scales,
+                        &mut pane.track_order,
                         &mut state.drag,
                         &pane.straggler_mask,
                     );
@@ -1328,7 +1373,7 @@ fn main() {
         if rank_groups.is_empty() && standalone.len() <= 1 {
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let path = standalone.first().map(|s| s.as_str()).unwrap_or(&bench_args[0]);
-            match loader::load_trace(path, &counter, 0) {
+            match loader::load_trace(path, &counter, 0, None) {
                 Ok(t) => eprintln!("  ok: {} events, {} tracks, {:.2}s", t.total_events, t.tracks.len(), t0.elapsed().as_secs_f64()),
                 Err(e) => eprintln!("  err: {e}"),
             }
@@ -1347,7 +1392,7 @@ fn main() {
                     let ctr = counter.clone();
                     s.spawn(move || {
                         let t = Instant::now();
-                        let res = loader::load_trace(path, &ctr, tpf);
+                        let res = loader::load_trace(path, &ctr, tpf, None);
                         let elapsed = t.elapsed().as_secs_f64();
                         (r, res, elapsed)
                     })

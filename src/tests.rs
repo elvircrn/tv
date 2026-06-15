@@ -615,7 +615,7 @@ fn test_load_trace_json() {
     let path = dir.join("test.json");
     std::fs::write(&path, json).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
     assert_eq!(trace.tracks.len(), 2);
     assert!(trace.names.contains(&"kern_a".to_string()));
     assert!(trace.names.contains(&"kern_b".to_string()));
@@ -646,7 +646,7 @@ fn test_load_trace_gz() {
     std::io::Write::write_all(&mut gz, json).unwrap();
     gz.finish().unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
     assert_eq!(trace.total_events, 1);
 
     std::fs::remove_file(&path).ok();
@@ -660,10 +660,60 @@ fn test_load_trace_no_events() {
     let path = dir.join("empty.json");
     std::fs::write(&path, json).unwrap();
 
-    let result = load_trace(path.to_str().unwrap(), &test_counter(), 0);
+    let result = load_trace(path.to_str().unwrap(), &test_counter(), 0, None);
     assert!(result.is_err());
 
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn test_cache_roundtrip() {
+    let json = r#"{"traceEvents": [
+        {"ph":"X","ts":100,"dur":50,"pid":1,"tid":1,"name":"kern_a","cat":"kernel","args":{"op":"matmul"}},
+        {"ph":"X","ts":200,"dur":30,"pid":1,"tid":1,"name":"kern_b","cat":"kernel"},
+        {"ph":"X","ts":300,"dur":40,"pid":1,"tid":2,"name":"cpu_fn","cat":"cpu_op"},
+        {"ph":"M","ts":0,"pid":1,"tid":1,"name":"thread_name","args":{"name":"GPU Stream 0"}}
+    ]}"#;
+    let dir = std::env::temp_dir().join("tv_test_cache");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("cache_test.json");
+    std::fs::write(&path, json).unwrap();
+    let path_str = path.to_str().unwrap();
+
+    let original = load_trace(path_str, &test_counter(), 0, None).unwrap();
+    let cache_path = format!("{path_str}.tvcache");
+    assert!(std::path::Path::new(&cache_path).exists(), "cache file should be created");
+
+    let cached = crate::loader::load_cache(path_str, None).expect("cache should load");
+    assert_eq!(cached.total_events, original.total_events);
+    assert_eq!(cached.tracks.len(), original.tracks.len());
+    assert_eq!(cached.names, original.names);
+    assert_eq!(cached.cats, original.cats);
+    assert_eq!(cached.max_ts, original.max_ts);
+    assert_eq!(cached.device, original.device);
+    assert_eq!(cached.stats.len(), original.stats.len());
+    for (a, b) in cached.tracks.iter().zip(original.tracks.iter()) {
+        assert_eq!(a.label, b.label);
+        assert_eq!(a.gpu, b.gpu);
+        assert_eq!(a.max_depth, b.max_depth);
+        assert_eq!(a.events.len(), b.events.len());
+        for (ea, eb) in a.events.iter().zip(b.events.iter()) {
+            assert_eq!(ea.ts, eb.ts);
+            assert_eq!(ea.dur, eb.dur);
+            assert_eq!(ea.name, eb.name);
+            assert_eq!(ea.depth, eb.depth);
+            assert_eq!(ea.args_off, eb.args_off);
+            assert_eq!(ea.args_len, eb.args_len);
+        }
+        assert_eq!(a.prefix_max_dur, b.prefix_max_dur);
+    }
+    let orig_args = &original.raw_bufs[0];
+    let cached_args = &cached.raw_bufs[0];
+    assert_eq!(orig_args.len(), cached_args.len());
+    assert_eq!(&orig_args[..], &cached_args[..]);
+
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&cache_path).ok();
 }
 
 #[test]
@@ -678,7 +728,7 @@ fn test_load_trace_depth_assignment() {
     let path = dir.join("depth.json");
     std::fs::write(&path, json).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
     let track = &trace.tracks[0];
     assert_eq!(track.events.len(), 3);
     let depths: Vec<u16> = track.events.iter().map(|e| e.depth).collect();
@@ -701,7 +751,7 @@ fn test_load_trace_truncated_json() {
     let path = dir.join("truncated.json");
     std::fs::write(&path, json).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
     assert!(trace.total_events >= 2, "should parse complete events from truncated JSON, got {}", trace.total_events);
 
     std::fs::remove_file(&path).ok();
@@ -729,7 +779,7 @@ fn test_load_trace_truncated_gz() {
     }
     std::fs::write(&path, &buf[..buf.len() - 10]).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
     assert!(trace.total_events >= 2, "should parse events from truncated gz, got {}", trace.total_events);
 
     std::fs::remove_file(&path).ok();

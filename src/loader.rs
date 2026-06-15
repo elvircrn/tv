@@ -1,7 +1,7 @@
 use crate::parse::*;
 use crate::types::*;
 use std::collections::HashMap;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -645,6 +645,282 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device })
 }
 
+const CACHE_MAGIC: &[u8; 4] = b"TRV1";
+const CACHE_VERSION: u32 = 1;
+
+fn cache_path(source: &str, cache_dir: Option<&str>) -> String {
+    if let Some(dir) = cache_dir {
+        let fname = std::path::Path::new(source)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or(source);
+        format!("{dir}/{fname}.tvcache")
+    } else {
+        format!("{source}.tvcache")
+    }
+}
+
+pub fn cache_dir_for_folder(dir: &str) -> String {
+    let cd = format!("{dir}.tvcache");
+    std::fs::create_dir_all(&cd).ok();
+    cd
+}
+
+fn source_meta(path: &str) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok()?
+        .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some((meta.len(), mtime))
+}
+
+fn write_u32(w: &mut impl std::io::Write, v: u32) { w.write_all(&v.to_le_bytes()).ok(); }
+fn write_u64(w: &mut impl std::io::Write, v: u64) { w.write_all(&v.to_le_bytes()).ok(); }
+fn write_f64(w: &mut impl std::io::Write, v: f64) { w.write_all(&v.to_le_bytes()).ok(); }
+
+fn write_strings(w: &mut impl std::io::Write, strings: &[String]) {
+    for s in strings {
+        write_u32(w, s.len() as u32);
+        w.write_all(s.as_bytes()).ok();
+    }
+}
+
+fn pad_to_8(w: &mut impl std::io::Write, written: usize) {
+    let rem = written % 8;
+    if rem != 0 {
+        let pad = [0u8; 8];
+        w.write_all(&pad[..8 - rem]).ok();
+    }
+}
+
+pub fn save_cache(trace: &Trace, source_path: &str, cache_dir: Option<&str>) {
+    if source_path.is_empty() { return; }
+    let cp = cache_path(source_path, cache_dir);
+    let (src_size, src_mtime) = match source_meta(source_path) {
+        Some(v) => v,
+        None => return,
+    };
+    let tmp = format!("{cp}.tmp");
+    let file = match std::fs::File::create(&tmp) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut w = BufWriter::new(file);
+
+    let total_events: u64 = trace.tracks.iter().map(|t| t.events.len() as u64).sum();
+    let args_buf = trace.raw_bufs.first().map(|b| &b[..]).unwrap_or(&[]);
+
+    w.write_all(CACHE_MAGIC).ok();
+    write_u32(&mut w, CACHE_VERSION);
+    write_u64(&mut w, src_size);
+    write_u64(&mut w, src_mtime);
+    write_f64(&mut w, trace.max_ts);
+    write_f64(&mut w, trace.min_ts);
+    write_u64(&mut w, total_events);
+    write_u32(&mut w, trace.tracks.len() as u32);
+    write_u32(&mut w, trace.names.len() as u32);
+    write_u32(&mut w, trace.cats.len() as u32);
+    write_u32(&mut w, trace.stats.len() as u32);
+    write_u32(&mut w, trace.device.len() as u32);
+    write_u64(&mut w, args_buf.len() as u64);
+    write_u32(&mut w, 0); // padding to 80
+
+    let mut written = 80usize;
+
+    write_strings(&mut w, &trace.names);
+    written += trace.names.iter().map(|s| 4 + s.len()).sum::<usize>();
+    write_strings(&mut w, &trace.cats);
+    written += trace.cats.iter().map(|s| 4 + s.len()).sum::<usize>();
+    write_u32(&mut w, trace.device.len() as u32);
+    w.write_all(trace.device.as_bytes()).ok();
+    written += 4 + trace.device.len();
+
+    for t in &trace.tracks {
+        let label = t.label.as_bytes();
+        let mut hdr = [0u8; 13];
+        hdr[0..2].copy_from_slice(&(label.len() as u16).to_le_bytes());
+        hdr[2] = t.gpu as u8;
+        hdr[3..5].copy_from_slice(&t.max_depth.to_le_bytes());
+        hdr[5..13].copy_from_slice(&(t.events.len() as u64).to_le_bytes());
+        w.write_all(&hdr).ok();
+        w.write_all(label).ok();
+        written += 13 + label.len();
+    }
+
+    pad_to_8(&mut w, written);
+    let padded = if written % 8 != 0 { 8 - written % 8 } else { 0 };
+    written += padded;
+    let _ = written;
+
+    for t in &trace.tracks {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                t.events.as_ptr() as *const u8,
+                t.events.len() * std::mem::size_of::<Event>(),
+            )
+        };
+        w.write_all(bytes).ok();
+    }
+
+    for t in &trace.tracks {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                t.prefix_max_dur.as_ptr() as *const u8,
+                t.prefix_max_dur.len() * 8,
+            )
+        };
+        w.write_all(bytes).ok();
+    }
+
+    let stats_bytes = unsafe {
+        std::slice::from_raw_parts(
+            trace.stats.as_ptr() as *const u8,
+            trace.stats.len() * std::mem::size_of::<KernelStats>(),
+        )
+    };
+    w.write_all(stats_bytes).ok();
+
+    w.write_all(args_buf).ok();
+
+    drop(w);
+    std::fs::rename(&tmp, &cp).ok();
+}
+
+pub fn load_cache(source_path: &str, cache_dir: Option<&str>) -> Option<Trace> {
+    let cp = cache_path(source_path, cache_dir);
+    let (src_size, src_mtime) = source_meta(source_path)?;
+    let file = std::fs::File::open(&cp).ok()?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    let d = &mmap[..];
+    if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
+    let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
+    let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
+    if r32(4) != CACHE_VERSION { return None; }
+    if r64(8) != src_size || r64(16) != src_mtime { return None; }
+    load_cache_from_mmap(d)
+}
+
+fn load_cache_from_mmap(d: &[u8]) -> Option<Trace> {
+    if d.len() < 80 { return None; }
+
+    let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
+    let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
+    let rf64 = |off: usize| f64::from_le_bytes(d[off..off + 8].try_into().unwrap());
+
+    let max_ts = rf64(24);
+    let min_ts = rf64(32);
+    let total_events = r64(40) as usize;
+    let n_tracks = r32(48) as usize;
+    let n_names = r32(52) as usize;
+    let n_cats = r32(56) as usize;
+    let n_stats = r32(60) as usize;
+    let _device_len = r32(64) as usize;
+    let args_len = r64(68) as usize;
+
+    let mut pos = 80usize;
+
+    let read_strings = |pos: &mut usize, count: usize| -> Option<Vec<String>> {
+        let mut v = Vec::with_capacity(count);
+        for _ in 0..count {
+            if *pos + 4 > d.len() { return None; }
+            let len = u32::from_le_bytes(d[*pos..*pos + 4].try_into().unwrap()) as usize;
+            *pos += 4;
+            if *pos + len > d.len() { return None; }
+            v.push(String::from_utf8_lossy(&d[*pos..*pos + len]).into_owned());
+            *pos += len;
+        }
+        Some(v)
+    };
+
+    let names = read_strings(&mut pos, n_names)?;
+    let cats = read_strings(&mut pos, n_cats)?;
+
+    if pos + 4 > d.len() { return None; }
+    let dev_len = u32::from_le_bytes(d[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    if pos + dev_len > d.len() { return None; }
+    let device = String::from_utf8_lossy(&d[pos..pos + dev_len]).into_owned();
+    pos += dev_len;
+
+    struct TrackHdr { label: String, gpu: bool, max_depth: u16, event_count: usize }
+    let mut track_hdrs: Vec<TrackHdr> = Vec::with_capacity(n_tracks);
+    let mut total_check: usize = 0;
+    for _ in 0..n_tracks {
+        if pos + 13 > d.len() { return None; }
+        let label_len = u16::from_le_bytes(d[pos..pos + 2].try_into().unwrap()) as usize;
+        let gpu = d[pos + 2] != 0;
+        let max_depth = u16::from_le_bytes(d[pos + 3..pos + 5].try_into().unwrap());
+        let event_count = u64::from_le_bytes(d[pos + 5..pos + 13].try_into().unwrap()) as usize;
+        pos += 13;
+        if pos + label_len > d.len() { return None; }
+        let label = String::from_utf8_lossy(&d[pos..pos + label_len]).into_owned();
+        pos += label_len;
+        total_check += event_count;
+        track_hdrs.push(TrackHdr { label, gpu, max_depth, event_count });
+    }
+    if total_check != total_events { return None; }
+
+    if pos % 8 != 0 { pos += 8 - pos % 8; }
+
+    let ev_size = std::mem::size_of::<Event>();
+    let events_bytes = total_events * ev_size;
+    if pos + events_bytes > d.len() { return None; }
+    let all_events: &[Event] = unsafe {
+        std::slice::from_raw_parts(d[pos..].as_ptr() as *const Event, total_events)
+    };
+    pos += events_bytes;
+
+    let pmd_bytes = total_events * 8;
+    if pos + pmd_bytes > d.len() { return None; }
+    let all_pmd: &[f64] = unsafe {
+        std::slice::from_raw_parts(d[pos..].as_ptr() as *const f64, total_events)
+    };
+    pos += pmd_bytes;
+
+    let stats_size = std::mem::size_of::<KernelStats>();
+    let stats_bytes = n_stats * stats_size;
+    if pos + stats_bytes > d.len() { return None; }
+    let stats: Vec<KernelStats> = unsafe {
+        std::slice::from_raw_parts(d[pos..].as_ptr() as *const KernelStats, n_stats)
+    }.to_vec();
+    pos += stats_bytes;
+
+    if pos + args_len > d.len() { return None; }
+    let args = d[pos..pos + args_len].to_vec();
+
+    let mut tracks = Vec::with_capacity(n_tracks);
+    let mut ev_off = 0usize;
+    for hdr in track_hdrs {
+        let n = hdr.event_count;
+        tracks.push(Track {
+            label: hdr.label,
+            gpu: hdr.gpu,
+            events: all_events[ev_off..ev_off + n].to_vec(),
+            max_depth: hdr.max_depth,
+            prefix_max_dur: all_pmd[ev_off..ev_off + n].to_vec(),
+            raw_buf_idx: 0,
+        });
+        ev_off += n;
+    }
+
+    Some(Trace {
+        tracks, names, cats,
+        raw_bufs: vec![Arc::new(args)],
+        stats, max_ts, min_ts, total_events, device,
+    })
+}
+
+fn load_cache_direct(cache_path: &str) -> Option<Trace> {
+    let file = std::fs::File::open(cache_path).ok()?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    let d = &mmap[..];
+    if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
+    let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
+    let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
+    if r32(4) != CACHE_VERSION { return None; }
+    // Skip source validation (bytes 8..24) — we're loading the cache directly
+    load_cache_from_mmap(d)
+}
+
 fn decompress_parse(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, t0: &Instant) -> Result<(RawData, Vec<ChunkState>, usize), String> {
     let use_streaming = path.ends_with(".json.gz") && max_parse_threads != 1;
     if use_streaming {
@@ -657,11 +933,25 @@ fn decompress_parse(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: u
     }
 }
 
-pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize) -> Result<Trace, String> {
+pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, cache_dir: Option<&str>) -> Result<Trace, String> {
     let t0 = Instant::now();
+
+    if path.ends_with(".tvcache") {
+        return load_cache_direct(path)
+            .ok_or_else(|| "invalid or corrupt .tvcache file".to_string())
+            .inspect(|t| eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events));
+    }
+
+    if let Some(trace) = load_cache(path, cache_dir) {
+        eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+        return Ok(trace);
+    }
+
     let (raw, chunks, n_chunks) = decompress_parse(path, counter, max_parse_threads, &t0)?;
     let mut trace = build_trace(raw, chunks, n_chunks, &t0)?;
     compact_args(&mut trace);
+
+    save_cache(&trace, path, cache_dir);
 
     let event_bytes: usize = trace.tracks.iter().map(|t| t.events.len() * std::mem::size_of::<Event>()).sum();
     let str_bytes: usize = trace.names.iter().chain(trace.cats.iter()).map(|s| s.len() + std::mem::size_of::<String>()).sum();
@@ -687,12 +977,13 @@ fn clone_trace(t: &Trace) -> Trace {
     }
 }
 
-fn send_progressive(trace: Trace, tx: &std::sync::mpsc::Sender<Result<Trace, String>>, t0: &Instant) {
+fn send_progressive(trace: Trace, tx: &std::sync::mpsc::Sender<Result<Trace, String>>, t0: &Instant, source_path: &str, cache_dir: Option<&str>) {
     eprintln!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
     let mut compact_trace = clone_trace(&trace);
     let _ = tx.send(Ok(trace));
 
     compact_args(&mut compact_trace);
+    save_cache(&compact_trace, source_path, cache_dir);
     let args_bytes: usize = compact_trace.raw_bufs.iter().map(|b| b.len()).sum();
     eprintln!("  compact: {:.2}s (args={}MB)", t0.elapsed().as_secs_f64(), args_bytes / 1024 / 1024);
     let _ = tx.send(Ok(compact_trace));
@@ -701,14 +992,33 @@ fn send_progressive(trace: Trace, tx: &std::sync::mpsc::Sender<Result<Trace, Str
 pub fn load_trace_progressive(
     path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize,
     tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
+    cache_dir: Option<&str>,
 ) {
     let t0 = Instant::now();
+
+    if path.ends_with(".tvcache") {
+        match load_cache_direct(path) {
+            Some(trace) => {
+                eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                let _ = tx.send(Ok(trace));
+            }
+            None => { let _ = tx.send(Err("invalid or corrupt .tvcache file".into())); }
+        }
+        return;
+    }
+
+    if let Some(trace) = load_cache(path, cache_dir) {
+        eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+        let _ = tx.send(Ok(trace));
+        return;
+    }
+
     let (raw, chunks, n_chunks) = match decompress_parse(path, counter, max_parse_threads, &t0) {
         Ok(v) => v,
         Err(e) => { let _ = tx.send(Err(e)); return; }
     };
     match build_trace(raw, chunks, n_chunks, &t0) {
-        Ok(trace) => send_progressive(trace, tx, &t0),
+        Ok(trace) => send_progressive(trace, tx, &t0, path, cache_dir),
         Err(e) => { let _ = tx.send(Err(e)); }
     }
 }
@@ -716,6 +1026,7 @@ pub fn load_trace_progressive(
 pub(crate) fn is_trace_file(name: &str) -> bool {
     name.ends_with(".json") || name.ends_with(".json.gz")
         || name.ends_with(".tar.gz") || name.ends_with(".tgz")
+        || name.ends_with(".tvcache")
 }
 
 fn expand_dirs(paths: &[String]) -> Vec<String> {
@@ -1013,6 +1324,7 @@ fn merge_traces_raw(traces: Vec<(usize, Trace)>) -> Trace {
 pub fn load_multi_progressive(
     rank_paths: Vec<(usize, String)>, counter: &Arc<AtomicUsize>, tpf: usize,
     tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
+    cache_dir: Option<&str>,
 ) {
     let t0 = Instant::now();
     let results: Vec<_> = std::thread::scope(|s| {
@@ -1035,7 +1347,7 @@ pub fn load_multi_progressive(
         return;
     }
     let trace = merge_traces_raw(traces);
-    send_progressive(trace, tx, &t0);
+    send_progressive(trace, tx, &t0, "", cache_dir);
 }
 
 fn compact_args(trace: &mut Trace) {

@@ -56,9 +56,11 @@ pub struct Pane {
     pub rank_time_offsets: Vec<f64>,
     pub step_aligned: bool,
     pub step_align_offsets: Vec<Vec<f64>>,
+    pub track_order: Vec<usize>,
     pub auto_reload: bool,
     pub reload_paths: Vec<(usize, String)>,
     pub reload_dir: Option<String>,
+    pub cache_dir: Option<String>,
     pub loading_events: Arc<AtomicUsize>,
 }
 
@@ -106,9 +108,11 @@ impl Pane {
             rank_time_offsets: Vec::new(),
             step_aligned: false,
             step_align_offsets: Vec::new(),
+            track_order: Vec::new(),
             auto_reload: false,
             reload_paths: Vec::new(),
             reload_dir: None,
+            cache_dir: None,
             loading_events: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -153,8 +157,9 @@ impl Pane {
         self.reload_paths = vec![(0, path.clone())];
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
+        let cd = self.cache_dir.clone();
         std::thread::spawn(move || {
-            load_trace_progressive(&path, &counter, 0, &tx);
+            load_trace_progressive(&path, &counter, 0, &tx, cd.as_deref());
         });
     }
 
@@ -174,8 +179,9 @@ impl Pane {
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
         let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / n).max(2);
+        let cd = self.cache_dir.clone();
         std::thread::spawn(move || {
-            load_multi_progressive(rank_paths, &counter, tpf, &tx);
+            load_multi_progressive(rank_paths, &counter, tpf, &tx, cd.as_deref());
         });
     }
 
@@ -200,15 +206,16 @@ impl Pane {
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
         let paths = self.reload_paths.clone();
+        let cd = self.cache_dir.clone();
         if paths.len() == 1 {
             let path = paths[0].1.clone();
             std::thread::spawn(move || {
-                load_trace_progressive(&path, &counter, 0, &tx);
+                load_trace_progressive(&path, &counter, 0, &tx, cd.as_deref());
             });
         } else {
             let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / paths.len()).max(1);
             std::thread::spawn(move || {
-                load_multi_progressive(paths, &counter, tpf, &tx);
+                load_multi_progressive(paths, &counter, tpf, &tx, cd.as_deref());
             });
         }
     }
@@ -226,6 +233,9 @@ impl Pane {
                     let n_names = trace.names.len();
                     self.collapsed.resize(n_tracks, false);
                     self.track_scales.resize(n_tracks, 1.0);
+                    if self.track_order.len() != n_tracks {
+                        self.track_order = (0..n_tracks).collect();
+                    }
                     self.event_labels = trace.tracks.iter()
                         .map(|t| vec![None; t.events.len()])
                         .collect();
@@ -249,6 +259,7 @@ impl Pane {
                     self.view.scroll_y = 0.0;
                     self.collapsed = vec![false; trace.tracks.len()];
                     self.track_scales = vec![1.0; trace.tracks.len()];
+                    self.track_order = (0..trace.tracks.len()).collect();
                     self.event_labels = trace.tracks.iter()
                         .map(|t| vec![None; t.events.len()])
                         .collect();
