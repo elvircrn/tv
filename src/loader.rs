@@ -76,7 +76,6 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
         }
 
         pos += 1;
-        let mut depth = 1u32;
         let mut ph: u8 = 0;
         let mut ts: f64 = 0.0;
         let mut dur: f64 = 0.0;
@@ -88,86 +87,107 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
         let mut args_off: u32 = 0;
         let mut args_len: u16 = 0;
 
-        while depth > 0 && pos < raw.len() {
-            match raw[pos] {
-                b'"' if depth == 1 => {
-                    let ks = pos + 1;
-                    pos = skip_string(raw, pos);
-                    let ke = pos - 1;
+        loop {
+            pos = skip_ws_comma(raw, pos);
+            if pos >= raw.len() || raw[pos] == b'}' { pos += 1; break; }
+            if raw[pos] != b'"' { pos = skip_value(raw, pos); continue; }
+
+            macro_rules! skip_colon {
+                () => {{
                     pos = skip_ws(raw, pos);
                     if pos < raw.len() && raw[pos] == b':' { pos += 1; }
                     pos = skip_ws(raw, pos);
+                }};
+            }
 
-                    let klen = ke - ks;
-                    if klen >= 2 && klen <= 4 && pos < raw.len() {
-                        match (klen, raw[ks]) {
-                            (2, b'p') if raw[ks + 1] == b'h' => {
-                                if raw[pos] == b'"' {
-                                    ph = raw[pos + 1];
-                                    pos = skip_string(raw, pos);
-                                } else { pos = skip_value(raw, pos); }
+            if pos + 4 < raw.len() && raw[pos + 3] == b'"' {
+                let k = [raw[pos + 1], raw[pos + 2]];
+                pos += 4;
+                skip_colon!();
+                match k {
+                    [b'p', b'h'] => {
+                        if pos < raw.len() && raw[pos] == b'"' {
+                            ph = raw[pos + 1];
+                            pos = skip_string(raw, pos);
+                            if ph != b'X' && ph != b'M' {
+                                pos = skip_to_closing(raw, pos);
+                                break;
                             }
-                            (2, b't') if raw[ks + 1] == b's' => {
-                                let s = pos;
-                                pos = skip_number(raw, pos);
-                                ts = parse_f64(&raw[s..pos]);
-                            }
-                            (3, b'd') if raw[ks + 1] == b'u' => {
-                                let s = pos;
-                                pos = skip_number(raw, pos);
-                                dur = parse_f64(&raw[s..pos]);
-                                has_dur = true;
-                            }
-                            (3, b't') if raw[ks + 1] == b'i' => {
-                                if raw[pos] == b'"' {
-                                    let s = pos + 1;
-                                    pos = skip_string(raw, pos);
-                                    tid = fnv1a(&raw[s..pos - 1]);
-                                } else {
-                                    let s = pos;
-                                    pos = skip_number(raw, pos);
-                                    tid = parse_f64(&raw[s..pos]) as u64;
-                                }
-                            }
-                            (3, b'p') if raw[ks + 1] == b'i' => {
-                                if raw[pos] == b'"' {
-                                    let s = pos + 1;
-                                    pos = skip_string(raw, pos);
-                                    pid = fnv1a(&raw[s..pos - 1]);
-                                } else {
-                                    let s = pos;
-                                    pos = skip_number(raw, pos);
-                                    pid = parse_f64(&raw[s..pos]) as u64;
-                                }
-                            }
-                            (4, b'n') if raw[ks + 1] == b'a' && raw[ks + 2] == b'm' => {
-                                if raw[pos] == b'"' {
-                                    let s = pos + 1;
-                                    pos = skip_string(raw, pos);
-                                    name = intern(&raw[s..pos - 1], &mut state.names, &mut state.name_idx);
-                                } else { pos = skip_value(raw, pos); }
-                            }
-                            (4, b'a') if raw[ks + 1] == b'r' => {
-                                args_off = pos as u32;
-                                pos = skip_value(raw, pos);
-                                let len = pos - args_off as usize;
-                                args_len = if len <= u16::MAX as usize { len as u16 } else { 0 };
-                            }
-                            (3, b'c') if raw[ks + 1] == b'a' => {
-                                if raw[pos] == b'"' {
-                                    let s = pos + 1;
-                                    pos = skip_string(raw, pos);
-                                    cat = intern(&raw[s..pos - 1], &mut state.cats, &mut state.cat_idx);
-                                } else { pos = skip_value(raw, pos); }
-                            }
-                            _ => { pos = skip_value(raw, pos); }
-                        }
-                    } else { pos = skip_value(raw, pos); }
+                        } else { pos = skip_value(raw, pos); }
+                    }
+                    [b't', b's'] => {
+                        let s = pos;
+                        pos = skip_number(raw, pos);
+                        ts = parse_f64(&raw[s..pos]);
+                    }
+                    _ => { pos = skip_value(raw, pos); }
                 }
-                b'"' => pos = skip_string(raw, pos),
-                b'{' | b'[' => { depth += 1; pos += 1; }
-                b'}' | b']' => { depth -= 1; pos += 1; }
-                _ => pos += 1,
+            } else if pos + 5 < raw.len() && raw[pos + 4] == b'"' {
+                let k = [raw[pos + 1], raw[pos + 2]];
+                pos += 5;
+                skip_colon!();
+                match k {
+                    [b'd', b'u'] => {
+                        let s = pos;
+                        pos = skip_number(raw, pos);
+                        dur = parse_f64(&raw[s..pos]);
+                        has_dur = true;
+                    }
+                    [b't', b'i'] => {
+                        if pos < raw.len() && raw[pos] == b'"' {
+                            let s = pos + 1;
+                            pos = skip_string(raw, pos);
+                            tid = fnv1a(&raw[s..pos - 1]);
+                        } else {
+                            let s = pos;
+                            pos = skip_number(raw, pos);
+                            tid = parse_f64(&raw[s..pos]) as u64;
+                        }
+                    }
+                    [b'p', b'i'] => {
+                        if pos < raw.len() && raw[pos] == b'"' {
+                            let s = pos + 1;
+                            pos = skip_string(raw, pos);
+                            pid = fnv1a(&raw[s..pos - 1]);
+                        } else {
+                            let s = pos;
+                            pos = skip_number(raw, pos);
+                            pid = parse_f64(&raw[s..pos]) as u64;
+                        }
+                    }
+                    [b'c', b'a'] => {
+                        if pos < raw.len() && raw[pos] == b'"' {
+                            let s = pos + 1;
+                            pos = skip_string(raw, pos);
+                            cat = intern(&raw[s..pos - 1], &mut state.cats, &mut state.cat_idx);
+                        } else { pos = skip_value(raw, pos); }
+                    }
+                    _ => { pos = skip_value(raw, pos); }
+                }
+            } else if pos + 6 < raw.len() && raw[pos + 5] == b'"' {
+                let k = [raw[pos + 1], raw[pos + 2]];
+                pos += 6;
+                skip_colon!();
+                match k {
+                    [b'n', b'a'] => {
+                        if pos < raw.len() && raw[pos] == b'"' {
+                            let s = pos + 1;
+                            pos = skip_string(raw, pos);
+                            name = intern(&raw[s..pos - 1], &mut state.names, &mut state.name_idx);
+                        } else { pos = skip_value(raw, pos); }
+                    }
+                    [b'a', b'r'] => {
+                        args_off = pos as u32;
+                        pos = skip_value(raw, pos);
+                        let len = pos - args_off as usize;
+                        args_len = if len <= u16::MAX as usize { len as u16 } else { 0 };
+                    }
+                    _ => { pos = skip_value(raw, pos); }
+                }
+            } else {
+                pos = skip_string(raw, pos);
+                skip_colon!();
+                pos = skip_value(raw, pos);
             }
         }
 
@@ -278,6 +298,15 @@ fn decompress_parse_seq(
     Ok((raw, chunks, n_chunks))
 }
 
+fn try_libdeflate(compressed: &[u8], estimated: usize) -> Option<Vec<u8>> {
+    let mut decompressor = libdeflater::Decompressor::new();
+    let mut buf = vec![0u8; estimated];
+    match decompressor.gzip_decompress(compressed, &mut buf) {
+        Ok(actual) => { buf.truncate(actual); Some(buf) }
+        Err(_) => None,
+    }
+}
+
 fn decompress_parse_streaming(
     path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, t0: &Instant,
 ) -> Result<(RawData, Vec<ChunkState>), String> {
@@ -291,6 +320,40 @@ fn decompress_parse_streaming(
     } else {
         compressed.len() * 25
     };
+
+    if let Some(buf) = try_libdeflate(&compressed, estimated) {
+        eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), buf.len() / 1024 / 1024);
+        let raw = RawData::Vec(buf);
+        let te = find_key(&raw, b"traceEvents").ok_or("no traceEvents found")?;
+        let mut pos = te + "\"traceEvents\"".len();
+        pos = skip_ws(&raw, pos);
+        if pos < raw.len() && raw[pos] == b':' { pos += 1; }
+        pos = skip_ws(&raw, pos);
+        if pos >= raw.len() || raw[pos] != b'[' {
+            return Err("malformed traceEvents".into());
+        }
+        let array_start = pos + 1;
+        let n_threads = calc_n_threads(raw.len(), max_parse_threads);
+        let split_points = find_split_points(&raw, array_start, n_threads);
+        let n_chunks = split_points.len() - 1;
+        let chunks: Vec<ChunkState> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..n_chunks).map(|i| {
+                let start = split_points[i];
+                let end = split_points[i + 1];
+                let raw_ref = &raw;
+                let ctr = &*counter;
+                s.spawn(move || {
+                    let mut state = ChunkState::new();
+                    parse_chunk(raw_ref, start, end, &mut state, ctr);
+                    state
+                })
+            }).collect();
+            collect_chunks(handles)
+        });
+        eprintln!("  scan: {:.2}s ({} events, {}x parallel)",
+            t0.elapsed().as_secs_f64(), chunks.iter().map(|c| c.total_events).sum::<usize>(), n_chunks);
+        return Ok((raw, chunks));
+    }
 
     let n_threads = calc_n_threads(estimated, max_parse_threads);
 
@@ -423,20 +486,7 @@ fn decompress_parse_streaming(
     Ok((RawData::Vec(backing), chunks))
 }
 
-pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize) -> Result<Trace, String> {
-    let t0 = Instant::now();
-
-    let use_streaming = path.ends_with(".json.gz") && max_parse_threads != 1;
-
-    let (raw, chunks, n_chunks) = if use_streaming {
-        match decompress_parse_streaming(path, counter, max_parse_threads, &t0) {
-            Ok((r, c)) => { let n = c.len(); (r, c, n) }
-            Err(_) => decompress_parse_seq(path, counter, max_parse_threads, &t0)?
-        }
-    } else {
-        decompress_parse_seq(path, counter, max_parse_threads, &t0)?
-    };
-
+fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Instant) -> Result<Trace, String> {
     let mut names: Vec<String> = vec![String::new()];
     let mut name_idx: FnvMap<u32> = FnvMap::default();
     name_idx.insert(0, 0);
@@ -511,7 +561,33 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
             .map(|((pid, tid), mut evs)| {
                 s.spawn(move || {
                     for ev in evs.iter_mut() { ev.ts -= min_ts; }
-                    evs.sort_unstable_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+                    let mut sorted_end = evs.len();
+                    for i in 1..evs.len() {
+                        if evs[i].ts < evs[i - 1].ts {
+                            sorted_end = i;
+                            break;
+                        }
+                    }
+                    if sorted_end < evs.len() {
+                        if evs.len() - sorted_end < evs.len() / 100 {
+                            let mut tail = evs.split_off(sorted_end);
+                            tail.sort_unstable_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+                            let prefix = std::mem::take(&mut evs);
+                            evs.reserve(prefix.len() + tail.len());
+                            let (mut i, mut j) = (0, 0);
+                            while i < prefix.len() && j < tail.len() {
+                                if prefix[i].ts <= tail[j].ts {
+                                    evs.push(prefix[i]); i += 1;
+                                } else {
+                                    evs.push(tail[j]); j += 1;
+                                }
+                            }
+                            if i < prefix.len() { evs.extend_from_slice(&prefix[i..]); }
+                            if j < tail.len() { evs.extend_from_slice(&tail[j..]); }
+                        } else {
+                            evs.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+                        }
+                    }
                     let mut lanes: Vec<f64> = Vec::new();
                     let mut max_depth: u16 = 1;
                     for ev in evs.iter_mut() {
@@ -545,7 +621,6 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
 
     tracks.sort_by(|a, b| b.gpu.cmp(&a.gpu).then_with(|| b.events.len().cmp(&a.events.len())));
     max_ts -= min_ts;
-
     let mut dur_map: HashMap<u32, Vec<f64>> = HashMap::new();
     for t in &tracks {
         for ev in &t.events {
@@ -566,18 +641,76 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
     names.shrink_to_fit();
     cats.shrink_to_fit();
 
-    let mut trace = Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device };
+    eprintln!("  lanes: {:.2}s ({} tracks)", t2.elapsed().as_secs_f64(), tracks.len());
+    Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device })
+}
+
+fn decompress_parse(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, t0: &Instant) -> Result<(RawData, Vec<ChunkState>, usize), String> {
+    let use_streaming = path.ends_with(".json.gz") && max_parse_threads != 1;
+    if use_streaming {
+        match decompress_parse_streaming(path, counter, max_parse_threads, t0) {
+            Ok((r, c)) => { let n = c.len(); Ok((r, c, n)) }
+            Err(_) => decompress_parse_seq(path, counter, max_parse_threads, t0)
+        }
+    } else {
+        decompress_parse_seq(path, counter, max_parse_threads, t0)
+    }
+}
+
+pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize) -> Result<Trace, String> {
+    let t0 = Instant::now();
+    let (raw, chunks, n_chunks) = decompress_parse(path, counter, max_parse_threads, &t0)?;
+    let mut trace = build_trace(raw, chunks, n_chunks, &t0)?;
     compact_args(&mut trace);
 
     let event_bytes: usize = trace.tracks.iter().map(|t| t.events.len() * std::mem::size_of::<Event>()).sum();
     let str_bytes: usize = trace.names.iter().chain(trace.cats.iter()).map(|s| s.len() + std::mem::size_of::<String>()).sum();
     let args_bytes: usize = trace.raw_bufs.iter().map(|b| b.len()).sum();
-    eprintln!("  sort+lanes: {:.2}s ({} tracks)", t2.elapsed().as_secs_f64(), trace.tracks.len());
     eprintln!("  memory: events={}MB strings={}MB args={}MB total={}MB",
         event_bytes / 1024 / 1024, str_bytes / 1024 / 1024, args_bytes / 1024 / 1024,
         (event_bytes + str_bytes + args_bytes) / 1024 / 1024);
     eprintln!("  total: {:.2}s", t0.elapsed().as_secs_f64());
     Ok(trace)
+}
+
+fn clone_trace(t: &Trace) -> Trace {
+    Trace {
+        tracks: t.tracks.clone(),
+        names: t.names.clone(),
+        cats: t.cats.clone(),
+        raw_bufs: t.raw_bufs.clone(),
+        stats: t.stats.clone(),
+        max_ts: t.max_ts,
+        min_ts: t.min_ts,
+        total_events: t.total_events,
+        device: t.device.clone(),
+    }
+}
+
+fn send_progressive(trace: Trace, tx: &std::sync::mpsc::Sender<Result<Trace, String>>, t0: &Instant) {
+    eprintln!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
+    let mut compact_trace = clone_trace(&trace);
+    let _ = tx.send(Ok(trace));
+
+    compact_args(&mut compact_trace);
+    let args_bytes: usize = compact_trace.raw_bufs.iter().map(|b| b.len()).sum();
+    eprintln!("  compact: {:.2}s (args={}MB)", t0.elapsed().as_secs_f64(), args_bytes / 1024 / 1024);
+    let _ = tx.send(Ok(compact_trace));
+}
+
+pub fn load_trace_progressive(
+    path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize,
+    tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
+) {
+    let t0 = Instant::now();
+    let (raw, chunks, n_chunks) = match decompress_parse(path, counter, max_parse_threads, &t0) {
+        Ok(v) => v,
+        Err(e) => { let _ = tx.send(Err(e)); return; }
+    };
+    match build_trace(raw, chunks, n_chunks, &t0) {
+        Ok(trace) => send_progressive(trace, tx, &t0),
+        Err(e) => { let _ = tx.send(Err(e)); }
+    }
 }
 
 pub(crate) fn is_trace_file(name: &str) -> bool {
@@ -777,6 +910,132 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     };
     compact_args(&mut trace);
     trace
+}
+
+fn load_trace_raw(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize) -> Result<Trace, String> {
+    let t0 = Instant::now();
+    let (raw, chunks, n_chunks) = decompress_parse(path, counter, max_parse_threads, &t0)?;
+    build_trace(raw, chunks, n_chunks, &t0)
+}
+
+fn merge_traces_raw(traces: Vec<(usize, Trace)>) -> Trace {
+    let global_min = traces.iter().map(|(_, t)| t.min_ts).fold(f64::MAX, f64::min);
+
+    let mut names: Vec<String> = vec![String::new()];
+    let mut name_idx: FnvMap<u32> = FnvMap::with_capacity_and_hasher(
+        traces.iter().map(|(_, t)| t.names.len()).max().unwrap_or(0) * 2,
+        Default::default(),
+    );
+    name_idx.insert(0, 0);
+    let mut cats: Vec<String> = vec![String::new()];
+    let mut cat_idx: FnvMap<u32> = FnvMap::with_capacity_and_hasher(
+        traces.iter().map(|(_, t)| t.cats.len()).max().unwrap_or(0) * 2,
+        Default::default(),
+    );
+    cat_idx.insert(0, 0);
+    let mut device = String::new();
+
+    let mut remap_info: Vec<(Vec<u32>, Vec<u32>, f64)> = Vec::with_capacity(traces.len());
+    let mut all_raw_bufs: Vec<Arc<Vec<u8>>> = Vec::new();
+
+    for (_, trace) in &traces {
+        let time_offset = trace.min_ts - global_min;
+        let name_remap = merge_intern_direct(&mut names, &mut name_idx, &trace.names);
+        let cat_remap = merge_intern_direct(&mut cats, &mut cat_idx, &trace.cats);
+        if device.is_empty() && !trace.device.is_empty() {
+            device = trace.device.clone();
+        }
+        remap_info.push((name_remap, cat_remap, time_offset));
+    }
+
+    let remapped: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = traces.into_iter().zip(remap_info).enumerate().map(|(trace_idx, ((rank, mut trace), (name_remap, cat_remap, time_offset)))| {
+            s.spawn(move || {
+                let raw_buf_idx = trace_idx as u8;
+                let mut max_ts: f64 = 0.0;
+                let mut total_events = 0usize;
+                let mut local_dur: HashMap<u32, Vec<f64>> = HashMap::new();
+                for track in &mut trace.tracks {
+                    track.label = format!("[rank {}] {}", rank, track.label);
+                    track.raw_buf_idx = raw_buf_idx;
+                    for ev in &mut track.events {
+                        ev.ts += time_offset;
+                        ev.name = name_remap[ev.name as usize];
+                        ev.cat = cat_remap[ev.cat as usize];
+                        max_ts = max_ts.max(ev.ts + ev.dur);
+                        local_dur.entry(ev.name).or_default().push(ev.dur);
+                    }
+                    total_events += track.events.len();
+                }
+                (trace.tracks, trace.raw_bufs, max_ts, total_events, local_dur)
+            })
+        }).collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+
+    let mut all_tracks: Vec<Track> = Vec::new();
+    let mut total_events = 0;
+    let mut max_ts: f64 = 0.0;
+    let mut dur_map: HashMap<u32, Vec<f64>> = HashMap::new();
+
+    for (tracks, raw_bufs, mt, te, local_dur) in remapped {
+        all_tracks.extend(tracks);
+        all_raw_bufs.extend(raw_bufs);
+        total_events += te;
+        max_ts = max_ts.max(mt);
+        for (name, durs) in local_dur {
+            dur_map.entry(name).or_default().extend(durs);
+        }
+    }
+
+    all_tracks.sort_by(|a, b| a.label.cmp(&b.label));
+
+    let mut stats: Vec<KernelStats> = dur_map.into_iter().map(|(name, mut durs)| {
+        let count = durs.len() as u32;
+        let total_dur: f64 = durs.iter().sum();
+        let max_dur = durs.iter().copied().fold(0.0f64, f64::max);
+        durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = durs.len();
+        let median_dur = if n % 2 == 1 { durs[n / 2] } else { (durs[n / 2 - 1] + durs[n / 2]) / 2.0 };
+        KernelStats { name, count, total_dur, median_dur, max_dur }
+    }).collect();
+    stats.sort_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
+
+    names.shrink_to_fit();
+    cats.shrink_to_fit();
+
+    Trace {
+        tracks: all_tracks, names, cats, raw_bufs: all_raw_bufs, stats,
+        max_ts, min_ts: global_min, total_events, device,
+    }
+}
+
+pub fn load_multi_progressive(
+    rank_paths: Vec<(usize, String)>, counter: &Arc<AtomicUsize>, tpf: usize,
+    tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
+) {
+    let t0 = Instant::now();
+    let results: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = rank_paths.iter().map(|(rank, path)| {
+            let r = *rank;
+            let ctr = counter.clone();
+            s.spawn(move || (r, load_trace_raw(path, &ctr, tpf)))
+        }).collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    let mut traces = Vec::new();
+    for (rank, result) in results {
+        match result {
+            Ok(t) => traces.push((rank, t)),
+            Err(e) => { eprintln!("  rank {rank}: {e}"); }
+        }
+    }
+    if traces.is_empty() {
+        let _ = tx.send(Err("all ranks failed to load".into()));
+        return;
+    }
+    let trace = merge_traces_raw(traces);
+    send_progressive(trace, tx, &t0);
 }
 
 fn compact_args(trace: &mut Trace) {

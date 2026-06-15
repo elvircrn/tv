@@ -84,6 +84,33 @@ fn skip_container(raw: &[u8], pos: usize) -> usize {
     i
 }
 
+pub fn skip_to_closing(raw: &[u8], pos: usize) -> usize {
+    let mut depth = 1u32;
+    let mut i = pos;
+    while depth > 0 && i < raw.len() {
+        match memchr::memchr3(b'"', b'{', b'}', &raw[i..]) {
+            Some(off) => {
+                for j in i..i + off {
+                    match raw[j] {
+                        b'[' => depth += 1,
+                        b']' => { depth -= 1; if depth == 0 { return j + 1; } }
+                        _ => {}
+                    }
+                }
+                i += off;
+                match raw[i] {
+                    b'"' => i = skip_string(raw, i),
+                    b'{' => { depth += 1; i += 1; }
+                    b'}' => { depth -= 1; i += 1; }
+                    _ => unreachable!(),
+                }
+            }
+            None => return raw.len(),
+        }
+    }
+    i
+}
+
 pub fn skip_number(raw: &[u8], pos: usize) -> usize {
     let mut i = pos;
     while i < raw.len()

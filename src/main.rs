@@ -1105,6 +1105,12 @@ impl App {
             }
         }
 
+        let needs_extra_frame = click_results.iter().any(|c| c.is_some())
+            || new_selections.iter().any(|s| s.is_some());
+        if needs_extra_frame {
+            window.request_redraw();
+        }
+
         for pi in 0..n_panes {
             if labels_changed[pi] {
                 let pane = &mut state.panes[pi];

@@ -82,6 +82,7 @@ pub struct Trace {
     pub device: String,
 }
 
+#[derive(Clone)]
 pub struct Track {
     pub label: String,
     pub gpu: bool,
@@ -120,6 +121,7 @@ impl Default for View {
     }
 }
 
+#[derive(Clone)]
 pub struct KernelStats {
     pub name: u32,
     pub count: u32,

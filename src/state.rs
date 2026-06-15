@@ -1,4 +1,4 @@
-use crate::loader::{load_trace, merge_traces};
+use crate::loader::{load_trace_progressive, load_multi_progressive};
 use crate::parse::json_unescape;
 use crate::types::*;
 use imgui::ImColor32;
@@ -154,7 +154,7 @@ impl Pane {
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
         std::thread::spawn(move || {
-            tx.send(load_trace(&path, &counter, 0)).ok();
+            load_trace_progressive(&path, &counter, 0, &tx);
         });
     }
 
@@ -175,26 +175,7 @@ impl Pane {
         let counter = self.loading_events.clone();
         let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / n).max(2);
         std::thread::spawn(move || {
-            let results: Vec<_> = std::thread::scope(|s| {
-                let handles: Vec<_> = rank_paths.iter().map(|(rank, path)| {
-                    let r = *rank;
-                    let ctr = counter.clone();
-                    s.spawn(move || (r, load_trace(path, &ctr, tpf)))
-                }).collect();
-                handles.into_iter().filter_map(|h| h.join().ok()).collect()
-            });
-            let mut traces = Vec::new();
-            for (rank, result) in results {
-                match result {
-                    Ok(t) => traces.push((rank, t)),
-                    Err(e) => { eprintln!("  rank {rank}: {e}"); }
-                }
-            }
-            if traces.is_empty() {
-                tx.send(Err("all ranks failed to load".into())).ok();
-                return;
-            }
-            tx.send(Ok(merge_traces(traces))).ok();
+            load_multi_progressive(rank_paths, &counter, tpf, &tx);
         });
     }
 
@@ -221,30 +202,13 @@ impl Pane {
         let paths = self.reload_paths.clone();
         if paths.len() == 1 {
             let path = paths[0].1.clone();
-            std::thread::spawn(move || { tx.send(load_trace(&path, &counter, 0)).ok(); });
+            std::thread::spawn(move || {
+                load_trace_progressive(&path, &counter, 0, &tx);
+            });
         } else {
             let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / paths.len()).max(1);
             std::thread::spawn(move || {
-                let results: Vec<_> = std::thread::scope(|s| {
-                    let handles: Vec<_> = paths.iter().map(|(rank, path)| {
-                        let r = *rank;
-                        let ctr = counter.clone();
-                        s.spawn(move || (r, load_trace(path, &ctr, tpf)))
-                    }).collect();
-                    handles.into_iter().filter_map(|h| h.join().ok()).collect()
-                });
-                let mut traces = Vec::new();
-                for (rank, result) in results {
-                    match result {
-                        Ok(t) => traces.push((rank, t)),
-                        Err(e) => { eprintln!("  rank {rank}: {e}"); }
-                    }
-                }
-                if traces.is_empty() {
-                    tx.send(Err("all ranks failed to load".into())).ok();
-                    return;
-                }
-                tx.send(Ok(merge_traces(traces))).ok();
+                load_multi_progressive(paths, &counter, tpf, &tx);
             });
         }
     }
@@ -274,7 +238,6 @@ impl Pane {
                     let old_stats = std::mem::take(&mut self.trace.as_mut().unwrap().stats);
                     self.trace = Some(trace);
                     self.trace.as_mut().unwrap().stats = old_stats;
-                    self.loading = None;
                     if self.time_aligned { self.align_rank_times(); }
                     if self.step_aligned { self.align_per_step(); }
                     if self.align_ranks { self.detect_stragglers(); }
@@ -293,7 +256,6 @@ impl Pane {
                     self.label_stats.clear();
                     self.hidden_names = vec![false; trace.names.len()];
                     self.trace = Some(trace);
-                    self.loading = None;
                     self.load_labels();
                 }
             }
@@ -302,8 +264,7 @@ impl Pane {
                 self.loading = None;
             }
             Err(mpsc::TryRecvError::Empty) => {}
-            Err(_) => {
-                self.error = Some("Load thread crashed".into());
+            Err(mpsc::TryRecvError::Disconnected) => {
                 self.loading = None;
             }
         }
