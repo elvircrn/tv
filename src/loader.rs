@@ -832,17 +832,6 @@ pub fn save_cache(trace: &Trace, source_path: &str, cache_dir: Option<&str>) {
 
     w.write_all(args_buf).ok();
 
-    write_u32(&mut w, trace.flow_pairs.len() as u32);
-    if !trace.flow_pairs.is_empty() {
-        let flow_bytes = unsafe {
-            std::slice::from_raw_parts(
-                trace.flow_pairs.as_ptr() as *const u8,
-                trace.flow_pairs.len() * std::mem::size_of::<FlowPair>(),
-            )
-        };
-        w.write_all(flow_bytes).ok();
-    }
-
     drop(w);
     std::fs::rename(&tmp, &cp).ok();
 }
@@ -948,7 +937,6 @@ fn load_cache_from_mmap(d: &[u8]) -> Option<Trace> {
 
     if pos + args_len > d.len() { return None; }
     let args_slice = &d[pos..pos + args_len];
-    let after_args = pos + args_len;
 
     let mut offsets = Vec::with_capacity(n_tracks);
     let mut ev_off = 0usize;
@@ -977,29 +965,10 @@ fn load_cache_from_mmap(d: &[u8]) -> Option<Trace> {
         (tracks, args)
     });
 
-    let fp_size = std::mem::size_of::<FlowPair>();
-    let mut flow_pairs = Vec::new();
-    let mut fpos = after_args;
-    if fpos + 4 <= d.len() {
-        let n_flows = u32::from_le_bytes(d[fpos..fpos + 4].try_into().unwrap()) as usize;
-        fpos += 4;
-        if fpos + n_flows * fp_size <= d.len() {
-            flow_pairs.reserve(n_flows);
-            for i in 0..n_flows {
-                let off = fpos + i * fp_size;
-                let src_track = u32::from_le_bytes(d[off..off+4].try_into().unwrap());
-                let dst_track = u32::from_le_bytes(d[off+4..off+8].try_into().unwrap());
-                let src_ts = f64::from_le_bytes(d[off+8..off+16].try_into().unwrap());
-                let dst_ts = f64::from_le_bytes(d[off+16..off+24].try_into().unwrap());
-                flow_pairs.push(FlowPair { src_track, dst_track, src_ts, dst_ts });
-            }
-        }
-    }
-
     Some(Trace {
         tracks, names, cats,
         raw_bufs: vec![Arc::new(args)],
-        stats, max_ts, min_ts, total_events, device, flow_pairs,
+        stats, max_ts, min_ts, total_events, device, flow_pairs: Vec::new(),
     })
 }
 
@@ -1122,17 +1091,6 @@ fn save_merged_cache(trace: &Trace, cache_dir: &str) {
     w.write_all(stats_bytes).ok();
 
     w.write_all(args_buf).ok();
-
-    write_u32(&mut w, trace.flow_pairs.len() as u32);
-    if !trace.flow_pairs.is_empty() {
-        let flow_bytes = unsafe {
-            std::slice::from_raw_parts(
-                trace.flow_pairs.as_ptr() as *const u8,
-                trace.flow_pairs.len() * std::mem::size_of::<FlowPair>(),
-            )
-        };
-        w.write_all(flow_bytes).ok();
-    }
 
     drop(w);
     std::fs::rename(&tmp, &cp).ok();
