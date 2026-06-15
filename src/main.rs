@@ -134,6 +134,9 @@ impl ApplicationHandler for App {
         let cli_dirs: Vec<String> = self.pending_files.iter()
             .filter(|p| std::path::Path::new(p).is_dir())
             .cloned().collect();
+        let cli_cache_dir = if cli_dirs.len() == 1 && !cli_dirs[0].ends_with(".tvcache") {
+            Some(crate::loader::cache_dir_for_folder(&cli_dirs[0]))
+        } else { None };
         let (rank_groups, standalone) = crate::loader::detect_rank_groups(&self.pending_files);
         let mut pi = 0;
         for group in rank_groups {
@@ -142,7 +145,7 @@ impl ApplicationHandler for App {
             }
             if cli_dirs.len() == 1 {
                 self.state.panes[pi].reload_dir = Some(cli_dirs[0].clone());
-                self.state.panes[pi].cache_dir = Some(crate::loader::cache_dir_for_folder(&cli_dirs[0]));
+                self.state.panes[pi].cache_dir = cli_cache_dir.clone();
             }
             self.state.panes[pi].open_multi(group);
             pi += 1;
@@ -153,7 +156,7 @@ impl ApplicationHandler for App {
             }
             if cli_dirs.len() == 1 {
                 self.state.panes[pi].reload_dir = Some(cli_dirs[0].clone());
-                self.state.panes[pi].cache_dir = Some(crate::loader::cache_dir_for_folder(&cli_dirs[0]));
+                self.state.panes[pi].cache_dir = cli_cache_dir.clone();
             }
             self.state.panes[pi].open(path);
             pi += 1;
@@ -348,6 +351,9 @@ impl App {
             let dropped_dirs: Vec<String> = drops.iter()
                 .filter(|p| std::path::Path::new(p).is_dir())
                 .cloned().collect();
+            let drop_cache_dir = if dropped_dirs.len() == 1 && !dropped_dirs[0].ends_with(".tvcache") {
+                Some(crate::loader::cache_dir_for_folder(&dropped_dirs[0]))
+            } else { None };
             let (rank_groups, standalone) = crate::loader::detect_rank_groups(&drops);
             for group in rank_groups {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
@@ -358,7 +364,7 @@ impl App {
                 self.state.active = target;
                 if dropped_dirs.len() == 1 {
                     self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
-                    self.state.panes[target].cache_dir = Some(crate::loader::cache_dir_for_folder(&dropped_dirs[0]));
+                    self.state.panes[target].cache_dir = drop_cache_dir.clone();
                 }
                 self.state.panes[target].open_multi(group);
             }
@@ -371,7 +377,7 @@ impl App {
                 self.state.active = target;
                 if dropped_dirs.len() == 1 {
                     self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
-                    self.state.panes[target].cache_dir = Some(crate::loader::cache_dir_for_folder(&dropped_dirs[0]));
+                    self.state.panes[target].cache_dir = drop_cache_dir.clone();
                 }
                 self.state.panes[target].open(path);
             }
