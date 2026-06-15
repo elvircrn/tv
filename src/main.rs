@@ -140,22 +140,22 @@ impl ApplicationHandler for App {
             if pi >= self.state.panes.len() {
                 self.state.panes.push(Pane::new());
             }
-            self.state.panes[pi].open_multi(group);
             if cli_dirs.len() == 1 {
                 self.state.panes[pi].reload_dir = Some(cli_dirs[0].clone());
                 self.state.panes[pi].cache_dir = Some(crate::loader::cache_dir_for_folder(&cli_dirs[0]));
             }
+            self.state.panes[pi].open_multi(group);
             pi += 1;
         }
         for path in standalone {
             if pi >= self.state.panes.len() {
                 self.state.panes.push(Pane::new());
             }
-            self.state.panes[pi].open(path);
             if cli_dirs.len() == 1 {
                 self.state.panes[pi].reload_dir = Some(cli_dirs[0].clone());
                 self.state.panes[pi].cache_dir = Some(crate::loader::cache_dir_for_folder(&cli_dirs[0]));
             }
+            self.state.panes[pi].open(path);
             pi += 1;
         }
         self.pending_files.clear();
@@ -356,11 +356,11 @@ impl App {
                     self.state.panes.len() - 1
                 };
                 self.state.active = target;
-                self.state.panes[target].open_multi(group);
                 if dropped_dirs.len() == 1 {
                     self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
                     self.state.panes[target].cache_dir = Some(crate::loader::cache_dir_for_folder(&dropped_dirs[0]));
                 }
+                self.state.panes[target].open_multi(group);
             }
             for path in standalone {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
@@ -369,11 +369,11 @@ impl App {
                     self.state.panes.len() - 1
                 };
                 self.state.active = target;
-                self.state.panes[target].open(path);
                 if dropped_dirs.len() == 1 {
                     self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
                     self.state.panes[target].cache_dir = Some(crate::loader::cache_dir_for_folder(&dropped_dirs[0]));
                 }
+                self.state.panes[target].open(path);
             }
         }
 
