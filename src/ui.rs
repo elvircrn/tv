@@ -652,21 +652,24 @@ pub fn draw_timeline(
                 let sel_ev = sel_track.events[sel.event_idx as usize];
 
                 let mut found_flow: Option<&FlowPair> = None;
+                let ti32 = sel_ti as u32;
+                let target_ts = sel_ev.ts;
                 let mut cur_ei = sel.event_idx as usize;
                 loop {
                     let ev = &sel_track.events[cur_ei];
-                    let ti32 = sel_ti as u32;
                     let idx = trace.flow_pairs.partition_point(|f|
                         (f.src_track, f.src_ts) < (ti32, ev.ts - 0.001));
+                    let mut best: Option<&FlowPair> = None;
+                    let mut best_dist = f64::MAX;
                     for k in idx..trace.flow_pairs.len() {
                         let f = &trace.flow_pairs[k];
                         if f.src_track != ti32 || f.src_ts > ev.ts + ev.dur + 0.001 { break; }
                         if f.src_ts >= ev.ts - 0.001 {
-                            found_flow = Some(f);
-                            break;
+                            let dist = (f.src_ts - target_ts).abs();
+                            if dist < best_dist { best_dist = dist; best = Some(f); }
                         }
                     }
-                    if found_flow.is_some() { break; }
+                    if best.is_some() { found_flow = best; break; }
                     if ev.depth == 0 { break; }
                     let target_depth = ev.depth - 1;
                     let mut parent = None;
