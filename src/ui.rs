@@ -650,26 +650,25 @@ pub fn draw_timeline(
                 let sel_ti = sel.track_idx as usize;
                 let sel_track = &trace.tracks[sel_ti];
                 let sel_ev = sel_track.events[sel.event_idx as usize];
-
-                let mut found_flow: Option<&FlowPair> = None;
                 let ti32 = sel_ti as u32;
-                let target_ts = sel_ev.ts;
+
+                let mut flow_start = usize::MAX;
+                let mut flow_end = 0;
                 let mut cur_ei = sel.event_idx as usize;
                 loop {
                     let ev = &sel_track.events[cur_ei];
                     let idx = trace.flow_pairs.partition_point(|f|
                         (f.src_track, f.src_ts) < (ti32, ev.ts - 0.001));
-                    let mut best: Option<&FlowPair> = None;
-                    let mut best_dist = f64::MAX;
+                    let mut found = false;
                     for k in idx..trace.flow_pairs.len() {
                         let f = &trace.flow_pairs[k];
                         if f.src_track != ti32 || f.src_ts > ev.ts + ev.dur + 0.001 { break; }
                         if f.src_ts >= ev.ts - 0.001 {
-                            let dist = (f.src_ts - target_ts).abs();
-                            if dist < best_dist { best_dist = dist; best = Some(f); }
+                            if !found { flow_start = k; found = true; }
+                            flow_end = k + 1;
                         }
                     }
-                    if best.is_some() { found_flow = best; break; }
+                    if found { break; }
                     if ev.depth == 0 { break; }
                     let target_depth = ev.depth - 1;
                     let mut parent = None;
@@ -684,23 +683,10 @@ pub fn draw_timeline(
                     match parent { Some(p) => cur_ei = p, None => break }
                 }
 
-                if let Some(fp) = found_flow {
-                    let dst_ti = fp.dst_track as usize;
-                    let dst_ts = fp.dst_ts;
-                    let dst_evs = &trace.tracks[dst_ti].events;
-                    let p = dst_evs.partition_point(|e| e.ts < dst_ts - 0.001);
-                    let mut dst_ei = None;
-                    for k in p..dst_evs.len().min(p + 10) {
-                        if (dst_evs[k].ts - dst_ts).abs() < 0.001 { dst_ei = Some(k); break; }
-                    }
-
-                    if let (Some(sel_vi), Some(dst_ei)) = (
-                        buf.visible.iter().position(|&v| v == sel_ti),
-                        dst_ei,
-                    ) {
+                if flow_start < flow_end {
+                    let sel_vi = buf.visible.iter().position(|&v| v == sel_ti);
+                    if let Some(sel_vi) = sel_vi {
                         let sel_gpu = sel_track.gpu;
-                        let dst_ev = dst_evs[dst_ei];
-
                         let src_sub_h = buf.heights[sel_vi] / sel_track.max_depth.max(1) as f32;
                         let src_lane_h = src_sub_h - LANE_GAP;
                         let src_y = tracks_top + buf.y_offsets[sel_vi] - view.scroll_y
@@ -711,42 +697,56 @@ pub fn draw_timeline(
                             t2x(sel_ev.ts + sel_ev.dur, view.t0, px_per_us, tl_left)
                         };
 
-                        let (dst_x, dst_y) = if let Some(dst_vi) = buf.visible.iter().position(|&v| v == dst_ti) {
-                            let dst_track = &trace.tracks[dst_ti];
-                            let dst_sub_h = buf.heights[dst_vi] / dst_track.max_depth.max(1) as f32;
-                            let dst_lane_h = dst_sub_h - LANE_GAP;
-                            let dy = tracks_top + buf.y_offsets[dst_vi] - view.scroll_y
-                                + dst_ev.depth as f32 * dst_sub_h + EV_INSET + dst_lane_h / 2.0;
-                            let dx = if sel_gpu {
-                                t2x(dst_ev.ts + dst_ev.dur, view.t0, px_per_us, tl_left)
-                            } else {
-                                t2x(dst_ev.ts, view.t0, px_per_us, tl_left)
-                            };
-                            (dx, dy)
-                        } else {
-                            let dx = if sel_gpu {
-                                t2x(dst_ev.ts + dst_ev.dur, view.t0, px_per_us, tl_left)
-                            } else {
-                                t2x(dst_ev.ts, view.t0, px_per_us, tl_left)
-                            };
-                            (dx, rect[3])
-                        };
-
                         let arrow_col = col32(255, 180, 50, 200);
-                        dl.add_line([src_x, src_y], [dst_x, dst_y], arrow_col).thickness(2.0).build();
+                        for fi in flow_start..flow_end {
+                            let fp = &trace.flow_pairs[fi];
+                            if fp.src_track != ti32 { continue; }
+                            let dst_ti = fp.dst_track as usize;
+                            let dst_evs = &trace.tracks[dst_ti].events;
+                            let p = dst_evs.partition_point(|e| e.ts < fp.dst_ts - 0.001);
+                            let mut dst_ei_found = None;
+                            for k in p..dst_evs.len().min(p + 10) {
+                                if (dst_evs[k].ts - fp.dst_ts).abs() < 0.001 { dst_ei_found = Some(k); break; }
+                            }
+                            let dst_ei = match dst_ei_found { Some(v) => v, None => continue };
+                            let dst_ev = dst_evs[dst_ei];
 
-                        let dx = dst_x - src_x;
-                        let dy = dst_y - src_y;
-                        let len = (dx * dx + dy * dy).sqrt();
-                        if len > 1.0 {
-                            let ux = dx / len;
-                            let uy = dy / len;
-                            let arrow_size = 8.0f32;
-                            let left = [dst_x - ux * arrow_size - uy * arrow_size * 0.5,
-                                        dst_y - uy * arrow_size + ux * arrow_size * 0.5];
-                            let right = [dst_x - ux * arrow_size + uy * arrow_size * 0.5,
-                                         dst_y - uy * arrow_size - ux * arrow_size * 0.5];
-                            dl.add_triangle([dst_x, dst_y], left, right, arrow_col).filled(true).build();
+                            let (dst_x, dst_y) = if let Some(dst_vi) = buf.visible.iter().position(|&v| v == dst_ti) {
+                                let dst_track = &trace.tracks[dst_ti];
+                                let dst_sub_h = buf.heights[dst_vi] / dst_track.max_depth.max(1) as f32;
+                                let dst_lane_h = dst_sub_h - LANE_GAP;
+                                let dy = tracks_top + buf.y_offsets[dst_vi] - view.scroll_y
+                                    + dst_ev.depth as f32 * dst_sub_h + EV_INSET + dst_lane_h / 2.0;
+                                let dx = if sel_gpu {
+                                    t2x(dst_ev.ts + dst_ev.dur, view.t0, px_per_us, tl_left)
+                                } else {
+                                    t2x(dst_ev.ts, view.t0, px_per_us, tl_left)
+                                };
+                                (dx, dy)
+                            } else {
+                                let dx = if sel_gpu {
+                                    t2x(dst_ev.ts + dst_ev.dur, view.t0, px_per_us, tl_left)
+                                } else {
+                                    t2x(dst_ev.ts, view.t0, px_per_us, tl_left)
+                                };
+                                (dx, rect[3])
+                            };
+
+                            dl.add_line([src_x, src_y], [dst_x, dst_y], arrow_col).thickness(2.0).build();
+
+                            let dx = dst_x - src_x;
+                            let dy = dst_y - src_y;
+                            let len = (dx * dx + dy * dy).sqrt();
+                            if len > 1.0 {
+                                let ux = dx / len;
+                                let uy = dy / len;
+                                let arrow_size = 8.0f32;
+                                let left = [dst_x - ux * arrow_size - uy * arrow_size * 0.5,
+                                            dst_y - uy * arrow_size + ux * arrow_size * 0.5];
+                                let right = [dst_x - ux * arrow_size + uy * arrow_size * 0.5,
+                                             dst_y - uy * arrow_size - ux * arrow_size * 0.5];
+                                dl.add_triangle([dst_x, dst_y], left, right, arrow_col).filled(true).build();
+                            }
                         }
                     }
                 }
