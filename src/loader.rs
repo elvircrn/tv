@@ -1223,115 +1223,19 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     trace
 }
 
-fn load_trace_raw(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize) -> Result<Trace, String> {
-    let t0 = Instant::now();
-    let (raw, chunks, n_chunks) = decompress_parse(path, counter, max_parse_threads, &t0)?;
-    build_trace(raw, chunks, n_chunks, &t0)
-}
-
-fn merge_traces_raw(traces: Vec<(usize, Trace)>) -> Trace {
-    let global_min = traces.iter().map(|(_, t)| t.min_ts).fold(f64::MAX, f64::min);
-
-    let mut names: Vec<String> = vec![String::new()];
-    let mut name_idx: FnvMap<u32> = FnvMap::with_capacity_and_hasher(
-        traces.iter().map(|(_, t)| t.names.len()).max().unwrap_or(0) * 2,
-        Default::default(),
-    );
-    name_idx.insert(0, 0);
-    let mut cats: Vec<String> = vec![String::new()];
-    let mut cat_idx: FnvMap<u32> = FnvMap::with_capacity_and_hasher(
-        traces.iter().map(|(_, t)| t.cats.len()).max().unwrap_or(0) * 2,
-        Default::default(),
-    );
-    cat_idx.insert(0, 0);
-    let mut device = String::new();
-
-    let mut remap_info: Vec<(Vec<u32>, Vec<u32>, f64)> = Vec::with_capacity(traces.len());
-    let mut all_raw_bufs: Vec<Arc<Vec<u8>>> = Vec::new();
-
-    for (_, trace) in &traces {
-        let time_offset = trace.min_ts - global_min;
-        let name_remap = merge_intern_direct(&mut names, &mut name_idx, &trace.names);
-        let cat_remap = merge_intern_direct(&mut cats, &mut cat_idx, &trace.cats);
-        if device.is_empty() && !trace.device.is_empty() {
-            device = trace.device.clone();
-        }
-        remap_info.push((name_remap, cat_remap, time_offset));
-    }
-
-    let remapped: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = traces.into_iter().zip(remap_info).enumerate().map(|(trace_idx, ((rank, mut trace), (name_remap, cat_remap, time_offset)))| {
-            s.spawn(move || {
-                let raw_buf_idx = trace_idx as u8;
-                let mut max_ts: f64 = 0.0;
-                let mut total_events = 0usize;
-                let mut local_dur: HashMap<u32, Vec<f64>> = HashMap::new();
-                for track in &mut trace.tracks {
-                    track.label = format!("[rank {}] {}", rank, track.label);
-                    track.raw_buf_idx = raw_buf_idx;
-                    for ev in &mut track.events {
-                        ev.ts += time_offset;
-                        ev.name = name_remap[ev.name as usize];
-                        ev.cat = cat_remap[ev.cat as usize];
-                        max_ts = max_ts.max(ev.ts + ev.dur);
-                        local_dur.entry(ev.name).or_default().push(ev.dur);
-                    }
-                    total_events += track.events.len();
-                }
-                (trace.tracks, trace.raw_bufs, max_ts, total_events, local_dur)
-            })
-        }).collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
-    });
-
-    let mut all_tracks: Vec<Track> = Vec::new();
-    let mut total_events = 0;
-    let mut max_ts: f64 = 0.0;
-    let mut dur_map: HashMap<u32, Vec<f64>> = HashMap::new();
-
-    for (tracks, raw_bufs, mt, te, local_dur) in remapped {
-        all_tracks.extend(tracks);
-        all_raw_bufs.extend(raw_bufs);
-        total_events += te;
-        max_ts = max_ts.max(mt);
-        for (name, durs) in local_dur {
-            dur_map.entry(name).or_default().extend(durs);
-        }
-    }
-
-    all_tracks.sort_by(|a, b| a.label.cmp(&b.label));
-
-    let mut stats: Vec<KernelStats> = dur_map.into_iter().map(|(name, mut durs)| {
-        let count = durs.len() as u32;
-        let total_dur: f64 = durs.iter().sum();
-        let max_dur = durs.iter().copied().fold(0.0f64, f64::max);
-        durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = durs.len();
-        let median_dur = if n % 2 == 1 { durs[n / 2] } else { (durs[n / 2 - 1] + durs[n / 2]) / 2.0 };
-        KernelStats { name, count, total_dur, median_dur, max_dur }
-    }).collect();
-    stats.sort_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
-
-    names.shrink_to_fit();
-    cats.shrink_to_fit();
-
-    Trace {
-        tracks: all_tracks, names, cats, raw_bufs: all_raw_bufs, stats,
-        max_ts, min_ts: global_min, total_events, device,
-    }
-}
-
 pub fn load_multi_progressive(
     rank_paths: Vec<(usize, String)>, counter: &Arc<AtomicUsize>, tpf: usize,
     tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
     cache_dir: Option<&str>,
 ) {
     let t0 = Instant::now();
+    let cd = cache_dir.map(|s| s.to_string());
     let results: Vec<_> = std::thread::scope(|s| {
         let handles: Vec<_> = rank_paths.iter().map(|(rank, path)| {
             let r = *rank;
             let ctr = counter.clone();
-            s.spawn(move || (r, load_trace_raw(path, &ctr, tpf)))
+            let cd_ref = cd.as_deref();
+            s.spawn(move || (r, load_trace(path, &ctr, tpf, cd_ref)))
         }).collect();
         handles.into_iter().filter_map(|h| h.join().ok()).collect()
     });
@@ -1346,8 +1250,9 @@ pub fn load_multi_progressive(
         let _ = tx.send(Err("all ranks failed to load".into()));
         return;
     }
-    let trace = merge_traces_raw(traces);
-    send_progressive(trace, tx, &t0, "", cache_dir);
+    let trace = merge_traces(traces);
+    eprintln!("  merged: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+    let _ = tx.send(Ok(trace));
 }
 
 fn compact_args(trace: &mut Trace) {
