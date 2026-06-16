@@ -329,7 +329,6 @@ pub fn draw_timeline(
     track_scales: &mut Vec<f32>,
     track_order: &mut Vec<usize>,
     drag: &mut DragKind,
-    straggler_mask: &[Vec<bool>],
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let dl = ui.get_window_draw_list();
     let tl_left = rect[0] + label_w;
@@ -566,10 +565,7 @@ pub fn draw_timeline(
                     if px == buf.last_px[ev.depth as usize] { continue; }
                     buf.last_px[ev.depth as usize] = px;
                     let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
-                    let is_straggler = straggler_mask.get(orig_ti).and_then(|t| t.get(ei)).copied().unwrap_or(false);
-                    let color = if is_straggler {
-                        col32(220, 50, 50, 255)
-                    } else if matches {
+                    let color = if matches {
                         event_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
                     } else {
                         event_dim_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
@@ -580,10 +576,7 @@ pub fn draw_timeline(
 
                 let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
                 let name = &trace.names[ev.name as usize];
-                let is_straggler = straggler_mask.get(orig_ti).and_then(|t| t.get(ei)).copied().unwrap_or(false);
-                let color = if is_straggler {
-                    col32(220, 50, 50, 255)
-                } else if matches {
+                let color = if matches {
                     event_color(orig_ti, ei, name, event_labels, labels)
                 } else {
                     event_dim_color(orig_ti, ei, name, event_labels, labels)
@@ -807,7 +800,6 @@ pub fn draw_timeline(
             .flags(WindowFlags::NO_SCROLLBAR | WindowFlags::NO_SCROLL_WITH_MOUSE | WindowFlags::NO_BACKGROUND | WindowFlags::NO_INPUTS)
             .begin()
         {
-            let is_collapsed = collapsed.get(orig_ti).copied().unwrap_or(false);
             buf.fmt.clear();
             write!(buf.fmt, "{}", track.label).ok();
             let _col = ui.push_style_color(StyleColor::Text, [0.67, 0.67, 0.67, 1.0]);

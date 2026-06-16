@@ -517,9 +517,6 @@ impl App {
         let mut search_changed = vec![false; n_panes];
         let mut close_pane: Option<usize> = None;
         let mut diff_clicked_against: Option<usize> = None;
-        let prev_align: Vec<bool> = state.panes.iter().map(|p| p.align_ranks).collect();
-        let prev_time_aligned: Vec<bool> = state.panes.iter().map(|p| p.time_aligned).collect();
-        let prev_step_aligned: Vec<bool> = state.panes.iter().map(|p| p.step_aligned).collect();
         let active_has_sel = !state.panes[state.active].selection_stats.is_empty();
         for pi in 0..n_panes {
             state.buf.fmt.clear();
@@ -537,7 +534,8 @@ impl App {
                 )
                 .build(|| {
                     let pane = &mut state.panes[pi];
-                    if let Some(t) = &pane.trace {
+                    if pane.trace.is_some() {
+                        let max_ts = pane.trace.as_ref().unwrap().max_ts;
                         {
                             let win_size = ui.window_size();
                             ui.set_cursor_pos([win_size[0] - 22.0, ui.cursor_pos()[1]]);
@@ -548,58 +546,6 @@ impl App {
                             }
                             ui.same_line_with_pos(ui.cursor_start_pos()[0]);
                         }
-                        ui.checkbox("CPU", &mut pane.show_cpu);
-                        let is_multi_rank = t.tracks.iter().any(|tr| tr.label.starts_with("[rank "));
-                        if is_multi_rank {
-                            ui.same_line();
-                            ui.checkbox("Align", &mut pane.time_aligned);
-                            ui.same_line();
-                            ui.checkbox("Per-step", &mut pane.step_aligned);
-                            ui.same_line();
-                            ui.checkbox("Stragglers", &mut pane.align_ranks);
-                        }
-                        if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
-                            ui.same_line();
-                            ui.checkbox("Watch", &mut pane.auto_reload);
-                        }
-                        ui.same_line();
-                        if ui.button("Fit") {
-                            let pad = t.max_ts * FIT_PAD_FRAC;
-                            pane.view.t0 = -pad;
-                            pane.view.t1 = t.max_ts + pad;
-                            pane.view.scroll_y = 0.0;
-                        }
-                        if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
-                            ui.same_line();
-                            if ui.button("Diff") {
-                                diff_clicked_against = Some(pi);
-                            }
-                        }
-                        if pi == 0 {
-                            ui.same_line();
-                            let _dim = ui.push_style_color(StyleColor::Text, [0.5, 0.5, 0.5, 1.0]);
-                            ui.text("?");
-                            if ui.is_item_hovered() {
-                                ui.tooltip(|| {
-                                    ui.text("Keyboard shortcuts");
-                                    ui.separator();
-                                    ui.text("W / Up       Zoom in");
-                                    ui.text("S / Down     Zoom out");
-                                    ui.text("A / Left     Pan left");
-                                    ui.text("D / Right    Pan right");
-                                    ui.text("/            Focus search");
-                                    ui.text("Enter        Select all matches");
-                                    ui.text("Escape       Clear search & selection");
-                                    ui.text("Home         Fit timeline");
-                                    ui.text("Ctrl+Scroll  Zoom");
-                                    ui.text("Shift+Drag   Select region");
-                                    ui.text("Double-click Highlight all same-name");
-                                    ui.text("Right-click  Copy kernel name");
-                                    ui.text("Drop file    Open trace (2nd = split)");
-                                });
-                            }
-                        }
-                        ui.same_line_with_spacing(0.0, 16.0);
                         if pane.search_focus {
                             ui.set_keyboard_focus_here();
                             pane.search_focus = false;
@@ -649,6 +595,60 @@ impl App {
                                 for h in &mut pane.hidden_names { *h = false; }
                             }
                         }
+                        ui.same_line_with_spacing(0.0, 16.0);
+                        ui.checkbox("CPU", &mut pane.show_cpu);
+                        if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
+                            ui.same_line();
+                            ui.checkbox("Watch", &mut pane.auto_reload);
+                        }
+                        ui.same_line();
+                        if ui.button("Fit") {
+                            let pad = max_ts * FIT_PAD_FRAC;
+                            pane.view.t0 = -pad;
+                            pane.view.t1 = max_ts + pad;
+                            pane.view.scroll_y = 0.0;
+                        }
+                        if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
+                            ui.same_line();
+                            if ui.button("Diff") {
+                                diff_clicked_against = Some(pi);
+                            }
+                        }
+                        if pi == 0 {
+                            ui.same_line();
+                            let _dim = ui.push_style_color(StyleColor::Text, [0.5, 0.5, 0.5, 1.0]);
+                            ui.text("?");
+                            if ui.is_item_hovered() {
+                                ui.tooltip(|| {
+                                    ui.text("Controls");
+                                    ui.separator();
+                                    ui.text("W / Up         Zoom in");
+                                    ui.text("S / Down       Zoom out");
+                                    ui.text("A / Left       Pan left");
+                                    ui.text("D / Right      Pan right");
+                                    ui.text("/              Focus search");
+                                    ui.text("Enter          Select all matches");
+                                    ui.text("Escape         Clear search & selection");
+                                    ui.text("Home           Fit timeline");
+                                    ui.text("Ctrl+Scroll    Zoom at cursor");
+                                    ui.text("Shift+Drag     Select region");
+                                    ui.text("Double-click   Highlight all same-name");
+                                    ui.text("Right-click    Copy kernel name");
+                                    ui.separator();
+                                    ui.text("Tracks");
+                                    ui.separator();
+                                    ui.text("Drag label     Reorder tracks");
+                                    ui.text("Drag border    Resize track height");
+                                    ui.text("Click event    Show detail + flow arrows");
+                                    ui.separator();
+                                    ui.text("Files");
+                                    ui.separator();
+                                    ui.text("Drop file      Open trace");
+                                    ui.text("Drop 2nd file  Split-pane view");
+                                    ui.text("Drop folder    Merge multi-rank traces");
+                                });
+                            }
+                        }
 
                     } else if pane.loading.is_some() {
                         ui.text(&pane.loading_progress_text());
@@ -660,34 +660,6 @@ impl App {
                         ui.text(e);
                     }
                 });
-        }
-
-        for pi in 0..state.panes.len().min(prev_align.len()) {
-            if state.panes[pi].align_ranks != prev_align[pi] {
-                if state.panes[pi].align_ranks {
-                    state.panes[pi].detect_stragglers();
-                } else {
-                    state.panes[pi].straggler_mask.clear();
-                }
-            }
-        }
-        for pi in 0..state.panes.len().min(prev_time_aligned.len()) {
-            if state.panes[pi].time_aligned != prev_time_aligned[pi] {
-                if state.panes[pi].time_aligned {
-                    state.panes[pi].align_rank_times();
-                } else {
-                    state.panes[pi].unalign_rank_times();
-                }
-            }
-        }
-        for pi in 0..state.panes.len().min(prev_step_aligned.len()) {
-            if state.panes[pi].step_aligned != prev_step_aligned[pi] {
-                if state.panes[pi].step_aligned {
-                    state.panes[pi].align_per_step();
-                } else {
-                    state.panes[pi].unalign_per_step();
-                }
-            }
         }
 
         if let Some(pi) = close_pane {
@@ -1109,7 +1081,6 @@ impl App {
                         &mut pane.track_scales,
                         &mut pane.track_order,
                         &mut state.drag,
-                        &pane.straggler_mask,
                     );
                     hover_results[pi] = h;
                     click_results[pi] = c;

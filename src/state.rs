@@ -50,12 +50,6 @@ pub struct Pane {
     pub sel_median: f64,
     pub sel_agg_stats: Vec<KernelStats>,
     pub sel_individual: Vec<KernelStats>,
-    pub align_ranks: bool,
-    pub straggler_mask: Vec<Vec<bool>>,
-    pub time_aligned: bool,
-    pub rank_time_offsets: Vec<f64>,
-    pub step_aligned: bool,
-    pub step_align_offsets: Vec<Vec<f64>>,
     pub track_order: Vec<usize>,
     pub auto_reload: bool,
     pub reload_paths: Vec<(usize, String)>,
@@ -102,12 +96,6 @@ impl Pane {
             sel_median: 0.0,
             sel_agg_stats: Vec::new(),
             sel_individual: Vec::new(),
-            align_ranks: false,
-            straggler_mask: Vec::new(),
-            time_aligned: false,
-            rank_time_offsets: Vec::new(),
-            step_aligned: false,
-            step_align_offsets: Vec::new(),
             track_order: Vec::new(),
             auto_reload: false,
             reload_paths: Vec::new(),
@@ -240,17 +228,11 @@ impl Pane {
                         .map(|t| vec![None; t.events.len()])
                         .collect();
                     self.hidden_names.resize(n_names, false);
-                    self.straggler_mask.clear();
                     self.search_mask.clear();
                     self.search_nav.clear();
-                    self.rank_time_offsets.clear();
-                    self.step_align_offsets.clear();
                     let old_stats = std::mem::take(&mut self.trace.as_mut().unwrap().stats);
                     self.trace = Some(trace);
                     self.trace.as_mut().unwrap().stats = old_stats;
-                    if self.time_aligned { self.align_rank_times(); }
-                    if self.step_aligned { self.align_per_step(); }
-                    if self.align_ranks { self.detect_stragglers(); }
                     if !self.search.is_empty() { self.rebuild_search(); }
                 } else {
                     let pad = trace.max_ts * 0.02;
@@ -486,230 +468,6 @@ impl Pane {
             }
         }
         self.sel_individual.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
-    }
-
-    pub fn align_rank_times(&mut self) {
-        let trace = match &mut self.trace {
-            Some(t) => t,
-            None => return,
-        };
-        let mut rank_min: HashMap<usize, f64> = HashMap::new();
-        let mut track_rank: Vec<Option<usize>> = Vec::new();
-        for track in trace.tracks.iter() {
-            let rank = parse_rank(&track.label);
-            if let Some(r) = rank {
-                if track.gpu {
-                    let min = track.events.iter().map(|e| e.ts).fold(f64::MAX, f64::min);
-                    let entry = rank_min.entry(r).or_insert(f64::MAX);
-                    *entry = entry.min(min);
-                }
-            }
-            track_rank.push(rank);
-        }
-        self.rank_time_offsets = vec![0.0; trace.tracks.len()];
-        for (ti, rank) in track_rank.iter().enumerate() {
-            if let Some(r) = rank {
-                let offset = match rank_min.get(r) {
-                    Some(&o) => o,
-                    None => continue,
-                };
-                self.rank_time_offsets[ti] = offset;
-                for ev in &mut trace.tracks[ti].events {
-                    ev.ts -= offset;
-                }
-            }
-        }
-        trace.max_ts = trace.tracks.iter()
-            .flat_map(|t| t.events.iter().map(|e| e.ts + e.dur))
-            .fold(0.0f64, f64::max);
-    }
-
-    pub fn unalign_rank_times(&mut self) {
-        let trace = match &mut self.trace {
-            Some(t) => t,
-            None => return,
-        };
-        for (ti, &offset) in self.rank_time_offsets.iter().enumerate() {
-            if offset != 0.0 {
-                for ev in &mut trace.tracks[ti].events {
-                    ev.ts += offset;
-                }
-            }
-        }
-        self.rank_time_offsets.clear();
-        trace.max_ts = trace.tracks.iter()
-            .flat_map(|t| t.events.iter().map(|e| e.ts + e.dur))
-            .fold(0.0f64, f64::max);
-    }
-
-    pub fn align_per_step(&mut self) {
-        let trace = match &mut self.trace {
-            Some(t) => t,
-            None => return,
-        };
-
-        let mut rank_gpu_tracks: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (ti, track) in trace.tracks.iter().enumerate() {
-            if !track.gpu { continue; }
-            if let Some(r) = parse_rank(&track.label) {
-                rank_gpu_tracks.entry(r).or_default().push(ti);
-            }
-        }
-        if rank_gpu_tracks.len() < 2 { return; }
-
-        let mut ranks_sorted: Vec<usize> = rank_gpu_tracks.keys().copied().collect();
-        ranks_sorted.sort();
-
-        let mut exec_times: Vec<Vec<f64>> = Vec::new();
-        for &rank in &ranks_sorted {
-            let tis = &rank_gpu_tracks[&rank];
-            let mut execs: Vec<f64> = Vec::new();
-            for &ti in tis {
-                for ev in &trace.tracks[ti].events {
-                    if trace.names[ev.name as usize].starts_with("execute") {
-                        execs.push(ev.ts);
-                    }
-                }
-            }
-            execs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            exec_times.push(execs);
-        }
-
-        let min_count = exec_times.iter().map(|e| e.len()).min().unwrap_or(0);
-        if min_count == 0 { return; }
-
-        let ref_times: Vec<f64> = (0..min_count).map(|k| exec_times[0][k]).collect();
-
-        let mut rank_segments: Vec<Vec<(f64, f64)>> = Vec::new();
-        for (ri, _rank) in ranks_sorted.iter().enumerate() {
-            let mut segs = Vec::new();
-            for k in 0..min_count {
-                let offset = ref_times[k] - exec_times[ri][k];
-                segs.push((exec_times[ri][k], offset));
-            }
-            rank_segments.push(segs);
-        }
-
-        self.step_align_offsets = vec![Vec::new(); trace.tracks.len()];
-        for (ti, track) in trace.tracks.iter_mut().enumerate() {
-            let rank = match parse_rank(&track.label) {
-                Some(r) => r,
-                None => continue,
-            };
-            let ri = match ranks_sorted.iter().position(|&r| r == rank) {
-                Some(i) => i,
-                None => continue,
-            };
-            let segs = &rank_segments[ri];
-            let mut ev_offsets = Vec::with_capacity(track.events.len());
-            for ev in &mut track.events {
-                let offset = match segs.binary_search_by(|s| s.0.partial_cmp(&ev.ts).unwrap()) {
-                    Ok(i) => segs[i].1,
-                    Err(0) => segs[0].1,
-                    Err(i) if i >= segs.len() => segs[segs.len() - 1].1,
-                    Err(i) => {
-                        let (t0, o0) = segs[i - 1];
-                        let (t1, o1) = segs[i];
-                        let frac = (ev.ts - t0) / (t1 - t0);
-                        o0 + frac * (o1 - o0)
-                    }
-                };
-                ev_offsets.push(offset);
-                ev.ts += offset;
-            }
-            self.step_align_offsets[ti] = ev_offsets;
-        }
-
-        trace.max_ts = trace.tracks.iter()
-            .flat_map(|t| t.events.iter().map(|e| e.ts + e.dur))
-            .fold(0.0f64, f64::max);
-        eprintln!("  step-align: {} steps matched across {} ranks", min_count, ranks_sorted.len());
-    }
-
-    pub fn unalign_per_step(&mut self) {
-        let trace = match &mut self.trace {
-            Some(t) => t,
-            None => return,
-        };
-        for (ti, offsets) in self.step_align_offsets.iter().enumerate() {
-            if offsets.len() != trace.tracks[ti].events.len() { continue; }
-            for (ei, ev) in trace.tracks[ti].events.iter_mut().enumerate() {
-                ev.ts -= offsets[ei];
-            }
-        }
-        self.step_align_offsets.clear();
-        trace.max_ts = trace.tracks.iter()
-            .flat_map(|t| t.events.iter().map(|e| e.ts + e.dur))
-            .fold(0.0f64, f64::max);
-    }
-
-    pub fn detect_stragglers(&mut self) {
-        let t0 = std::time::Instant::now();
-        let trace = match &self.trace {
-            Some(t) => t,
-            None => return,
-        };
-        self.straggler_mask = trace.tracks.iter()
-            .map(|t| vec![false; t.events.len()])
-            .collect();
-
-        let mut rank_tracks: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (ti, track) in trace.tracks.iter().enumerate() {
-            if !track.gpu { continue; }
-            if let Some(rank) = parse_rank(&track.label) {
-                rank_tracks.entry(rank).or_default().push(ti);
-            }
-        }
-        let n_ranks = rank_tracks.len();
-        if n_ranks < 2 { return; }
-
-        let mut ranks_sorted: Vec<usize> = rank_tracks.keys().copied().collect();
-        ranks_sorted.sort();
-
-        // Single pass: group events by (name, rank) → Vec<(ti, ei, dur)> sorted by ts
-        // Key: (event_name, rank_index_in_sorted_order)
-        let mut by_name_rank: HashMap<u32, Vec<Vec<(usize, usize, f64)>>> = HashMap::new();
-        for (ri, &rank) in ranks_sorted.iter().enumerate() {
-            let tis = &rank_tracks[&rank];
-            let mut events: Vec<(u32, usize, usize, f64, f64)> = Vec::new();
-            for &ti in tis {
-                for (ei, ev) in trace.tracks[ti].events.iter().enumerate() {
-                    events.push((ev.name, ti, ei, ev.dur, ev.ts));
-                }
-            }
-            events.sort_by(|a, b| a.4.partial_cmp(&b.4).unwrap());
-            for (name, ti, ei, dur, _ts) in events {
-                let entry = by_name_rank.entry(name).or_insert_with(|| vec![Vec::new(); n_ranks]);
-                entry[ri].push((ti, ei, dur));
-            }
-        }
-
-        let mut n_collectives = 0u32;
-        let mut flagged = 0usize;
-        for (_name, rank_seqs) in &by_name_rank {
-            if rank_seqs.iter().any(|s| s.is_empty()) { continue; }
-            let min_len = rank_seqs.iter().map(|s| s.len()).min().unwrap();
-            n_collectives += 1;
-
-            for k in 0..min_len {
-                let mut durs: Vec<f64> = rank_seqs.iter().map(|s| s[k].2).collect();
-                durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-                let n = durs.len();
-                let median = if n % 2 == 1 { durs[n / 2] } else { (durs[n / 2 - 1] + durs[n / 2]) / 2.0 };
-                let threshold = median * 2.0;
-
-                for seq in rank_seqs {
-                    let (ti, ei, dur) = seq[k];
-                    if dur > threshold {
-                        self.straggler_mask[ti][ei] = true;
-                        flagged += 1;
-                    }
-                }
-            }
-        }
-
-        eprintln!("  stragglers: {:.1}ms, {} flagged across {} collective names, {} ranks",
-            t0.elapsed().as_secs_f64() * 1000.0, flagged, n_collectives, n_ranks);
     }
 
     pub fn apply_label(&mut self, name: &str) {
