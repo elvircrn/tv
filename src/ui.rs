@@ -808,10 +808,8 @@ pub fn draw_timeline(
             .begin()
         {
             let is_collapsed = collapsed.get(orig_ti).copied().unwrap_or(false);
-            let indicator = if track.max_depth <= 1 { " " } else if is_collapsed { ">" } else { "v" };
-
             buf.fmt.clear();
-            write!(buf.fmt, "{indicator}  {}", track.label).ok();
+            write!(buf.fmt, "{}", track.label).ok();
             let _col = ui.push_style_color(StyleColor::Text, [0.67, 0.67, 0.67, 1.0]);
             ui.text_wrapped(&buf.fmt);
         }
