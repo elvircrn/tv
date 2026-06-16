@@ -1403,7 +1403,7 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
                 let mut total_events = 0usize;
                 let mut local_dur: HashMap<u32, Vec<f64>> = HashMap::new();
                 for track in &mut trace.tracks {
-                    track.label = format!("[rank {}] {}", rank, track.label);
+                    track.label = format!("  Rank {} {}", rank, track.label);
                     track.raw_buf_idx = raw_buf_idx;
                     for ev in &mut track.events {
                         ev.ts += time_offset;

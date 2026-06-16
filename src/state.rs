@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
 pub(crate) fn parse_rank(label: &str) -> Option<usize> {
-    if label.starts_with("[rank ") {
-        label[6..].find(']').and_then(|p| label[6..6 + p].parse().ok())
+    let l = label.trim_start();
+    if l.starts_with("Rank ") {
+        l[5..].split_once(' ').and_then(|(n, _)| n.parse().ok())
     } else {
         None
     }

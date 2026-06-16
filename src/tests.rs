@@ -1283,12 +1283,12 @@ fn test_diff_both_sides_match_added_dur_fields() {
 
 #[test]
 fn test_parse_rank() {
-    assert_eq!(parse_rank("[rank 0] GPU 0"), Some(0));
-    assert_eq!(parse_rank("[rank 12] CPU"), Some(12));
-    assert_eq!(parse_rank("[rank 99]"), Some(99));
+    assert_eq!(parse_rank("Rank 0 GPU 0"), Some(0));
+    assert_eq!(parse_rank("Rank 12 CPU"), Some(12));
+    assert_eq!(parse_rank("Rank 99 Stream"), Some(99));
     assert_eq!(parse_rank("GPU 0"), None);
     assert_eq!(parse_rank(""), None);
-    assert_eq!(parse_rank("[rank abc]"), None);
+    assert_eq!(parse_rank("Rank abc GPU"), None);
 }
 
 // --- detect_rank_groups ---
@@ -1373,8 +1373,8 @@ fn test_merge_traces() {
     let merged = merge_traces(vec![(0, t0), (1, t1)]);
 
     assert_eq!(merged.tracks.len(), 2);
-    assert!(merged.tracks[0].label.contains("[rank 0]"));
-    assert!(merged.tracks[1].label.contains("[rank 1]"));
+    assert!(merged.tracks[0].label.contains("Rank 0"));
+    assert!(merged.tracks[1].label.contains("Rank 1"));
     assert!(merged.names.contains(&"kern_a".to_string()));
     assert!(merged.names.contains(&"kern_b".to_string()));
     let r0_ev = &merged.tracks[0].events[0];

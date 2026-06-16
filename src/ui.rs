@@ -802,7 +802,10 @@ pub fn draw_timeline(
         {
             buf.fmt.clear();
             write!(buf.fmt, "{}", track.label).ok();
-            let _col = ui.push_style_color(StyleColor::Text, [0.67, 0.67, 0.67, 1.0]);
+            let text_h = ui.calc_text_size_with_opts(&buf.fmt, false, label_area_w - 4.0)[1];
+            let pad_y = ((vis_h - text_h) * 0.5).max(0.0);
+            ui.set_cursor_pos([ui.cursor_pos()[0], pad_y]);
+            let _col = ui.push_style_color(StyleColor::Text, [0.82, 0.82, 0.82, 1.0]);
             ui.text_wrapped(&buf.fmt);
         }
         drop(_pad);
