@@ -538,14 +538,21 @@ impl App {
                         let max_ts = pane.trace.as_ref().unwrap().max_ts;
                         {
                             let win_size = ui.window_size();
-                            ui.set_cursor_pos([win_size[0] - 22.0, ui.cursor_pos()[1]]);
-                            state.buf.fmt.clear();
-                            write!(state.buf.fmt, "x##close{}", pi).unwrap();
-                            if ui.small_button(&state.buf.fmt) {
-                                close_pane = Some(pi);
-                            }
+                            let text_w = ui.calc_text_size("\u{00d7}")[0];
+                            let close_x = win_size[0] - text_w - ui.clone_style().window_padding[0];
+                            let cur_y = ui.cursor_pos()[1];
+                            ui.set_cursor_pos([close_x, cur_y]);
+                            ui.invisible_button("##close", [text_w, TOOLBAR_ROW]);
+                            let hovered = ui.is_item_hovered();
+                            if ui.is_item_clicked() { close_pane = Some(pi); }
+                            ui.set_cursor_pos([close_x, cur_y]);
+                            let _c = ui.push_style_color(StyleColor::Text,
+                                if hovered { [1.0, 0.4, 0.4, 1.0] } else { [0.45, 0.45, 0.45, 1.0] });
+                            ui.text("\u{00d7}");
                             ui.same_line_with_pos(ui.cursor_start_pos()[0]);
                         }
+
+                        // Search
                         if pane.search_focus {
                             ui.set_keyboard_focus_here();
                             pane.search_focus = false;
@@ -579,29 +586,31 @@ impl App {
                         }
                         let search_active = pane.search_mask.iter().any(|&m| m);
                         if search_active {
-                            ui.same_line();
+                            ui.same_line_with_spacing(0.0, 6.0);
                             state.buf.fmt.clear();
                             write!(state.buf.fmt, "{} matches", pane.search_nav.len()).unwrap();
                             ui.text_colored([0.6, 0.8, 1.0, 1.0], &state.buf.fmt);
                         }
                         let n_hidden = pane.hidden_names.iter().filter(|&&h| h).count();
                         if n_hidden > 0 {
-                            ui.same_line_with_spacing(0.0, 16.0);
+                            ui.same_line_with_spacing(0.0, 10.0);
                             state.buf.fmt.clear();
                             write!(state.buf.fmt, "{} hidden", n_hidden).unwrap();
                             ui.text_colored([1.0, 0.7, 0.3, 1.0], &state.buf.fmt);
-                            ui.same_line();
+                            ui.same_line_with_spacing(0.0, 4.0);
                             if ui.small_button("Clear##unhide") {
                                 for h in &mut pane.hidden_names { *h = false; }
                             }
                         }
+
+                        // Controls
                         ui.same_line_with_spacing(0.0, 16.0);
                         ui.checkbox("CPU", &mut pane.show_cpu);
                         if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
-                            ui.same_line();
+                            ui.same_line_with_spacing(0.0, 10.0);
                             ui.checkbox("Watch", &mut pane.auto_reload);
                         }
-                        ui.same_line();
+                        ui.same_line_with_spacing(0.0, 10.0);
                         if ui.button("Fit") {
                             let pad = max_ts * FIT_PAD_FRAC;
                             pane.view.t0 = -pad;
@@ -609,14 +618,14 @@ impl App {
                             pane.view.scroll_y = 0.0;
                         }
                         if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
-                            ui.same_line();
+                            ui.same_line_with_spacing(0.0, 10.0);
                             if ui.button("Diff") {
                                 diff_clicked_against = Some(pi);
                             }
                         }
                         if pi == 0 {
-                            ui.same_line();
-                            let _dim = ui.push_style_color(StyleColor::Text, [0.5, 0.5, 0.5, 1.0]);
+                            ui.same_line_with_spacing(0.0, 10.0);
+                            let _dim = ui.push_style_color(StyleColor::Text, [0.45, 0.45, 0.45, 1.0]);
                             ui.text("?");
                             if ui.is_item_hovered() {
                                 ui.tooltip(|| {
