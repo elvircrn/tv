@@ -1,6 +1,6 @@
 # tv
 
-Native trace viewer for PyTorch/Chrome trace format. macOS only (Metal renderer).
+Vibe-coded native trace viewer for PyTorch/Chrome trace format. macOS only (Metal renderer).
 
 Handles large traces (1M+ events) with GPU-accelerated rendering via imgui + Metal.
 
