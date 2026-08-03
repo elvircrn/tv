@@ -2,6 +2,21 @@ use imgui::ImColor32;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub enum ArgsBuf {
+    Heap(Vec<u8>),
+    Mmap { mmap: memmap2::Mmap, offset: usize, len: usize },
+}
+
+impl std::ops::Deref for ArgsBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            ArgsBuf::Heap(v) => v,
+            ArgsBuf::Mmap { mmap, offset, len } => &mmap[*offset..*offset + *len],
+        }
+    }
+}
+
 pub const RULER_H: f32 = 28.0;
 pub const SUB_LANE_H: f32 = 20.0;
 pub const LABEL_W: f32 = 200.0;
@@ -74,7 +89,7 @@ pub struct Trace {
     pub tracks: Vec<Track>,
     pub names: Vec<String>,
     pub cats: Vec<String>,
-    pub raw_bufs: Vec<Arc<Vec<u8>>>,
+    pub raw_bufs: Vec<Arc<ArgsBuf>>,
     pub stats: Vec<KernelStats>,
     pub max_ts: f64,
     pub min_ts: f64,
@@ -207,4 +222,6 @@ pub struct DrawBuf {
     pub sel_map: HashMap<u32, (u32, f64, Vec<f64>)>,
     pub sel_bars: Vec<(f64, u32)>,
     pub detail_buf: String,
+    pub col_widths: [f32; 7],
+    pub col_widths_total: f32,
 }

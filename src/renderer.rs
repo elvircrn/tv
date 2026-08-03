@@ -122,7 +122,7 @@ impl MetalRenderer {
                     oversample_h: 3,
                     oversample_v: 1,
                     pixel_snap_h: true,
-                    rasterizer_multiply: 1.3,
+                    rasterizer_multiply: 1.5,
                     ..Default::default()
                 }),
             }]);
