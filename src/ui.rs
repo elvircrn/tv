@@ -139,14 +139,30 @@ pub fn draw_stats_table(
     ui.child_window("##statstable")
         .size([avail[0], avail[1]])
         .build(|| {
-            let col_w = STATS_COL_W;
             let swatch_w = 14.0;
-            let name_w = avail[0] - col_w * 6.0 - swatch_w - 16.0;
+            let content_w = avail[0] - swatch_w - 16.0;
+            let cw = &mut buf.col_widths;
+            if cw[0] == 0.0 || (buf.col_widths_total - content_w).abs() > 1.0 {
+                let ratio = if buf.col_widths_total > 0.0 { content_w / buf.col_widths_total } else { 0.0 };
+                if ratio > 0.0 && cw[0] > 0.0 {
+                    for w in cw.iter_mut() { *w *= ratio; }
+                } else {
+                    let col_w = STATS_COL_W;
+                    cw[0] = content_w - col_w * 6.0;
+                    for i in 1..7 { cw[i] = col_w; }
+                }
+                buf.col_widths_total = content_w;
+            }
+            let mut positions = [0.0f32; 7];
+            positions[0] = swatch_w;
+            for i in 1..7 { positions[i] = positions[i - 1] + cw[i - 1]; }
+
             let headers = ["Name", "Count", "Total", "%", "Mean", "Median", "Max"];
-            let positions = [swatch_w, swatch_w + name_w, swatch_w + name_w + col_w, swatch_w + name_w + col_w * 2.0, swatch_w + name_w + col_w * 3.0, swatch_w + name_w + col_w * 4.0, swatch_w + name_w + col_w * 5.0];
+            let header_y = ui.cursor_pos()[1];
+            let row_h_hdr = ui.current_font_size() + ROW_PAD;
             for (ci, &label) in headers.iter().enumerate() {
                 if ci > 0 { ui.same_line_with_pos(positions[ci]); }
-                else { ui.set_cursor_pos([positions[0], ui.cursor_pos()[1]]); }
+                else { ui.set_cursor_pos([positions[0], header_y]); }
                 let arrow = if *sort_col == ci { if *sort_asc { " ^" } else { " v" } } else { "" };
                 let col = if *sort_col == ci { [0.85, 0.85, 0.55, 1.0] } else { [0.55, 0.55, 0.55, 1.0] };
                 buf.fmt.clear();
@@ -157,6 +173,30 @@ pub fn draw_stats_table(
                     else { *sort_col = ci; *sort_asc = ci == 0; }
                 }
             }
+            let grab_w = 8.0;
+            let min_col = 40.0f32;
+            for ci in 1..7 {
+                let x = positions[ci] - grab_w * 0.5;
+                ui.set_cursor_pos([x, header_y]);
+                ui.invisible_button(format!("##colsep{ci}"), [grab_w, row_h_hdr]);
+                if ui.is_item_hovered() {
+                    ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeEW));
+                }
+                if ui.is_item_active() {
+                    let delta = ui.io().mouse_delta[0];
+                    if delta != 0.0 {
+                        let left = (buf.col_widths[ci - 1] + delta).max(min_col);
+                        let right = (buf.col_widths[ci] - delta).max(min_col);
+                        let total_pair = buf.col_widths[ci - 1] + buf.col_widths[ci];
+                        if (left + right - total_pair).abs() < 0.1 {
+                            buf.col_widths[ci - 1] = left;
+                            buf.col_widths[ci] = right;
+                        }
+                    }
+                    ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeEW));
+                }
+            }
+            ui.set_cursor_pos([0.0, header_y + row_h_hdr]);
             ui.separator();
 
             buf.sort_idx.clear();
@@ -193,7 +233,16 @@ pub fn draw_stats_table(
 
             let dl = ui.get_window_draw_list();
             let char_w = ui.calc_text_size("M")[0];
-            let max_name_chars = ((name_w - 8.0) / char_w) as usize;
+            let max_name_chars = ((buf.col_widths[0] - 8.0) / char_w) as usize;
+
+            let line_col = imgui::ImColor32::from_rgba(255, 255, 255, 25);
+            let win_pos = ui.window_pos();
+            let table_top = ui.cursor_screen_pos()[1];
+            let table_bot = table_top + total_rows.min(last.saturating_sub(first)) as f32 * row_h;
+            for ci in 1..positions.len() {
+                let x = win_pos[0] + positions[ci] - 4.0;
+                dl.add_line([x, table_top], [x, table_bot], line_col).build();
+            }
 
             for i in first..last {
                 let si = buf.sort_idx[i];
@@ -204,6 +253,7 @@ pub fn draw_stats_table(
                 let text_color = if i % 2 == 0 { [0.85, 0.85, 0.85, 1.0] } else { [0.75, 0.75, 0.75, 1.0] };
 
                 let cursor = ui.cursor_screen_pos();
+                dl.add_line([cursor[0], cursor[1]], [cursor[0] + avail[0], cursor[1]], line_col).build();
                 let swatch_color = name_color(name);
                 dl.add_rect([cursor[0], cursor[1] + EV_INSET], [cursor[0] + SWATCH_W, cursor[1] + row_h - EV_INSET], swatch_color)
                     .filled(true).rounding(EV_ROUNDING).build();
@@ -638,7 +688,7 @@ pub fn draw_timeline(
             }
         }
 
-        if !trace.flow_pairs.is_empty() {
+        if !trace.flow_pairs.is_empty() && show_cpu {
             if let Some(sel) = selected {
                 let sel_ti = sel.track_idx as usize;
                 let sel_track = &trace.tracks[sel_ti];

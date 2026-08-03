@@ -404,6 +404,70 @@ impl Pane {
         events.into_iter().map(|(_, name, dur)| (name, dur)).collect()
     }
 
+    pub fn copy_selection_text(&self) -> Option<String> {
+        let trace = self.trace.as_ref()?;
+        let mut events: Vec<(f64, &str, f64)> = Vec::new();
+
+        if self.finished_sel.is_some() {
+            let sel = self.finished_sel.unwrap();
+            let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
+            let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
+            let mut cum_y = 0.0f32;
+            for (ti, track) in trace.tracks.iter().enumerate() {
+                if !self.show_cpu && !track.gpu { continue; }
+                let track_h = track_height(
+                    track.max_depth,
+                    self.collapsed.get(ti).copied().unwrap_or(false),
+                    self.track_scales.get(ti).copied().unwrap_or(1.0),
+                );
+                let sub_h = track_h / track.max_depth.max(1) as f32;
+                let track_top = cum_y;
+                cum_y += track_h;
+                let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
+                let end = track.events.partition_point(|e| e.ts <= s1).max(start);
+                let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
+                for ev in &track.events[start..end] {
+                    if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                    let ev_top = track_top + ev.depth as f32 * sub_h;
+                    let ev_bot = ev_top + sub_h;
+                    for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
+                    if ev_bot < y0 || ev_top > y1 { continue; }
+                    if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
+                        ancestor_sel[ev.depth as usize] = true;
+                        if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
+                        events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
+                    }
+                }
+            }
+        } else if let Some(name_id) = self.multi_select_name {
+            for track in &trace.tracks {
+                if !self.show_cpu && !track.gpu { continue; }
+                for ev in &track.events {
+                    if ev.name == name_id {
+                        events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
+                    }
+                }
+            }
+        } else if let Some(sel) = self.selected {
+            let track = &trace.tracks[sel.track_idx as usize];
+            let ev = &track.events[sel.event_idx as usize];
+            events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
+        }
+
+        if events.is_empty() { return None; }
+        events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+        let mut out = String::new();
+        for (_, name, dur) in &events {
+            use crate::ui::write_time;
+            out.push_str(name);
+            out.push_str(" (");
+            write_time(&mut out, *dur);
+            out.push_str(")\n");
+        }
+        Some(out)
+    }
+
     pub fn select_from_search(&mut self, buf: &mut DrawBuf) {
         let trace = match &self.trace {
             Some(t) => t,

@@ -12,7 +12,7 @@ use renderer::MetalRenderer;
 use state::*;
 use ui::*;
 
-use imgui::{Condition, InputTextCallback, InputTextCallbackHandler, StyleColor, StyleVar, TextCallbackData, WindowFlags};
+use imgui::{ClipboardBackend, Condition, InputTextCallback, InputTextCallbackHandler, StyleColor, StyleVar, TextCallbackData, WindowFlags};
 use std::fmt::Write as FmtWrite;
 use std::io::Write as IoWrite;
 use std::time::Instant;
@@ -244,9 +244,14 @@ impl ApplicationHandler for App {
                             self.nav_keys &= !nav_bit;
                         }
                     }
-                    if event.state == ElementState::Pressed && self.mod_ctrl {
+                    if event.state == ElementState::Pressed && (self.mod_ctrl || self.mod_super) {
                         if code == KeyCode::KeyA {
                             self.state.panes[self.state.active].select_all_pending = true;
+                        }
+                        if code == KeyCode::KeyC {
+                            if let Some(text) = self.state.panes[self.state.active].copy_selection_text() {
+                                MacClipboard.set(&text);
+                            }
                         }
                     }
                 }

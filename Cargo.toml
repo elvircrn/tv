@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 imgui = "0.12"
-imgui-sys = "0.12"
+imgui-sys = { version = "0.12", features = ["freetype"] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 metal = "0.33"
 raw-window-metal = "1"

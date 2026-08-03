@@ -559,7 +559,7 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     drop(name_idx);
     drop(cat_idx);
 
-    let raw_buf: Arc<Vec<u8>> = Arc::new(raw.into_vec());
+    let raw_buf: Arc<ArgsBuf> = Arc::new(ArgsBuf::Heap(raw.into_vec()));
 
     if min_ts == f64::MAX {
         return Err("no duration events found".into());
@@ -854,153 +854,154 @@ pub fn load_cache(source_path: &str, cache_dir: Option<&str>) -> Option<Trace> {
     let (src_size, src_mtime) = source_meta(source_path)?;
     let file = std::fs::File::open(&cp).ok()?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-    let d = &mmap[..];
-    if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
-    let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
-    let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
-    if r32(4) != CACHE_VERSION { return None; }
-    if r64(8) != src_size || r64(16) != src_mtime { return None; }
-    load_cache_from_mmap(d)
+    if mmap.len() < 80 || &mmap[0..4] != CACHE_MAGIC { return None; }
+    let r32 = |d: &[u8], off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
+    let r64 = |d: &[u8], off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
+    if r32(&mmap, 4) != CACHE_VERSION { return None; }
+    if r64(&mmap, 8) != src_size || r64(&mmap, 16) != src_mtime { return None; }
+    load_cache_from_mmap(mmap)
 }
 
-fn load_cache_from_mmap(d: &[u8]) -> Option<Trace> {
-    if d.len() < 80 { return None; }
+fn load_cache_from_mmap(mmap: memmap2::Mmap) -> Option<Trace> {
+    let (tracks, names, cats, device, stats, flow_pairs, max_ts, min_ts, total_events, args_offset, args_len) = {
+        let d = &mmap[..];
+        if d.len() < 80 { return None; }
 
-    let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
-    let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
-    let rf64 = |off: usize| f64::from_le_bytes(d[off..off + 8].try_into().unwrap());
+        let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
+        let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
+        let rf64 = |off: usize| f64::from_le_bytes(d[off..off + 8].try_into().unwrap());
 
-    let max_ts = rf64(24);
-    let min_ts = rf64(32);
-    let total_events = r64(40) as usize;
-    let n_tracks = r32(48) as usize;
-    let n_names = r32(52) as usize;
-    let n_cats = r32(56) as usize;
-    let n_stats = r32(60) as usize;
-    let _device_len = r32(64) as usize;
-    let args_len = r64(68) as usize;
+        let max_ts = rf64(24);
+        let min_ts = rf64(32);
+        let total_events = r64(40) as usize;
+        let n_tracks = r32(48) as usize;
+        let n_names = r32(52) as usize;
+        let n_cats = r32(56) as usize;
+        let n_stats = r32(60) as usize;
+        let _device_len = r32(64) as usize;
+        let args_len = r64(68) as usize;
 
-    let mut pos = 80usize;
+        let mut pos = 80usize;
 
-    let read_strings = |pos: &mut usize, count: usize| -> Option<Vec<String>> {
-        let mut v = Vec::with_capacity(count);
-        for _ in 0..count {
-            if *pos + 4 > d.len() { return None; }
-            let len = u32::from_le_bytes(d[*pos..*pos + 4].try_into().unwrap()) as usize;
-            *pos += 4;
-            if *pos + len > d.len() { return None; }
-            v.push(String::from_utf8_lossy(&d[*pos..*pos + len]).into_owned());
-            *pos += len;
+        let read_strings = |pos: &mut usize, count: usize| -> Option<Vec<String>> {
+            let mut v = Vec::with_capacity(count);
+            for _ in 0..count {
+                if *pos + 4 > d.len() { return None; }
+                let len = u32::from_le_bytes(d[*pos..*pos + 4].try_into().unwrap()) as usize;
+                *pos += 4;
+                if *pos + len > d.len() { return None; }
+                v.push(String::from_utf8_lossy(&d[*pos..*pos + len]).into_owned());
+                *pos += len;
+            }
+            Some(v)
+        };
+
+        let names = read_strings(&mut pos, n_names)?;
+        let cats = read_strings(&mut pos, n_cats)?;
+
+        if pos + 4 > d.len() { return None; }
+        let dev_len = u32::from_le_bytes(d[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + dev_len > d.len() { return None; }
+        let device = String::from_utf8_lossy(&d[pos..pos + dev_len]).into_owned();
+        pos += dev_len;
+
+        struct TrackHdr { label: String, gpu: bool, max_depth: u16, event_count: usize }
+        let mut track_hdrs: Vec<TrackHdr> = Vec::with_capacity(n_tracks);
+        let mut total_check: usize = 0;
+        for _ in 0..n_tracks {
+            if pos + 13 > d.len() { return None; }
+            let label_len = u16::from_le_bytes(d[pos..pos + 2].try_into().unwrap()) as usize;
+            let gpu = d[pos + 2] != 0;
+            let max_depth = u16::from_le_bytes(d[pos + 3..pos + 5].try_into().unwrap());
+            let event_count = u64::from_le_bytes(d[pos + 5..pos + 13].try_into().unwrap()) as usize;
+            pos += 13;
+            if pos + label_len > d.len() { return None; }
+            let label = String::from_utf8_lossy(&d[pos..pos + label_len]).into_owned();
+            pos += label_len;
+            total_check += event_count;
+            track_hdrs.push(TrackHdr { label, gpu, max_depth, event_count });
         }
-        Some(v)
-    };
+        if total_check != total_events { return None; }
 
-    let names = read_strings(&mut pos, n_names)?;
-    let cats = read_strings(&mut pos, n_cats)?;
+        if pos % 8 != 0 { pos += 8 - pos % 8; }
 
-    if pos + 4 > d.len() { return None; }
-    let dev_len = u32::from_le_bytes(d[pos..pos + 4].try_into().unwrap()) as usize;
-    pos += 4;
-    if pos + dev_len > d.len() { return None; }
-    let device = String::from_utf8_lossy(&d[pos..pos + dev_len]).into_owned();
-    pos += dev_len;
+        let ev_size = std::mem::size_of::<Event>();
+        let events_bytes = total_events * ev_size;
+        if pos + events_bytes > d.len() { return None; }
+        let all_events: &[Event] = unsafe {
+            std::slice::from_raw_parts(d[pos..].as_ptr() as *const Event, total_events)
+        };
+        pos += events_bytes;
 
-    struct TrackHdr { label: String, gpu: bool, max_depth: u16, event_count: usize }
-    let mut track_hdrs: Vec<TrackHdr> = Vec::with_capacity(n_tracks);
-    let mut total_check: usize = 0;
-    for _ in 0..n_tracks {
-        if pos + 13 > d.len() { return None; }
-        let label_len = u16::from_le_bytes(d[pos..pos + 2].try_into().unwrap()) as usize;
-        let gpu = d[pos + 2] != 0;
-        let max_depth = u16::from_le_bytes(d[pos + 3..pos + 5].try_into().unwrap());
-        let event_count = u64::from_le_bytes(d[pos + 5..pos + 13].try_into().unwrap()) as usize;
-        pos += 13;
-        if pos + label_len > d.len() { return None; }
-        let label = String::from_utf8_lossy(&d[pos..pos + label_len]).into_owned();
-        pos += label_len;
-        total_check += event_count;
-        track_hdrs.push(TrackHdr { label, gpu, max_depth, event_count });
-    }
-    if total_check != total_events { return None; }
+        let pmd_bytes = total_events * 8;
+        if pos + pmd_bytes > d.len() { return None; }
+        let all_pmd: &[f64] = unsafe {
+            std::slice::from_raw_parts(d[pos..].as_ptr() as *const f64, total_events)
+        };
+        pos += pmd_bytes;
 
-    if pos % 8 != 0 { pos += 8 - pos % 8; }
+        let stats_size = std::mem::size_of::<KernelStats>();
+        let stats_bytes = n_stats * stats_size;
+        if pos + stats_bytes > d.len() { return None; }
+        let stats: Vec<KernelStats> = unsafe {
+            std::slice::from_raw_parts(d[pos..].as_ptr() as *const KernelStats, n_stats)
+        }.to_vec();
+        pos += stats_bytes;
 
-    let ev_size = std::mem::size_of::<Event>();
-    let events_bytes = total_events * ev_size;
-    if pos + events_bytes > d.len() { return None; }
-    let all_events: &[Event] = unsafe {
-        std::slice::from_raw_parts(d[pos..].as_ptr() as *const Event, total_events)
-    };
-    pos += events_bytes;
+        if pos + args_len > d.len() { return None; }
+        let args_offset = pos;
+        let after_args = pos + args_len;
 
-    let pmd_bytes = total_events * 8;
-    if pos + pmd_bytes > d.len() { return None; }
-    let all_pmd: &[f64] = unsafe {
-        std::slice::from_raw_parts(d[pos..].as_ptr() as *const f64, total_events)
-    };
-    pos += pmd_bytes;
+        let mut offsets = Vec::with_capacity(n_tracks);
+        let mut ev_off = 0usize;
+        for hdr in &track_hdrs {
+            offsets.push(ev_off);
+            ev_off += hdr.event_count;
+        }
 
-    let stats_size = std::mem::size_of::<KernelStats>();
-    let stats_bytes = n_stats * stats_size;
-    if pos + stats_bytes > d.len() { return None; }
-    let stats: Vec<KernelStats> = unsafe {
-        std::slice::from_raw_parts(d[pos..].as_ptr() as *const KernelStats, n_stats)
-    }.to_vec();
-    pos += stats_bytes;
+        let tracks = std::thread::scope(|s| {
+            let track_handles: Vec<_> = track_hdrs.into_iter().zip(offsets).map(|(hdr, off)| {
+                s.spawn(move || {
+                    let n = hdr.event_count;
+                    Track {
+                        label: hdr.label,
+                        gpu: hdr.gpu,
+                        events: all_events[off..off + n].to_vec(),
+                        max_depth: hdr.max_depth,
+                        prefix_max_dur: all_pmd[off..off + n].to_vec(),
+                        raw_buf_idx: 0,
+                    }
+                })
+            }).collect();
+            track_handles.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<Track>>()
+        });
 
-    if pos + args_len > d.len() { return None; }
-    let args_slice = &d[pos..pos + args_len];
-    let after_args = pos + args_len;
-
-    let mut offsets = Vec::with_capacity(n_tracks);
-    let mut ev_off = 0usize;
-    for hdr in &track_hdrs {
-        offsets.push(ev_off);
-        ev_off += hdr.event_count;
-    }
-
-    let (tracks, args) = std::thread::scope(|s| {
-        let args_handle = s.spawn(|| args_slice.to_vec());
-        let track_handles: Vec<_> = track_hdrs.into_iter().zip(offsets).map(|(hdr, off)| {
-            s.spawn(move || {
-                let n = hdr.event_count;
-                Track {
-                    label: hdr.label,
-                    gpu: hdr.gpu,
-                    events: all_events[off..off + n].to_vec(),
-                    max_depth: hdr.max_depth,
-                    prefix_max_dur: all_pmd[off..off + n].to_vec(),
-                    raw_buf_idx: 0,
+        let fp_size = std::mem::size_of::<FlowPair>();
+        let mut flow_pairs = Vec::new();
+        let mut fpos = after_args;
+        if fpos + 4 <= d.len() {
+            let n_flows = u32::from_le_bytes(d[fpos..fpos + 4].try_into().unwrap()) as usize;
+            fpos += 4;
+            if fpos + n_flows * fp_size <= d.len() {
+                flow_pairs.reserve(n_flows);
+                for i in 0..n_flows {
+                    let off = fpos + i * fp_size;
+                    let src_track = u32::from_le_bytes(d[off..off+4].try_into().unwrap());
+                    let dst_track = u32::from_le_bytes(d[off+4..off+8].try_into().unwrap());
+                    let src_ts = f64::from_le_bytes(d[off+8..off+16].try_into().unwrap());
+                    let dst_ts = f64::from_le_bytes(d[off+16..off+24].try_into().unwrap());
+                    flow_pairs.push(FlowPair { src_track, dst_track, src_ts, dst_ts });
                 }
-            })
-        }).collect();
-        let tracks: Vec<Track> = track_handles.into_iter().filter_map(|h| h.join().ok()).collect();
-        let args = args_handle.join().unwrap_or_default();
-        (tracks, args)
-    });
-
-    let fp_size = std::mem::size_of::<FlowPair>();
-    let mut flow_pairs = Vec::new();
-    let mut fpos = after_args;
-    if fpos + 4 <= d.len() {
-        let n_flows = u32::from_le_bytes(d[fpos..fpos + 4].try_into().unwrap()) as usize;
-        fpos += 4;
-        if fpos + n_flows * fp_size <= d.len() {
-            flow_pairs.reserve(n_flows);
-            for i in 0..n_flows {
-                let off = fpos + i * fp_size;
-                let src_track = u32::from_le_bytes(d[off..off+4].try_into().unwrap());
-                let dst_track = u32::from_le_bytes(d[off+4..off+8].try_into().unwrap());
-                let src_ts = f64::from_le_bytes(d[off+8..off+16].try_into().unwrap());
-                let dst_ts = f64::from_le_bytes(d[off+16..off+24].try_into().unwrap());
-                flow_pairs.push(FlowPair { src_track, dst_track, src_ts, dst_ts });
             }
         }
-    }
+
+        (tracks, names, cats, device, stats, flow_pairs, max_ts, min_ts, total_events, args_offset, args_len)
+    };
 
     Some(Trace {
         tracks, names, cats,
-        raw_bufs: vec![Arc::new(args)],
+        raw_bufs: vec![Arc::new(ArgsBuf::Mmap { mmap, offset: args_offset, len: args_len })],
         stats, max_ts, min_ts, total_events, device, flow_pairs,
     })
 }
@@ -1008,13 +1009,9 @@ fn load_cache_from_mmap(d: &[u8]) -> Option<Trace> {
 fn load_cache_direct(cache_path: &str) -> Option<Trace> {
     let file = std::fs::File::open(cache_path).ok()?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-    let d = &mmap[..];
-    if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
-    let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
-    let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
-    if r32(4) != CACHE_VERSION { return None; }
-    // Skip source validation (bytes 8..24) — we're loading the cache directly
-    load_cache_from_mmap(d)
+    if mmap.len() < 80 || &mmap[0..4] != CACHE_MAGIC { return None; }
+    if u32::from_le_bytes(mmap[4..8].try_into().unwrap()) != CACHE_VERSION { return None; }
+    load_cache_from_mmap(mmap)
 }
 
 fn merged_cache_hash(cache_dir: &str) -> u64 {
@@ -1144,15 +1141,12 @@ fn load_merged_cache(cache_dir: &str) -> Option<Trace> {
     let cp = format!("{cache_dir}/_merged.tvcache");
     let file = std::fs::File::open(&cp).ok()?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-    let d = &mmap[..];
-    if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
-    let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
-    let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
-    if r32(4) != CACHE_VERSION { return None; }
-    let stored_hash = r64(8);
+    if mmap.len() < 80 || &mmap[0..4] != CACHE_MAGIC { return None; }
+    if u32::from_le_bytes(mmap[4..8].try_into().unwrap()) != CACHE_VERSION { return None; }
+    let stored_hash = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
     let current_hash = merged_cache_hash(cache_dir);
     if stored_hash != current_hash { return None; }
-    load_cache_from_mmap(d)
+    load_cache_from_mmap(mmap)
 }
 
 fn decompress_parse(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, t0: &Instant) -> Result<(RawData, Vec<ChunkState>, usize), String> {
@@ -1380,7 +1374,7 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     let mut device = String::new();
 
     let mut remap_info: Vec<(Vec<u32>, Vec<u32>, f64)> = Vec::with_capacity(traces.len());
-    let mut all_raw_bufs: Vec<Arc<Vec<u8>>> = Vec::new();
+    let mut all_raw_bufs: Vec<Arc<ArgsBuf>> = Vec::new();
 
     for (_, trace) in &traces {
         let time_offset = trace.min_ts - global_min;
@@ -1557,7 +1551,7 @@ fn compact_args(trace: &mut Trace) {
         track.raw_buf_idx = 0;
     }
     compact.shrink_to_fit();
-    trace.raw_bufs = vec![Arc::new(compact)];
+    trace.raw_bufs = vec![Arc::new(ArgsBuf::Heap(compact))];
 }
 
 fn read_gz_tolerant<R: std::io::Read>(reader: R) -> Result<Vec<u8>, String> {
