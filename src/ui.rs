@@ -379,6 +379,7 @@ pub fn draw_timeline(
     track_scales: &mut Vec<f32>,
     track_order: &mut Vec<usize>,
     drag: &mut DragKind,
+    merge_gpu: bool,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let dl = ui.get_window_draw_list();
     let tl_left = rect[0] + label_w;
@@ -403,9 +404,59 @@ pub fn draw_timeline(
     buf.visible.clear();
     buf.heights.clear();
     buf.y_offsets.clear();
+    buf.merged_gpu_tracks.clear();
+    buf.merged_gpu_vi = None;
+    buf.merged_gpu_events.clear();
+    buf.merged_gpu_max_depth = 0;
     let mut cumulative = 0.0f32;
+    if merge_gpu {
+        for &i in track_order.iter() {
+            if trace.tracks[i].gpu {
+                buf.merged_gpu_tracks.push(i);
+            }
+        }
+        if !buf.merged_gpu_tracks.is_empty() {
+            // Collect visible events from all GPU tracks, sort by time, assign depths (Tetris packing)
+            let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
+            for &ti in &buf.merged_gpu_tracks {
+                let t = &trace.tracks[ti];
+                let start = bisect_overlap(&t.events, &t.prefix_max_dur, view.t0);
+                let end = t.events.partition_point(|e| e.ts <= view.t1);
+                for ei in start..end {
+                    let ev = &t.events[ei];
+                    if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                    let has_child = t.events[ei + 1..].iter()
+                        .take_while(|e2| e2.ts <= ev.ts + ev.dur)
+                        .any(|e2| e2.depth > ev.depth);
+                    if has_child { continue; }
+                    ev_list.push((ev.ts, ev.dur, ti as u32, ei as u32));
+                }
+            }
+            ev_list.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let mut depth_ends: Vec<f64> = Vec::new();
+            let mut max_depth: u16 = 0;
+            for &(ts, dur, ti, ei) in &ev_list {
+                let d = depth_ends.iter().position(|&end| end <= ts)
+                    .unwrap_or_else(|| { depth_ends.push(0.0); depth_ends.len() - 1 });
+                depth_ends[d] = ts + dur;
+                let d16 = d as u16;
+                if d16 >= max_depth { max_depth = d16 + 1; }
+                buf.merged_gpu_events.push((ti, ei, d16));
+            }
+            buf.merged_gpu_max_depth = max_depth.max(1);
+            let first = buf.merged_gpu_tracks[0];
+            let scale = track_scales.get(first).copied().unwrap_or(1.0);
+            let h = buf.merged_gpu_max_depth as f32 * SUB_LANE_H * scale;
+            buf.merged_gpu_vi = Some(buf.visible.len());
+            buf.visible.push(first);
+            buf.heights.push(h);
+            buf.y_offsets.push(cumulative);
+            cumulative += h;
+        }
+    }
     for &i in track_order.iter() {
         let t = &trace.tracks[i];
+        if merge_gpu && t.gpu { continue; }
         if !show_cpu && !t.gpu { continue; }
         buf.visible.push(i);
         let h = track_height(
@@ -580,110 +631,209 @@ pub fn draw_timeline(
         }
 
         for vi in 0..buf.visible.len() {
-            let orig_ti = buf.visible[vi];
-            let track = &trace.tracks[orig_ti];
             let track_h = buf.heights[vi];
-            let is_collapsed = collapsed.get(orig_ti).copied().unwrap_or(false);
             let y = tracks_top + buf.y_offsets[vi] - view.scroll_y;
             if y + track_h < tracks_top || y > rect[3] { continue; }
 
             let bg = if vi % 2 == 0 { col32(28, 28, 28, 255) } else { col32(32, 32, 32, 255) };
             dl.add_rect([rect[0], y], [rect[2], y + track_h], bg).filled(true).build();
 
-            let sub_h = track_h / track.max_depth.max(1) as f32;
-            let lane_h = sub_h - LANE_GAP;
-            let start = bisect_overlap(&track.events, &track.prefix_max_dur, view.t0);
-            let end = track.events.partition_point(|e| e.ts <= view.t1);
+            let is_merged = buf.merged_gpu_vi == Some(vi);
 
-            buf.last_px.clear();
-            buf.last_px.resize(track.max_depth as usize, -1i32);
+            if is_merged {
+                let total_depth = buf.merged_gpu_max_depth;
+                let sub_h = track_h / total_depth as f32;
+                let lane_h = sub_h - LANE_GAP;
+                buf.last_px.clear();
+                buf.last_px.resize(total_depth as usize, -1i32);
 
-            for ei in start..end {
-                let ev = &track.events[ei];
-                if is_collapsed && ev.depth > 0 { continue; }
-                if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                let x0 = t2x(ev.ts, view.t0, px_per_us, tl_left).max(tl_left);
-                let x1 = t2x(ev.ts + ev.dur, view.t0, px_per_us, tl_left).min(rect[2]);
-                let w = x1 - x0;
+                for &(ti32, ei32, eff_depth) in &buf.merged_gpu_events {
+                    let orig_ti = ti32 as usize;
+                    let ei = ei32 as usize;
+                    let ev = &trace.tracks[orig_ti].events[ei];
+                    let x0 = t2x(ev.ts, view.t0, px_per_us, tl_left).max(tl_left);
+                    let x1 = t2x(ev.ts + ev.dur, view.t0, px_per_us, tl_left).min(rect[2]);
+                    let w = x1 - x0;
 
-                let matches = !filtering
-                    || (searching && (ev.name as usize) < search_mask.len() && search_mask[ev.name as usize])
-                    || (has_sel_mask && sel_mask.get(ev.name as usize).copied().unwrap_or(false));
+                    let matches = !filtering
+                        || (searching && (ev.name as usize) < search_mask.len() && search_mask[ev.name as usize])
+                        || (has_sel_mask && sel_mask.get(ev.name as usize).copied().unwrap_or(false));
 
-                if w < MIN_EV_PX {
-                    let px = x0 as i32;
-                    if px == buf.last_px[ev.depth as usize] { continue; }
-                    buf.last_px[ev.depth as usize] = px;
-                    let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
+                    if w < MIN_EV_PX {
+                        let px = x0 as i32;
+                        if px == buf.last_px[eff_depth as usize] { continue; }
+                        buf.last_px[eff_depth as usize] = px;
+                        let ev_y = y + eff_depth as f32 * sub_h + EV_INSET;
+                        let color = if matches {
+                            event_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
+                        } else {
+                            event_dim_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
+                        };
+                        dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + lane_h], color).filled(true).build();
+                        continue;
+                    }
+
+                    let ev_y = y + eff_depth as f32 * sub_h + EV_INSET;
+                    let name = &trace.names[ev.name as usize];
                     let color = if matches {
-                        event_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
+                        event_color(orig_ti, ei, name, event_labels, labels)
                     } else {
-                        event_dim_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
+                        event_dim_color(orig_ti, ei, name, event_labels, labels)
                     };
-                    dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + lane_h], color).filled(true).build();
-                    continue;
-                }
+                    let ev_rect = [x0, ev_y, x1, ev_y + lane_h];
 
-                let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
-                let name = &trace.names[ev.name as usize];
-                let color = if matches {
-                    event_color(orig_ti, ei, name, event_labels, labels)
-                } else {
-                    event_dim_color(orig_ti, ei, name, event_labels, labels)
-                };
-                let ev_rect = [x0, ev_y, x1, ev_y + lane_h];
+                    let is_hovered = hover_in_timeline
+                        && mouse_pos[0] >= ev_rect[0] && mouse_pos[0] <= ev_rect[2]
+                        && mouse_pos[1] >= ev_rect[1] && mouse_pos[1] <= ev_rect[3];
 
-                let is_hovered = hover_in_timeline
-                    && mouse_pos[0] >= ev_rect[0] && mouse_pos[0] <= ev_rect[2]
-                    && mouse_pos[1] >= ev_rect[1] && mouse_pos[1] <= ev_rect[3];
-
-                let is_primary = selected.map_or(false, |s| s.track_idx == orig_ti as u32 && s.event_idx == ei as u32);
-                let is_multi = multi_select_name.map_or(false, |n| ev.name == n);
-                let is_selected = sel_bounds.map_or(false, |(sa, sb, ya, yb)| {
-                    let ev_track_y = buf.y_offsets[vi] + ev.depth as f32 * sub_h;
-                    let ev_bot = ev_track_y + sub_h;
-                    ev.ts + ev.dur >= sa && ev.ts <= sb && ev_bot >= ya && ev_track_y <= yb
-                });
-                let is_sel_mask = !sel_mask.is_empty() && sel_mask.get(ev.name as usize).copied().unwrap_or(false);
-
-                let fill = if is_hovered { brighten(color, 30) } else if is_selected || is_sel_mask { brighten(color, 20) } else { color };
-                dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], fill)
-                    .filled(true).rounding(EV_ROUNDING).build();
-
-                if is_primary {
-                    dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 220, 50, 255))
-                        .rounding(EV_ROUNDING).build();
-                } else if is_hovered {
-                    dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 255, 255, 255))
-                        .rounding(EV_ROUNDING).build();
-                } else if is_selected || is_sel_mask {
-                    dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
-                        .rounding(EV_ROUNDING).build();
-                } else if is_multi {
-                    dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 220, 50, 140))
-                        .rounding(EV_ROUNDING).build();
-                } else if searching && matches {
-                    dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
-                        .rounding(EV_ROUNDING).build();
-                }
-
-                if is_hovered {
-                    let r = EventRef { track_idx: orig_ti as u32, event_idx: ei as u32 };
-                    let prefer = hover_result.map_or(true, |prev| {
-                        let prev_ev = &trace.tracks[prev.track_idx as usize].events[prev.event_idx as usize];
-                        ev.depth > prev_ev.depth || (ev.depth == prev_ev.depth && ev.dur < prev_ev.dur)
+                    let is_primary = selected.map_or(false, |s| s.track_idx == ti32 && s.event_idx == ei32);
+                    let is_multi = multi_select_name.map_or(false, |n| ev.name == n);
+                    let is_selected = sel_bounds.map_or(false, |(sa, sb, ya, yb)| {
+                        let ev_track_y = buf.y_offsets[vi] + eff_depth as f32 * sub_h;
+                        let ev_bot = ev_track_y + sub_h;
+                        ev.ts + ev.dur >= sa && ev.ts <= sb && ev_bot >= ya && ev_track_y <= yb
                     });
-                    if prefer {
-                        if clicked && !shift { click_result = Some(r); }
-                        hover_result = Some(r);
+                    let is_sel_mask = !sel_mask.is_empty() && sel_mask.get(ev.name as usize).copied().unwrap_or(false);
+
+                    let fill = if is_hovered { brighten(color, 30) } else if is_selected || is_sel_mask { brighten(color, 20) } else { color };
+                    dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], fill)
+                        .filled(true).rounding(EV_ROUNDING).build();
+
+                    if is_primary {
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 220, 50, 255))
+                            .rounding(EV_ROUNDING).build();
+                    } else if is_hovered {
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 255, 255, 255))
+                            .rounding(EV_ROUNDING).build();
+                    } else if is_selected || is_sel_mask {
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
+                            .rounding(EV_ROUNDING).build();
+                    } else if is_multi {
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 220, 50, 140))
+                            .rounding(EV_ROUNDING).build();
+                    } else if searching && matches {
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
+                            .rounding(EV_ROUNDING).build();
+                    }
+
+                    if is_hovered {
+                        let r = EventRef { track_idx: ti32, event_idx: ei32 };
+                        let prefer = hover_result.map_or(true, |prev| {
+                            let prev_ev = &trace.tracks[prev.track_idx as usize].events[prev.event_idx as usize];
+                            ev.depth > prev_ev.depth || (ev.depth == prev_ev.depth && ev.dur < prev_ev.dur)
+                        });
+                        if prefer {
+                            if clicked && !shift { click_result = Some(r); }
+                            hover_result = Some(r);
+                        }
+                    }
+
+                    if w > TEXT_MIN_PX {
+                        let tx = ev_rect[0] + 3.0;
+                        let ty = ev_rect[1] + 2.0;
+                        let text_col = if matches { col32(240, 240, 240, 255) } else { col32(120, 120, 120, 255) };
+                        draw_text_wrapped(text_col, name, [tx, ty], w - 6.0, ev_rect);
                     }
                 }
+            } else {
+                let orig_ti = buf.visible[vi];
+                let track = &trace.tracks[orig_ti];
+                let is_collapsed = collapsed.get(orig_ti).copied().unwrap_or(false);
+                let sub_h = track_h / track.max_depth.max(1) as f32;
+                let lane_h = sub_h - LANE_GAP;
+                let start = bisect_overlap(&track.events, &track.prefix_max_dur, view.t0);
+                let end = track.events.partition_point(|e| e.ts <= view.t1);
 
-                if w > TEXT_MIN_PX {
-                    let tx = ev_rect[0] + 3.0;
-                    let ty = ev_rect[1] + 2.0;
-                    let text_col = if matches { col32(240, 240, 240, 255) } else { col32(120, 120, 120, 255) };
-                    draw_text_wrapped(text_col, name, [tx, ty], w - 6.0, ev_rect);
+                buf.last_px.clear();
+                buf.last_px.resize(track.max_depth as usize, -1i32);
+
+                for ei in start..end {
+                    let ev = &track.events[ei];
+                    if is_collapsed && ev.depth > 0 { continue; }
+                    if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                    let x0 = t2x(ev.ts, view.t0, px_per_us, tl_left).max(tl_left);
+                    let x1 = t2x(ev.ts + ev.dur, view.t0, px_per_us, tl_left).min(rect[2]);
+                    let w = x1 - x0;
+
+                    let matches = !filtering
+                        || (searching && (ev.name as usize) < search_mask.len() && search_mask[ev.name as usize])
+                        || (has_sel_mask && sel_mask.get(ev.name as usize).copied().unwrap_or(false));
+
+                    if w < MIN_EV_PX {
+                        let px = x0 as i32;
+                        if px == buf.last_px[ev.depth as usize] { continue; }
+                        buf.last_px[ev.depth as usize] = px;
+                        let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
+                        let color = if matches {
+                            event_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
+                        } else {
+                            event_dim_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
+                        };
+                        dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + lane_h], color).filled(true).build();
+                        continue;
+                    }
+
+                    let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
+                    let name = &trace.names[ev.name as usize];
+                    let color = if matches {
+                        event_color(orig_ti, ei, name, event_labels, labels)
+                    } else {
+                        event_dim_color(orig_ti, ei, name, event_labels, labels)
+                    };
+                    let ev_rect = [x0, ev_y, x1, ev_y + lane_h];
+
+                    let is_hovered = hover_in_timeline
+                        && mouse_pos[0] >= ev_rect[0] && mouse_pos[0] <= ev_rect[2]
+                        && mouse_pos[1] >= ev_rect[1] && mouse_pos[1] <= ev_rect[3];
+
+                    let is_primary = selected.map_or(false, |s| s.track_idx == orig_ti as u32 && s.event_idx == ei as u32);
+                    let is_multi = multi_select_name.map_or(false, |n| ev.name == n);
+                    let is_selected = sel_bounds.map_or(false, |(sa, sb, ya, yb)| {
+                        let ev_track_y = buf.y_offsets[vi] + ev.depth as f32 * sub_h;
+                        let ev_bot = ev_track_y + sub_h;
+                        ev.ts + ev.dur >= sa && ev.ts <= sb && ev_bot >= ya && ev_track_y <= yb
+                    });
+                    let is_sel_mask = !sel_mask.is_empty() && sel_mask.get(ev.name as usize).copied().unwrap_or(false);
+
+                    let fill = if is_hovered { brighten(color, 30) } else if is_selected || is_sel_mask { brighten(color, 20) } else { color };
+                    dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], fill)
+                        .filled(true).rounding(EV_ROUNDING).build();
+
+                    if is_primary {
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 220, 50, 255))
+                            .rounding(EV_ROUNDING).build();
+                    } else if is_hovered {
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 255, 255, 255))
+                            .rounding(EV_ROUNDING).build();
+                    } else if is_selected || is_sel_mask {
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
+                            .rounding(EV_ROUNDING).build();
+                    } else if is_multi {
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 220, 50, 140))
+                            .rounding(EV_ROUNDING).build();
+                    } else if searching && matches {
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
+                            .rounding(EV_ROUNDING).build();
+                    }
+
+                    if is_hovered {
+                        let r = EventRef { track_idx: orig_ti as u32, event_idx: ei as u32 };
+                        let prefer = hover_result.map_or(true, |prev| {
+                            let prev_ev = &trace.tracks[prev.track_idx as usize].events[prev.event_idx as usize];
+                            ev.depth > prev_ev.depth || (ev.depth == prev_ev.depth && ev.dur < prev_ev.dur)
+                        });
+                        if prefer {
+                            if clicked && !shift { click_result = Some(r); }
+                            hover_result = Some(r);
+                        }
+                    }
+
+                    if w > TEXT_MIN_PX {
+                        let tx = ev_rect[0] + 3.0;
+                        let ty = ev_rect[1] + 2.0;
+                        let text_col = if matches { col32(240, 240, 240, 255) } else { col32(120, 120, 120, 255) };
+                        draw_text_wrapped(text_col, name, [tx, ty], w - 6.0, ev_rect);
+                    }
                 }
             }
         }
@@ -727,13 +877,33 @@ pub fn draw_timeline(
                 }
 
                 if flow_start < flow_end {
-                    let sel_vi = buf.visible.iter().position(|&v| v == sel_ti);
-                    if let Some(sel_vi) = sel_vi {
+                    let find_vi_and_depth = |ti: usize, ei: usize, depth: u16| -> Option<(usize, u16)> {
+                        if let Some(vi) = buf.visible.iter().position(|&v| v == ti) {
+                            return Some((vi, depth));
+                        }
+                        if let Some(mvi) = buf.merged_gpu_vi {
+                            if buf.merged_gpu_tracks.contains(&ti) {
+                                let md = buf.merged_gpu_events.iter()
+                                    .find(|&&(t, e, _)| t == ti as u32 && e == ei as u32)
+                                    .map(|&(_, _, d)| d)
+                                    .unwrap_or(0);
+                                return Some((mvi, md));
+                            }
+                        }
+                        None
+                    };
+                    let sel_loc = find_vi_and_depth(sel_ti, sel.event_idx as usize, sel_ev.depth);
+                    if let Some((sel_vi, sel_eff_depth)) = sel_loc {
                         let sel_gpu = sel_track.gpu;
-                        let src_sub_h = buf.heights[sel_vi] / sel_track.max_depth.max(1) as f32;
+                        let total_depth: u16 = if buf.merged_gpu_vi == Some(sel_vi) {
+                            buf.merged_gpu_max_depth
+                        } else {
+                            sel_track.max_depth.max(1)
+                        };
+                        let src_sub_h = buf.heights[sel_vi] / total_depth as f32;
                         let src_lane_h = src_sub_h - LANE_GAP;
                         let src_y = tracks_top + buf.y_offsets[sel_vi] - view.scroll_y
-                            + sel_ev.depth as f32 * src_sub_h + EV_INSET + src_lane_h / 2.0;
+                            + sel_eff_depth as f32 * src_sub_h + EV_INSET + src_lane_h / 2.0;
                         let src_x = if sel_gpu {
                             t2x(sel_ev.ts, view.t0, px_per_us, tl_left)
                         } else {
@@ -754,12 +924,16 @@ pub fn draw_timeline(
                             let dst_ei = match dst_ei_found { Some(v) => v, None => continue };
                             let dst_ev = dst_evs[dst_ei];
 
-                            let (dst_x, dst_y) = if let Some(dst_vi) = buf.visible.iter().position(|&v| v == dst_ti) {
-                                let dst_track = &trace.tracks[dst_ti];
-                                let dst_sub_h = buf.heights[dst_vi] / dst_track.max_depth.max(1) as f32;
+                            let (dst_x, dst_y) = if let Some((dst_vi, dst_eff_depth)) = find_vi_and_depth(dst_ti, dst_ei, dst_ev.depth) {
+                                let dst_total: u16 = if buf.merged_gpu_vi == Some(dst_vi) {
+                                    buf.merged_gpu_max_depth
+                                } else {
+                                    trace.tracks[dst_ti].max_depth.max(1)
+                                };
+                                let dst_sub_h = buf.heights[dst_vi] / dst_total as f32;
                                 let dst_lane_h = dst_sub_h - LANE_GAP;
                                 let dy = tracks_top + buf.y_offsets[dst_vi] - view.scroll_y
-                                    + dst_ev.depth as f32 * dst_sub_h + EV_INSET + dst_lane_h / 2.0;
+                                    + dst_eff_depth as f32 * dst_sub_h + EV_INSET + dst_lane_h / 2.0;
                                 let dx = if sel_gpu {
                                     t2x(dst_ev.ts + dst_ev.dur, view.t0, px_per_us, tl_left)
                                 } else {
@@ -851,7 +1025,11 @@ pub fn draw_timeline(
             .begin()
         {
             buf.fmt.clear();
-            write!(buf.fmt, "{}", track.label).ok();
+            if buf.merged_gpu_vi == Some(vi) {
+                write!(buf.fmt, "GPU (merged)").ok();
+            } else {
+                write!(buf.fmt, "{}", track.label).ok();
+            }
             let text_h = ui.calc_text_size_with_opts(&buf.fmt, false, label_area_w - 4.0)[1];
             let pad_y = ((vis_h - text_h) * 0.5).max(0.0);
             ui.set_cursor_pos([ui.cursor_pos()[0], pad_y]);

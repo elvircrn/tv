@@ -611,6 +611,8 @@ impl App {
                         // Controls
                         ui.same_line_with_spacing(0.0, 16.0);
                         ui.checkbox("CPU", &mut pane.show_cpu);
+                        ui.same_line_with_spacing(0.0, 10.0);
+                        ui.checkbox("Merge Streams", &mut pane.merge_gpu);
                         if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
                             ui.same_line_with_spacing(0.0, 10.0);
                             ui.checkbox("Watch", &mut pane.auto_reload);
@@ -1095,6 +1097,7 @@ impl App {
                         &mut pane.track_scales,
                         &mut pane.track_order,
                         &mut state.drag,
+                        pane.merge_gpu,
                     );
                     hover_results[pi] = h;
                     click_results[pi] = c;
