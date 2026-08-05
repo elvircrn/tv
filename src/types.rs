@@ -224,4 +224,8 @@ pub struct DrawBuf {
     pub detail_buf: String,
     pub col_widths: [f32; 7],
     pub col_widths_total: f32,
+    pub merged_gpu_tracks: Vec<usize>,
+    pub merged_gpu_vi: Option<usize>,
+    pub merged_gpu_events: Vec<(u32, u32, u16)>,
+    pub merged_gpu_max_depth: u16,
 }
