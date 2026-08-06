@@ -425,10 +425,6 @@ pub fn draw_timeline(
                 for ei in start..end {
                     let ev = &t.events[ei];
                     if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                    let has_grandchild = t.events[ei + 1..].iter()
-                        .take_while(|e2| e2.ts <= ev.ts + ev.dur)
-                        .any(|e2| e2.depth > ev.depth + 1);
-                    if has_grandchild { continue; }
                     ev_list.push((ev.ts, ev.dur, ti as u32, ei as u32));
                 }
             }
