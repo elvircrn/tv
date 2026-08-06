@@ -249,7 +249,7 @@ impl ApplicationHandler for App {
                             self.state.panes[self.state.active].select_all_pending = true;
                         }
                         if code == KeyCode::KeyC {
-                            if let Some(text) = self.state.panes[self.state.active].copy_selection_text() {
+                            if let Some(text) = self.state.panes[self.state.active].copy_selection_text(&self.state.buf) {
                                 MacClipboard.set(&text);
                             }
                         }
@@ -693,8 +693,8 @@ impl App {
         mark!("toolbar", t_section);
         // ---- Diff trigger ----
         if let Some(other) = diff_clicked_against {
-            let seq_a = state.panes[state.active].extract_selection_events();
-            let seq_b = state.panes[other].extract_selection_events();
+            let seq_a = state.panes[state.active].extract_selection_events(&state.buf);
+            let seq_b = state.panes[other].extract_selection_events(&state.buf);
             state.diff_result = Some(diff::compute_diff(&seq_a, &seq_b));
             state.diff_bar_scroll = 0.0;
             state.diff_bar_zoom = 1.0;

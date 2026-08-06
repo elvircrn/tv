@@ -49,6 +49,15 @@ fn make_state(trace: Trace) -> AppState {
         .collect();
     let hidden_names = vec![false; trace.names.len()];
     let collapsed = vec![false; trace.tracks.len()];
+    let mut buf = DrawBuf::default();
+    let mut cum = 0.0f32;
+    for (i, t) in trace.tracks.iter().enumerate() {
+        buf.visible.push(i);
+        let h = track_height(t.max_depth, false, 1.0);
+        buf.heights.push(h);
+        buf.y_offsets.push(cum);
+        cum += h;
+    }
     let mut pane = Pane::new();
     pane.event_labels = event_labels;
     pane.hidden_names = hidden_names;
@@ -58,7 +67,7 @@ fn make_state(trace: Trace) -> AppState {
         panes: vec![pane],
         active: 0,
         divider_xs: Vec::new(),
-        buf: DrawBuf::default(),
+        buf,
         bottom_h: DETAIL_H,
         drag: DragKind::None,
         show_diff: false,
@@ -1104,7 +1113,7 @@ fn test_diff_extract_selection_events() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.finished_sel = Some([0.0, 20.0, 0.0, 100.0]);
-    let events = p.extract_selection_events();
+    let events = p.extract_selection_events(&state.buf);
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].0, "matmul");
     assert_eq!(events[1].0, "softmax");
@@ -1125,7 +1134,7 @@ fn test_diff_extract_selection_respects_hidden() {
     let p = &mut state.panes[0];
     p.hidden_names[1] = true;
     p.finished_sel = Some([0.0, 20.0, 0.0, 100.0]);
-    let events = p.extract_selection_events();
+    let events = p.extract_selection_events(&state.buf);
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].0, "matmul");
     assert_eq!(events[1].0, "relu");
@@ -1144,7 +1153,7 @@ fn test_diff_extract_selection_partial_time_range() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.finished_sel = Some([5.0, 12.0, 0.0, 100.0]);
-    let events = p.extract_selection_events();
+    let events = p.extract_selection_events(&state.buf);
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].0, "matmul");
     assert_eq!(events[1].0, "softmax");
@@ -1163,7 +1172,7 @@ fn test_diff_extract_selection_sorted_by_timestamp() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.finished_sel = Some([0.0, 30.0, 0.0, 100.0]);
-    let events = p.extract_selection_events();
+    let events = p.extract_selection_events(&state.buf);
     assert_eq!(events[0].0, "early");
     assert_eq!(events[1].0, "mid");
     assert_eq!(events[2].0, "late");

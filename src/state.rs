@@ -110,22 +110,6 @@ impl Pane {
 
     pub fn has_trace(&self) -> bool { self.trace.is_some() }
 
-    fn compute_merged_gpu_y(&self, trace: &Trace) -> Option<(f32, f32)> {
-        if !self.merge_gpu { return None; }
-        let mut total_depth: u16 = 0;
-        let mut first_gpu = None;
-        for (i, t) in trace.tracks.iter().enumerate() {
-            if t.gpu {
-                if first_gpu.is_none() { first_gpu = Some(i); }
-                total_depth = total_depth.saturating_add(t.max_depth.max(1));
-            }
-        }
-        let first = first_gpu?;
-        let scale = self.track_scales.get(first).copied().unwrap_or(1.0);
-        let h = total_depth as f32 * SUB_LANE_H * scale;
-        Some((0.0, h))
-    }
-
     pub fn loading_progress_text(&self) -> String {
         let n = self.loading_events.load(Ordering::Relaxed);
         if n == 0 {
@@ -327,61 +311,52 @@ impl Pane {
         let map = &mut buf.sel_map;
         for v in map.values_mut() { v.0 = 0; v.1 = 0.0; v.2.clear(); }
 
-        let merged_gpu_y = self.compute_merged_gpu_y(trace);
-        let mut cum_y = 0.0f32;
         let mut total_scanned = 0usize;
-        if self.merge_gpu {
-            if let Some((mg_top, mg_h)) = merged_gpu_y {
-                if mg_top + mg_h >= y0 && mg_top <= y1 {
-                    for track in &trace.tracks {
-                        if !track.gpu { continue; }
-                        let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
-                        let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-                        total_scanned += end - start;
-                        for ev in &track.events[start..end] {
-                            if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                            if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                                let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new()));
-                                e.0 += 1;
-                                e.1 += ev.dur;
-                                e.2.push(ev.dur);
-                            }
+        for vi in 0..buf.visible.len() {
+            let track_top = buf.y_offsets[vi];
+            let track_h = buf.heights[vi];
+            let track_bot = track_top + track_h;
+            if track_bot < y0 || track_top > y1 { continue; }
+
+            if buf.merged_gpu_vi == Some(vi) {
+                for track in &trace.tracks {
+                    if !track.gpu { continue; }
+                    let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
+                    let end = track.events.partition_point(|e| e.ts <= s1).max(start);
+                    total_scanned += end - start;
+                    for ev in &track.events[start..end] {
+                        if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                        if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
+                            let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new()));
+                            e.0 += 1;
+                            e.1 += ev.dur;
+                            e.2.push(ev.dur);
                         }
                     }
                 }
-                cum_y = mg_top + mg_h;
-            }
-        }
-        for (ti, track) in trace.tracks.iter().enumerate() {
-            if self.merge_gpu && track.gpu { continue; }
-            if !self.show_cpu && !track.gpu { continue; }
-            let track_h = track_height(
-                track.max_depth,
-                self.collapsed.get(ti).copied().unwrap_or(false),
-                self.track_scales.get(ti).copied().unwrap_or(1.0),
-            );
-            let sub_h = track_h / track.max_depth.max(1) as f32;
-            let track_top = cum_y;
-            cum_y += track_h;
-            let track_bot = cum_y;
-            if track_bot < y0 || track_top > y1 { continue; }
-            let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
-            let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-            total_scanned += end - start;
-            let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
-            for ev in &track.events[start..end] {
-                if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                let ev_top = track_top + ev.depth as f32 * sub_h;
-                let ev_bot = ev_top + sub_h;
-                for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
-                if ev_bot < y0 || ev_top > y1 { continue; }
-                if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                    ancestor_sel[ev.depth as usize] = true;
-                    if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
-                    let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new()));
-                    e.0 += 1;
-                    e.1 += ev.dur;
-                    e.2.push(ev.dur);
+            } else {
+                let ti = buf.visible[vi];
+                let track = &trace.tracks[ti];
+                if !self.show_cpu && !track.gpu { continue; }
+                let sub_h = track_h / track.max_depth.max(1) as f32;
+                let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
+                let end = track.events.partition_point(|e| e.ts <= s1).max(start);
+                total_scanned += end - start;
+                let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
+                for ev in &track.events[start..end] {
+                    if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                    let ev_top = track_top + ev.depth as f32 * sub_h;
+                    let ev_bot = ev_top + sub_h;
+                    for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
+                    if ev_bot < y0 || ev_top > y1 { continue; }
+                    if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
+                        ancestor_sel[ev.depth as usize] = true;
+                        if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
+                        let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new()));
+                        e.0 += 1;
+                        e.1 += ev.dur;
+                        e.2.push(ev.dur);
+                    }
                 }
             }
         }
@@ -402,7 +377,7 @@ impl Pane {
         eprintln!("  aggregate: {:.1}ms ({} agg, {} individual)", t_agg.elapsed().as_secs_f64() * 1000.0, self.sel_agg_stats.len(), self.sel_individual.len());
     }
 
-    pub fn extract_selection_events(&self) -> Vec<(String, f64)> {
+    pub fn extract_selection_events(&self, buf: &DrawBuf) -> Vec<(String, f64)> {
         let trace = match &self.trace {
             Some(t) => t,
             None => return Vec::new(),
@@ -415,96 +390,29 @@ impl Pane {
         let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
 
         let mut events: Vec<(f64, String, f64)> = Vec::new();
-        let merged_gpu_y = self.compute_merged_gpu_y(trace);
-        let mut cum_y = 0.0f32;
-        if self.merge_gpu {
-            if let Some((mg_top, mg_h)) = merged_gpu_y {
-                if mg_top + mg_h >= y0 && mg_top <= y1 {
-                    for track in &trace.tracks {
-                        if !track.gpu { continue; }
-                        let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
-                        let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-                        for ev in &track.events[start..end] {
-                            if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                            if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                                events.push((ev.ts, trace.names[ev.name as usize].clone(), ev.dur));
-                            }
+        for vi in 0..buf.visible.len() {
+            let track_top = buf.y_offsets[vi];
+            let track_h = buf.heights[vi];
+            let track_bot = track_top + track_h;
+            if track_bot < y0 || track_top > y1 { continue; }
+
+            if buf.merged_gpu_vi == Some(vi) {
+                for track in &trace.tracks {
+                    if !track.gpu { continue; }
+                    let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
+                    let end = track.events.partition_point(|e| e.ts <= s1).max(start);
+                    for ev in &track.events[start..end] {
+                        if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                        if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
+                            events.push((ev.ts, trace.names[ev.name as usize].clone(), ev.dur));
                         }
                     }
                 }
-                cum_y = mg_top + mg_h;
-            }
-        }
-        for (ti, track) in trace.tracks.iter().enumerate() {
-            if self.merge_gpu && track.gpu { continue; }
-            if !self.show_cpu && !track.gpu { continue; }
-            let track_h = track_height(
-                track.max_depth,
-                self.collapsed.get(ti).copied().unwrap_or(false),
-                self.track_scales.get(ti).copied().unwrap_or(1.0),
-            );
-            let sub_h = track_h / track.max_depth.max(1) as f32;
-            let track_top = cum_y;
-            cum_y += track_h;
-            let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
-            let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-            let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
-            for ev in &track.events[start..end] {
-                if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                let ev_top = track_top + ev.depth as f32 * sub_h;
-                let ev_bot = ev_top + sub_h;
-                for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
-                if ev_bot < y0 || ev_top > y1 { continue; }
-                if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                    ancestor_sel[ev.depth as usize] = true;
-                    if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
-                    events.push((ev.ts, trace.names[ev.name as usize].clone(), ev.dur));
-                }
-            }
-        }
-        events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        events.into_iter().map(|(_, name, dur)| (name, dur)).collect()
-    }
-
-    pub fn copy_selection_text(&self) -> Option<String> {
-        let trace = self.trace.as_ref()?;
-        let mut events: Vec<(f64, &str, f64)> = Vec::new();
-
-        if self.finished_sel.is_some() {
-            let sel = self.finished_sel.unwrap();
-            let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
-            let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
-            let merged_gpu_y = self.compute_merged_gpu_y(trace);
-            let mut cum_y = 0.0f32;
-            if self.merge_gpu {
-                if let Some((mg_top, mg_h)) = merged_gpu_y {
-                    if mg_top + mg_h >= y0 && mg_top <= y1 {
-                        for track in &trace.tracks {
-                            if !track.gpu { continue; }
-                            let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
-                            let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-                            for ev in &track.events[start..end] {
-                                if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                                if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                                    events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
-                                }
-                            }
-                        }
-                    }
-                    cum_y = mg_top + mg_h;
-                }
-            }
-            for (ti, track) in trace.tracks.iter().enumerate() {
-                if self.merge_gpu && track.gpu { continue; }
+            } else {
+                let ti = buf.visible[vi];
+                let track = &trace.tracks[ti];
                 if !self.show_cpu && !track.gpu { continue; }
-                let track_h = track_height(
-                    track.max_depth,
-                    self.collapsed.get(ti).copied().unwrap_or(false),
-                    self.track_scales.get(ti).copied().unwrap_or(1.0),
-                );
                 let sub_h = track_h / track.max_depth.max(1) as f32;
-                let track_top = cum_y;
-                cum_y += track_h;
                 let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
                 let end = track.events.partition_point(|e| e.ts <= s1).max(start);
                 let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
@@ -517,7 +425,60 @@ impl Pane {
                     if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
                         ancestor_sel[ev.depth as usize] = true;
                         if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
-                        events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
+                        events.push((ev.ts, trace.names[ev.name as usize].clone(), ev.dur));
+                    }
+                }
+            }
+        }
+        events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        events.into_iter().map(|(_, name, dur)| (name, dur)).collect()
+    }
+
+    pub fn copy_selection_text(&self, buf: &DrawBuf) -> Option<String> {
+        let trace = self.trace.as_ref()?;
+        let mut events: Vec<(f64, &str, f64)> = Vec::new();
+
+        if self.finished_sel.is_some() {
+            let sel = self.finished_sel.unwrap();
+            let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
+            let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
+            for vi in 0..buf.visible.len() {
+                let track_top = buf.y_offsets[vi];
+                let track_h = buf.heights[vi];
+                let track_bot = track_top + track_h;
+                if track_bot < y0 || track_top > y1 { continue; }
+
+                if buf.merged_gpu_vi == Some(vi) {
+                    for track in &trace.tracks {
+                        if !track.gpu { continue; }
+                        let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
+                        let end = track.events.partition_point(|e| e.ts <= s1).max(start);
+                        for ev in &track.events[start..end] {
+                            if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                            if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
+                                events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
+                            }
+                        }
+                    }
+                } else {
+                    let ti = buf.visible[vi];
+                    let track = &trace.tracks[ti];
+                    if !self.show_cpu && !track.gpu { continue; }
+                    let sub_h = track_h / track.max_depth.max(1) as f32;
+                    let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
+                    let end = track.events.partition_point(|e| e.ts <= s1).max(start);
+                    let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
+                    for ev in &track.events[start..end] {
+                        if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                        let ev_top = track_top + ev.depth as f32 * sub_h;
+                        let ev_bot = ev_top + sub_h;
+                        for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
+                        if ev_bot < y0 || ev_top > y1 { continue; }
+                        if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
+                            ancestor_sel[ev.depth as usize] = true;
+                            if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
+                            events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
+                        }
                     }
                 }
             }
