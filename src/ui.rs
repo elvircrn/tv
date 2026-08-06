@@ -404,77 +404,102 @@ pub fn draw_timeline(
     buf.visible.clear();
     buf.heights.clear();
     buf.y_offsets.clear();
-    buf.merged_gpu_groups.clear();
+    let n_old_groups = buf.merged_gpu_groups.len();
     let mut cumulative = 0.0f32;
 
-    // Pre-group GPU tracks by rank when merging
-    let mut rank_groups: Vec<(Option<usize>, Vec<usize>, String)> = Vec::new();
+    // Pre-group GPU tracks by rank when merging (simple Vec, no BTreeMap)
+    let mut rank_group_idxs: Vec<(Option<usize>, usize)> = Vec::new(); // (rank, group_slot)
+    let mut group_slot = 0usize;
     if merge_gpu {
-        use std::collections::BTreeMap;
-        let mut by_rank: BTreeMap<Option<usize>, Vec<usize>> = BTreeMap::new();
         for &i in track_order.iter() {
-            if trace.tracks[i].gpu {
-                let rank = crate::state::parse_rank(&trace.tracks[i].label);
-                by_rank.entry(rank).or_default().push(i);
+            if !trace.tracks[i].gpu { continue; }
+            let rank = crate::state::parse_rank(&trace.tracks[i].label);
+            if let Some(&(_, gi)) = rank_group_idxs.iter().find(|(r, _)| *r == rank) {
+                if gi < n_old_groups {
+                    buf.merged_gpu_groups[gi].tracks.push(i);
+                } else {
+                    buf.merged_gpu_groups[gi - n_old_groups].tracks.push(i);
+                }
+            } else {
+                let gi = group_slot;
+                group_slot += 1;
+                if gi < n_old_groups {
+                    let g = &mut buf.merged_gpu_groups[gi];
+                    g.tracks.clear();
+                    g.tracks.push(i);
+                    g.events.clear();
+                    g.max_depth = 0;
+                    g.vi = 0;
+                    g.label.clear();
+                    match rank {
+                        Some(r) => write!(g.label, "  Rank {} GPU (merged)", r).ok(),
+                        None => write!(g.label, "GPU (merged)").ok(),
+                    };
+                } else {
+                    let label = match rank {
+                        Some(r) => format!("  Rank {} GPU (merged)", r),
+                        None => "GPU (merged)".to_string(),
+                    };
+                    buf.merged_gpu_groups.push(MergedGpuGroup {
+                        tracks: vec![i], events: Vec::new(), max_depth: 0, vi: 0, label,
+                    });
+                }
+                rank_group_idxs.push((rank, gi));
             }
         }
-        for (rank, tracks) in by_rank {
-            let label = match rank {
-                Some(r) => format!("  Rank {} GPU (merged)", r),
-                None => "GPU (merged)".to_string(),
-            };
-            rank_groups.push((rank, tracks, label));
-        }
     }
+    buf.merged_gpu_groups.truncate(group_slot);
 
-    let mut emitted_ranks: Vec<bool> = vec![false; rank_groups.len()];
+    let mut emitted_ranks: Vec<bool> = vec![false; rank_group_idxs.len()];
     for &i in track_order.iter() {
         let t = &trace.tracks[i];
         if merge_gpu && t.gpu {
             let rank = crate::state::parse_rank(&t.label);
-            if let Some(gi) = rank_groups.iter().position(|g| g.0 == rank) {
-                if emitted_ranks[gi] { continue; }
-                emitted_ranks[gi] = true;
-                let group_tracks = &rank_groups[gi].1;
+            if let Some(ri) = rank_group_idxs.iter().position(|(r, _)| *r == rank) {
+                if emitted_ranks[ri] { continue; }
+                emitted_ranks[ri] = true;
+                let gi = rank_group_idxs[ri].1;
+                let g = &buf.merged_gpu_groups[gi];
+                let group_tracks: Vec<usize> = g.tracks.clone();
                 let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
-                for &ti in group_tracks {
+                for &ti in &group_tracks {
                     let gt = &trace.tracks[ti];
                     let start = bisect_overlap(&gt.events, &gt.prefix_max_dur, view.t0);
                     let end = gt.events.partition_point(|e| e.ts <= view.t1);
                     for ei in start..end {
                         let ev = &gt.events[ei];
                         if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                        let has_child = gt.events[ei + 1..].iter()
+                            .take_while(|e2| e2.ts <= ev.ts + ev.dur)
+                            .any(|e2| e2.depth > ev.depth);
+                        if has_child { continue; }
                         ev_list.push((ev.ts, ev.dur, ti as u32, ei as u32));
                     }
                 }
-                ev_list.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                ev_list.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                 let mut depth_ends: Vec<f64> = Vec::new();
                 let mut max_depth: u16 = 0;
-                let mut events: Vec<(u32, u32, u16)> = Vec::new();
+                let g = &mut buf.merged_gpu_groups[gi];
+                g.events.clear();
                 for &(ts, dur, ti, ei) in &ev_list {
                     let d = depth_ends.iter().position(|&end| end <= ts)
                         .unwrap_or_else(|| { depth_ends.push(0.0); depth_ends.len() - 1 });
                     depth_ends[d] = ts + dur;
                     let d16 = d as u16;
                     if d16 >= max_depth { max_depth = d16 + 1; }
-                    events.push((ti, ei, d16));
+                    g.events.push((ti, ei, d16));
                 }
                 let md = max_depth.max(1);
                 let first = group_tracks[0];
                 let scale = track_scales.get(first).copied().unwrap_or(1.0);
                 let h = md as f32 * SUB_LANE_H * scale;
                 let vi = buf.visible.len();
+                g.max_depth = md;
+                g.vi = vi;
                 buf.visible.push(first);
                 buf.heights.push(h);
                 buf.y_offsets.push(cumulative);
                 cumulative += h;
-                buf.merged_gpu_groups.push(MergedGpuGroup {
-                    tracks: group_tracks.clone(),
-                    events,
-                    max_depth: md,
-                    vi,
-                    label: rank_groups[gi].2.clone(),
-                });
             }
             continue;
         }
