@@ -1131,6 +1131,11 @@ impl App {
                     pane.selected = None;
                     pane.multi_select_name = None;
                     pane.selection_dirty = true;
+                    // A region shift-drag supersedes an active search: clear the
+                    // search box and its highlight (once, at drag start).
+                    if !pane.search.is_empty() || pane.search_mask.iter().any(|&m| m) {
+                        pane.clear_search();
+                    }
                 } else {
                     pane.clear_selection();
                 }

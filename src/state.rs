@@ -133,6 +133,14 @@ impl Pane {
         self.sel_individual.clear();
     }
 
+    pub fn clear_search(&mut self) {
+        self.search.clear();
+        self.prev_search.clear();
+        self.search_mask.clear();
+        self.search_nav.clear();
+        self.search_cursor = 0;
+    }
+
     pub fn finish_selection(&mut self, buf: &mut DrawBuf) {
         self.finished_sel = self.selection;
         self.selection = None;
