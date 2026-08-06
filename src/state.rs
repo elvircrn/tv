@@ -318,9 +318,9 @@ impl Pane {
             let track_bot = track_top + track_h;
             if track_bot < y0 || track_top > y1 { continue; }
 
-            if buf.merged_gpu_vi == Some(vi) {
-                for track in &trace.tracks {
-                    if !track.gpu { continue; }
+            if let Some(group) = buf.merged_gpu_groups.iter().find(|g| g.vi == vi) {
+                for &gti in &group.tracks {
+                    let track = &trace.tracks[gti];
                     let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
                     let end = track.events.partition_point(|e| e.ts <= s1).max(start);
                     total_scanned += end - start;
@@ -396,9 +396,9 @@ impl Pane {
             let track_bot = track_top + track_h;
             if track_bot < y0 || track_top > y1 { continue; }
 
-            if buf.merged_gpu_vi == Some(vi) {
-                for track in &trace.tracks {
-                    if !track.gpu { continue; }
+            if let Some(group) = buf.merged_gpu_groups.iter().find(|g| g.vi == vi) {
+                for &gti in &group.tracks {
+                    let track = &trace.tracks[gti];
                     let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
                     let end = track.events.partition_point(|e| e.ts <= s1).max(start);
                     for ev in &track.events[start..end] {
@@ -448,9 +448,9 @@ impl Pane {
                 let track_bot = track_top + track_h;
                 if track_bot < y0 || track_top > y1 { continue; }
 
-                if buf.merged_gpu_vi == Some(vi) {
-                    for track in &trace.tracks {
-                        if !track.gpu { continue; }
+                if let Some(group) = buf.merged_gpu_groups.iter().find(|g| g.vi == vi) {
+                    for &gti in &group.tracks {
+                        let track = &trace.tracks[gti];
                         let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
                         let end = track.events.partition_point(|e| e.ts <= s1).max(start);
                         for ev in &track.events[start..end] {

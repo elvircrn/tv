@@ -404,55 +404,80 @@ pub fn draw_timeline(
     buf.visible.clear();
     buf.heights.clear();
     buf.y_offsets.clear();
-    buf.merged_gpu_tracks.clear();
-    buf.merged_gpu_vi = None;
-    buf.merged_gpu_events.clear();
-    buf.merged_gpu_max_depth = 0;
+    buf.merged_gpu_groups.clear();
     let mut cumulative = 0.0f32;
+
+    // Pre-group GPU tracks by rank when merging
+    let mut rank_groups: Vec<(Option<usize>, Vec<usize>, String)> = Vec::new();
     if merge_gpu {
+        use std::collections::BTreeMap;
+        let mut by_rank: BTreeMap<Option<usize>, Vec<usize>> = BTreeMap::new();
         for &i in track_order.iter() {
             if trace.tracks[i].gpu {
-                buf.merged_gpu_tracks.push(i);
+                let rank = crate::state::parse_rank(&trace.tracks[i].label);
+                by_rank.entry(rank).or_default().push(i);
             }
         }
-        if !buf.merged_gpu_tracks.is_empty() {
-            // Collect visible events from all GPU tracks, sort by time, assign depths (Tetris packing)
-            let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
-            for &ti in &buf.merged_gpu_tracks {
-                let t = &trace.tracks[ti];
-                let start = bisect_overlap(&t.events, &t.prefix_max_dur, view.t0);
-                let end = t.events.partition_point(|e| e.ts <= view.t1);
-                for ei in start..end {
-                    let ev = &t.events[ei];
-                    if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                    ev_list.push((ev.ts, ev.dur, ti as u32, ei as u32));
-                }
-            }
-            ev_list.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-            let mut depth_ends: Vec<f64> = Vec::new();
-            let mut max_depth: u16 = 0;
-            for &(ts, dur, ti, ei) in &ev_list {
-                let d = depth_ends.iter().position(|&end| end <= ts)
-                    .unwrap_or_else(|| { depth_ends.push(0.0); depth_ends.len() - 1 });
-                depth_ends[d] = ts + dur;
-                let d16 = d as u16;
-                if d16 >= max_depth { max_depth = d16 + 1; }
-                buf.merged_gpu_events.push((ti, ei, d16));
-            }
-            buf.merged_gpu_max_depth = max_depth.max(1);
-            let first = buf.merged_gpu_tracks[0];
-            let scale = track_scales.get(first).copied().unwrap_or(1.0);
-            let h = buf.merged_gpu_max_depth as f32 * SUB_LANE_H * scale;
-            buf.merged_gpu_vi = Some(buf.visible.len());
-            buf.visible.push(first);
-            buf.heights.push(h);
-            buf.y_offsets.push(cumulative);
-            cumulative += h;
+        for (rank, tracks) in by_rank {
+            let label = match rank {
+                Some(r) => format!("  Rank {} GPU (merged)", r),
+                None => "GPU (merged)".to_string(),
+            };
+            rank_groups.push((rank, tracks, label));
         }
     }
+
+    let mut emitted_ranks: Vec<bool> = vec![false; rank_groups.len()];
     for &i in track_order.iter() {
         let t = &trace.tracks[i];
-        if merge_gpu && t.gpu { continue; }
+        if merge_gpu && t.gpu {
+            let rank = crate::state::parse_rank(&t.label);
+            if let Some(gi) = rank_groups.iter().position(|g| g.0 == rank) {
+                if emitted_ranks[gi] { continue; }
+                emitted_ranks[gi] = true;
+                let group_tracks = &rank_groups[gi].1;
+                let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
+                for &ti in group_tracks {
+                    let gt = &trace.tracks[ti];
+                    let start = bisect_overlap(&gt.events, &gt.prefix_max_dur, view.t0);
+                    let end = gt.events.partition_point(|e| e.ts <= view.t1);
+                    for ei in start..end {
+                        let ev = &gt.events[ei];
+                        if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                        ev_list.push((ev.ts, ev.dur, ti as u32, ei as u32));
+                    }
+                }
+                ev_list.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let mut depth_ends: Vec<f64> = Vec::new();
+                let mut max_depth: u16 = 0;
+                let mut events: Vec<(u32, u32, u16)> = Vec::new();
+                for &(ts, dur, ti, ei) in &ev_list {
+                    let d = depth_ends.iter().position(|&end| end <= ts)
+                        .unwrap_or_else(|| { depth_ends.push(0.0); depth_ends.len() - 1 });
+                    depth_ends[d] = ts + dur;
+                    let d16 = d as u16;
+                    if d16 >= max_depth { max_depth = d16 + 1; }
+                    events.push((ti, ei, d16));
+                }
+                let md = max_depth.max(1);
+                let first = group_tracks[0];
+                let scale = track_scales.get(first).copied().unwrap_or(1.0);
+                let h = md as f32 * SUB_LANE_H * scale;
+                let vi = buf.visible.len();
+                buf.visible.push(first);
+                buf.heights.push(h);
+                buf.y_offsets.push(cumulative);
+                cumulative += h;
+                buf.merged_gpu_groups.push(MergedGpuGroup {
+                    tracks: group_tracks.clone(),
+                    events,
+                    max_depth: md,
+                    vi,
+                    label: rank_groups[gi].2.clone(),
+                });
+            }
+            continue;
+        }
         if !show_cpu && !t.gpu { continue; }
         buf.visible.push(i);
         let h = track_height(
@@ -634,16 +659,16 @@ pub fn draw_timeline(
             let bg = if vi % 2 == 0 { col32(28, 28, 28, 255) } else { col32(32, 32, 32, 255) };
             dl.add_rect([rect[0], y], [rect[2], y + track_h], bg).filled(true).build();
 
-            let is_merged = buf.merged_gpu_vi == Some(vi);
+            let merged_group = buf.merged_gpu_groups.iter().find(|g| g.vi == vi);
 
-            if is_merged {
-                let total_depth = buf.merged_gpu_max_depth;
+            if let Some(group) = merged_group {
+                let total_depth = group.max_depth;
                 let sub_h = track_h / total_depth as f32;
                 let lane_h = sub_h - LANE_GAP;
                 buf.last_px.clear();
                 buf.last_px.resize(total_depth as usize, -1i32);
 
-                for &(ti32, ei32, eff_depth) in &buf.merged_gpu_events {
+                for &(ti32, ei32, eff_depth) in &group.events {
                     let orig_ti = ti32 as usize;
                     let ei = ei32 as usize;
                     let ev = &trace.tracks[orig_ti].events[ei];
@@ -877,13 +902,13 @@ pub fn draw_timeline(
                         if let Some(vi) = buf.visible.iter().position(|&v| v == ti) {
                             return Some((vi, depth));
                         }
-                        if let Some(mvi) = buf.merged_gpu_vi {
-                            if buf.merged_gpu_tracks.contains(&ti) {
-                                let md = buf.merged_gpu_events.iter()
+                        for g in &buf.merged_gpu_groups {
+                            if g.tracks.contains(&ti) {
+                                let md = g.events.iter()
                                     .find(|&&(t, e, _)| t == ti as u32 && e == ei as u32)
                                     .map(|&(_, _, d)| d)
                                     .unwrap_or(0);
-                                return Some((mvi, md));
+                                return Some((g.vi, md));
                             }
                         }
                         None
@@ -891,11 +916,9 @@ pub fn draw_timeline(
                     let sel_loc = find_vi_and_depth(sel_ti, sel.event_idx as usize, sel_ev.depth);
                     if let Some((sel_vi, sel_eff_depth)) = sel_loc {
                         let sel_gpu = sel_track.gpu;
-                        let total_depth: u16 = if buf.merged_gpu_vi == Some(sel_vi) {
-                            buf.merged_gpu_max_depth
-                        } else {
-                            sel_track.max_depth.max(1)
-                        };
+                        let total_depth: u16 = buf.merged_gpu_groups.iter()
+                            .find(|g| g.vi == sel_vi)
+                            .map_or(sel_track.max_depth.max(1), |g| g.max_depth);
                         let src_sub_h = buf.heights[sel_vi] / total_depth as f32;
                         let src_lane_h = src_sub_h - LANE_GAP;
                         let src_y = tracks_top + buf.y_offsets[sel_vi] - view.scroll_y
@@ -921,11 +944,9 @@ pub fn draw_timeline(
                             let dst_ev = dst_evs[dst_ei];
 
                             let (dst_x, dst_y) = if let Some((dst_vi, dst_eff_depth)) = find_vi_and_depth(dst_ti, dst_ei, dst_ev.depth) {
-                                let dst_total: u16 = if buf.merged_gpu_vi == Some(dst_vi) {
-                                    buf.merged_gpu_max_depth
-                                } else {
-                                    trace.tracks[dst_ti].max_depth.max(1)
-                                };
+                                let dst_total: u16 = buf.merged_gpu_groups.iter()
+                                    .find(|g| g.vi == dst_vi)
+                                    .map_or(trace.tracks[dst_ti].max_depth.max(1), |g| g.max_depth);
                                 let dst_sub_h = buf.heights[dst_vi] / dst_total as f32;
                                 let dst_lane_h = dst_sub_h - LANE_GAP;
                                 let dy = tracks_top + buf.y_offsets[dst_vi] - view.scroll_y
@@ -1021,8 +1042,8 @@ pub fn draw_timeline(
             .begin()
         {
             buf.fmt.clear();
-            if buf.merged_gpu_vi == Some(vi) {
-                write!(buf.fmt, "GPU (merged)").ok();
+            if let Some(g) = buf.merged_gpu_groups.iter().find(|g| g.vi == vi) {
+                write!(buf.fmt, "{}", g.label).ok();
             } else {
                 write!(buf.fmt, "{}", track.label).ok();
             }
