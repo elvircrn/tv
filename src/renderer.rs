@@ -135,18 +135,29 @@ impl MetalRenderer {
             }]);
         }
         let atlas = fonts.build_rgba32_texture();
+        let (aw, ah) = (atlas.width, atlas.height);
+        // SF Mono is a light-weight face; on the dark theme its anti-aliased
+        // edges read as muddy grey. Lift the atlas coverage with a gamma curve
+        // (a^0.72) so mid-alpha edge pixels move toward white, while fully
+        // covered glyph pixels and the reserved solid-white pixel (a=255, used
+        // for shape fills) stay untouched.
+        let mut atlas_px = atlas.data.to_vec();
+        for px in atlas_px.chunks_exact_mut(4) {
+            let a = px[3] as f32 / 255.0;
+            px[3] = (a.powf(0.72) * 255.0 + 0.5) as u8;
+        }
         let tdesc = TextureDescriptor::new();
         tdesc.set_texture_type(MTLTextureType::D2);
         tdesc.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
-        tdesc.set_width(atlas.width as u64);
-        tdesc.set_height(atlas.height as u64);
+        tdesc.set_width(aw as u64);
+        tdesc.set_height(ah as u64);
         tdesc.set_usage(MTLTextureUsage::ShaderRead);
         let font_tex = device.new_texture(&tdesc);
         font_tex.replace_region(
-            MTLRegion::new_2d(0, 0, atlas.width as u64, atlas.height as u64),
+            MTLRegion::new_2d(0, 0, aw as u64, ah as u64),
             0,
-            atlas.data.as_ptr() as *const _,
-            (atlas.width * 4) as u64,
+            atlas_px.as_ptr() as *const _,
+            (aw * 4) as u64,
         );
         imgui.fonts().tex_id = imgui::TextureId::new(0);
         imgui.io_mut().font_global_scale = 1.0 / scale_factor as f32;
