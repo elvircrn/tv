@@ -1391,3 +1391,116 @@ fn test_merge_traces() {
     assert!(r0_ev.ts < r1_ev.ts, "rank 0 event should be earlier");
 }
 
+// Measures the per-frame cost of the merged-GPU buffer build for two depth
+// filters: leaf-only (delta=0, current) vs. keep-one-parent-level (delta=1,
+// the 047226a design that un-hides parent blocks). Run with:
+//   cargo test --release bench_merge_filter -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_merge_filter() {
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache> to run this bench"); return; }
+    };
+    let counter = test_counter();
+    let trace = load_trace(&path, &counter, 8, None).expect("load trace");
+    eprintln!(
+        "loaded: {} tracks, {} events, span {:.0}..{:.0} us",
+        trace.tracks.len(), trace.total_events, trace.min_ts, trace.max_ts
+    );
+
+    // Group GPU tracks by rank, mirroring ui.rs merge pre-grouping.
+    let mut groups: Vec<(Option<usize>, Vec<usize>)> = Vec::new();
+    for i in 0..trace.tracks.len() {
+        if !trace.tracks[i].gpu { continue; }
+        let rank = parse_rank(&trace.tracks[i].label);
+        if let Some(g) = groups.iter_mut().find(|(r, _)| *r == rank) {
+            g.1.push(i);
+        } else {
+            groups.push((rank, vec![i]));
+        }
+    }
+    let gpu_tracks: usize = groups.iter().map(|(_, t)| t.len()).sum();
+    eprintln!("gpu rank groups: {}, gpu tracks: {}", groups.len(), gpu_tracks);
+
+    // How deep do the source GPU tracks actually nest?
+    let mut src_max_depth = 0u16;
+    let mut depth_hist = [0usize; 8];
+    for (_r, tracks) in &groups {
+        for &ti in tracks {
+            for e in &trace.tracks[ti].events {
+                src_max_depth = src_max_depth.max(e.depth + 1);
+                depth_hist[(e.depth as usize).min(7)] += 1;
+            }
+        }
+    }
+    eprintln!("source max nesting depth: {}  per-depth counts: {:?}", src_max_depth, depth_hist);
+
+    // trace.min_ts/max_ts are unreliable on the merged cache; derive the real
+    // GPU time span from the events themselves.
+    let mut gmin = f64::INFINITY;
+    let mut gmax = f64::NEG_INFINITY;
+    for (_r, tracks) in &groups {
+        for &ti in tracks {
+            let evs = &trace.tracks[ti].events;
+            if let Some(first) = evs.first() { gmin = gmin.min(first.ts); }
+            for e in evs { gmax = gmax.max(e.ts + e.dur); }
+        }
+    }
+    eprintln!("gpu span: {:.0}..{:.0} us ({:.0} us)", gmin, gmax, gmax - gmin);
+
+    // One full merge-buffer build over [t0,t1] for the given depth delta.
+    // Returns (surviving events, max tetris depth).
+    let build = |delta: i32, t0: f64, t1: f64| -> (usize, u16) {
+        let mut total_ev = 0usize;
+        let mut max_md = 0u16;
+        for (_rank, tracks) in &groups {
+            let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
+            for &ti in tracks {
+                let gt = &trace.tracks[ti];
+                let start = crate::types::bisect_overlap(&gt.events, &gt.prefix_max_dur, t0);
+                let end = gt.events.partition_point(|e| e.ts <= t1);
+                for ei in start..end {
+                    let ev = &gt.events[ei];
+                    let strip = gt.events[ei + 1..].iter()
+                        .take_while(|e2| e2.ts <= ev.ts + ev.dur)
+                        .any(|e2| e2.depth as i32 > ev.depth as i32 + delta);
+                    if strip { continue; }
+                    ev_list.push((ev.ts, ev.dur, ti as u32, ei as u32));
+                }
+            }
+            ev_list.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let mut depth_ends: Vec<f64> = Vec::new();
+            let mut max_depth: u16 = 0;
+            for &(ts, dur, _, _) in &ev_list {
+                let d = depth_ends.iter().position(|&end| end <= ts)
+                    .unwrap_or_else(|| { depth_ends.push(0.0); depth_ends.len() - 1 });
+                depth_ends[d] = ts + dur;
+                let d16 = d as u16;
+                if d16 >= max_depth { max_depth = d16 + 1; }
+            }
+            total_ev += ev_list.len();
+            if max_depth > max_md { max_md = max_depth; }
+        }
+        (total_ev, max_md)
+    };
+
+    let span = gmax - gmin;
+    let mid = (gmin + gmax) / 2.0;
+    for &frac in &[1.0f64, 0.25, 0.05] {
+        let half = span * frac / 2.0;
+        let (t0, t1) = (mid - half, mid + half);
+        for &(label, delta) in &[("leaf-only  ", 0i32), ("keep-parent", 1i32), ("keep-all   ", 10000i32)] {
+            let (n, md) = build(delta, t0, t1); // warmup + result
+            let iters = 30;
+            let start = std::time::Instant::now();
+            for _ in 0..iters { let _ = build(delta, t0, t1); }
+            let per = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            eprintln!(
+                "zoom={:>5.0}%  {}  {:>9} events  max_depth={:>3}  {:>7.3} ms/build",
+                frac * 100.0, label, n, md, per
+            );
+        }
+    }
+}
+
