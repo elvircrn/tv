@@ -320,7 +320,11 @@ fn apply_style(style: &mut imgui::Style) {
     style.frame_border_size = 0.0;
     style.popup_border_size = 1.0;
     style.frame_padding = [8.0, 4.0];
-    style.item_spacing = [8.0, 6.0];
+    // Leave item_spacing at imgui's default [8, 4]: the hand-rolled virtualized
+    // tables (draw_stats_table, labels table) assume a row pitch of
+    // font_size + ROW_PAD (4) == default item_spacing.y. Bumping it opens a gap
+    // after the header and desyncs the scroll virtualization.
+    style.item_spacing = [8.0, 4.0];
     style.item_inner_spacing = [6.0, 4.0];
     style.scrollbar_size = 12.0;
     style.grab_min_size = 10.0;
