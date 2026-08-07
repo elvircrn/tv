@@ -85,6 +85,24 @@ pub const LABEL_PALETTE: &[u32] = &[
     0x2196F3, 0x4CAF50, 0xFF9800, 0xE91E63, 0x9C27B0, 0x00BCD4, 0xFFEB3B, 0x795548,
 ];
 
+// ---- Unified chrome colors ----
+// A single accent (the logo blue) replaces the several mismatched blues that
+// used to be scattered across selection rects, tooltips and outlines.
+pub const ACCENT_LINE: ImColor32 = ImColor32::from_rgba(48, 162, 255, 200); // selection/tooltip borders
+pub const ACCENT_FILL: ImColor32 = ImColor32::from_rgba(48, 162, 255, 40); // range-select fill
+pub const ACCENT_SOFT: ImColor32 = ImColor32::from_rgba(48, 162, 255, 180); // block selection/search outline
+
+// Neutral greys used across the timeline chrome (values unchanged, just named).
+pub const BG_TIMELINE: ImColor32 = ImColor32::from_rgba(24, 24, 24, 255);
+pub const BG_LABELS: ImColor32 = ImColor32::from_rgba(20, 20, 20, 255);
+pub const DIVIDER: ImColor32 = ImColor32::from_rgba(50, 50, 50, 255);
+pub const GRID: ImColor32 = ImColor32::from_rgba(40, 40, 40, 255);
+pub const ROW_BG_A: ImColor32 = ImColor32::from_rgba(28, 28, 28, 255);
+pub const ROW_BG_B: ImColor32 = ImColor32::from_rgba(32, 32, 32, 255);
+pub const RULER_BG: ImColor32 = ImColor32::from_rgba(18, 18, 18, 255);
+pub const RULER_TICK: ImColor32 = ImColor32::from_rgba(60, 60, 60, 255);
+pub const RULER_TEXT: ImColor32 = ImColor32::from_rgba(160, 160, 160, 255);
+
 pub struct Trace {
     pub tracks: Vec<Track>,
     pub names: Vec<String>,

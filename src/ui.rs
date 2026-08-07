@@ -694,16 +694,14 @@ pub fn draw_timeline(
     let time_range = (view.t1 - view.t0).max(1e-9);
     let px_per_us = tl_w as f64 / time_range;
 
-    let bg = col32(24, 24, 24, 255);
-    dl.add_rect([rect[0], rect[1]], [rect[2], rect[3]], bg).filled(true).build();
+    dl.add_rect([rect[0], rect[1]], [rect[2], rect[3]], BG_TIMELINE).filled(true).build();
 
     let ruler_rect = [tl_left, rect[1], rect[2], rect[1] + RULER_H];
     draw_ruler(&dl, ruler_rect, view, &mut buf.fmt);
 
-    let lbg = col32(20, 20, 20, 255);
-    dl.add_rect([rect[0], rect[1]], [tl_left, rect[3]], lbg).filled(true).build();
-    dl.add_line([tl_left, rect[1]], [tl_left, rect[3]], col32(50, 50, 50, 255)).build();
-    dl.add_line([rect[0], rect[1] + RULER_H], [rect[2], rect[1] + RULER_H], col32(50, 50, 50, 255)).build();
+    dl.add_rect([rect[0], rect[1]], [tl_left, rect[3]], BG_LABELS).filled(true).build();
+    dl.add_line([tl_left, rect[1]], [tl_left, rect[3]], DIVIDER).build();
+    dl.add_line([rect[0], rect[1] + RULER_H], [rect[2], rect[1] + RULER_H], DIVIDER).build();
 
     let mut hover_result: Option<EventRef> = None;
     let mut click_result: Option<EventRef> = None;
@@ -729,7 +727,7 @@ pub fn draw_timeline(
             while tick <= view.t1 && count < 500 {
                 let x = t2x(tick, view.t0, px_per_us, tl_left);
                 if x > tl_left && x < rect[2] {
-                    dl.add_line([x, tracks_top], [x, rect[3]], col32(40, 40, 40, 255)).build();
+                    dl.add_line([x, tracks_top], [x, rect[3]], GRID).build();
                 }
                 tick += interval;
                 count += 1;
@@ -741,7 +739,7 @@ pub fn draw_timeline(
             let y = tracks_top + buf.y_offsets[vi] - view.scroll_y;
             if y + track_h < tracks_top || y > rect[3] { continue; }
 
-            let bg = if vi % 2 == 0 { col32(28, 28, 28, 255) } else { col32(32, 32, 32, 255) };
+            let bg = if vi % 2 == 0 { ROW_BG_A } else { ROW_BG_B };
             dl.add_rect([rect[0], y], [rect[2], y + track_h], bg).filled(true).build();
 
             let merged_group = buf.merged_gpu_groups.iter().find(|g| g.vi == vi);
@@ -812,13 +810,13 @@ pub fn draw_timeline(
                         dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 255, 255, 255))
                             .rounding(EV_ROUNDING).build();
                     } else if is_selected || is_sel_mask {
-                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], ACCENT_SOFT)
                             .rounding(EV_ROUNDING).build();
                     } else if is_multi {
                         dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 220, 50, 140))
                             .rounding(EV_ROUNDING).build();
                     } else if searching && matches {
-                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], ACCENT_SOFT)
                             .rounding(EV_ROUNDING).build();
                     }
 
@@ -912,13 +910,13 @@ pub fn draw_timeline(
                         dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 255, 255, 255))
                             .rounding(EV_ROUNDING).build();
                     } else if is_selected || is_sel_mask {
-                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], ACCENT_SOFT)
                             .rounding(EV_ROUNDING).build();
                     } else if is_multi {
                         dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 220, 50, 140))
                             .rounding(EV_ROUNDING).build();
                     } else if searching && matches {
-                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(100, 180, 255, 180))
+                        dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], ACCENT_SOFT)
                             .rounding(EV_ROUNDING).build();
                     }
 
@@ -1080,12 +1078,12 @@ pub fn draw_timeline(
             let sy0 = (tracks_top + ya - view.scroll_y).max(tracks_top);
             let sy1 = (tracks_top + yb - view.scroll_y).min(rect[3]);
             if sx1 > sx0 && sy1 > sy0 {
-                dl.add_rect([sx0, sy0], [sx1, sy1], ImColor32::from_rgba(60, 130, 220, 40))
+                dl.add_rect([sx0, sy0], [sx1, sy1], ACCENT_FILL)
                     .filled(true).build();
-                dl.add_line([sx0, sy0], [sx0, sy1], ImColor32::from_rgba(80, 160, 255, 200)).build();
-                dl.add_line([sx1, sy0], [sx1, sy1], ImColor32::from_rgba(80, 160, 255, 200)).build();
-                dl.add_line([sx0, sy0], [sx1, sy0], ImColor32::from_rgba(80, 160, 255, 200)).build();
-                dl.add_line([sx0, sy1], [sx1, sy1], ImColor32::from_rgba(80, 160, 255, 200)).build();
+                dl.add_line([sx0, sy0], [sx0, sy1], ACCENT_LINE).build();
+                dl.add_line([sx1, sy0], [sx1, sy1], ACCENT_LINE).build();
+                dl.add_line([sx0, sy0], [sx1, sy0], ACCENT_LINE).build();
+                dl.add_line([sx0, sy1], [sx1, sy1], ACCENT_LINE).build();
                 buf.fmt.clear();
                 write_time(&mut buf.fmt, sb - sa);
                 let text_sz = ui.calc_text_size(&buf.fmt);
@@ -1094,7 +1092,7 @@ pub fn draw_timeline(
                 let pad = 3.0;
                 dl.add_rect([tx - pad, ty - 1.0], [tx + text_sz[0] + pad, ty + text_sz[1] + 1.0], col32(20, 20, 20, 220))
                     .filled(true).rounding(3.0).build();
-                dl.add_rect([tx - pad, ty - 1.0], [tx + text_sz[0] + pad, ty + text_sz[1] + 1.0], col32(80, 160, 255, 180))
+                dl.add_rect([tx - pad, ty - 1.0], [tx + text_sz[0] + pad, ty + text_sz[1] + 1.0], ACCENT_SOFT)
                     .rounding(3.0).build();
                 dl.add_text([tx, ty], col32(220, 230, 255, 255), &buf.fmt);
             }
@@ -1149,7 +1147,7 @@ pub fn draw_timeline(
     for vi in 0..buf.visible.len() {
         let border_y = tracks_top + buf.y_offsets[vi] + buf.heights[vi] - view.scroll_y;
         if border_y < tracks_top || border_y > rect[3] { continue; }
-        dl.add_line([rect[0], border_y], [rect[2], border_y], col32(50, 50, 50, 255)).build();
+        dl.add_line([rect[0], border_y], [rect[2], border_y], DIVIDER).build();
 
         // !shift: suppress resize affordance during shift-drag selection.
         // !*even_spacing: heights are auto-managed in even mode, so per-track
@@ -1248,7 +1246,7 @@ pub fn draw_timeline(
 }
 
 fn draw_ruler(dl: &imgui::DrawListMut, rect: [f32; 4], view: &View, fmt: &mut String) {
-    dl.add_rect([rect[0], rect[1]], [rect[2], rect[3]], col32(18, 18, 18, 255))
+    dl.add_rect([rect[0], rect[1]], [rect[2], rect[3]], RULER_BG)
         .filled(true).build();
     let range = view.t1 - view.t0;
     let interval = nice_interval(range);
@@ -1260,10 +1258,10 @@ fn draw_ruler(dl: &imgui::DrawListMut, rect: [f32; 4], view: &View, fmt: &mut St
     while tick <= view.t1 && count < 500 {
         let x = rect[0] + ((tick - view.t0) * px_per_us) as f32;
         if x >= rect[0] && x <= rect[2] {
-            dl.add_line([x, rect[1]], [x, rect[3]], col32(60, 60, 60, 255)).build();
+            dl.add_line([x, rect[1]], [x, rect[3]], RULER_TICK).build();
             fmt.clear();
             write_time(fmt, tick);
-            dl.add_text([x + 3.0, rect[1] + 4.0], col32(160, 160, 160, 255), &*fmt);
+            dl.add_text([x + 3.0, rect[1] + 4.0], RULER_TEXT, &*fmt);
         }
         tick += interval;
         count += 1;
