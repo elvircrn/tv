@@ -52,7 +52,7 @@ pub const DIFF_SEG_GAP: f32 = 3.0;
 pub const ZOOM_STEP: f64 = 1.15;
 pub const MAX_ZOOM: f64 = 200.0;
 pub const TRACK_SCALE_MIN: f32 = 0.5;
-pub const TRACK_SCALE_MAX: f32 = 10.0;
+pub const TRACK_SCALE_MAX: f32 = 30.0;
 pub const RESIZE_GRAB_H: f32 = 6.0;
 pub const ROW_PAD: f32 = 4.0;
 pub const HISTOGRAM_BAR_H: f32 = 18.0;
@@ -217,6 +217,32 @@ pub struct MergedGpuGroup {
     pub max_depth: u16,
     pub vi: usize,
     pub label: String,
+}
+
+/// Per-pane snapshot of the final row layout produced by `draw_timeline`.
+///
+/// `DrawBuf` (the render scratch) is shared across panes, so after the per-pane
+/// render loop it only holds the LAST-drawn pane's geometry. Any per-pane
+/// operation that runs later — selection stats, diff extraction, clipboard copy
+/// — must read from this pane-owned snapshot instead, or it would compute
+/// against the wrong pane's tracks.
+#[derive(Default)]
+pub struct PaneGeom {
+    pub visible: Vec<usize>,
+    pub heights: Vec<f32>,
+    pub y_offsets: Vec<f32>,
+    pub merged: Vec<MergedGeom>,
+}
+
+pub struct MergedGeom {
+    pub vi: usize,
+    pub max_depth: u16,
+    /// Packed `(track_idx, event_idx, packed_depth)` triples — exactly the events
+    /// drawn in the merged row. The Tetris packing in `draw_timeline` already
+    /// stripped grandparent wrappers (whole-stream spans) and hidden names, so a
+    /// selection that iterates these matches the rendered row precisely instead of
+    /// sweeping in ghost events that were never drawn.
+    pub events: Vec<(u32, u32, u16)>,
 }
 
 #[derive(Default)]

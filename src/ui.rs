@@ -392,6 +392,8 @@ pub fn draw_timeline(
     sel_mask: &[bool],
     label_w: f32,
     track_scales: &mut Vec<f32>,
+    even_spacing: &mut bool,
+    geom: &mut PaneGeom,
     track_order: &mut Vec<usize>,
     drag: &mut DragKind,
     merge_gpu: bool,
@@ -534,8 +536,46 @@ pub fn draw_timeline(
         buf.y_offsets.push(cumulative);
         cumulative += h;
     }
-    let total_h = cumulative;
+    let mut total_h = cumulative;
     let tracks_top = rect[1] + RULER_H;
+
+    // Even-spacing mode: override the drawn row heights so every visible track
+    // shares the viewport height equally, filling down to the bottom pane. It
+    // recomputes each frame from the current viewport, so dragging the bottom
+    // divider (which changes rect[3]) re-flows the lanes live. It intentionally
+    // does NOT touch track_scales, so toggling the mode off restores the manual
+    // layout — an easy undo. Toggled by double-clicking the last lane.
+    if *even_spacing && !buf.visible.is_empty() {
+        let n = buf.visible.len();
+        let avail = (rect[3] - tracks_top).max(1.0);
+        let h = avail / n as f32;
+        let mut cum = 0.0;
+        for vi in 0..n {
+            buf.heights[vi] = h;
+            buf.y_offsets[vi] = cum;
+            cum += h;
+        }
+        total_h = cum;
+    }
+
+    // Snapshot the final row layout into the pane-owned geometry. `buf` is shared
+    // across panes, so after the render loop it only holds the last-drawn pane's
+    // layout. Selection stats, diff extraction and clipboard copy run later and
+    // must read this per-pane copy, or they'd compute against the wrong pane.
+    geom.visible.clear();
+    geom.visible.extend_from_slice(&buf.visible);
+    geom.heights.clear();
+    geom.heights.extend_from_slice(&buf.heights);
+    geom.y_offsets.clear();
+    geom.y_offsets.extend_from_slice(&buf.y_offsets);
+    geom.merged.clear();
+    for g in &buf.merged_gpu_groups {
+        geom.merged.push(MergedGeom {
+            vi: g.vi,
+            max_depth: g.max_depth,
+            events: g.events.clone(),
+        });
+    }
 
     if let DragKind::TrackDrag(pi, ref mut dragged_vi, _grab_off) = *drag {
         if pi == pane_idx {
@@ -1111,8 +1151,10 @@ pub fn draw_timeline(
         if border_y < tracks_top || border_y > rect[3] { continue; }
         dl.add_line([rect[0], border_y], [rect[2], border_y], col32(50, 50, 50, 255)).build();
 
-        // !shift: suppress resize affordance during shift-drag selection
-        if !shift && !drag.is_active() && hovered && mouse_pos[1] > tracks_top {
+        // !shift: suppress resize affordance during shift-drag selection.
+        // !*even_spacing: heights are auto-managed in even mode, so per-track
+        // border resizing is disabled (double-click the last lane to exit).
+        if !shift && !*even_spacing && !drag.is_active() && hovered && mouse_pos[1] > tracks_top {
             if (mouse_pos[1] - border_y).abs() < RESIZE_GRAB_H {
                 hovered_border_y = Some(border_y);
                 near_border = true;
@@ -1173,6 +1215,31 @@ pub fn draw_timeline(
                     }
                 }
                 break;
+            }
+        }
+    }
+
+    // Double-click the last lane (or the empty space beneath it) to toggle
+    // "even spacing": every visible track shares the viewport height equally and
+    // re-flows live as the viewport changes (e.g. dragging the bottom-pane
+    // divider). The mode overrides the drawn heights without touching
+    // track_scales, so double-clicking again restores the manual layout — an
+    // easy undo. Handy for the merged multi-rank view, where the few rank rows
+    // otherwise leave a lot of dead space. Guarded by hover_result.is_none() so
+    // double-clicking an event still multi-selects, and by x > tl_left so it
+    // never collides with the label-column collapse toggle.
+    if ui.is_mouse_double_clicked(imgui::MouseButton::Left)
+        && !drag.is_active()
+        && hovered
+        && hover_result.is_none()
+        && mouse_pos[0] > tl_left
+        && mouse_pos[0] <= rect[2]
+    {
+        let n = buf.visible.len();
+        if n > 0 {
+            let last_top = tracks_top + buf.y_offsets[n - 1] - view.scroll_y;
+            if mouse_pos[1] >= last_top && mouse_pos[1] <= rect[3] {
+                *even_spacing = !*even_spacing;
             }
         }
     }

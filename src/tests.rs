@@ -59,6 +59,11 @@ fn make_state(trace: Trace) -> AppState {
         cum += h;
     }
     let mut pane = Pane::new();
+    // Mirror the layout into the pane-owned geom, exactly as draw_timeline's
+    // per-frame snapshot does. Selection/diff/copy read pane.geom, not buf.
+    pane.geom.visible = buf.visible.clone();
+    pane.geom.heights = buf.heights.clone();
+    pane.geom.y_offsets = buf.y_offsets.clone();
     pane.event_labels = event_labels;
     pane.hidden_names = hidden_names;
     pane.collapsed = collapsed;
@@ -1113,7 +1118,7 @@ fn test_diff_extract_selection_events() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.finished_sel = Some([0.0, 20.0, 0.0, 100.0]);
-    let events = p.extract_selection_events(&state.buf);
+    let events = p.extract_selection_events();
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].0, "matmul");
     assert_eq!(events[1].0, "softmax");
@@ -1134,7 +1139,7 @@ fn test_diff_extract_selection_respects_hidden() {
     let p = &mut state.panes[0];
     p.hidden_names[1] = true;
     p.finished_sel = Some([0.0, 20.0, 0.0, 100.0]);
-    let events = p.extract_selection_events(&state.buf);
+    let events = p.extract_selection_events();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].0, "matmul");
     assert_eq!(events[1].0, "relu");
@@ -1153,7 +1158,7 @@ fn test_diff_extract_selection_partial_time_range() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.finished_sel = Some([5.0, 12.0, 0.0, 100.0]);
-    let events = p.extract_selection_events(&state.buf);
+    let events = p.extract_selection_events();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].0, "matmul");
     assert_eq!(events[1].0, "softmax");
@@ -1172,10 +1177,68 @@ fn test_diff_extract_selection_sorted_by_timestamp() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.finished_sel = Some([0.0, 30.0, 0.0, 100.0]);
-    let events = p.extract_selection_events(&state.buf);
+    let events = p.extract_selection_events();
     assert_eq!(events[0].0, "early");
     assert_eq!(events[1].0, "mid");
     assert_eq!(events[2].0, "late");
+}
+
+// Merged rows Tetris-pack their events and strip grandparent wrappers (whole-
+// stream spans). A selection over a merged row must read the packed set that was
+// actually drawn — not re-scan the raw track — or it picks up "ghost" wrappers
+// that were never rendered. `geom.merged` here mimics draw_timeline's snapshot:
+// the raw track has a `wrapper` span at index 0, but it is absent from the packed
+// events, so selection must never return it.
+#[test]
+fn test_merged_selection_excludes_unrendered_wrapper() {
+    let trace = make_trace(
+        vec!["wrapper", "kA", "kB"],
+        vec![("GPU", true, vec![
+            ev(0.0, 100.0, 0, 0),  // idx 0: whole-stream wrapper — stripped from merged row
+            ev(0.0, 10.0, 1, 1),   // idx 1: kA
+            ev(20.0, 10.0, 2, 1),  // idx 2: kB
+        ])],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    // Packed row: kA at depth 0, kB at depth 1; wrapper (idx 0) intentionally omitted.
+    p.geom.merged = vec![MergedGeom { vi: 0, max_depth: 2, events: vec![(0, 1, 0), (0, 2, 1)] }];
+    p.geom.heights[0] = 40.0; // max_depth 2 * SUB_LANE_H(20)
+    p.geom.y_offsets[0] = 0.0;
+
+    // Full-height selection over the whole time range: kA + kB, never the wrapper.
+    p.finished_sel = Some([0.0, 30.0, 0.0, 40.0]);
+    let events = p.extract_selection_events();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|(n, _)| n != "wrapper"));
+    assert_eq!(events[0].0, "kA");
+    assert_eq!(events[1].0, "kB");
+}
+
+// The renderer only highlights packed events whose depth lane intersects the
+// selection rectangle; the stats/extract must apply the same y-test so they stay
+// in sync with the highlight. sub_h = 40/2 = 20, so a y-range of [0,10] hits only
+// depth-0 (kA), not depth-1 (kB).
+#[test]
+fn test_merged_selection_respects_depth_yrange() {
+    let trace = make_trace(
+        vec!["wrapper", "kA", "kB"],
+        vec![("GPU", true, vec![
+            ev(0.0, 100.0, 0, 0),
+            ev(0.0, 10.0, 1, 1),
+            ev(20.0, 10.0, 2, 1),
+        ])],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    p.geom.merged = vec![MergedGeom { vi: 0, max_depth: 2, events: vec![(0, 1, 0), (0, 2, 1)] }];
+    p.geom.heights[0] = 40.0;
+    p.geom.y_offsets[0] = 0.0;
+
+    p.finished_sel = Some([0.0, 30.0, 0.0, 10.0]);
+    let events = p.extract_selection_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "kA");
 }
 
 #[test]

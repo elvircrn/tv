@@ -39,6 +39,8 @@ pub struct Pane {
     pub sel_mask: Vec<bool>,
     pub collapsed: Vec<bool>,
     pub track_scales: Vec<f32>,
+    pub even_spacing: bool,
+    pub geom: PaneGeom,
     pub labels: Vec<Label>,
     pub event_labels: Vec<Vec<Option<u8>>>,
     pub label_input: String,
@@ -86,6 +88,8 @@ impl Pane {
             sel_mask: Vec::new(),
             collapsed: Vec::new(),
             track_scales: Vec::new(),
+            even_spacing: false,
+            geom: PaneGeom::default(),
             labels: Vec::new(),
             event_labels: Vec::new(),
             label_input: String::with_capacity(64),
@@ -320,30 +324,32 @@ impl Pane {
         for v in map.values_mut() { v.0 = 0; v.1 = 0.0; v.2.clear(); }
 
         let mut total_scanned = 0usize;
-        for vi in 0..buf.visible.len() {
-            let track_top = buf.y_offsets[vi];
-            let track_h = buf.heights[vi];
+        for vi in 0..self.geom.visible.len() {
+            let track_top = self.geom.y_offsets[vi];
+            let track_h = self.geom.heights[vi];
             let track_bot = track_top + track_h;
             if track_bot < y0 || track_top > y1 { continue; }
 
-            if let Some(group) = buf.merged_gpu_groups.iter().find(|g| g.vi == vi) {
-                for &gti in &group.tracks {
-                    let track = &trace.tracks[gti];
-                    let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
-                    let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-                    total_scanned += end - start;
-                    for ev in &track.events[start..end] {
-                        if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                        if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                            let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new()));
-                            e.0 += 1;
-                            e.1 += ev.dur;
-                            e.2.push(ev.dur);
-                        }
-                    }
+            if let Some(group) = self.geom.merged.iter().find(|g| g.vi == vi) {
+                // Iterate the packed events that were actually drawn in the merged
+                // row (grandparent wrappers already stripped), and apply the same
+                // depth/y test the renderer uses for its selection highlight, so
+                // the stats match the visible rectangle exactly.
+                let sub_h = track_h / group.max_depth.max(1) as f32;
+                total_scanned += group.events.len();
+                for &(ti32, ei32, depth) in &group.events {
+                    let ev = &trace.tracks[ti32 as usize].events[ei32 as usize];
+                    if !(ev.ts + ev.dur >= s0 && ev.ts <= s1) { continue; }
+                    let ev_top = track_top + depth as f32 * sub_h;
+                    let ev_bot = ev_top + sub_h;
+                    if ev_bot < y0 || ev_top > y1 { continue; }
+                    let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new()));
+                    e.0 += 1;
+                    e.1 += ev.dur;
+                    e.2.push(ev.dur);
                 }
             } else {
-                let ti = buf.visible[vi];
+                let ti = self.geom.visible[vi];
                 let track = &trace.tracks[ti];
                 if !self.show_cpu && !track.gpu { continue; }
                 let sub_h = track_h / track.max_depth.max(1) as f32;
@@ -385,7 +391,7 @@ impl Pane {
         eprintln!("  aggregate: {:.1}ms ({} agg, {} individual)", t_agg.elapsed().as_secs_f64() * 1000.0, self.sel_agg_stats.len(), self.sel_individual.len());
     }
 
-    pub fn extract_selection_events(&self, buf: &DrawBuf) -> Vec<(String, f64)> {
+    pub fn extract_selection_events(&self) -> Vec<(String, f64)> {
         let trace = match &self.trace {
             Some(t) => t,
             None => return Vec::new(),
@@ -398,26 +404,26 @@ impl Pane {
         let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
 
         let mut events: Vec<(f64, String, f64)> = Vec::new();
-        for vi in 0..buf.visible.len() {
-            let track_top = buf.y_offsets[vi];
-            let track_h = buf.heights[vi];
+        for vi in 0..self.geom.visible.len() {
+            let track_top = self.geom.y_offsets[vi];
+            let track_h = self.geom.heights[vi];
             let track_bot = track_top + track_h;
             if track_bot < y0 || track_top > y1 { continue; }
 
-            if let Some(group) = buf.merged_gpu_groups.iter().find(|g| g.vi == vi) {
-                for &gti in &group.tracks {
-                    let track = &trace.tracks[gti];
-                    let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
-                    let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-                    for ev in &track.events[start..end] {
-                        if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                        if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                            events.push((ev.ts, trace.names[ev.name as usize].clone(), ev.dur));
-                        }
-                    }
+            if let Some(group) = self.geom.merged.iter().find(|g| g.vi == vi) {
+                // Match the rendered merged row: iterate the packed events (wrappers
+                // stripped) and apply the renderer's depth/y test.
+                let sub_h = track_h / group.max_depth.max(1) as f32;
+                for &(ti32, ei32, depth) in &group.events {
+                    let ev = &trace.tracks[ti32 as usize].events[ei32 as usize];
+                    if !(ev.ts + ev.dur >= s0 && ev.ts <= s1) { continue; }
+                    let ev_top = track_top + depth as f32 * sub_h;
+                    let ev_bot = ev_top + sub_h;
+                    if ev_bot < y0 || ev_top > y1 { continue; }
+                    events.push((ev.ts, trace.names[ev.name as usize].clone(), ev.dur));
                 }
             } else {
-                let ti = buf.visible[vi];
+                let ti = self.geom.visible[vi];
                 let track = &trace.tracks[ti];
                 if !self.show_cpu && !track.gpu { continue; }
                 let sub_h = track_h / track.max_depth.max(1) as f32;
@@ -442,7 +448,7 @@ impl Pane {
         events.into_iter().map(|(_, name, dur)| (name, dur)).collect()
     }
 
-    pub fn copy_selection_text(&self, buf: &DrawBuf) -> Option<String> {
+    pub fn copy_selection_text(&self) -> Option<String> {
         let trace = self.trace.as_ref()?;
         let mut events: Vec<(f64, &str, f64)> = Vec::new();
 
@@ -450,26 +456,26 @@ impl Pane {
             let sel = self.finished_sel.unwrap();
             let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
             let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
-            for vi in 0..buf.visible.len() {
-                let track_top = buf.y_offsets[vi];
-                let track_h = buf.heights[vi];
+            for vi in 0..self.geom.visible.len() {
+                let track_top = self.geom.y_offsets[vi];
+                let track_h = self.geom.heights[vi];
                 let track_bot = track_top + track_h;
                 if track_bot < y0 || track_top > y1 { continue; }
 
-                if let Some(group) = buf.merged_gpu_groups.iter().find(|g| g.vi == vi) {
-                    for &gti in &group.tracks {
-                        let track = &trace.tracks[gti];
-                        let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
-                        let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-                        for ev in &track.events[start..end] {
-                            if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                            if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                                events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
-                            }
-                        }
+                if let Some(group) = self.geom.merged.iter().find(|g| g.vi == vi) {
+                    // Match the rendered merged row: iterate the packed events
+                    // (wrappers stripped) and apply the renderer's depth/y test.
+                    let sub_h = track_h / group.max_depth.max(1) as f32;
+                    for &(ti32, ei32, depth) in &group.events {
+                        let ev = &trace.tracks[ti32 as usize].events[ei32 as usize];
+                        if !(ev.ts + ev.dur >= s0 && ev.ts <= s1) { continue; }
+                        let ev_top = track_top + depth as f32 * sub_h;
+                        let ev_bot = ev_top + sub_h;
+                        if ev_bot < y0 || ev_top > y1 { continue; }
+                        events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
                     }
                 } else {
-                    let ti = buf.visible[vi];
+                    let ti = self.geom.visible[vi];
                     let track = &trace.tracks[ti];
                     if !self.show_cpu && !track.gpu { continue; }
                     let sub_h = track_h / track.max_depth.max(1) as f32;

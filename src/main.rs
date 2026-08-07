@@ -249,7 +249,7 @@ impl ApplicationHandler for App {
                             self.state.panes[self.state.active].select_all_pending = true;
                         }
                         if code == KeyCode::KeyC {
-                            if let Some(text) = self.state.panes[self.state.active].copy_selection_text(&self.state.buf) {
+                            if let Some(text) = self.state.panes[self.state.active].copy_selection_text() {
                                 MacClipboard.set(&text);
                             }
                         }
@@ -655,6 +655,7 @@ impl App {
                                     ui.separator();
                                     ui.text("Drag label     Reorder tracks");
                                     ui.text("Drag border    Resize track height");
+                                    ui.text("Dbl-click last Even-fill lanes (toggle)");
                                     ui.text("Click event    Show detail + flow arrows");
                                     ui.separator();
                                     ui.text("Files");
@@ -693,8 +694,8 @@ impl App {
         mark!("toolbar", t_section);
         // ---- Diff trigger ----
         if let Some(other) = diff_clicked_against {
-            let seq_a = state.panes[state.active].extract_selection_events(&state.buf);
-            let seq_b = state.panes[other].extract_selection_events(&state.buf);
+            let seq_a = state.panes[state.active].extract_selection_events();
+            let seq_b = state.panes[other].extract_selection_events();
             state.diff_result = Some(diff::compute_diff(&seq_a, &seq_b));
             state.diff_bar_scroll = 0.0;
             state.diff_bar_zoom = 1.0;
@@ -1095,6 +1096,8 @@ impl App {
                         &pane.sel_mask,
                         pane.label_w,
                         &mut pane.track_scales,
+                        &mut pane.even_spacing,
+                        &mut pane.geom,
                         &mut pane.track_order,
                         &mut state.drag,
                         pane.merge_gpu,
