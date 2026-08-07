@@ -213,6 +213,10 @@ pub fn draw_stats_table(
             }
             ui.set_cursor_pos([0.0, header_y + row_h_hdr]);
             ui.separator();
+            // Pin the first row directly under the divider. Without this, imgui
+            // adds another item_spacing.y after the separator, opening a gap that
+            // reads as larger than the tight data-row pitch.
+            ui.set_cursor_pos([0.0, header_y + row_h_hdr + 1.0]);
 
             buf.sort_idx.clear();
             buf.sort_idx.extend(0..stats.len());
