@@ -27,6 +27,21 @@ fn draw_text_clipped(col: ImColor32, text: &str, pos: [f32; 2], clip: [f32; 4]) 
 }
 
 fn draw_text_wrapped(col: ImColor32, text: &str, pos: [f32; 2], wrap_width: f32, clip: [f32; 4]) {
+    // imgui word-wrap only breaks on blanks (space/tab/ideographic) plus .,;!?".
+    // A kernel signature like `void vllm::silu_and_mul_kernel<c10::BFloat16>(...)`
+    // has no such break point except the space after "void", so imgui wraps there
+    // and shoves the giant identifier wholesale onto the next line — a one-line-tall
+    // lane then shows only "void". Swap ASCII spaces for U+00A0 (SF Mono renders it
+    // with an identical glyph and advance, but it is not a wrap point) so the whole
+    // name is one atomic word that imgui slices character-by-character, filling every
+    // line of the lane top-to-bottom.
+    let nbsp_buf;
+    let text = if text.as_bytes().contains(&b' ') {
+        nbsp_buf = text.replace(' ', "\u{a0}");
+        nbsp_buf.as_str()
+    } else {
+        text
+    };
     unsafe {
         let raw_dl = imgui_sys::igGetWindowDrawList();
         let font = imgui_sys::igGetFont();
