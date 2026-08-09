@@ -189,7 +189,10 @@ impl View {
             Some(a) => a,
             None => return false,
         };
-        a.elapsed += dt;
+        // Clamp per-tick dt: the first frame after an idle Wait can carry a large
+        // elapsed time, which would blow past dur and snap the zoom instead of
+        // gliding. While animating we run in Poll (~60fps), so capping keeps it smooth.
+        a.elapsed += dt.min(0.05);
         let f = (a.elapsed / a.dur).clamp(0.0, 1.0);
         if f >= 1.0 {
             self.t0 = a.to_t0;

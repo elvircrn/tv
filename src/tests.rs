@@ -1567,3 +1567,58 @@ fn bench_merge_filter() {
     }
 }
 
+
+#[test]
+fn test_zoom_to_search_targets_80pct_fill() {
+    // One GPU track: "foo" events clustered at [100,110], "bar" spread wide.
+    let trace = make_trace(
+        vec!["", "foo", "bar"],
+        vec![(
+            "GPU 0", true,
+            vec![
+                ev(0.0, 5.0, 2, 0),      // bar (early)
+                ev(100.0, 4.0, 1, 0),    // foo
+                ev(106.0, 4.0, 1, 0),    // foo -> ends at 110
+                ev(900.0, 5.0, 2, 0),    // bar (late)
+            ],
+        )],
+    );
+    let mut state = make_state(trace);
+    let pane = &mut state.panes[0];
+    pane.view.t0 = 0.0;
+    pane.view.t1 = 1000.0;
+    pane.search.push_str("foo");
+    pane.rebuild_search();
+    pane.zoom_to_search();
+
+    let a = pane.view.anim.as_ref().expect("search zoom should start an animation");
+    // matches span [100,110] => span 10, range = 10/0.8 = 12.5, center 105
+    assert!((a.to_t0 - 98.75).abs() < 1e-6, "to_t0={}", a.to_t0);
+    assert!((a.to_t1 - 111.25).abs() < 1e-6, "to_t1={}", a.to_t1);
+    // 80% fill: matched span occupies 10/12.5 = 0.8 of the framed range.
+    let matched = 110.0 - 100.0;
+    let framed = a.to_t1 - a.to_t0;
+    assert!((matched / framed - 0.8).abs() < 1e-9);
+
+    // Driving the animation to completion lands exactly on target and clears.
+    // dt is clamped per tick, so step until it finishes (bounded loop).
+    let mut guard = 0;
+    while pane.view.tick_anim(0.05) { guard += 1; assert!(guard < 100); }
+    assert!(pane.view.anim.is_none());
+    assert!((pane.view.t0 - 98.75).abs() < 1e-6);
+    assert!((pane.view.t1 - 111.25).abs() < 1e-6);
+}
+
+#[test]
+fn test_zoom_to_search_no_matches_no_anim() {
+    let trace = make_trace(
+        vec!["", "foo"],
+        vec![("GPU 0", true, vec![ev(0.0, 5.0, 1, 0)])],
+    );
+    let mut state = make_state(trace);
+    let pane = &mut state.panes[0];
+    pane.search.push_str("zzz");
+    pane.rebuild_search();
+    pane.zoom_to_search();
+    assert!(pane.view.anim.is_none());
+}
