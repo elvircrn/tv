@@ -27,6 +27,42 @@ extern "C" {
     fn objc_autoreleasePoolPop(pool: *mut std::ffi::c_void);
 }
 
+/// Compact rank descriptor for the status bar, e.g. "rank 0/32 · tp0 pp0 dp0 ep0".
+/// `rank`/`world` come from the trace's `distributedInfo`; the parallelism
+/// coordinates are parsed from the vLLM filename (`..dp0_pp0_tp0_dcp0_ep0_rank0..`).
+/// Returns "" when nothing useful is known (non-distributed / non-vLLM traces).
+fn rank_summary(fname: &str, dist_rank: i32, dist_world: i32) -> String {
+    let mut out = String::new();
+    if dist_rank >= 0 && dist_world > 0 {
+        let _ = write!(out, "rank {}/{}", dist_rank, dist_world);
+    } else if dist_rank >= 0 {
+        let _ = write!(out, "rank {}", dist_rank);
+    } else if dist_world > 0 {
+        let _ = write!(out, "{} ranks", dist_world);
+    }
+
+    // Parallelism coordinates from the underscore/dot-delimited filename tokens.
+    // Fixed display order; dcp is omitted when 0 (the common case) to cut noise.
+    let mut mesh = String::new();
+    for pfx in ["tp", "pp", "dp", "ep", "dcp"] {
+        for tok in fname.split(|c| c == '_' || c == '.') {
+            if let Some(rest) = tok.strip_prefix(pfx) {
+                if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+                    if pfx == "dcp" && rest == "0" { break; }
+                    if !mesh.is_empty() { mesh.push(' '); }
+                    let _ = write!(mesh, "{}{}", pfx, rest);
+                    break;
+                }
+            }
+        }
+    }
+    if !mesh.is_empty() {
+        if !out.is_empty() { out.push_str(" · "); }
+        out.push_str(&mesh);
+    }
+    out
+}
+
 struct App {
     window: Option<Window>,
     imgui: Option<imgui::Context>,
@@ -925,7 +961,12 @@ impl App {
 
                     state.buf.fmt.clear();
                     let fname = pane.trace_path.rsplit('/').next().unwrap_or(&pane.trace_path);
-                    write!(state.buf.fmt, "{} | {} events | {} tracks | {:.1}ms", fname, t.total_events, t.tracks.len(), dt * 1000.0).unwrap();
+                    let ranks = rank_summary(fname, t.dist_rank, t.dist_world);
+                    if ranks.is_empty() {
+                        write!(state.buf.fmt, "{} | {} events | {} tracks | {:.1}ms", fname, t.total_events, t.tracks.len(), dt * 1000.0).unwrap();
+                    } else {
+                        write!(state.buf.fmt, "{} | {} | {} events | {} tracks | {:.1}ms", fname, ranks, t.total_events, t.tracks.len(), dt * 1000.0).unwrap();
+                    }
                     dl.add_text([win_pos[0] + 8.0, cy], col32(153, 153, 153, 255), &state.buf.fmt);
 
                     let logo_scale = text_h / 16.0;

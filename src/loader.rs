@@ -498,6 +498,23 @@ fn decompress_parse_streaming(
     Ok((RawData::Vec(backing), chunks))
 }
 
+/// Read an integer value for `key` in the JSON object at/after `start`.
+/// Used for the small `distributedInfo` fields; None if not found/parsable.
+fn parse_int_after_key(raw: &[u8], start: usize, key: &[u8]) -> Option<i64> {
+    let kp = find_key(&raw[start..], key)? + start;
+    let mut q = kp + key.len() + 2; // past opening quote + key + closing quote
+    q = skip_ws(raw, q);
+    if q < raw.len() && raw[q] == b':' { q += 1; }
+    q = skip_ws(raw, q);
+    let neg = q < raw.len() && raw[q] == b'-';
+    if neg { q += 1; }
+    let s = q;
+    while q < raw.len() && raw[q].is_ascii_digit() { q += 1; }
+    if q == s { return None; }
+    let n: i64 = std::str::from_utf8(&raw[s..q]).ok()?.parse().ok()?;
+    Some(if neg { -n } else { n })
+}
+
 fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Instant) -> Result<Trace, String> {
     let mut names: Vec<String> = vec![String::new()];
     let mut name_idx: FnvMap<u32> = FnvMap::default();
@@ -566,6 +583,15 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
             let end = skip_string(&raw, q);
             vllm_version = json_unescape(std::str::from_utf8(&raw[q + 1..end - 1]).unwrap_or(""));
         }
+    }
+
+    // `distributedInfo.{rank,world_size}` identify this rank within the job.
+    // `"rank"` (singular) only appears at the top of the distributedInfo object;
+    // the pg_config arrays use `"ranks"` (plural), which find_key won't match.
+    let (mut dist_rank, mut dist_world) = (-1i32, 0i32);
+    if let Some(di) = find_key(&raw, b"distributedInfo") {
+        if let Some(r) = parse_int_after_key(&raw, di, b"rank") { dist_rank = r as i32; }
+        if let Some(w) = parse_int_after_key(&raw, di, b"world_size") { dist_world = w as i32; }
     }
 
     eprintln!("  scan: {:.2}s ({} objects, {} events, {} names, {}x parallel)",
@@ -709,11 +735,16 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     cats.shrink_to_fit();
 
     eprintln!("  lanes: {:.2}s ({} tracks, {} flow_pairs)", t2.elapsed().as_secs_f64(), tracks.len(), flow_pairs.len());
-    Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, vllm_version, flow_pairs })
+    Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, vllm_version, dist_rank, dist_world, flow_pairs })
 }
 
 const CACHE_MAGIC: &[u8; 4] = b"TRV2";
-const CACHE_VERSION: u32 = 2;
+// Bumped only when the header layout or an existing field's encoding changes.
+// New *trailing* fields don't need a bump: the reader bounds-checks each one and
+// defaults it when missing, and loads accept any version <= this (older caches
+// simply lack the newer trailing fields). Only a newer-than-known cache is
+// rejected, since its layout may have diverged.
+const CACHE_VERSION: u32 = 3;
 
 fn cache_path(source: &str, cache_dir: Option<&str>) -> String {
     if let Some(dir) = cache_dir {
@@ -859,9 +890,12 @@ pub fn save_cache(trace: &Trace, source_path: &str, cache_dir: Option<&str>) {
         w.write_all(flow_bytes).ok();
     }
 
-    // Optional trailing field: vLLM version string (empty when absent).
+    // Optional trailing fields (each independently bounds-checked on read, so
+    // older caches that lack them still load): vLLM version, then rank/world.
     write_u32(&mut w, trace.vllm_version.len() as u32);
     w.write_all(trace.vllm_version.as_bytes()).ok();
+    write_u32(&mut w, trace.dist_rank as u32);
+    write_u32(&mut w, trace.dist_world as u32);
 
     drop(w);
     std::fs::rename(&tmp, &cp).ok();
@@ -875,13 +909,13 @@ pub fn load_cache(source_path: &str, cache_dir: Option<&str>) -> Option<Trace> {
     if mmap.len() < 80 || &mmap[0..4] != CACHE_MAGIC { return None; }
     let r32 = |d: &[u8], off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
     let r64 = |d: &[u8], off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
-    if r32(&mmap, 4) != CACHE_VERSION { return None; }
+    if r32(&mmap, 4) > CACHE_VERSION { return None; }
     if r64(&mmap, 8) != src_size || r64(&mmap, 16) != src_mtime { return None; }
     load_cache_from_mmap(mmap)
 }
 
 fn load_cache_from_mmap(mmap: memmap2::Mmap) -> Option<Trace> {
-    let (tracks, names, cats, device, vllm_version, stats, flow_pairs, max_ts, min_ts, total_events, args_offset, args_len) = {
+    let (tracks, names, cats, device, vllm_version, dist_rank, dist_world, stats, flow_pairs, max_ts, min_ts, total_events, args_offset, args_len) = {
         let d = &mmap[..];
         if d.len() < 80 { return None; }
 
@@ -1022,16 +1056,25 @@ fn load_cache_from_mmap(mmap: memmap2::Mmap) -> Option<Trace> {
             fpos += 4;
             if fpos + vlen <= d.len() {
                 vllm_version = String::from_utf8_lossy(&d[fpos..fpos + vlen]).into_owned();
+                fpos += vlen;
             }
         }
 
-        (tracks, names, cats, device, vllm_version, stats, flow_pairs, max_ts, min_ts, total_events, args_offset, args_len)
+        // Optional trailing fields: distributed rank / world_size. Absent in
+        // caches written before these were added — default to "no rank info".
+        let (mut dist_rank, mut dist_world) = (-1i32, 0i32);
+        if fpos + 8 <= d.len() {
+            dist_rank = i32::from_le_bytes(d[fpos..fpos + 4].try_into().unwrap());
+            dist_world = i32::from_le_bytes(d[fpos + 4..fpos + 8].try_into().unwrap());
+        }
+
+        (tracks, names, cats, device, vllm_version, dist_rank, dist_world, stats, flow_pairs, max_ts, min_ts, total_events, args_offset, args_len)
     };
 
     Some(Trace {
         tracks, names, cats,
         raw_bufs: vec![Arc::new(ArgsBuf::Mmap { mmap, offset: args_offset, len: args_len })],
-        stats, max_ts, min_ts, total_events, device, vllm_version, flow_pairs,
+        stats, max_ts, min_ts, total_events, device, vllm_version, dist_rank, dist_world, flow_pairs,
     })
 }
 
@@ -1039,7 +1082,7 @@ fn load_cache_direct(cache_path: &str) -> Option<Trace> {
     let file = std::fs::File::open(cache_path).ok()?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
     if mmap.len() < 80 || &mmap[0..4] != CACHE_MAGIC { return None; }
-    if u32::from_le_bytes(mmap[4..8].try_into().unwrap()) != CACHE_VERSION { return None; }
+    if u32::from_le_bytes(mmap[4..8].try_into().unwrap()) > CACHE_VERSION { return None; }
     load_cache_from_mmap(mmap)
 }
 
@@ -1162,9 +1205,12 @@ fn save_merged_cache(trace: &Trace, cache_dir: &str) {
         w.write_all(flow_bytes).ok();
     }
 
-    // Optional trailing field: vLLM version string (empty when absent).
+    // Optional trailing fields (each independently bounds-checked on read, so
+    // older caches that lack them still load): vLLM version, then rank/world.
     write_u32(&mut w, trace.vllm_version.len() as u32);
     w.write_all(trace.vllm_version.as_bytes()).ok();
+    write_u32(&mut w, trace.dist_rank as u32);
+    write_u32(&mut w, trace.dist_world as u32);
 
     drop(w);
     std::fs::rename(&tmp, &cp).ok();
@@ -1175,7 +1221,7 @@ fn load_merged_cache(cache_dir: &str) -> Option<Trace> {
     let file = std::fs::File::open(&cp).ok()?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
     if mmap.len() < 80 || &mmap[0..4] != CACHE_MAGIC { return None; }
-    if u32::from_le_bytes(mmap[4..8].try_into().unwrap()) != CACHE_VERSION { return None; }
+    if u32::from_le_bytes(mmap[4..8].try_into().unwrap()) > CACHE_VERSION { return None; }
     let stored_hash = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
     let current_hash = merged_cache_hash(cache_dir);
     if stored_hash != current_hash { return None; }
@@ -1236,6 +1282,8 @@ fn clone_trace(t: &Trace) -> Trace {
         total_events: t.total_events,
         device: t.device.clone(),
         vllm_version: t.vllm_version.clone(),
+        dist_rank: t.dist_rank,
+        dist_world: t.dist_world,
         flow_pairs: t.flow_pairs.clone(),
     }
 }
@@ -1407,6 +1455,9 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     cat_idx.insert(0, 0);
     let mut device = String::new();
     let mut vllm_version = String::new();
+    // A merged trace spans many ranks, so there's no single rank id; keep the
+    // shared world_size (from the first rank that reports one) for context.
+    let mut dist_world = 0i32;
 
     let mut remap_info: Vec<(Vec<u32>, Vec<u32>, f64)> = Vec::with_capacity(traces.len());
     let mut all_raw_bufs: Vec<Arc<ArgsBuf>> = Vec::new();
@@ -1422,6 +1473,9 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
         }
         if vllm_version.is_empty() && !trace.vllm_version.is_empty() {
             vllm_version = trace.vllm_version.clone();
+        }
+        if dist_world == 0 && trace.dist_world > 0 {
+            dist_world = trace.dist_world;
         }
 
         remap_info.push((name_remap, cat_remap, time_offset));
@@ -1516,7 +1570,8 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
 
     let mut trace = Trace {
         tracks: sorted_tracks, names, cats, raw_bufs: all_raw_bufs, stats,
-        max_ts, min_ts: global_min, total_events, device, vllm_version, flow_pairs: all_flow_pairs,
+        max_ts, min_ts: global_min, total_events, device, vllm_version,
+        dist_rank: -1, dist_world, flow_pairs: all_flow_pairs,
     };
     compact_args(&mut trace);
     trace

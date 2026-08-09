@@ -112,6 +112,11 @@ pub struct Trace {
     /// vLLM version/commit string from the trace header (e.g.
     /// "0.26.1rc1.dev528+gf8d03e774"). Empty when the trace omits it.
     pub vllm_version: String,
+    /// This rank's id from `distributedInfo`, or -1 if the trace has none
+    /// (non-distributed run, or a merged multi-rank trace).
+    pub dist_rank: i32,
+    /// Total ranks in the job from `distributedInfo.world_size`, or 0 if absent.
+    pub dist_world: i32,
     pub flow_pairs: Vec<FlowPair>,
 }
 

@@ -40,6 +40,7 @@ fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace 
         raw_bufs: Vec::new(), stats: Vec::new(),
         max_ts, min_ts: 0.0, total_events, device: String::new(),
         vllm_version: String::new(),
+        dist_rank: -1, dist_world: 0,
         flow_pairs: Vec::new(),
     }
 }
@@ -494,7 +495,7 @@ fn test_load_trace_no_events() {
 
 #[test]
 fn test_cache_roundtrip() {
-    let json = r#"{"vllm_version": "0.26.1rc1.dev528+gf8d03e774", "traceEvents": [
+    let json = r#"{"vllm_version": "0.26.1rc1.dev528+gf8d03e774", "distributedInfo": {"backend": "nccl", "rank": 3, "world_size": 8, "pg_config": [{"pg_name": "0", "ranks": [0, 1, 2, 3, 4, 5, 6, 7]}]}, "traceEvents": [
         {"ph":"X","ts":100,"dur":50,"pid":1,"tid":1,"name":"kern_a","cat":"kernel","args":{"op":"matmul"}},
         {"ph":"X","ts":200,"dur":30,"pid":1,"tid":1,"name":"kern_b","cat":"kernel"},
         {"ph":"X","ts":300,"dur":40,"pid":1,"tid":2,"name":"cpu_fn","cat":"cpu_op"},
@@ -519,6 +520,10 @@ fn test_cache_roundtrip() {
     assert_eq!(cached.device, original.device);
     assert_eq!(original.vllm_version, "0.26.1rc1.dev528+gf8d03e774");
     assert_eq!(cached.vllm_version, original.vllm_version);
+    assert_eq!(original.dist_rank, 3);
+    assert_eq!(original.dist_world, 8);
+    assert_eq!(cached.dist_rank, original.dist_rank);
+    assert_eq!(cached.dist_world, original.dist_world);
     assert_eq!(cached.stats.len(), original.stats.len());
     for (a, b) in cached.tracks.iter().zip(original.tracks.iter()) {
         assert_eq!(a.label, b.label);
@@ -542,6 +547,22 @@ fn test_cache_roundtrip() {
 
     std::fs::remove_file(&path).ok();
     std::fs::remove_file(&cache_path).ok();
+}
+
+#[test]
+fn test_rank_summary() {
+    use crate::rank_summary;
+    let fname = "dp0_pp0_tp3_dcp0_ep3_rank3.1786304095590565996.pt.trace.json.gz";
+    // Full info: distributedInfo rank/world + filename coords (dcp0 omitted).
+    assert_eq!(rank_summary(fname, 3, 32), "rank 3/32 · tp3 pp0 dp0 ep3");
+    // No distributedInfo, coords still parse from the filename.
+    assert_eq!(rank_summary(fname, -1, 0), "tp3 pp0 dp0 ep3");
+    // Merged trace: world known, no single rank.
+    assert_eq!(rank_summary("8 ranks: prefix", -1, 8), "8 ranks");
+    // Non-vLLM filename with no coords and no dist info.
+    assert_eq!(rank_summary("chrome_trace.json", -1, 0), "");
+    // dcp shown when non-zero.
+    assert_eq!(rank_summary("tp1_dcp2_ep0", -1, 0), "tp1 ep0 dcp2");
 }
 
 #[test]
