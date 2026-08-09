@@ -320,7 +320,8 @@ impl ApplicationHandler for App {
             || self.nav_keys != 0
             || self.nav_pan_vel.abs() > 1e-6
             || self.nav_zoom_vel.abs() > 1e-6
-            || any_watching;
+            || any_watching
+            || self.state.panes.iter().any(|p| p.view.anim.is_some());
         if needs_poll {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             if let Some(w) = &self.window {
@@ -587,6 +588,7 @@ impl App {
                                 search_changed[pi] = false;
                             }
                             pane.select_from_search(&mut state.buf);
+                            pane.zoom_to_search();
                             pane.pending_tab = Some(BottomTab::Selection);
                         }
                         let search_active = pane.search_mask.iter().any(|&m| m);
@@ -623,6 +625,7 @@ impl App {
                             pane.view.t0 = -pad;
                             pane.view.t1 = max_ts + pad;
                             pane.view.scroll_y = 0.0;
+                            pane.view.anim = None;
                         }
                         if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
                             ui.same_line_with_spacing(0.0, 10.0);
@@ -1101,6 +1104,7 @@ impl App {
                         &mut pane.track_order,
                         &mut state.drag,
                         pane.merge_gpu,
+                        dt,
                     );
                     hover_results[pi] = h;
                     click_results[pi] = c;
@@ -1250,6 +1254,7 @@ impl App {
                 state.panes[ai].view.t0 = -pad;
                 state.panes[ai].view.t1 = max_ts + pad;
                 state.panes[ai].view.scroll_y = 0.0;
+                state.panes[ai].view.anim = None;
             }
         }
         if ui.is_key_pressed(imgui::Key::Escape) {
@@ -1297,6 +1302,10 @@ impl App {
 
             let pane = &mut state.panes[ai];
             if pane.trace.is_some() {
+                // A manual keyboard zoom/pan supersedes an in-flight search zoom.
+                if (zoom_target != 0.0 || pan_target != 0.0) && pane.view.anim.is_some() {
+                    pane.view.anim = None;
+                }
                 let range = pane.view.t1 - pane.view.t0;
                 if self.nav_zoom_vel.abs() > 1e-6 {
                     let factor = ZOOM_STEP.powf(nav_dt * 20.0 * self.nav_zoom_vel);
@@ -1335,6 +1344,7 @@ impl App {
                     let pad = (pane.view.t1 - pane.view.t0) * 0.1;
                     pane.view.t0 = ts - pad;
                     pane.view.t1 = ts + ev.dur + pad;
+                    pane.view.anim = None;
                     if !shift { pane.search_cursor += 1; }
                 }
             }

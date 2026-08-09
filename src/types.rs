@@ -54,6 +54,8 @@ pub const MAX_ZOOM: f64 = 200.0;
 pub const TRACK_SCALE_MIN: f32 = 0.5;
 pub const TRACK_SCALE_MAX: f32 = 30.0;
 pub const RESIZE_GRAB_H: f32 = 8.0;
+pub const ZOOM_ANIM_DUR: f32 = 0.35;
+pub const SEARCH_ZOOM_FILL: f64 = 0.8; // matches fill this fraction of the width
 pub const ROW_PAD: f32 = 4.0;
 pub const HISTOGRAM_BAR_H: f32 = 18.0;
 pub const LABEL_NAME_W: f32 = 160.0;
@@ -157,11 +159,55 @@ pub struct View {
     pub t0: f64,
     pub t1: f64,
     pub scroll_y: f32,
+    /// In-flight smooth zoom (e.g. from search-Enter). `None` when idle.
+    pub anim: Option<ViewAnim>,
 }
 
 impl Default for View {
     fn default() -> Self {
-        Self { t0: 0.0, t1: 1.0, scroll_y: 0.0 }
+        Self { t0: 0.0, t1: 1.0, scroll_y: 0.0, anim: None }
+    }
+}
+
+/// A smooth zoom between two time ranges. The center eases linearly while the
+/// range eases geometrically (log space), which reads as a natural zoom rather
+/// than the visible content rushing when endpoints are lerped directly.
+pub struct ViewAnim {
+    pub from_t0: f64,
+    pub from_t1: f64,
+    pub to_t0: f64,
+    pub to_t1: f64,
+    pub elapsed: f32,
+    pub dur: f32,
+}
+
+impl View {
+    /// Advance an in-flight zoom by `dt` seconds, writing the eased t0/t1.
+    /// Returns true while the animation is still running.
+    pub fn tick_anim(&mut self, dt: f32) -> bool {
+        let a = match self.anim.as_mut() {
+            Some(a) => a,
+            None => return false,
+        };
+        a.elapsed += dt;
+        let f = (a.elapsed / a.dur).clamp(0.0, 1.0);
+        if f >= 1.0 {
+            self.t0 = a.to_t0;
+            self.t1 = a.to_t1;
+            self.anim = None;
+            return false;
+        }
+        // smoothstep ease-in-out
+        let e = (f * f * (3.0 - 2.0 * f)) as f64;
+        let c_from = (a.from_t0 + a.from_t1) / 2.0;
+        let c_to = (a.to_t0 + a.to_t1) / 2.0;
+        let r_from = (a.from_t1 - a.from_t0).max(1e-12);
+        let r_to = (a.to_t1 - a.to_t0).max(1e-12);
+        let c = c_from + (c_to - c_from) * e;
+        let r = r_from * (r_to / r_from).powf(e);
+        self.t0 = c - r / 2.0;
+        self.t1 = c + r / 2.0;
+        true
     }
 }
 

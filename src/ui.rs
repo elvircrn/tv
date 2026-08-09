@@ -401,6 +401,7 @@ pub fn draw_timeline(
     track_order: &mut Vec<usize>,
     drag: &mut DragKind,
     merge_gpu: bool,
+    dt: f32,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let dl = ui.get_window_draw_list();
     let tl_left = rect[0] + label_w;
@@ -619,6 +620,15 @@ pub fn draw_timeline(
     fn t2x(t: f64, t0: f64, ppus: f64, left: f32) -> f32 { left + ((t - t0) * ppus) as f32 }
     #[inline]
     fn x2t(x: f32, t0: f64, ppus: f64, left: f32) -> f64 { t0 + (x - left) as f64 / ppus }
+
+    // A live search zoom drives the view unless the user grabs it back with a
+    // mouse zoom/pan; cancel then so the two don't fight for t0/t1.
+    let user_zoomed = hovered && (pinch != 0.0 || (ctrl && scroll[1] != 0.0) || scroll[0] != 0.0);
+    let user_panned = active && !drag.is_active() && !shift && mouse_delta[0] != 0.0;
+    if user_zoomed || user_panned {
+        view.anim = None;
+    }
+    view.tick_anim(dt);
 
     if hovered {
         if pinch != 0.0 {

@@ -565,6 +565,43 @@ impl Pane {
         self.compute_aggregates();
     }
 
+    /// Start a smooth zoom to the current search matches, sized so they fill
+    /// `SEARCH_ZOOM_FILL` (80%) of the timeline width. Uses the same visibility
+    /// filters as `select_from_search` so the framed span matches what's shown.
+    pub fn zoom_to_search(&mut self) {
+        let trace = match &self.trace {
+            Some(t) => t,
+            None => return,
+        };
+        if !self.search_mask.iter().any(|&m| m) { return; }
+        let mut lo = f64::MAX;
+        let mut hi = f64::MIN;
+        for track in &trace.tracks {
+            if !self.show_cpu && !track.gpu { continue; }
+            for ev in &track.events {
+                if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                if self.search_mask[ev.name as usize] {
+                    lo = lo.min(ev.ts);
+                    hi = hi.max(ev.ts + ev.dur);
+                }
+            }
+        }
+        if lo == f64::MAX || hi < lo { return; }
+        let span = (hi - lo).max(0.0);
+        let range = (span / crate::types::SEARCH_ZOOM_FILL).max(crate::types::MIN_TIME_RANGE);
+        let center = (lo + hi) / 2.0;
+        let to_t0 = center - range / 2.0;
+        let to_t1 = center + range / 2.0;
+        self.view.anim = Some(crate::types::ViewAnim {
+            from_t0: self.view.t0,
+            from_t1: self.view.t1,
+            to_t0,
+            to_t1,
+            elapsed: 0.0,
+            dur: crate::types::ZOOM_ANIM_DUR,
+        });
+    }
+
     fn compute_aggregates(&mut self) {
         let mut all_durs: Vec<f64> = self.selection_stats.iter().flat_map(|s| s.durations.iter().copied()).collect();
         all_durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
