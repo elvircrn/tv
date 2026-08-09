@@ -174,6 +174,13 @@ pub fn draw_stats_table(
         | TableFlags::SIZING_FIXED_FIT;
 
     let avail = ui.content_region_avail();
+    // Pin each numeric column to a stable width up front. If we left them to
+    // auto-fit (init width 0), imgui re-measures against only the rows the
+    // clipper renders, so the columns jitter horizontally while scrolling. A
+    // width sized to the header and a representative value keeps them steady.
+    let num_w = ui
+        .calc_text_size("0000.00 ms")[0]
+        .max(ui.calc_text_size("Median")[0] + 22.0);
     let cols: [TableColumnSetup<&str>; 7] = std::array::from_fn(|i| {
         let mut c = TableColumnSetup::new(STATS_HEADERS[i]);
         if i == 0 {
@@ -183,6 +190,7 @@ pub fn draw_stats_table(
             c.flags |= TableColumnFlags::WIDTH_STRETCH | TableColumnFlags::NO_HIDE;
         } else {
             c.flags |= TableColumnFlags::WIDTH_FIXED;
+            c.init_width_or_weight = num_w;
         }
         if i == *sort_col {
             c.flags |= TableColumnFlags::DEFAULT_SORT;
