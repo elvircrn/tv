@@ -648,6 +648,30 @@ impl App {
                         ui.checkbox("Show CPU trace", &mut pane.show_cpu);
                         ui.same_line_with_spacing(0.0, 10.0);
                         ui.checkbox("Merge Streams", &mut pane.merge_gpu);
+
+                        // vLLM traces emit a per-generation `execute_context_N(N)_generation_M(M)`
+                        // span on every stream — one toggle hides/shows them all. Only shown
+                        // when the trace actually contains such names.
+                        let exec_names: Vec<usize> = match pane.trace.as_ref() {
+                            Some(trace) => trace.names.iter().enumerate()
+                                .filter(|(_, n)| n.contains("execute_context"))
+                                .map(|(i, _)| i)
+                                .collect(),
+                            None => Vec::new(),
+                        };
+                        if !exec_names.is_empty() {
+                            let all_hidden = exec_names.iter()
+                                .all(|&i| pane.hidden_names.get(i).copied().unwrap_or(false));
+                            ui.same_line_with_spacing(0.0, 10.0);
+                            let label = if all_hidden { "Show Execute Context" } else { "Hide Execute Context" };
+                            if ui.button(label) {
+                                for &i in &exec_names {
+                                    if let Some(h) = pane.hidden_names.get_mut(i) { *h = !all_hidden; }
+                                }
+                                if !pane.search.is_empty() { pane.rebuild_search(); }
+                            }
+                        }
+
                         if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
                             ui.same_line_with_spacing(0.0, 10.0);
                             ui.checkbox("Watch", &mut pane.auto_reload);
