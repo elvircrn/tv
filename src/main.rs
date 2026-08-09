@@ -906,6 +906,14 @@ impl App {
                         dl.add_text([right_x, cy], col32(120, 120, 120, 255), "on");
                         right_x -= 6.0;
                     }
+                    // vLLM version/commit, when the trace carries it, sits just
+                    // right of the logo: `[logo] 0.26.1rc1.dev528+g...  on  Device`.
+                    if !t.vllm_version.is_empty() {
+                        let ver_size = ui.calc_text_size(&t.vllm_version);
+                        right_x -= ver_size[0];
+                        dl.add_text([right_x, cy], col32(120, 120, 120, 255), &t.vllm_version);
+                        right_x -= 6.0;
+                    }
                     right_x -= logo_w;
                     draw_vllm_logo(&dl, right_x, cy, logo_scale);
                 });

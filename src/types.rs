@@ -109,6 +109,9 @@ pub struct Trace {
     pub min_ts: f64,
     pub total_events: usize,
     pub device: String,
+    /// vLLM version/commit string from the trace header (e.g.
+    /// "0.26.1rc1.dev528+gf8d03e774"). Empty when the trace omits it.
+    pub vllm_version: String,
     pub flow_pairs: Vec<FlowPair>,
 }
 

@@ -554,6 +554,20 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
         }
     }
 
+    // vLLM traces embed a top-level `vllm_version` string (e.g.
+    // "0.26.1rc1.dev528+gf8d03e774"). Plenty of traces lack it — leave it empty.
+    let mut vllm_version = String::new();
+    if let Some(vp) = find_key(&raw, b"vllm_version") {
+        let mut q = vp + "\"vllm_version\"".len();
+        q = skip_ws(&raw, q);
+        if q < raw.len() && raw[q] == b':' { q += 1; }
+        q = skip_ws(&raw, q);
+        if q < raw.len() && raw[q] == b'"' {
+            let end = skip_string(&raw, q);
+            vllm_version = json_unescape(std::str::from_utf8(&raw[q + 1..end - 1]).unwrap_or(""));
+        }
+    }
+
     eprintln!("  scan: {:.2}s ({} objects, {} events, {} names, {}x parallel)",
         t0.elapsed().as_secs_f64(), scan_count, total_events, names.len(), n_chunks);
     drop(name_idx);
@@ -695,11 +709,11 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     cats.shrink_to_fit();
 
     eprintln!("  lanes: {:.2}s ({} tracks, {} flow_pairs)", t2.elapsed().as_secs_f64(), tracks.len(), flow_pairs.len());
-    Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, flow_pairs })
+    Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, vllm_version, flow_pairs })
 }
 
 const CACHE_MAGIC: &[u8; 4] = b"TRV2";
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 fn cache_path(source: &str, cache_dir: Option<&str>) -> String {
     if let Some(dir) = cache_dir {
@@ -845,6 +859,10 @@ pub fn save_cache(trace: &Trace, source_path: &str, cache_dir: Option<&str>) {
         w.write_all(flow_bytes).ok();
     }
 
+    // Optional trailing field: vLLM version string (empty when absent).
+    write_u32(&mut w, trace.vllm_version.len() as u32);
+    w.write_all(trace.vllm_version.as_bytes()).ok();
+
     drop(w);
     std::fs::rename(&tmp, &cp).ok();
 }
@@ -863,7 +881,7 @@ pub fn load_cache(source_path: &str, cache_dir: Option<&str>) -> Option<Trace> {
 }
 
 fn load_cache_from_mmap(mmap: memmap2::Mmap) -> Option<Trace> {
-    let (tracks, names, cats, device, stats, flow_pairs, max_ts, min_ts, total_events, args_offset, args_len) = {
+    let (tracks, names, cats, device, vllm_version, stats, flow_pairs, max_ts, min_ts, total_events, args_offset, args_len) = {
         let d = &mmap[..];
         if d.len() < 80 { return None; }
 
@@ -993,16 +1011,27 @@ fn load_cache_from_mmap(mmap: memmap2::Mmap) -> Option<Trace> {
                     let dst_ts = f64::from_le_bytes(d[off+16..off+24].try_into().unwrap());
                     flow_pairs.push(FlowPair { src_track, dst_track, src_ts, dst_ts });
                 }
+                fpos += n_flows * fp_size;
             }
         }
 
-        (tracks, names, cats, device, stats, flow_pairs, max_ts, min_ts, total_events, args_offset, args_len)
+        // Optional trailing field: vLLM version string.
+        let mut vllm_version = String::new();
+        if fpos + 4 <= d.len() {
+            let vlen = u32::from_le_bytes(d[fpos..fpos + 4].try_into().unwrap()) as usize;
+            fpos += 4;
+            if fpos + vlen <= d.len() {
+                vllm_version = String::from_utf8_lossy(&d[fpos..fpos + vlen]).into_owned();
+            }
+        }
+
+        (tracks, names, cats, device, vllm_version, stats, flow_pairs, max_ts, min_ts, total_events, args_offset, args_len)
     };
 
     Some(Trace {
         tracks, names, cats,
         raw_bufs: vec![Arc::new(ArgsBuf::Mmap { mmap, offset: args_offset, len: args_len })],
-        stats, max_ts, min_ts, total_events, device, flow_pairs,
+        stats, max_ts, min_ts, total_events, device, vllm_version, flow_pairs,
     })
 }
 
@@ -1133,6 +1162,10 @@ fn save_merged_cache(trace: &Trace, cache_dir: &str) {
         w.write_all(flow_bytes).ok();
     }
 
+    // Optional trailing field: vLLM version string (empty when absent).
+    write_u32(&mut w, trace.vllm_version.len() as u32);
+    w.write_all(trace.vllm_version.as_bytes()).ok();
+
     drop(w);
     std::fs::rename(&tmp, &cp).ok();
 }
@@ -1202,6 +1235,7 @@ fn clone_trace(t: &Trace) -> Trace {
         min_ts: t.min_ts,
         total_events: t.total_events,
         device: t.device.clone(),
+        vllm_version: t.vllm_version.clone(),
         flow_pairs: t.flow_pairs.clone(),
     }
 }
@@ -1372,6 +1406,7 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     );
     cat_idx.insert(0, 0);
     let mut device = String::new();
+    let mut vllm_version = String::new();
 
     let mut remap_info: Vec<(Vec<u32>, Vec<u32>, f64)> = Vec::with_capacity(traces.len());
     let mut all_raw_bufs: Vec<Arc<ArgsBuf>> = Vec::new();
@@ -1384,6 +1419,9 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
 
         if device.is_empty() && !trace.device.is_empty() {
             device = trace.device.clone();
+        }
+        if vllm_version.is_empty() && !trace.vllm_version.is_empty() {
+            vllm_version = trace.vllm_version.clone();
         }
 
         remap_info.push((name_remap, cat_remap, time_offset));
@@ -1478,7 +1516,7 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
 
     let mut trace = Trace {
         tracks: sorted_tracks, names, cats, raw_bufs: all_raw_bufs, stats,
-        max_ts, min_ts: global_min, total_events, device, flow_pairs: all_flow_pairs,
+        max_ts, min_ts: global_min, total_events, device, vllm_version, flow_pairs: all_flow_pairs,
     };
     compact_args(&mut trace);
     trace

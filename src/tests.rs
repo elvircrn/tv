@@ -39,6 +39,7 @@ fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace 
         tracks: trs, names: name_strs, cats: vec![String::new()],
         raw_bufs: Vec::new(), stats: Vec::new(),
         max_ts, min_ts: 0.0, total_events, device: String::new(),
+        vllm_version: String::new(),
         flow_pairs: Vec::new(),
     }
 }
@@ -493,7 +494,7 @@ fn test_load_trace_no_events() {
 
 #[test]
 fn test_cache_roundtrip() {
-    let json = r#"{"traceEvents": [
+    let json = r#"{"vllm_version": "0.26.1rc1.dev528+gf8d03e774", "traceEvents": [
         {"ph":"X","ts":100,"dur":50,"pid":1,"tid":1,"name":"kern_a","cat":"kernel","args":{"op":"matmul"}},
         {"ph":"X","ts":200,"dur":30,"pid":1,"tid":1,"name":"kern_b","cat":"kernel"},
         {"ph":"X","ts":300,"dur":40,"pid":1,"tid":2,"name":"cpu_fn","cat":"cpu_op"},
@@ -516,6 +517,8 @@ fn test_cache_roundtrip() {
     assert_eq!(cached.cats, original.cats);
     assert_eq!(cached.max_ts, original.max_ts);
     assert_eq!(cached.device, original.device);
+    assert_eq!(original.vllm_version, "0.26.1rc1.dev528+gf8d03e774");
+    assert_eq!(cached.vllm_version, original.vllm_version);
     assert_eq!(cached.stats.len(), original.stats.len());
     for (a, b) in cached.tracks.iter().zip(original.tracks.iter()) {
         assert_eq!(a.label, b.label);
