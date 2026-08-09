@@ -544,18 +544,31 @@ impl App {
                         let max_ts = pane.trace.as_ref().unwrap().max_ts;
                         {
                             let win_size = ui.window_size();
-                            let text_w = ui.calc_text_size("\u{00d7}")[0];
-                            let close_x = win_size[0] - text_w - ui.clone_style().window_padding[0];
+                            let btn = TOOLBAR_ROW; // square hit target
+                            let close_x = win_size[0] - btn - ui.clone_style().window_padding[0];
                             let cur_y = ui.cursor_pos()[1];
                             ui.set_cursor_pos([close_x, cur_y]);
-                            ui.invisible_button("##close", [text_w, TOOLBAR_ROW]);
+                            ui.invisible_button("##close", [btn, btn]);
                             let hovered = ui.is_item_hovered();
                             if ui.is_item_clicked() { close_pane = Some(pi); }
-                            ui.set_cursor_pos([close_x, cur_y]);
-                            let _c = ui.push_style_color(StyleColor::Text,
-                                if hovered { [1.0, 0.4, 0.4, 1.0] } else { [0.45, 0.45, 0.45, 1.0] });
-                            ui.text("\u{00d7}");
-                            ui.same_line_with_pos(ui.cursor_start_pos()[0]);
+                            if ui.is_item_hovered() { ui.tooltip_text("Close trace"); }
+                            let p_min = ui.item_rect_min();
+                            let p_max = ui.item_rect_max();
+                            let dl = ui.get_window_draw_list();
+                            if hovered {
+                                dl.add_rect(p_min, p_max, col32(200, 55, 55, 255))
+                                    .filled(true).rounding(4.0).build();
+                            }
+                            // Draw the glyph as two crossing strokes so it stays crisp
+                            // and legible at any size, instead of the tiny default "×".
+                            let inset = btn * 0.32;
+                            let a = [p_min[0] + inset, p_min[1] + inset];
+                            let b = [p_max[0] - inset, p_max[1] - inset];
+                            let stroke = if hovered { col32(255, 255, 255, 255) } else { col32(150, 150, 150, 255) };
+                            dl.add_line([a[0], a[1]], [b[0], b[1]], stroke).thickness(2.0).build();
+                            dl.add_line([a[0], b[1]], [b[0], a[1]], stroke).thickness(2.0).build();
+                            drop(dl);
+                            ui.set_cursor_pos([ui.cursor_start_pos()[0], cur_y]);
                         }
 
                         // Search
@@ -610,16 +623,8 @@ impl App {
                             ui.text_colored([0.6, 0.8, 1.0, 1.0], &state.buf.fmt);
                         }
 
-                        // Controls
+                        // Controls: view actions first, then display toggles.
                         ui.same_line_with_spacing(0.0, 16.0);
-                        ui.checkbox("CPU", &mut pane.show_cpu);
-                        ui.same_line_with_spacing(0.0, 10.0);
-                        ui.checkbox("Merge Streams", &mut pane.merge_gpu);
-                        if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
-                            ui.same_line_with_spacing(0.0, 10.0);
-                            ui.checkbox("Watch", &mut pane.auto_reload);
-                        }
-                        ui.same_line_with_spacing(0.0, 10.0);
                         if ui.button("Fit") {
                             let pad = max_ts * FIT_PAD_FRAC;
                             pane.view.t0 = -pad;
@@ -628,13 +633,21 @@ impl App {
                             pane.view.anim = None;
                         }
                         if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
-                            ui.same_line_with_spacing(0.0, 10.0);
+                            ui.same_line_with_spacing(0.0, 8.0);
                             if ui.button("Diff") {
                                 diff_clicked_against = Some(pi);
                             }
                         }
-                        if pi == 0 {
+                        ui.same_line_with_spacing(0.0, 16.0);
+                        ui.checkbox("Show CPU trace", &mut pane.show_cpu);
+                        ui.same_line_with_spacing(0.0, 10.0);
+                        ui.checkbox("Merge Streams", &mut pane.merge_gpu);
+                        if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
                             ui.same_line_with_spacing(0.0, 10.0);
+                            ui.checkbox("Watch", &mut pane.auto_reload);
+                        }
+                        if pi == 0 {
+                            ui.same_line_with_spacing(0.0, 16.0);
                             let _dim = ui.push_style_color(StyleColor::Text, [0.45, 0.45, 0.45, 1.0]);
                             ui.text("?");
                             if ui.is_item_hovered() {

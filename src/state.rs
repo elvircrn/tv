@@ -1,6 +1,5 @@
 use crate::loader::{load_trace_progressive, load_multi_progressive};
 use crate::types::*;
-use imgui::ImColor32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
