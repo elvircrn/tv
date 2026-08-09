@@ -252,12 +252,7 @@ impl Pane {
                     self.collapsed = vec![false; trace.tracks.len()];
                     self.track_scales = vec![1.0; trace.tracks.len()];
                     self.track_order = (0..trace.tracks.len()).collect();
-                    // vLLM's per-generation `execute_context_..._generation_..` spans
-                    // clutter the timeline, so hide them by default. The toolbar's
-                    // "Show Execute Context" toggle brings them back.
-                    self.hidden_names = trace.names.iter()
-                        .map(|n| n.contains("execute_context"))
-                        .collect();
+                    self.hidden_names = vec![false; trace.names.len()];
                     self.trace = Some(trace);
                 }
             }
