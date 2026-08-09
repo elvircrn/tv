@@ -1122,15 +1122,19 @@ impl App {
                 let pane = &mut state.panes[pi];
                 let trace = pane.trace.as_ref().unwrap();
                 let ev = &trace.tracks[c.track_idx as usize].events[c.event_idx as usize];
-                if double_clicks[pi] {
-                    pane.multi_select_name = Some(ev.name);
-                } else {
-                    pane.multi_select_name = None;
-                }
+                let double = double_clicks[pi];
+                pane.multi_select_name = if double { Some(ev.name) } else { None };
                 pane.selected = Some(c);
                 pane.clear_selection();
                 state.active = pi;
-                pane.pending_tab = Some(BottomTab::Detail);
+                if double {
+                    // Double-click selects every event of this name: populate the
+                    // Selection tab with that kernel's aggregate + distribution.
+                    pane.rebuild_multi_select_stats();
+                    pane.pending_tab = Some(BottomTab::Selection);
+                } else {
+                    pane.pending_tab = Some(BottomTab::Detail);
+                }
             }
 
             if let Some(sel) = new_selections[pi] {

@@ -576,6 +576,38 @@ impl Pane {
         self.compute_aggregates();
     }
 
+    /// Build the Selection-tab stats for a double-click multi-select: every
+    /// event whose name matches `multi_select_name`, across the visible tracks
+    /// (respecting the CPU/GPU filter), so the tab shows that kernel's count,
+    /// totals and duration distribution — matching the timeline highlight.
+    pub fn rebuild_multi_select_stats(&mut self) {
+        let name_id = match self.multi_select_name {
+            Some(n) => n,
+            None => return,
+        };
+        let trace = match &self.trace {
+            Some(t) => t,
+            None => return,
+        };
+        let mut count = 0u32;
+        let mut total_dur = 0.0f64;
+        let mut durations = Vec::new();
+        for track in &trace.tracks {
+            if !self.show_cpu && !track.gpu { continue; }
+            for ev in &track.events {
+                if ev.name != name_id { continue; }
+                count += 1;
+                total_dur += ev.dur;
+                durations.push(ev.dur);
+            }
+        }
+        self.selection_stats.clear();
+        if count > 0 {
+            self.selection_stats.push(SelectionEntry { name: name_id, count, total_dur, durations });
+        }
+        self.compute_aggregates();
+    }
+
     /// Start a smooth zoom to the FIRST (earliest) search match, sized so that
     /// event fills `SEARCH_ZOOM_FILL` (80%) of the timeline width, and record
     /// its track as the pending vertical focus so draw_timeline can scroll it

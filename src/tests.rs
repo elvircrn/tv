@@ -1665,6 +1665,48 @@ fn test_nav_search_wraps_and_frames_each_match() {
 }
 
 #[test]
+fn test_rebuild_multi_select_stats_aggregates_by_name() {
+    // "foo" (name id 1) appears 3x on GPU tracks and 1x on a CPU track.
+    let trace = make_trace(
+        vec!["", "foo", "bar"],
+        vec![
+            ("GPU 0", true, vec![
+                ev(0.0, 10.0, 1, 0),   // foo
+                ev(20.0, 2.0, 2, 0),   // bar
+                ev(30.0, 20.0, 1, 0),  // foo
+            ]),
+            ("GPU 1", true, vec![
+                ev(5.0, 30.0, 1, 0),   // foo
+            ]),
+            ("CPU", false, vec![
+                ev(1.0, 99.0, 1, 0),   // foo, but on a CPU track
+            ]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let pane = &mut state.panes[0];
+    assert!(!pane.show_cpu, "default hides CPU tracks");
+
+    // Double-click selects every "foo": with CPU hidden, only the 3 GPU ones.
+    pane.multi_select_name = Some(1);
+    pane.rebuild_multi_select_stats();
+    assert_eq!(pane.selection_stats.len(), 1);
+    let se = &pane.selection_stats[0];
+    assert_eq!(se.name, 1);
+    assert_eq!(se.count, 3);
+    assert!((se.total_dur - 60.0).abs() < 1e-9, "total={}", se.total_dur);
+    // median of [10,20,30] = 20
+    assert!((pane.sel_median - 20.0).abs() < 1e-9, "median={}", pane.sel_median);
+    assert_eq!(pane.sel_individual.len(), 3);
+
+    // Enabling CPU includes the 4th instance.
+    pane.show_cpu = true;
+    pane.rebuild_multi_select_stats();
+    assert_eq!(pane.selection_stats[0].count, 4);
+    assert!((pane.selection_stats[0].total_dur - 159.0).abs() < 1e-9);
+}
+
+#[test]
 fn test_copy_selection_text_survives_stale_selection() {
     // Regression: after a reload/merge the trace can shrink, leaving a stale
     // EventRef whose index is out of bounds. Indexing it must not panic.
