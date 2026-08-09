@@ -171,16 +171,18 @@ pub fn draw_stats_table(
         | TableFlags::BORDERS_OUTER
         | TableFlags::SCROLL_Y
         | TableFlags::NO_SAVED_SETTINGS
-        | TableFlags::SIZING_STRETCH_PROP;
+        | TableFlags::SIZING_FIXED_FIT;
 
     let avail = ui.content_region_avail();
     let cols: [TableColumnSetup<&str>; 7] = std::array::from_fn(|i| {
         let mut c = TableColumnSetup::new(STATS_HEADERS[i]);
-        // Name gets the lion's share of the stretch weight; numeric cols split
-        // the rest evenly. The Name column can't be hidden (it's the key).
-        c.init_width_or_weight = if i == 0 { 3.0 } else { 1.0 };
         if i == 0 {
-            c.flags |= TableColumnFlags::NO_HIDE;
+            // The name is textual and usually long, so let it stretch to absorb
+            // all the slack. The numeric columns fit their (short) content and
+            // get pushed to the right. Name can't be hidden (it's the key).
+            c.flags |= TableColumnFlags::WIDTH_STRETCH | TableColumnFlags::NO_HIDE;
+        } else {
+            c.flags |= TableColumnFlags::WIDTH_FIXED;
         }
         if i == *sort_col {
             c.flags |= TableColumnFlags::DEFAULT_SORT;
