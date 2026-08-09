@@ -1569,19 +1569,22 @@ fn bench_merge_filter() {
 
 
 #[test]
-fn test_zoom_to_search_targets_80pct_fill() {
-    // One GPU track: "foo" events clustered at [100,110], "bar" spread wide.
+fn test_zoom_to_search_frames_first_match_80pct_fill() {
+    // Two tracks; "foo" matches appear on both. The earliest match (ts=50 on
+    // track 1) is what we frame, not the bounding box of all matches.
     let trace = make_trace(
         vec!["", "foo", "bar"],
-        vec![(
-            "GPU 0", true,
-            vec![
-                ev(0.0, 5.0, 2, 0),      // bar (early)
-                ev(100.0, 4.0, 1, 0),    // foo
-                ev(106.0, 4.0, 1, 0),    // foo -> ends at 110
-                ev(900.0, 5.0, 2, 0),    // bar (late)
-            ],
-        )],
+        vec![
+            ("GPU 0", true, vec![
+                ev(0.0, 5.0, 2, 0),      // bar
+                ev(100.0, 4.0, 1, 0),    // foo (later)
+                ev(900.0, 5.0, 2, 0),    // bar
+            ]),
+            ("GPU 1", true, vec![
+                ev(50.0, 4.0, 1, 0),     // foo (EARLIEST match)
+                ev(800.0, 4.0, 1, 0),    // foo (later)
+            ]),
+        ],
     );
     let mut state = make_state(trace);
     let pane = &mut state.panes[0];
@@ -1591,22 +1594,24 @@ fn test_zoom_to_search_targets_80pct_fill() {
     pane.rebuild_search();
     pane.zoom_to_search();
 
+    // Vertical focus is the track holding the earliest match (track 1).
+    assert_eq!(pane.pending_focus, Some(1));
+
     let a = pane.view.anim.as_ref().expect("search zoom should start an animation");
-    // matches span [100,110] => span 10, range = 10/0.8 = 12.5, center 105
-    assert!((a.to_t0 - 98.75).abs() < 1e-6, "to_t0={}", a.to_t0);
-    assert!((a.to_t1 - 111.25).abs() < 1e-6, "to_t1={}", a.to_t1);
-    // 80% fill: matched span occupies 10/12.5 = 0.8 of the framed range.
-    let matched = 110.0 - 100.0;
+    // first match = [50,54] => dur 4, range = 4/0.8 = 5, center 52
+    assert!((a.to_t0 - 49.5).abs() < 1e-6, "to_t0={}", a.to_t0);
+    assert!((a.to_t1 - 54.5).abs() < 1e-6, "to_t1={}", a.to_t1);
+    // 80% fill: the event's duration occupies 4/5 = 0.8 of the framed range.
     let framed = a.to_t1 - a.to_t0;
-    assert!((matched / framed - 0.8).abs() < 1e-9);
+    assert!((4.0 / framed - 0.8).abs() < 1e-9);
 
     // Driving the animation to completion lands exactly on target and clears.
     // dt is clamped per tick, so step until it finishes (bounded loop).
     let mut guard = 0;
     while pane.view.tick_anim(0.05) { guard += 1; assert!(guard < 100); }
     assert!(pane.view.anim.is_none());
-    assert!((pane.view.t0 - 98.75).abs() < 1e-6);
-    assert!((pane.view.t1 - 111.25).abs() < 1e-6);
+    assert!((pane.view.t0 - 49.5).abs() < 1e-6);
+    assert!((pane.view.t1 - 54.5).abs() < 1e-6);
 }
 
 #[test]

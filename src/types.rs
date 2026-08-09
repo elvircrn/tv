@@ -177,6 +177,8 @@ pub struct ViewAnim {
     pub from_t1: f64,
     pub to_t0: f64,
     pub to_t1: f64,
+    pub from_scroll: f32,
+    pub to_scroll: f32,
     pub elapsed: f32,
     pub dur: f32,
 }
@@ -197,6 +199,7 @@ impl View {
         if f >= 1.0 {
             self.t0 = a.to_t0;
             self.t1 = a.to_t1;
+            self.scroll_y = a.to_scroll;
             self.anim = None;
             return false;
         }
@@ -210,6 +213,7 @@ impl View {
         let r = r_from * (r_to / r_from).powf(e);
         self.t0 = c - r / 2.0;
         self.t1 = c + r / 2.0;
+        self.scroll_y = a.from_scroll + (a.to_scroll - a.from_scroll) * e as f32;
         true
     }
 }

@@ -1105,6 +1105,7 @@ impl App {
                         &mut state.drag,
                         pane.merge_gpu,
                         dt,
+                        &mut pane.pending_focus,
                     );
                     hover_results[pi] = h;
                     click_results[pi] = c;

@@ -402,6 +402,7 @@ pub fn draw_timeline(
     drag: &mut DragKind,
     merge_gpu: bool,
     dt: f32,
+    focus: &mut Option<u32>,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let dl = ui.get_window_draw_list();
     let tl_left = rect[0] + label_w;
@@ -627,6 +628,26 @@ pub fn draw_timeline(
     let user_panned = active && !drag.is_active() && !shift && mouse_delta[0] != 0.0;
     if user_zoomed || user_panned {
         view.anim = None;
+        *focus = None;
+    }
+    // Resolve a pending vertical focus (from a search zoom) into the animation's
+    // scroll target, now that the final row layout + viewport height are known.
+    // Vertical layout doesn't depend on the horizontal zoom, so this is stable
+    // even while t0/t1 are still animating.
+    if let Some(ti) = focus.take() {
+        if let Some(a) = view.anim.as_mut() {
+            let row_vi = buf.merged_gpu_groups.iter()
+                .find(|g| g.tracks.contains(&(ti as usize)))
+                .map(|g| g.vi)
+                .or_else(|| buf.visible.iter().position(|&v| v == ti as usize));
+            if let Some(vi) = row_vi {
+                let visible_h = (rect[3] - tracks_top).max(1.0);
+                let max_scroll = (total_h - visible_h).max(0.0);
+                let center = buf.y_offsets[vi] + buf.heights[vi] * 0.5;
+                a.from_scroll = view.scroll_y;
+                a.to_scroll = (center - visible_h * 0.5).clamp(0.0, max_scroll);
+            }
+        }
     }
     view.tick_anim(dt);
 
