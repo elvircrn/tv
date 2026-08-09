@@ -772,10 +772,6 @@ impl App {
                                         pane.hidden_names[ev.name as usize] = !is_hidden;
                                     }
                                 }
-                                ui.same_line_with_spacing(0.0, 8.0);
-                                if ui.small_button("Copy All") {
-                                    ui.set_clipboard_text(&state.buf.detail_buf);
-                                }
                                 state.buf.detail_buf.clear();
                                 write!(state.buf.detail_buf, "{}\n", name).unwrap();
                                 state.buf.detail_buf.push_str("Dur: ");
