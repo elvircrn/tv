@@ -249,6 +249,11 @@ impl Pane {
                     self.hidden_names.resize(n_names, false);
                     self.search_mask.clear();
                     self.search_nav.clear();
+                    self.search_cursor = 0;
+                    // The reloaded trace may have fewer events; a retained
+                    // EventRef would index out of bounds in the Detail panel.
+                    self.selected = None;
+                    self.selection_stats.clear();
                     let old_stats = std::mem::take(&mut self.trace.as_mut().unwrap().stats);
                     self.trace = Some(trace);
                     self.trace.as_mut().unwrap().stats = old_stats;
@@ -510,9 +515,11 @@ impl Pane {
                 }
             }
         } else if let Some(sel) = self.selected {
-            let track = &trace.tracks[sel.track_idx as usize];
-            let ev = &track.events[sel.event_idx as usize];
-            events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
+            if let Some(ev) = trace.tracks.get(sel.track_idx as usize)
+                .and_then(|t| t.events.get(sel.event_idx as usize))
+            {
+                events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
+            }
         }
 
         if events.is_empty() { return None; }

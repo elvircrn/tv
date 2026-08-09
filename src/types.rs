@@ -327,7 +327,5 @@ pub struct DrawBuf {
     pub sel_map: HashMap<u32, (u32, f64, Vec<f64>)>,
     pub sel_bars: Vec<(f64, u32)>,
     pub detail_buf: String,
-    pub col_widths: [f32; 7],
-    pub col_widths_total: f32,
     pub merged_gpu_groups: Vec<MergedGpuGroup>,
 }

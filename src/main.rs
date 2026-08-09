@@ -761,9 +761,15 @@ impl App {
                             imgui::TabItemFlags::SET_SELECTED
                         } else { imgui::TabItemFlags::empty() };
                         if let Some(_t) = imgui::TabItem::new("Detail").flags(detail_flags).begin(&ui) {
-                            if let Some(sel) = &pane.selected {
-                                let track = &trace.tracks[sel.track_idx as usize];
-                                let ev = &track.events[sel.event_idx as usize];
+                            // Resolve the selection defensively: after a reload/merge
+                            // the trace can have fewer tracks/events than when the
+                            // EventRef was captured, so a stale index must not panic.
+                            let sel_ev = pane.selected.and_then(|sel| {
+                                trace.tracks.get(sel.track_idx as usize).and_then(|t| {
+                                    t.events.get(sel.event_idx as usize).map(|ev| (t, ev))
+                                })
+                            });
+                            if let Some((track, ev)) = sel_ev {
                                 let name = &trace.names[ev.name as usize];
                                 let is_hidden = pane.hidden_names.get(ev.name as usize).copied().unwrap_or(false);
                                 state.buf.fmt.clear();
@@ -818,7 +824,7 @@ impl App {
                             imgui::TabItemFlags::SET_SELECTED
                         } else { imgui::TabItemFlags::empty() };
                         if let Some(_t) = imgui::TabItem::new("Stats").flags(stats_flags).begin(&ui) {
-                            draw_stats_table(&ui, trace, &trace.stats, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf);
+                            draw_stats_table(&ui, trace, &trace.stats, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##statstable");
                         }
 
                         let sel_flags = if pending == Some(BottomTab::Selection) {
@@ -846,9 +852,9 @@ impl App {
                                 draw_selection_histogram(&ui, trace, &pane.selection_stats, pane.sel_aggregate, &mut state.buf);
                                 ui.separator();
                                 if pane.sel_aggregate {
-                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf);
+                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
                                 } else {
-                                    draw_stats_table(&ui, trace, &pane.sel_individual, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf);
+                                    draw_stats_table(&ui, trace, &pane.sel_individual, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
                                 }
                             } else {
                                 ui.text_colored([0.5, 0.5, 0.5, 1.0], "Shift+drag to select a time range");
@@ -1278,8 +1284,11 @@ impl App {
             let pane = &state.panes[ai];
             if let Some(sel) = &pane.selected {
                 if let Some(trace) = &pane.trace {
-                    let ev = &trace.tracks[sel.track_idx as usize].events[sel.event_idx as usize];
-                    ui.set_clipboard_text(&trace.names[ev.name as usize]);
+                    if let Some(ev) = trace.tracks.get(sel.track_idx as usize)
+                        .and_then(|t| t.events.get(sel.event_idx as usize))
+                    {
+                        ui.set_clipboard_text(&trace.names[ev.name as usize]);
+                    }
                 }
             }
         }

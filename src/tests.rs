@@ -1665,6 +1665,35 @@ fn test_nav_search_wraps_and_frames_each_match() {
 }
 
 #[test]
+fn test_copy_selection_text_survives_stale_selection() {
+    // Regression: after a reload/merge the trace can shrink, leaving a stale
+    // EventRef whose index is out of bounds. Indexing it must not panic.
+    let trace = make_trace(
+        vec!["", "foo", "bar"],
+        vec![("GPU 0", true, vec![
+            ev(0.0, 5.0, 2, 0),
+            ev(10.0, 4.0, 1, 0),
+            ev(20.0, 3.0, 2, 0),
+        ])],
+    );
+    let mut state = make_state(trace);
+    let pane = &mut state.panes[0];
+
+    // A valid selection produces text.
+    pane.selected = Some(crate::types::EventRef { track_idx: 0, event_idx: 1 });
+    let out = pane.copy_selection_text().expect("valid selection yields text");
+    assert!(out.contains("foo"), "got {out:?}");
+
+    // Stale event index (track has only 3 events) must not panic.
+    pane.selected = Some(crate::types::EventRef { track_idx: 0, event_idx: 23226 });
+    assert!(pane.copy_selection_text().is_none());
+
+    // Stale track index must not panic either.
+    pane.selected = Some(crate::types::EventRef { track_idx: 99, event_idx: 0 });
+    assert!(pane.copy_selection_text().is_none());
+}
+
+#[test]
 fn test_nav_search_no_matches_noop() {
     let trace = make_trace(
         vec!["", "foo"],
