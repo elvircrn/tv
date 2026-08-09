@@ -1527,6 +1527,53 @@ fn test_nav_search_no_matches_noop() {
 }
 
 #[test]
+fn test_nav_search_skips_hidden_cpu_matches() {
+    // A "foo" match on a hidden CPU track precedes two on GPU tracks. With CPU
+    // hidden (the default), navigation must frame and step only through the
+    // visible GPU matches — never the off-screen CPU one.
+    let trace = make_trace(
+        vec!["", "foo"],
+        vec![
+            ("python (CPU)", false, vec![ev(10.0, 5.0, 1, 0)]), // search_nav[0], hidden
+            ("GPU 0", true, vec![
+                ev(50.0, 4.0, 1, 0),   // search_nav[1], visible
+                ev(100.0, 4.0, 1, 0),  // search_nav[2], visible
+            ]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let pane = &mut state.panes[0];
+    assert!(!pane.show_cpu, "CPU hidden by default");
+    pane.view.t0 = 0.0;
+    pane.view.t1 = 1000.0;
+    pane.search.push_str("foo");
+    pane.rebuild_search();
+    assert_eq!(pane.search_nav.len(), 3);
+
+    // Enter frames the first *visible* match (GPU ts=50) and syncs the cursor.
+    pane.zoom_to_search();
+    assert_eq!(pane.search_cursor, 1);
+    let sel = pane.selected.expect("frames a visible match");
+    assert_eq!((sel.track_idx, sel.event_idx), (1, 0));
+
+    // Next advances to the other GPU match, not the CPU one.
+    pane.nav_search(true);
+    assert_eq!(pane.search_cursor, 2);
+    assert_eq!(pane.selected.unwrap().track_idx, 1);
+
+    // Next wraps past the hidden CPU match (index 0) back to the first GPU match.
+    pane.nav_search(true);
+    assert_eq!(pane.search_cursor, 1);
+    assert_eq!(pane.selected.unwrap().track_idx, 1);
+
+    // Showing CPU makes the previously-skipped match reachable.
+    pane.show_cpu = true;
+    pane.nav_search(false);
+    assert_eq!(pane.search_cursor, 0);
+    assert_eq!(pane.selected.unwrap().track_idx, 0);
+}
+
+#[test]
 fn test_zoom_to_search_no_matches_no_anim() {
     let trace = make_trace(
         vec!["", "foo"],

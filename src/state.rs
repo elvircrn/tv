@@ -592,30 +592,38 @@ impl Pane {
     /// event fills `SEARCH_ZOOM_FILL` (80%) of the timeline width, and record
     /// its track as the pending vertical focus so draw_timeline can scroll it
     /// into view. Uses the same visibility filters as `select_from_search`.
-    pub fn zoom_to_search(&mut self) {
-        let trace = match &self.trace {
-            Some(t) => t,
-            None => return,
-        };
-        if !self.search_mask.iter().any(|&m| m) { return; }
-        // Earliest visible matching event across all tracks.
-        let mut best: Option<(f64, f64, usize)> = None; // (ts, dur, track_idx)
-        for (ti, track) in trace.tracks.iter().enumerate() {
-            if !self.show_cpu && !track.gpu { continue; }
-            for ev in &track.events {
-                if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                if self.search_mask[ev.name as usize] {
-                    if best.map_or(true, |(bts, _, _)| ev.ts < bts) {
-                        best = Some((ev.ts, ev.dur, ti));
-                    }
-                }
-            }
+    /// Whether the match at `(track_idx, event_idx)` is currently on screen —
+    /// i.e. its track isn't CPU-hidden and its name isn't hidden. Search
+    /// navigation skips matches that fail this, so it never frames an event on a
+    /// track the user can't see.
+    fn nav_match_visible(&self, ti: u32, ei: u32) -> bool {
+        let trace = match &self.trace { Some(t) => t, None => return false };
+        let track = match trace.tracks.get(ti as usize) { Some(t) => t, None => return false };
+        if !self.show_cpu && !track.gpu { return false; }
+        match track.events.get(ei as usize) {
+            Some(ev) => !self.hidden_names.get(ev.name as usize).copied().unwrap_or(false),
+            None => false,
         }
-        let (ts, dur, track_idx) = match best {
-            Some(b) => b,
-            None => return,
-        };
-        self.start_zoom_to(ts, dur, track_idx);
+    }
+
+    /// Frame the first visible match and sync the nav cursor to it, so a
+    /// subsequent prev/next continues from the framed event rather than from a
+    /// stale cursor (which could step into a hidden CPU match and appear to do
+    /// nothing).
+    pub fn zoom_to_search(&mut self) {
+        let idx = self.search_nav.iter()
+            .position(|&(_, ti, ei)| self.nav_match_visible(ti, ei));
+        if let Some(idx) = idx {
+            self.search_cursor = idx;
+            self.zoom_to_nav_cursor();
+        }
+    }
+
+    fn zoom_to_nav_cursor(&mut self) {
+        let (ts, ti, ei) = self.search_nav[self.search_cursor];
+        self.selected = Some(EventRef { track_idx: ti, event_idx: ei });
+        let dur = self.trace.as_ref().unwrap().tracks[ti as usize].events[ei as usize].dur;
+        self.start_zoom_to(ts, dur, ti as usize);
     }
 
     /// Start a smooth zoom that frames a single event (`ts`, `dur`) at
@@ -645,16 +653,20 @@ impl Pane {
     pub fn nav_search(&mut self, forward: bool) {
         let n = self.search_nav.len();
         if n == 0 { return; }
-        self.search_cursor = if forward {
-            (self.search_cursor + 1) % n
-        } else {
-            (self.search_cursor + n - 1) % n
-        };
-        let (ts, ti, ei) = self.search_nav[self.search_cursor];
-        self.selected = Some(EventRef { track_idx: ti, event_idx: ei });
-        self.pending_tab = Some(BottomTab::Detail);
-        let dur = self.trace.as_ref().unwrap().tracks[ti as usize].events[ei as usize].dur;
-        self.start_zoom_to(ts, dur, ti as usize);
+        // Step to the next/previous *visible* match, skipping hidden CPU-track
+        // and hidden-name matches, wrapping around. If none are visible, do
+        // nothing rather than jump to an off-screen event.
+        let mut i = self.search_cursor;
+        for _ in 0..n {
+            i = if forward { (i + 1) % n } else { (i + n - 1) % n };
+            let (_, ti, ei) = self.search_nav[i];
+            if self.nav_match_visible(ti, ei) {
+                self.search_cursor = i;
+                self.pending_tab = Some(BottomTab::Detail);
+                self.zoom_to_nav_cursor();
+                return;
+            }
+        }
     }
 
     fn compute_aggregates(&mut self) {
