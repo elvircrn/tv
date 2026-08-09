@@ -1487,15 +1487,22 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
 pub fn load_multi_progressive(
     rank_paths: Vec<(usize, String)>, counter: &Arc<AtomicUsize>, tpf: usize,
     tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
-    cache_dir: Option<&str>,
+    cache_dir: Option<&str>, bypass_cache: bool,
 ) {
     let t0 = Instant::now();
 
-    if let Some(cd) = cache_dir {
-        if let Some(trace) = load_merged_cache(cd) {
-            eprintln!("  merged cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
-            let _ = tx.send(Ok(trace));
-            return;
+    // On a watch-triggered reload (bypass_cache), skip the merged cache: its hash
+    // is keyed off the per-file .tvcache names+sizes, which don't reflect a
+    // source-file edit yet, so it would keep serving stale data. The per-file
+    // load_trace below still uses its mtime-validated caches, so unchanged ranks
+    // stay fast while the edited one is re-read and the merge re-saved.
+    if !bypass_cache {
+        if let Some(cd) = cache_dir {
+            if let Some(trace) = load_merged_cache(cd) {
+                eprintln!("  merged cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                let _ = tx.send(Ok(trace));
+                return;
+            }
         }
     }
 

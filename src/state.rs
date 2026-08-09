@@ -184,7 +184,7 @@ impl Pane {
         let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / n).max(2);
         let cd = self.cache_dir.clone();
         std::thread::spawn(move || {
-            load_multi_progressive(rank_paths, &counter, tpf, &tx, cd.as_deref());
+            load_multi_progressive(rank_paths, &counter, tpf, &tx, cd.as_deref(), false);
         });
     }
 
@@ -218,7 +218,7 @@ impl Pane {
         } else {
             let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / paths.len()).max(1);
             std::thread::spawn(move || {
-                load_multi_progressive(paths, &counter, tpf, &tx, cd.as_deref());
+                load_multi_progressive(paths, &counter, tpf, &tx, cd.as_deref(), true);
             });
         }
     }
