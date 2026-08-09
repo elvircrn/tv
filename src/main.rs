@@ -542,11 +542,16 @@ impl App {
                     let pane = &mut state.panes[pi];
                     if pane.trace.is_some() {
                         let max_ts = pane.trace.as_ref().unwrap().max_ts;
+                        // Vertically center the row's widgets within the toolbar. Frame
+                        // widgets (input, buttons, checkboxes) are `frame_height` tall;
+                        // the square close button is `TOOLBAR_ROW` tall.
+                        let frame_h = ui.frame_height();
+                        let row_y = ((TOOLBAR_H - frame_h) * 0.5).max(0.0);
                         {
                             let win_size = ui.window_size();
                             let btn = TOOLBAR_ROW; // square hit target
                             let close_x = win_size[0] - btn - ui.clone_style().window_padding[0];
-                            let cur_y = ui.cursor_pos()[1];
+                            let cur_y = ((TOOLBAR_H - btn) * 0.5).max(0.0);
                             ui.set_cursor_pos([close_x, cur_y]);
                             ui.invisible_button("##close", [btn, btn]);
                             let hovered = ui.is_item_hovered();
@@ -568,7 +573,7 @@ impl App {
                             dl.add_line([a[0], a[1]], [b[0], b[1]], stroke).thickness(2.0).build();
                             dl.add_line([a[0], b[1]], [b[0], a[1]], stroke).thickness(2.0).build();
                             drop(dl);
-                            ui.set_cursor_pos([ui.cursor_start_pos()[0], cur_y]);
+                            ui.set_cursor_pos([ui.cursor_start_pos()[0], row_y]);
                         }
 
                         // Search
@@ -618,6 +623,7 @@ impl App {
                             });
                             if ui.is_item_hovered() { ui.tooltip_text("Next match (N)"); }
                             ui.same_line_with_spacing(0.0, 6.0);
+                            ui.align_text_to_frame_padding();
                             state.buf.fmt.clear();
                             write!(state.buf.fmt, "{} matches", pane.search_nav.len()).unwrap();
                             ui.text_colored([0.6, 0.8, 1.0, 1.0], &state.buf.fmt);
@@ -648,6 +654,7 @@ impl App {
                         }
                         if pi == 0 {
                             ui.same_line_with_spacing(0.0, 16.0);
+                            ui.align_text_to_frame_padding();
                             let _dim = ui.push_style_color(StyleColor::Text, [0.45, 0.45, 0.45, 1.0]);
                             ui.text("?");
                             if ui.is_item_hovered() {
@@ -684,8 +691,10 @@ impl App {
                         }
 
                     } else if pane.loading.is_some() {
+                        ui.align_text_to_frame_padding();
                         ui.text(&pane.loading_progress_text());
                     } else {
+                        ui.align_text_to_frame_padding();
                         ui.text("Drop a trace file here, or: tv <file.json[.gz]>");
                     }
                     if let Some(e) = &pane.error {
