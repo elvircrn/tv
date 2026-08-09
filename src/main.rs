@@ -609,17 +609,6 @@ impl App {
                             write!(state.buf.fmt, "{} matches", pane.search_nav.len()).unwrap();
                             ui.text_colored([0.6, 0.8, 1.0, 1.0], &state.buf.fmt);
                         }
-                        let n_hidden = pane.hidden_names.iter().filter(|&&h| h).count();
-                        if n_hidden > 0 {
-                            ui.same_line_with_spacing(0.0, 10.0);
-                            state.buf.fmt.clear();
-                            write!(state.buf.fmt, "{} hidden", n_hidden).unwrap();
-                            ui.text_colored([1.0, 0.7, 0.3, 1.0], &state.buf.fmt);
-                            ui.same_line_with_spacing(0.0, 4.0);
-                            if ui.small_button("Clear##unhide") {
-                                for h in &mut pane.hidden_names { *h = false; }
-                            }
-                        }
 
                         // Controls
                         ui.same_line_with_spacing(0.0, 16.0);
@@ -839,6 +828,7 @@ impl App {
                                         if let Some(h) = pane.hidden_names.get_mut(se.name as usize) { *h = true; }
                                     }
                                 }
+                                draw_hidden_clear(&ui, 10.0, &mut pane.hidden_names, &mut state.buf.fmt);
                                 ui.same_line();
                                 let sel_total_count: u32 = pane.selection_stats.iter().map(|s| s.count).sum();
                                 let sel_total_dur: f64 = pane.selection_stats.iter().map(|s| s.total_dur).sum();
@@ -858,6 +848,7 @@ impl App {
                                 }
                             } else {
                                 ui.text_colored([0.5, 0.5, 0.5, 1.0], "Shift+drag to select a time range");
+                                draw_hidden_clear(&ui, 16.0, &mut pane.hidden_names, &mut state.buf.fmt);
                             }
                         }
 

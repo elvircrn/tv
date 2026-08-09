@@ -144,6 +144,27 @@ pub fn draw_selection_histogram(
 /// `Pane::sort_col`, so keep the two in sync.
 const STATS_HEADERS: [&str; 7] = ["Name", "Count", "Total", "%", "Mean", "Median", "Max"];
 
+/// Renders the "N hidden" indicator and its "Clear" (unhide-all) button, placed
+/// on the current row after `spacing` px. Draws nothing when nothing is hidden.
+/// Lives beside the Selection table's "Hide Selected" so all hide/unhide
+/// controls sit together instead of being scattered into the toolbar.
+pub fn draw_hidden_clear(ui: &imgui::Ui, spacing: f32, hidden_names: &mut [bool], fmt: &mut String) {
+    let n_hidden = hidden_names.iter().filter(|&&h| h).count();
+    if n_hidden == 0 {
+        return;
+    }
+    ui.same_line_with_spacing(0.0, spacing);
+    fmt.clear();
+    write!(fmt, "{} hidden", n_hidden).unwrap();
+    ui.text_colored([1.0, 0.7, 0.3, 1.0], fmt);
+    ui.same_line_with_spacing(0.0, 4.0);
+    if ui.small_button("Clear##unhide") {
+        for h in hidden_names.iter_mut() {
+            *h = false;
+        }
+    }
+}
+
 pub fn draw_stats_table(
     ui: &imgui::Ui,
     trace: &Trace,
