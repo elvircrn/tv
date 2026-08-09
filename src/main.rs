@@ -809,13 +809,6 @@ impl App {
                             }
                         }
 
-                        let stats_flags = if pending == Some(BottomTab::Stats) {
-                            imgui::TabItemFlags::SET_SELECTED
-                        } else { imgui::TabItemFlags::empty() };
-                        if let Some(_t) = imgui::TabItem::new("Stats").flags(stats_flags).begin(&ui) {
-                            draw_stats_table(&ui, trace, &trace.stats, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##statstable");
-                        }
-
                         let sel_flags = if pending == Some(BottomTab::Selection) {
                             imgui::TabItemFlags::SET_SELECTED
                         } else { imgui::TabItemFlags::empty() };

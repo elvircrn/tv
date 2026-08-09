@@ -98,7 +98,7 @@ impl Pane {
             label_input: String::with_capacity(64),
             label_stats: Vec::new(),
             hidden_names: Vec::new(),
-            pending_tab: Some(BottomTab::Stats),
+            pending_tab: Some(BottomTab::Detail),
             pending_focus: None,
             sort_col: 2,
             sort_asc: false,

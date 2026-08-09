@@ -266,7 +266,7 @@ pub struct DiffResult {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum BottomTab { Detail, Stats, Selection, Labels }
+pub enum BottomTab { Detail, Selection, Labels }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum DragKind {
