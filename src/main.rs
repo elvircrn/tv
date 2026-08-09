@@ -725,8 +725,6 @@ impl App {
 
         mark!("dividers", t_section);
         // ---- Per-pane bottom panels ----
-        let mut labels_changed = vec![false; n_panes];
-        let mut pending_delete_label: Vec<Option<usize>> = vec![None; n_panes];
         for pi in 0..n_panes {
             if !state.panes[pi].has_trace() { continue; }
             let bottom_name = format!("##bottom{}", pi);
@@ -838,102 +836,6 @@ impl App {
                             } else {
                                 ui.text_colored([0.5, 0.5, 0.5, 1.0], "Shift+drag to select a time range");
                                 draw_hidden_clear(&ui, 16.0, &mut pane.hidden_names, &mut state.buf.fmt);
-                            }
-                        }
-
-                        let labels_flags = if pending == Some(BottomTab::Labels) {
-                            imgui::TabItemFlags::SET_SELECTED
-                        } else { imgui::TabItemFlags::empty() };
-                        if let Some(_t) = imgui::TabItem::new("Labels").flags(labels_flags).begin(&ui) {
-                            if pane.selection.is_some() || !pane.selection_stats.is_empty() {
-                                ui.set_next_item_width(LABEL_NAME_W);
-                                let label_enter = ui.input_text("##labelinput", &mut pane.label_input)
-                                    .hint("Label name")
-                                    .flags(imgui::InputTextFlags::ENTER_RETURNS_TRUE)
-                                    .build();
-                                ui.same_line();
-                                let label_btn = ui.button("Label");
-                                if (label_enter || label_btn) && !pane.label_input.is_empty() {
-                                    labels_changed[pi] = true;
-                                }
-                            } else {
-                                ui.text_colored([0.5, 0.5, 0.5, 1.0], "(select a region first)");
-                            }
-                            if pane.labels.is_empty() {
-                                if pane.selection.is_none() && pane.selection_stats.is_empty() {
-                                    ui.text_colored([0.5, 0.5, 0.5, 1.0], "Select a range and label it to categorize kernels");
-                                }
-                            } else {
-                                let avail = ui.content_region_avail();
-                                let total_trace_dur: f64 = trace.tracks.iter()
-                                    .flat_map(|t| t.events.iter())
-                                    .map(|e| e.dur)
-                                    .sum();
-                                ui.child_window("##labelstable")
-                                    .size([avail[0], avail[1]])
-                                    .build(|| {
-                                        ui.text_colored([0.55, 0.55, 0.55, 1.0], "Label");
-                                        ui.same_line_with_pos(LABEL_NAME_W);
-                                        ui.text_colored([0.55, 0.55, 0.55, 1.0], "Kernels");
-                                        ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W);
-                                        ui.text_colored([0.55, 0.55, 0.55, 1.0], "Events");
-                                        ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W * 2.0);
-                                        ui.text_colored([0.55, 0.55, 0.55, 1.0], "Total");
-                                        ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W * 3.0);
-                                        ui.text_colored([0.55, 0.55, 0.55, 1.0], "%");
-                                        ui.separator();
-
-                                        for ls in &pane.label_stats {
-                                            let li = ls.label_idx as usize;
-                                            let label = &pane.labels[li];
-                                            let lc: u32 = label.color.into();
-                                            let r = (lc & 0xFF) as f32 / 255.0;
-                                            let g = ((lc >> 8) & 0xFF) as f32 / 255.0;
-                                            let b = ((lc >> 16) & 0xFF) as f32 / 255.0;
-                                            let color = [r, g, b, 1.0];
-                                            ui.text_colored(color, &label.name);
-                                            if ui.is_item_clicked() {
-                                                let n = pane.trace.as_ref().map(|t| t.names.len()).unwrap_or(0);
-                                                pane.search_mask.clear();
-                                                pane.search_mask.resize(n, false);
-                                                for &kn in &label.pattern {
-                                                    if (kn as usize) < pane.search_mask.len() {
-                                                        pane.search_mask[kn as usize] = true;
-                                                    }
-                                                }
-                                                pane.search.clear();
-                                                pane.search.push_str(&label.name);
-                                                pane.prev_search.clear();
-                                                pane.prev_search.push_str(&label.name);
-                                            }
-                                            ui.same_line_with_pos(LABEL_NAME_W);
-                                            state.buf.fmt.clear();
-                                            write!(state.buf.fmt, "{}", label.pattern.len()).unwrap();
-                                            ui.text(&state.buf.fmt);
-                                            ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W);
-                                            state.buf.fmt.clear();
-                                            write!(state.buf.fmt, "{}", ls.count).unwrap();
-                                            ui.text(&state.buf.fmt);
-                                            ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W * 2.0);
-                                            state.buf.fmt.clear();
-                                            write_time(&mut state.buf.fmt, ls.total_dur);
-                                            ui.text(&state.buf.fmt);
-                                            ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W * 3.0);
-                                            let pct = if total_trace_dur > 0.0 { ls.total_dur / total_trace_dur * 100.0 } else { 0.0 };
-                                            state.buf.fmt.clear();
-                                            write!(state.buf.fmt, "{:.1}%", pct).unwrap();
-                                            ui.text(&state.buf.fmt);
-                                            ui.same_line_with_pos(LABEL_NAME_W + STATS_COL_W * 4.0);
-                                            state.buf.fmt.clear();
-                                            write!(state.buf.fmt, "x##del{}", li).unwrap();
-                                            if ui.small_button(&state.buf.fmt) {
-                                                pending_delete_label[pi] = Some(li);
-                                            }
-                                        }
-                                        if pending_delete_label[pi].is_some() {
-                                            labels_changed[pi] = true;
-                                        }
-                                    });
                             }
                         }
                     }
@@ -1088,8 +990,6 @@ impl App {
                         pane.selection,
                         pane.finished_sel,
                         &mut pane.collapsed,
-                        &pane.event_labels,
-                        &pane.labels,
                         &pane.hidden_names,
                         pane.selected,
                         pane.multi_select_name,
@@ -1162,22 +1062,6 @@ impl App {
             || new_selections.iter().any(|s| s.is_some());
         if needs_extra_frame {
             window.request_redraw();
-        }
-
-        for pi in 0..n_panes {
-            if labels_changed[pi] {
-                let pane = &mut state.panes[pi];
-                if !pane.label_input.is_empty() {
-                    let name = pane.label_input.clone();
-                    pane.apply_label(&name);
-                    pane.label_input.clear();
-                    pane.clear_selection();
-                }
-                if let Some(di) = pending_delete_label[pi] {
-                    pane.delete_label(di);
-                }
-                pane.pending_tab = Some(BottomTab::Labels);
-            }
         }
 
         mark!("clicks", t_section);

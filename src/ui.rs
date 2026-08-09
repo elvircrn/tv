@@ -389,8 +389,6 @@ pub fn draw_timeline(
     selection: Option<[f64; 4]>,
     finished_sel: Option<[f64; 4]>,
     collapsed: &mut Vec<bool>,
-    event_labels: &[Vec<Option<u8>>],
-    labels: &[Label],
     hidden_names: &[bool],
     selected: Option<EventRef>,
     multi_select_name: Option<u32>,
@@ -805,9 +803,9 @@ pub fn draw_timeline(
                         buf.last_px[eff_depth as usize] = px;
                         let ev_y = y + eff_depth as f32 * sub_h + EV_INSET;
                         let color = if matches {
-                            event_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
+                            name_color(&trace.names[ev.name as usize])
                         } else {
-                            event_dim_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
+                            dim_color(&trace.names[ev.name as usize])
                         };
                         dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + lane_h], color).filled(true).build();
                         continue;
@@ -816,9 +814,9 @@ pub fn draw_timeline(
                     let ev_y = y + eff_depth as f32 * sub_h + EV_INSET;
                     let name = &trace.names[ev.name as usize];
                     let color = if matches {
-                        event_color(orig_ti, ei, name, event_labels, labels)
+                        name_color(name)
                     } else {
-                        event_dim_color(orig_ti, ei, name, event_labels, labels)
+                        dim_color(name)
                     };
                     let ev_rect = [x0, ev_y, x1, ev_y + lane_h];
 
@@ -905,9 +903,9 @@ pub fn draw_timeline(
                         buf.last_px[ev.depth as usize] = px;
                         let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
                         let color = if matches {
-                            event_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
+                            name_color(&trace.names[ev.name as usize])
                         } else {
-                            event_dim_color(orig_ti, ei, &trace.names[ev.name as usize], event_labels, labels)
+                            dim_color(&trace.names[ev.name as usize])
                         };
                         dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + lane_h], color).filled(true).build();
                         continue;
@@ -916,9 +914,9 @@ pub fn draw_timeline(
                     let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
                     let name = &trace.names[ev.name as usize];
                     let color = if matches {
-                        event_color(orig_ti, ei, name, event_labels, labels)
+                        name_color(name)
                     } else {
-                        event_dim_color(orig_ti, ei, name, event_labels, labels)
+                        dim_color(name)
                     };
                     let ev_rect = [x0, ev_y, x1, ev_y + lane_h];
 
@@ -1709,26 +1707,6 @@ pub fn device_name_color() -> ImColor32 {
 
 pub fn col32(r: u8, g: u8, b: u8, a: u8) -> ImColor32 {
     ImColor32::from_rgba(r, g, b, a)
-}
-
-pub fn event_color(track_idx: usize, event_idx: usize, name: &str, event_labels: &[Vec<Option<u8>>], labels: &[Label]) -> ImColor32 {
-    if let Some(li) = event_labels.get(track_idx).and_then(|t| t.get(event_idx)).copied().flatten() {
-        labels[li as usize].color
-    } else {
-        name_color(name)
-    }
-}
-
-pub fn event_dim_color(track_idx: usize, event_idx: usize, name: &str, event_labels: &[Vec<Option<u8>>], labels: &[Label]) -> ImColor32 {
-    if let Some(li) = event_labels.get(track_idx).and_then(|t| t.get(event_idx)).copied().flatten() {
-        let c: u32 = labels[li as usize].color.into();
-        let r = (c & 0xFF) as u32 * 77 / 255;
-        let g = ((c >> 8) & 0xFF) as u32 * 77 / 255;
-        let b = ((c >> 16) & 0xFF) as u32 * 77 / 255;
-        ImColor32::from_rgba(r as u8, g as u8, b as u8, 255)
-    } else {
-        dim_color(name)
-    }
 }
 
 pub fn palette_color(name: &str, brightness: u32) -> ImColor32 {

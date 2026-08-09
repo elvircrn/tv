@@ -44,9 +44,6 @@ fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace 
 }
 
 fn make_state(trace: Trace) -> AppState {
-    let event_labels = trace.tracks.iter()
-        .map(|t| vec![None; t.events.len()])
-        .collect();
     let hidden_names = vec![false; trace.names.len()];
     let collapsed = vec![false; trace.tracks.len()];
     let mut buf = DrawBuf::default();
@@ -64,7 +61,6 @@ fn make_state(trace: Trace) -> AppState {
     pane.geom.visible = buf.visible.clone();
     pane.geom.heights = buf.heights.clone();
     pane.geom.y_offsets = buf.y_offsets.clone();
-    pane.event_labels = event_labels;
     pane.hidden_names = hidden_names;
     pane.collapsed = collapsed;
     pane.trace = Some(trace);
@@ -144,22 +140,15 @@ fn test_parse_f64() {
     assert_eq!(parse_f64(b".5"), 0.5);
 }
 
-// --- JSON escape/unescape ---
+// --- JSON unescape ---
 
 #[test]
-fn test_json_escape_roundtrip() {
-    let cases = ["hello", "with\"quotes", "back\\slash", "new\nline", ""];
-    for s in cases {
-        let escaped = json_escape(s);
-        let inner = &escaped[1..escaped.len() - 1];
-        assert_eq!(json_unescape(inner), s);
+fn test_json_unescape_roundtrip() {
+    let cases = ["hello", "with\\\"quotes", "back\\\\slash", "new\\nline", ""];
+    let expected = ["hello", "with\"quotes", "back\\slash", "new\nline", ""];
+    for (inner, want) in cases.iter().zip(expected.iter()) {
+        assert_eq!(json_unescape(inner), *want);
     }
-}
-
-#[test]
-fn test_json_escape_format() {
-    assert_eq!(json_escape("a\"b"), "\"a\\\"b\"");
-    assert_eq!(json_escape("a\\b"), "\"a\\\\b\"");
 }
 
 // --- Hashing ---
@@ -272,167 +261,6 @@ fn test_brighten_saturates() {
     let c = col32(250, 250, 250, 255);
     let b: u32 = brighten(c, 30).into();
     assert_eq!(b & 0xFF, 255);
-}
-
-#[test]
-fn test_event_color_unlabeled() {
-    let el: Vec<Vec<Option<u8>>> = vec![vec![None; 3]];
-    let labels: Vec<Label> = Vec::new();
-    let c = event_color(0, 0, "kern", &el, &labels);
-    assert_eq!(Into::<u32>::into(c), Into::<u32>::into(name_color("kern")));
-}
-
-#[test]
-fn test_event_color_labeled() {
-    let color = ImColor32::from_rgba(0x21, 0x96, 0xF3, 255);
-    let el = vec![vec![None, Some(0u8), None]];
-    let labels = vec![Label { name: "attn".into(), color, pattern: vec![1] }];
-    let c = event_color(0, 1, "kern", &el, &labels);
-    assert_eq!(Into::<u32>::into(c), Into::<u32>::into(color));
-}
-
-#[test]
-fn test_event_color_out_of_bounds() {
-    let el: Vec<Vec<Option<u8>>> = vec![vec![None]];
-    let c = event_color(5, 0, "kern", &el, &[]);
-    assert_eq!(Into::<u32>::into(c), Into::<u32>::into(name_color("kern")));
-}
-
-// --- Labeling and pattern matching ---
-
-fn gpu_trace() -> (Trace, Vec<&'static str>) {
-    let names = vec!["", "exec_ctx", "attn_qkv", "attn_proj", "moe_gate", "moe_expert", "allreduce"];
-    let layer = [1, 2, 3, 4, 5, 6];
-    let mut events = Vec::new();
-    for rep in 0..3 {
-        let base = rep as f64 * 600.0;
-        for (j, &n) in layer.iter().enumerate() {
-            events.push(ev(base + j as f64 * 100.0, 90.0, n, 0));
-        }
-    }
-    let trace = make_trace(names.clone(), vec![("GPU 0", true, events)]);
-    (trace, names)
-}
-
-#[test]
-fn test_label_pattern_exact_match() {
-    let (trace, _) = gpu_trace();
-    let mut state = make_state(trace);
-    let p = &mut state.panes[0];
-    p.selection = Some([0.0, 290.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
-    p.apply_label("attn");
-
-    assert_eq!(p.labels.len(), 1);
-    assert_eq!(p.labels[0].name, "attn");
-    assert_eq!(p.labels[0].pattern, vec![1, 2, 3]);
-}
-
-#[test]
-fn test_label_repeating_pattern_labels_all_occurrences() {
-    let (trace, _) = gpu_trace();
-    let mut state = make_state(trace);
-    let p = &mut state.panes[0];
-    p.selection = Some([100.0, 290.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
-    p.apply_label("attn");
-
-    let labeled: Vec<(usize, usize)> = p.event_labels[0].iter().enumerate()
-        .filter_map(|(i, l)| l.map(|_| (0, i)))
-        .collect();
-    assert_eq!(labeled.len(), 6);
-}
-
-#[test]
-fn test_label_no_orphan_islands() {
-    let names = vec!["", "A", "B", "C"];
-    let events = vec![
-        ev(0.0, 10.0, 1, 0), ev(10.0, 10.0, 2, 0), ev(20.0, 10.0, 3, 0),
-        ev(30.0, 10.0, 1, 0), ev(40.0, 10.0, 2, 0), ev(50.0, 10.0, 3, 0),
-        ev(60.0, 10.0, 1, 0), ev(70.0, 10.0, 3, 0), ev(80.0, 10.0, 1, 0),
-    ];
-    let trace = make_trace(names, vec![("GPU 0", true, events)]);
-    let mut state = make_state(trace);
-    let p = &mut state.panes[0];
-    p.selection = Some([0.0, 29.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
-    p.apply_label("abc");
-
-    assert_eq!(p.labels[0].pattern, vec![1, 2, 3]);
-    let labeled: Vec<usize> = p.event_labels[0].iter().enumerate()
-        .filter_map(|(i, l)| l.map(|_| i))
-        .collect();
-    assert_eq!(labeled, vec![0, 1, 2, 3, 4, 5]);
-}
-
-#[test]
-fn test_label_hidden_names_excluded_from_pattern() {
-    let (trace, _) = gpu_trace();
-    let mut state = make_state(trace);
-    let p = &mut state.panes[0];
-    p.hidden_names[1] = true;
-    p.selection = Some([100.0, 290.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
-    p.apply_label("attn");
-
-    assert!(!p.labels[0].pattern.contains(&1));
-}
-
-#[test]
-fn test_label_hidden_names_excluded_from_matching() {
-    let names = vec!["", "wrap", "A", "B"];
-    let events = vec![
-        ev(0.0, 10.0, 1, 0), ev(10.0, 10.0, 2, 0), ev(20.0, 10.0, 3, 0),
-        ev(30.0, 10.0, 1, 0), ev(40.0, 10.0, 2, 0), ev(50.0, 10.0, 3, 0),
-    ];
-    let trace = make_trace(names, vec![("GPU 0", true, events)]);
-    let mut state = make_state(trace);
-    let p = &mut state.panes[0];
-    p.hidden_names[1] = true;
-    p.selection = Some([10.0, 30.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
-    p.apply_label("ab");
-
-    assert_eq!(p.labels[0].pattern, vec![2, 3]);
-    let labeled: Vec<usize> = p.event_labels[0].iter().enumerate()
-        .filter_map(|(i, l)| l.map(|_| i))
-        .collect();
-    assert_eq!(labeled, vec![1, 2, 4, 5]);
-}
-
-#[test]
-fn test_delete_label() {
-    let (trace, _) = gpu_trace();
-    let mut state = make_state(trace);
-    let p = &mut state.panes[0];
-    p.selection = Some([100.0, 290.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
-    p.apply_label("attn");
-    assert_eq!(p.labels.len(), 1);
-
-    p.delete_label(0);
-    assert!(p.labels.is_empty());
-    assert!(p.event_labels[0].iter().all(|l| l.is_none()));
-}
-
-#[test]
-fn test_multiple_labels_no_overlap() {
-    let (trace, _) = gpu_trace();
-    let mut state = make_state(trace);
-    let p = &mut state.panes[0];
-    p.selection = Some([100.0, 290.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
-    p.apply_label("attn");
-    p.selection = Some([300.0, 490.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
-    p.apply_label("moe");
-
-    assert_eq!(p.labels.len(), 2);
-    for track_labels in &p.event_labels {
-        for label in track_labels.iter().flatten() {
-            assert!(*label < 2);
-        }
-    }
 }
 
 // --- Selection stats ---
@@ -549,24 +377,6 @@ fn test_finish_selection_stats_match_region() {
 
     let a = p.selection_stats.iter().find(|s| s.name == 1).unwrap();
     assert_eq!(a.count, 1, "only one A event is in the region, not all As");
-}
-
-// --- Label stats ---
-
-#[test]
-fn test_label_stats() {
-    let (trace, _) = gpu_trace();
-    let mut state = make_state(trace);
-    let p = &mut state.panes[0];
-    p.selection = Some([100.0, 290.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
-    p.apply_label("attn");
-
-    assert!(!p.label_stats.is_empty());
-    let ls = &p.label_stats[0];
-    assert_eq!(ls.label_idx, 0);
-    assert!(ls.count > 0);
-    assert!(ls.total_dur > 0.0);
 }
 
 // --- Search ---
@@ -753,8 +563,6 @@ fn test_load_trace_depth_assignment() {
     std::fs::remove_file(&path).ok();
 }
 
-// --- Label save/load roundtrip ---
-
 #[test]
 fn test_load_trace_truncated_json() {
     let json = r#"{"traceEvents": [
@@ -798,38 +606,6 @@ fn test_load_trace_truncated_gz() {
     assert!(trace.total_events >= 2, "should parse events from truncated gz, got {}", trace.total_events);
 
     std::fs::remove_file(&path).ok();
-}
-
-#[test]
-fn test_label_save_load_roundtrip() {
-    let (trace, _) = gpu_trace();
-    let dir = std::env::temp_dir().join("tv_test_labels");
-    let _ = std::fs::create_dir_all(&dir);
-    let trace_path = dir.join("trace.json").to_string_lossy().to_string();
-
-    let mut state = make_state(trace);
-    let p = &mut state.panes[0];
-    p.trace_path = trace_path.clone();
-    p.selection = Some([100.0, 290.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
-    p.apply_label("attn");
-
-    let orig_pattern = p.labels[0].pattern.clone();
-    let orig_labeled: Vec<Option<u8>> = p.event_labels[0].clone();
-
-    let (trace2, _) = gpu_trace();
-    let mut state2 = make_state(trace2);
-    let p2 = &mut state2.panes[0];
-    p2.trace_path = trace_path.clone();
-    p2.load_labels();
-
-    assert_eq!(p2.labels.len(), 1);
-    assert_eq!(p2.labels[0].name, "attn");
-    assert_eq!(p2.labels[0].pattern, orig_pattern);
-    assert_eq!(p2.event_labels[0], orig_labeled);
-
-    let label_path = format!("{}.labels.json", trace_path);
-    std::fs::remove_file(&label_path).ok();
 }
 
 // --- Args parsing ---

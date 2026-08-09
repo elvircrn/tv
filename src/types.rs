@@ -44,7 +44,6 @@ pub const EV_INSET: f32 = 2.0;
 pub const EV_ROUNDING: f32 = 2.0;
 pub const SWATCH_W: f32 = 10.0;
 pub const SWATCH_PAD: f32 = SWATCH_W + 4.0;
-pub const STATS_COL_W: f32 = 80.0;
 pub const SEARCH_W: f32 = 200.0;
 pub const DIFF_BAR_H: f32 = 22.0;
 pub const DIFF_BAR_GAP: f32 = 4.0;
@@ -58,7 +57,6 @@ pub const ZOOM_ANIM_DUR: f32 = 0.35;
 pub const SEARCH_ZOOM_FILL: f64 = 0.8; // matches fill this fraction of the width
 pub const ROW_PAD: f32 = 4.0;
 pub const HISTOGRAM_BAR_H: f32 = 18.0;
-pub const LABEL_NAME_W: f32 = 160.0;
 
 pub fn track_height(max_depth: u16, collapsed: bool, scale: f32) -> f32 {
     let base = if collapsed { SUB_LANE_H } else { max_depth.max(1) as f32 * SUB_LANE_H };
@@ -81,10 +79,6 @@ pub fn bisect_overlap(events: &[Event], prefix_max_dur: &[f64], t: f64) -> usize
 pub const PALETTE: &[u32] = &[
     0x4E79A7, 0xF28E2B, 0xE15759, 0x76B7B2, 0x59A14F, 0xEDC948, 0xB07AA1, 0xFF9DA7, 0x9C755F,
     0x86BCB6, 0x8CD17D, 0xB6992D, 0xF1CE63, 0xA0CBE8, 0xFFBE7D, 0xD4A6C8,
-];
-
-pub const LABEL_PALETTE: &[u32] = &[
-    0x2196F3, 0x4CAF50, 0xFF9800, 0xE91E63, 0x9C27B0, 0x00BCD4, 0xFFEB3B, 0x795548,
 ];
 
 // ---- Unified chrome colors ----
@@ -235,18 +229,6 @@ pub struct SelectionEntry {
     pub durations: Vec<f64>,
 }
 
-pub struct Label {
-    pub name: String,
-    pub color: ImColor32,
-    pub pattern: Vec<u32>,
-}
-
-pub struct LabelStats {
-    pub label_idx: u8,
-    pub total_dur: f64,
-    pub count: u32,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DiffKind { Same, Added, Removed }
 
@@ -266,7 +248,7 @@ pub struct DiffResult {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum BottomTab { Detail, Selection, Labels }
+pub enum BottomTab { Detail, Selection }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum DragKind {

@@ -1,8 +1,6 @@
 use crate::loader::{load_trace_progressive, load_multi_progressive};
-use crate::parse::json_unescape;
 use crate::types::*;
 use imgui::ImColor32;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -41,10 +39,6 @@ pub struct Pane {
     pub track_scales: Vec<f32>,
     pub even_spacing: bool,
     pub geom: PaneGeom,
-    pub labels: Vec<Label>,
-    pub event_labels: Vec<Vec<Option<u8>>>,
-    pub label_input: String,
-    pub label_stats: Vec<LabelStats>,
     pub hidden_names: Vec<bool>,
     pub pending_tab: Option<BottomTab>,
     /// Track index whose row draw_timeline should scroll into view as part of an
@@ -93,10 +87,6 @@ impl Pane {
             track_scales: Vec::new(),
             even_spacing: false,
             geom: PaneGeom::default(),
-            labels: Vec::new(),
-            event_labels: Vec::new(),
-            label_input: String::with_capacity(64),
-            label_stats: Vec::new(),
             hidden_names: Vec::new(),
             pending_tab: Some(BottomTab::Detail),
             pending_focus: None,
@@ -243,9 +233,6 @@ impl Pane {
                     if self.track_order.len() != n_tracks {
                         self.track_order = (0..n_tracks).collect();
                     }
-                    self.event_labels = trace.tracks.iter()
-                        .map(|t| vec![None; t.events.len()])
-                        .collect();
                     self.hidden_names.resize(n_names, false);
                     self.search_mask.clear();
                     self.search_nav.clear();
@@ -266,14 +253,8 @@ impl Pane {
                     self.collapsed = vec![false; trace.tracks.len()];
                     self.track_scales = vec![1.0; trace.tracks.len()];
                     self.track_order = (0..trace.tracks.len()).collect();
-                    self.event_labels = trace.tracks.iter()
-                        .map(|t| vec![None; t.events.len()])
-                        .collect();
-                    self.labels.clear();
-                    self.label_stats.clear();
                     self.hidden_names = vec![false; trace.names.len()];
                     self.trace = Some(trace);
-                    self.load_labels();
                 }
             }
             Ok(Err(e)) => {
@@ -704,224 +685,6 @@ impl Pane {
         self.sel_individual.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
     }
 
-    pub fn apply_label(&mut self, name: &str) {
-        if name.is_empty() { return; }
-        let trace = match &self.trace {
-            Some(t) => t,
-            None => return,
-        };
-        let sel = match &self.selection {
-            Some(s) => *s,
-            None => return,
-        };
-        let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
-
-        let hidden = &self.hidden_names;
-        let is_visible = |e: &Event| !hidden.get(e.name as usize).copied().unwrap_or(false);
-
-        let mut pattern: Vec<u32> = Vec::new();
-        for track in &trace.tracks {
-            if !self.show_cpu && !track.gpu { continue; }
-            let p: Vec<u32> = track.events.iter()
-                .filter(|e| e.depth == 0 && is_visible(e) && e.ts + e.dur >= s0 && e.ts <= s1)
-                .map(|e| e.name)
-                .collect();
-            if !p.is_empty() {
-                pattern = p;
-                break;
-            }
-        }
-        if pattern.is_empty() {
-            for track in &trace.tracks {
-                if !self.show_cpu && !track.gpu { continue; }
-                let p: Vec<u32> = track.events.iter()
-                    .filter(|e| is_visible(e) && e.ts + e.dur >= s0 && e.ts <= s1)
-                    .map(|e| e.name)
-                    .collect();
-                if !p.is_empty() {
-                    pattern = p;
-                    break;
-                }
-            }
-        }
-        if pattern.is_empty() { return; }
-
-        let li = if let Some(i) = self.labels.iter().position(|l| l.name == name) {
-            self.labels[i].pattern = pattern.clone();
-            i
-        } else {
-            let ci = self.labels.len() % LABEL_PALETTE.len();
-            let c = LABEL_PALETTE[ci];
-            self.labels.push(Label {
-                name: name.to_string(),
-                color: ImColor32::from_rgba((c >> 16) as u8, ((c >> 8) & 0xFF) as u8, (c & 0xFF) as u8, 255),
-                pattern: pattern.clone(),
-            });
-            self.labels.len() - 1
-        };
-
-        self.compact_labels();
-        self.rebuild_event_labels();
-        self.rebuild_label_stats();
-        self.save_labels();
-        eprintln!("  label \"{name}\": pattern len {}, label idx {li}", pattern.len());
-    }
-
-    pub fn delete_label(&mut self, idx: usize) {
-        if idx >= self.labels.len() { return; }
-        self.labels.remove(idx);
-        self.rebuild_event_labels();
-        self.rebuild_label_stats();
-        self.save_labels();
-    }
-
-    fn compact_labels(&mut self) {
-        self.labels.retain(|l| !l.pattern.is_empty());
-    }
-
-    pub fn rebuild_event_labels(&mut self) {
-        for track_labels in &mut self.event_labels {
-            for v in track_labels.iter_mut() { *v = None; }
-        }
-        let trace = match &self.trace {
-            Some(t) => t,
-            None => return,
-        };
-        for (li, label) in self.labels.iter().enumerate() {
-            if label.pattern.is_empty() { continue; }
-            for (ti, track) in trace.tracks.iter().enumerate() {
-                let seq: Vec<usize> = track.events.iter().enumerate()
-                    .filter(|(_, e)| !self.hidden_names.get(e.name as usize).copied().unwrap_or(false))
-                    .map(|(i, _)| i)
-                    .collect();
-                let seq_names: Vec<u32> = seq.iter().map(|&i| track.events[i].name).collect();
-                if label.pattern.len() > seq_names.len() { continue; }
-                for i in 0..=seq_names.len() - label.pattern.len() {
-                    if seq_names[i..i + label.pattern.len()] == label.pattern[..] {
-                        for j in 0..label.pattern.len() {
-                            let ei = seq[i + j];
-                            if ti < self.event_labels.len() && ei < self.event_labels[ti].len() {
-                                self.event_labels[ti][ei] = Some(li as u8);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn rebuild_label_stats(&mut self) {
-        self.label_stats.clear();
-        let trace = match &self.trace {
-            Some(t) => t,
-            None => return,
-        };
-        let mut by_label: Vec<(f64, u32)> = vec![(0.0, 0); self.labels.len()];
-        for (ti, track) in trace.tracks.iter().enumerate() {
-            for (ei, ev) in track.events.iter().enumerate() {
-                if let Some(li) = self.event_labels.get(ti).and_then(|t| t.get(ei)).copied().flatten() {
-                    by_label[li as usize].0 += ev.dur;
-                    by_label[li as usize].1 += 1;
-                }
-            }
-        }
-        for (li, &(total_dur, count)) in by_label.iter().enumerate() {
-            self.label_stats.push(LabelStats { label_idx: li as u8, total_dur, count });
-        }
-        self.label_stats.sort_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
-    }
-
-    pub fn save_labels(&self) {
-        if self.trace_path.is_empty() { return; }
-        let trace = match &self.trace {
-            Some(t) => t,
-            None => return,
-        };
-        let path = format!("{}.labels.json", self.trace_path.trim_end_matches(".gz"));
-        let mut out = String::from("{\"labels\":[\n");
-        for (i, label) in self.labels.iter().enumerate() {
-            if i > 0 { out.push_str(",\n"); }
-            out.push_str(&format!("  {{\"name\":{},\"pattern\":[",
-                json_escape(&label.name)));
-            for (j, &kn) in label.pattern.iter().enumerate() {
-                if j > 0 { out.push(','); }
-                out.push_str(&json_escape(&trace.names[kn as usize]));
-            }
-            out.push_str("]}");
-        }
-        out.push_str("\n]}\n");
-        let _ = std::fs::write(&path, &out);
-    }
-
-    pub fn load_labels(&mut self) {
-        if self.trace_path.is_empty() { return; }
-        let trace = match &self.trace {
-            Some(t) => t,
-            None => return,
-        };
-        let path = format!("{}.labels.json", self.trace_path.trim_end_matches(".gz"));
-        let data = match std::fs::read_to_string(&path) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-
-        let mut name_to_idx: HashMap<&str, u32> = HashMap::new();
-        for (i, name) in trace.names.iter().enumerate() {
-            name_to_idx.insert(name, i as u32);
-        }
-
-        self.labels.clear();
-
-        let mut pos = 0;
-        let bytes = data.as_bytes();
-        while pos < bytes.len() {
-            if let Some(p) = data[pos..].find("\"name\":\"") {
-                let name_start = pos + p + 8;
-                let name_end = match data[name_start..].find('"') {
-                    Some(e) => name_start + e,
-                    None => break,
-                };
-                let label_name = json_unescape(&data[name_start..name_end]);
-
-                let rest_start = name_end + 1;
-                let arr_start = match data[rest_start..].find('[') {
-                    Some(a) => rest_start + a + 1,
-                    None => break,
-                };
-                let arr_end = match data[arr_start..].find(']') {
-                    Some(a) => arr_start + a,
-                    None => break,
-                };
-                let arr = &data[arr_start..arr_end];
-
-                let mut pattern = Vec::new();
-                for part in arr.split(',') {
-                    let s = part.trim().trim_matches('"');
-                    if !s.is_empty() {
-                        if let Some(&idx) = name_to_idx.get(s) {
-                            pattern.push(idx);
-                        }
-                    }
-                }
-
-                if !pattern.is_empty() {
-                    let ci = self.labels.len() % LABEL_PALETTE.len();
-                    let c = LABEL_PALETTE[ci];
-                    self.labels.push(Label {
-                        name: label_name,
-                        color: ImColor32::from_rgba((c >> 16) as u8, ((c >> 8) & 0xFF) as u8, (c & 0xFF) as u8, 255),
-                        pattern,
-                    });
-                }
-
-                pos = arr_end + 1;
-            } else {
-                break;
-            }
-        }
-        self.rebuild_event_labels();
-        self.rebuild_label_stats();
-    }
 }
 
 pub struct AppState {
@@ -980,19 +743,4 @@ impl AppState {
         }
         self.panes.len() - 1
     }
-}
-
-pub fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            _ => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
