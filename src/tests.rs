@@ -1615,6 +1615,71 @@ fn test_zoom_to_search_frames_first_match_80pct_fill() {
 }
 
 #[test]
+fn test_nav_search_wraps_and_frames_each_match() {
+    // Three "foo" matches, sorted by ts into search_nav: [50, 100, 800].
+    let trace = make_trace(
+        vec!["", "foo", "bar"],
+        vec![
+            ("GPU 0", true, vec![
+                ev(0.0, 5.0, 2, 0),      // bar
+                ev(100.0, 4.0, 1, 0),    // foo (cursor 1)
+                ev(800.0, 4.0, 1, 0),    // foo (cursor 2)
+            ]),
+            ("GPU 1", true, vec![
+                ev(50.0, 6.0, 1, 0),     // foo (cursor 0, earliest)
+            ]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let pane = &mut state.panes[0];
+    pane.view.t0 = 0.0;
+    pane.view.t1 = 1000.0;
+    pane.search.push_str("foo");
+    pane.rebuild_search();
+    assert_eq!(pane.search_nav.len(), 3);
+    assert_eq!(pane.search_cursor, 0);
+
+    // Forward: cursor 0 -> 1, frames the ts=100 match (track 0), dur 4.
+    pane.nav_search(true);
+    assert_eq!(pane.search_cursor, 1);
+    assert_eq!(pane.pending_focus, Some(0));
+    let sel = pane.selected.expect("nav selects the match");
+    assert_eq!((sel.track_idx, sel.event_idx), (0, 1));
+    let a = pane.view.anim.as_ref().unwrap();
+    assert!((a.to_t1 - a.to_t0 - 4.0 / SEARCH_ZOOM_FILL).abs() < 1e-6);
+
+    // Backward from cursor 1 -> 0: earliest match on track 1.
+    pane.nav_search(false);
+    assert_eq!(pane.search_cursor, 0);
+    assert_eq!(pane.pending_focus, Some(1));
+
+    // Backward again wraps 0 -> 2 (last match).
+    pane.nav_search(false);
+    assert_eq!(pane.search_cursor, 2);
+    let sel = pane.selected.unwrap();
+    assert_eq!((sel.track_idx, sel.event_idx), (0, 2));
+
+    // Forward from last wraps 2 -> 0.
+    pane.nav_search(true);
+    assert_eq!(pane.search_cursor, 0);
+}
+
+#[test]
+fn test_nav_search_no_matches_noop() {
+    let trace = make_trace(
+        vec!["", "foo"],
+        vec![("GPU 0", true, vec![ev(0.0, 5.0, 1, 0)])],
+    );
+    let mut state = make_state(trace);
+    let pane = &mut state.panes[0];
+    pane.search.push_str("zzz");
+    pane.rebuild_search();
+    pane.nav_search(true);
+    assert!(pane.view.anim.is_none());
+    assert!(pane.selected.is_none());
+}
+
+#[test]
 fn test_zoom_to_search_no_matches_no_anim() {
     let trace = make_trace(
         vec!["", "foo"],

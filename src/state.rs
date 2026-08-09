@@ -596,6 +596,13 @@ impl Pane {
             Some(b) => b,
             None => return,
         };
+        self.start_zoom_to(ts, dur, track_idx);
+    }
+
+    /// Start a smooth zoom that frames a single event (`ts`, `dur`) at
+    /// `SEARCH_ZOOM_FILL` of the width and requests a vertical scroll to its
+    /// track. The vertical target is resolved in `draw_timeline` from layout.
+    pub fn start_zoom_to(&mut self, ts: f64, dur: f64, track_idx: usize) {
         let range = (dur / crate::types::SEARCH_ZOOM_FILL).max(crate::types::MIN_TIME_RANGE);
         let center = ts + dur / 2.0;
         let to_t0 = center - range / 2.0;
@@ -611,6 +618,24 @@ impl Pane {
             dur: crate::types::ZOOM_ANIM_DUR,
         });
         self.pending_focus = Some(track_idx as u32);
+    }
+
+    /// Step the search-match cursor by one and smooth-zoom to that match.
+    /// `forward` advances, `!forward` goes back; both wrap around. Selects the
+    /// event and switches the bottom panel to the Detail tab.
+    pub fn nav_search(&mut self, forward: bool) {
+        let n = self.search_nav.len();
+        if n == 0 { return; }
+        self.search_cursor = if forward {
+            (self.search_cursor + 1) % n
+        } else {
+            (self.search_cursor + n - 1) % n
+        };
+        let (ts, ti, ei) = self.search_nav[self.search_cursor];
+        self.selected = Some(EventRef { track_idx: ti, event_idx: ei });
+        self.pending_tab = Some(BottomTab::Detail);
+        let dur = self.trace.as_ref().unwrap().tracks[ti as usize].events[ei as usize].dur;
+        self.start_zoom_to(ts, dur, ti as usize);
     }
 
     fn compute_aggregates(&mut self) {

@@ -593,6 +593,17 @@ impl App {
                         }
                         let search_active = pane.search_mask.iter().any(|&m| m);
                         if search_active {
+                            let has_matches = !pane.search_nav.is_empty();
+                            ui.same_line_with_spacing(0.0, 6.0);
+                            ui.enabled(has_matches, || {
+                                if ui.small_button("<##prevmatch") { pane.nav_search(false); }
+                            });
+                            if ui.is_item_hovered() { ui.tooltip_text("Previous match (Shift+N)"); }
+                            ui.same_line_with_spacing(0.0, 2.0);
+                            ui.enabled(has_matches, || {
+                                if ui.small_button(">##nextmatch") { pane.nav_search(true); }
+                            });
+                            if ui.is_item_hovered() { ui.tooltip_text("Next match (N)"); }
                             ui.same_line_with_spacing(0.0, 6.0);
                             state.buf.fmt.clear();
                             write!(state.buf.fmt, "{} matches", pane.search_nav.len()).unwrap();
@@ -1326,28 +1337,7 @@ impl App {
                 state.panes[ai].search_focus = true;
             }
             if ui.is_key_pressed(imgui::Key::N) {
-                let pane = &mut state.panes[ai];
-                if !pane.search_nav.is_empty() {
-                    if shift {
-                        if pane.search_cursor == 0 {
-                            pane.search_cursor = pane.search_nav.len();
-                        }
-                        pane.search_cursor -= 1;
-                    } else {
-                        if pane.search_cursor >= pane.search_nav.len() {
-                            pane.search_cursor = 0;
-                        }
-                    }
-                    let (ts, ti, ei) = pane.search_nav[pane.search_cursor];
-                    pane.selected = Some(EventRef { track_idx: ti, event_idx: ei });
-                    pane.pending_tab = Some(BottomTab::Detail);
-                    let ev = &pane.trace.as_ref().unwrap().tracks[ti as usize].events[ei as usize];
-                    let pad = (pane.view.t1 - pane.view.t0) * 0.1;
-                    pane.view.t0 = ts - pad;
-                    pane.view.t1 = ts + ev.dur + pad;
-                    pane.view.anim = None;
-                    if !shift { pane.search_cursor += 1; }
-                }
+                state.panes[ai].nav_search(!shift);
             }
         }
 
