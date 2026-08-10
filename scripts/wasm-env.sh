@@ -32,5 +32,16 @@ export AR_wasm32_unknown_unknown="$LLVM_PREFIX/bin/llvm-ar"
 # libc-independent sprintf instead of calling libc's vsnprintf, which
 # doesn't exist on this target. See third-party/stb_sprintf.h (vendored
 # from https://github.com/nothings/stb, public domain).
-export CXXFLAGS_wasm32_unknown_unknown="-isystem $WASI_SYSROOT/include/wasm32-wasi -mno-reference-types -mno-multivalue -DNDEBUG -DIMGUI_USE_STB_SPRINTF -DIMGUI_STB_SPRINTF_FILENAME=\"$REPO_ROOT/third-party/stb_sprintf.h\""
+#
+# -DIMGUI_DISABLE_TTY_FUNCTIONS: ImGui::LogToTTY() references the libc
+# global `stdout` (a real FILE* object, not a function — wasm_libc_shims.rs
+# only shims functions, and there's nothing to sensibly shim a TTY stream to
+# in a browser anyway). Locally this is dead code wasm-ld's function-level
+# --gc-sections drops before it ever needs `stdout`, but that elimination
+# turned out to depend on exactly which LLVM/clang build compiled imgui-sys's
+# C++ — CI's Homebrew LLVM linked it in a --release build where local builds
+# didn't, causing "undefined symbol: stdout" only in CI. Disabling the whole
+# (browser-meaningless) TTY logging feature removes the reference outright
+# instead of depending on a DCE outcome that isn't actually guaranteed.
+export CXXFLAGS_wasm32_unknown_unknown="-isystem $WASI_SYSROOT/include/wasm32-wasi -mno-reference-types -mno-multivalue -DNDEBUG -DIMGUI_USE_STB_SPRINTF -DIMGUI_STB_SPRINTF_FILENAME=\"$REPO_ROOT/third-party/stb_sprintf.h\" -DIMGUI_DISABLE_TTY_FUNCTIONS"
 export CXXSTDLIB_wasm32_unknown_unknown=""

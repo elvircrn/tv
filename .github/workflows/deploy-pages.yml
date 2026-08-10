@@ -36,7 +36,7 @@ jobs:
       # actually point at either way, and Homebrew runs on Linux too — this
       # keeps CI on the exact same, already-verified toolchain instead of
       # guessing at a differently-laid-out Linux equivalent).
-      - uses: Homebrew/actions/setup-homebrew@master
+      - uses: Homebrew/actions/setup-homebrew@b35a29a0f83ee8b8ca07b219fc8db3d7bb88ab49 # 2026.08.10.2
 
       - name: Install LLVM + wasi-libc
         run: brew install llvm wasi-libc
