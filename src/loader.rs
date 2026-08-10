@@ -1,8 +1,11 @@
 use crate::parse::*;
 use crate::types::*;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use crate::time::Instant;
 
@@ -262,6 +265,10 @@ fn calc_n_threads(data_len: usize, max_parse_threads: usize) -> usize {
     avail.clamp(2, cap)
 }
 
+// Used only by decompress_parse_streaming's manual overlapped-decompress path
+// below, which spawns real OS threads (native-only — see the comment there
+// for why that path can't move to rayon).
+#[cfg(not(target_arch = "wasm32"))]
 fn collect_chunks(handles: Vec<std::thread::ScopedJoinHandle<'_, ChunkState>>) -> Vec<ChunkState> {
     handles.into_iter().filter_map(|h| match h.join() {
         Ok(state) => Some(state),
@@ -273,6 +280,30 @@ fn collect_chunks(handles: Vec<std::thread::ScopedJoinHandle<'_, ChunkState>>) -
             None
         }
     }).collect()
+}
+
+// Runs `f(0)..f(n_chunks)` across rayon's pool (real OS threads natively,
+// transparent sequential fallback on wasm32 — see module-level notes). Mirrors
+// `collect_chunks`'s panic handling: a chunk that panics is dropped with a
+// message instead of taking the whole parse down, matching the previous
+// std::thread::scope + ScopedJoinHandle::join() behavior exactly.
+fn parse_chunks_parallel<F>(n_chunks: usize, f: F) -> Vec<ChunkState>
+where
+    F: Fn(usize) -> ChunkState + Sync,
+{
+    (0..n_chunks)
+        .into_par_iter()
+        .filter_map(|i| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(i))) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                eprintln!("  parse thread panicked: {msg}");
+                None
+            }
+        })
+        .collect()
 }
 
 fn decompress_parse_seq(
@@ -295,19 +326,12 @@ fn decompress_parse_seq(
     let split_points = find_split_points(&raw, array_start, n_threads);
     let n_chunks = split_points.len() - 1;
 
-    let chunks: Vec<ChunkState> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..n_chunks).map(|i| {
-            let start = split_points[i];
-            let end = split_points[i + 1];
-            let raw_ref = &raw;
-            let ctr = &*counter;
-            s.spawn(move || {
-                let mut state = ChunkState::new();
-                parse_chunk(raw_ref, start, end, &mut state, ctr);
-                state
-            })
-        }).collect();
-        collect_chunks(handles)
+    let chunks: Vec<ChunkState> = parse_chunks_parallel(n_chunks, |i| {
+        let start = split_points[i];
+        let end = split_points[i + 1];
+        let mut state = ChunkState::new();
+        parse_chunk(&raw, start, end, &mut state, &counter);
+        state
     });
 
     Ok((raw, chunks, n_chunks))
@@ -357,25 +381,45 @@ fn decompress_parse_streaming(
         let n_threads = calc_n_threads(raw.len(), max_parse_threads);
         let split_points = find_split_points(&raw, array_start, n_threads);
         let n_chunks = split_points.len() - 1;
-        let chunks: Vec<ChunkState> = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..n_chunks).map(|i| {
-                let start = split_points[i];
-                let end = split_points[i + 1];
-                let raw_ref = &raw;
-                let ctr = &*counter;
-                s.spawn(move || {
-                    let mut state = ChunkState::new();
-                    parse_chunk(raw_ref, start, end, &mut state, ctr);
-                    state
-                })
-            }).collect();
-            collect_chunks(handles)
+        let chunks: Vec<ChunkState> = parse_chunks_parallel(n_chunks, |i| {
+            let start = split_points[i];
+            let end = split_points[i + 1];
+            let mut state = ChunkState::new();
+            parse_chunk(&raw, start, end, &mut state, &counter);
+            state
         });
         eprintln!("  scan: {:.2}s ({} events, {}x parallel)",
             t0.elapsed().as_secs_f64(), chunks.iter().map(|c| c.total_events).sum::<usize>(), n_chunks);
         return Ok((raw, chunks));
     }
 
+    // The rest of this function overlaps background decompression with
+    // progressive parsing of the bytes decompressed so far, using a spawned
+    // thread plus a busy spin-wait on shared atomics (`wait_for` below) —
+    // not the "split N independent chunks, run them, collect" shape the rest
+    // of this file's parallelism was migrated to rayon for. That distinction
+    // matters here: rayon's `scope`/`spawn` are only deadlock-safe under
+    // nesting or its no-real-threads wasm fallback because the *waiting* side
+    // (`join`/the end of `scope`) is cooperative — an idle worker steals other
+    // pending work while it waits. A raw `spin_loop()` never calls back into
+    // the scheduler, so it can't be helped along: on wasm's sequential
+    // fallback the spawned decompressor would never run before this spins
+    // forever (the "spawned" job is only picked up once the scope closure
+    // returns), and even natively, if every rayon worker ends up spinning
+    // here at once (e.g. loading several ranks in parallel on a
+    // fully-subscribed pool), there's no worker left to run the decompressor
+    // job either. Real `std::thread::spawn` sidesteps both failure modes by
+    // guaranteeing a dedicated OS thread outside rayon's pool — so this stays
+    // on `std::thread` and is native-only; `decompress_parse` already falls
+    // back to `decompress_parse_seq` (fully migrated, safe) whenever this
+    // function returns `Err`, so wasm just takes that path directly instead.
+    #[cfg(target_arch = "wasm32")]
+    {
+        return Err("streaming gz decompression is native-only".into());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
     let n_threads = calc_n_threads(estimated, max_parse_threads);
 
     let mut backing: Vec<u8> = Vec::with_capacity(estimated);
@@ -505,6 +549,7 @@ fn decompress_parse_streaming(
     eprintln!("  scan: {:.2}s ({} events, streaming)",
         t0.elapsed().as_secs_f64(), chunks.iter().map(|c| c.total_events).sum::<usize>());
     Ok((RawData::Vec(backing), chunks))
+    }
 }
 
 fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Instant) -> Result<Trace, String> {
@@ -598,74 +643,70 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     }
 
     let t2 = Instant::now();
-    let mut keyed_tracks: Vec<((u64, u64), Track)> = Vec::new();
 
-    std::thread::scope(|s| {
+    let mut keyed_tracks: Vec<((u64, u64), Track)> = {
         let cat_ref = &cats;
         let tn_ref = &thread_names;
-        let handles: Vec<_> = track_map
-            .into_iter()
+        track_map
+            .into_par_iter()
             .map(|((pid, tid), mut evs)| {
-                s.spawn(move || {
-                    for ev in evs.iter_mut() { ev.ts -= min_ts; }
-                    let mut sorted_end = evs.len();
-                    for i in 1..evs.len() {
-                        if evs[i].ts < evs[i - 1].ts {
-                            sorted_end = i;
-                            break;
-                        }
+                for ev in evs.iter_mut() { ev.ts -= min_ts; }
+                let mut sorted_end = evs.len();
+                for i in 1..evs.len() {
+                    if evs[i].ts < evs[i - 1].ts {
+                        sorted_end = i;
+                        break;
                     }
-                    if sorted_end < evs.len() {
-                        if evs.len() - sorted_end < evs.len() / 100 {
-                            let mut tail = evs.split_off(sorted_end);
-                            tail.sort_unstable_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
-                            let prefix = std::mem::take(&mut evs);
-                            evs.reserve(prefix.len() + tail.len());
-                            let (mut i, mut j) = (0, 0);
-                            while i < prefix.len() && j < tail.len() {
-                                if prefix[i].ts <= tail[j].ts {
-                                    evs.push(prefix[i]); i += 1;
-                                } else {
-                                    evs.push(tail[j]); j += 1;
-                                }
+                }
+                if sorted_end < evs.len() {
+                    if evs.len() - sorted_end < evs.len() / 100 {
+                        let mut tail = evs.split_off(sorted_end);
+                        tail.sort_unstable_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+                        let prefix = std::mem::take(&mut evs);
+                        evs.reserve(prefix.len() + tail.len());
+                        let (mut i, mut j) = (0, 0);
+                        while i < prefix.len() && j < tail.len() {
+                            if prefix[i].ts <= tail[j].ts {
+                                evs.push(prefix[i]); i += 1;
+                            } else {
+                                evs.push(tail[j]); j += 1;
                             }
-                            if i < prefix.len() { evs.extend_from_slice(&prefix[i..]); }
-                            if j < tail.len() { evs.extend_from_slice(&tail[j..]); }
-                        } else {
-                            evs.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
                         }
+                        if i < prefix.len() { evs.extend_from_slice(&prefix[i..]); }
+                        if j < tail.len() { evs.extend_from_slice(&tail[j..]); }
+                    } else {
+                        evs.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
                     }
-                    let mut lanes: Vec<f64> = Vec::new();
-                    let mut max_depth: u16 = 1;
-                    for ev in evs.iter_mut() {
-                        let d = lanes.iter().position(|&end| end <= ev.ts)
-                            .unwrap_or_else(|| { lanes.push(0.0); lanes.len() - 1 });
-                        lanes[d] = ev.ts + ev.dur;
-                        ev.depth = d as u16;
-                        max_depth = max_depth.max(d as u16 + 1);
-                    }
-                    let mut prefix_max_dur = Vec::with_capacity(evs.len());
-                    let mut running_max = 0.0f64;
-                    for ev in &evs {
-                        running_max = running_max.max(ev.dur);
-                        prefix_max_dur.push(running_max);
-                    }
-                    let gpu_count = evs.iter().filter(|e| {
-                        let c = &cat_ref[e.cat as usize];
-                        c == "kernel" || c.starts_with("gpu_")
-                    }).count();
-                    let gpu = gpu_count > evs.len() / 2;
-                    let label = tn_ref.get(&(pid, tid)).cloned().unwrap_or_else(|| {
-                        if gpu { format!("GPU {tid}") } else { format!("Thread {tid}") }
-                    });
-                    evs.shrink_to_fit();
-                    let track = Track { label, gpu, events: evs, max_depth, prefix_max_dur, raw_buf_idx: 0 };
-                    ((pid, tid), track)
-                })
+                }
+                let mut lanes: Vec<f64> = Vec::new();
+                let mut max_depth: u16 = 1;
+                for ev in evs.iter_mut() {
+                    let d = lanes.iter().position(|&end| end <= ev.ts)
+                        .unwrap_or_else(|| { lanes.push(0.0); lanes.len() - 1 });
+                    lanes[d] = ev.ts + ev.dur;
+                    ev.depth = d as u16;
+                    max_depth = max_depth.max(d as u16 + 1);
+                }
+                let mut prefix_max_dur = Vec::with_capacity(evs.len());
+                let mut running_max = 0.0f64;
+                for ev in &evs {
+                    running_max = running_max.max(ev.dur);
+                    prefix_max_dur.push(running_max);
+                }
+                let gpu_count = evs.iter().filter(|e| {
+                    let c = &cat_ref[e.cat as usize];
+                    c == "kernel" || c.starts_with("gpu_")
+                }).count();
+                let gpu = gpu_count > evs.len() / 2;
+                let label = tn_ref.get(&(pid, tid)).cloned().unwrap_or_else(|| {
+                    if gpu { format!("GPU {tid}") } else { format!("Thread {tid}") }
+                });
+                evs.shrink_to_fit();
+                let track = Track { label, gpu, events: evs, max_depth, prefix_max_dur, raw_buf_idx: 0 };
+                ((pid, tid), track)
             })
-            .collect();
-        keyed_tracks = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    });
+            .collect()
+    };
 
     keyed_tracks.sort_by(|a, b| b.1.gpu.cmp(&a.1.gpu).then_with(|| b.1.events.len().cmp(&a.1.events.len())));
 
@@ -1011,22 +1052,17 @@ fn load_cache_from_mmap(mmap: memmap2::Mmap) -> Option<Trace> {
             ev_off += hdr.event_count;
         }
 
-        let tracks = std::thread::scope(|s| {
-            let track_handles: Vec<_> = track_hdrs.into_iter().zip(offsets).map(|(hdr, off)| {
-                s.spawn(move || {
-                    let n = hdr.event_count;
-                    Track {
-                        label: hdr.label,
-                        gpu: hdr.gpu,
-                        events: all_events[off..off + n].to_vec(),
-                        max_depth: hdr.max_depth,
-                        prefix_max_dur: all_pmd[off..off + n].to_vec(),
-                        raw_buf_idx: 0,
-                    }
-                })
-            }).collect();
-            track_handles.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<Track>>()
-        });
+        let tracks: Vec<Track> = track_hdrs.into_par_iter().zip(offsets).map(|(hdr, off)| {
+            let n = hdr.event_count;
+            Track {
+                label: hdr.label,
+                gpu: hdr.gpu,
+                events: all_events[off..off + n].to_vec(),
+                max_depth: hdr.max_depth,
+                prefix_max_dur: all_pmd[off..off + n].to_vec(),
+                raw_buf_idx: 0,
+            }
+        }).collect();
 
         let fp_size = std::mem::size_of::<FlowPair>();
         let mut flow_pairs = Vec::new();
@@ -1650,36 +1686,35 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
         remap_info.push((name_remap, cat_remap, time_offset));
     }
 
-    let remapped: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = traces.into_iter().zip(remap_info).enumerate().map(|(trace_idx, ((rank, mut trace), (name_remap, cat_remap, time_offset)))| {
-            s.spawn(move || {
-                let raw_buf_idx = trace_idx as u8;
-                let mut max_ts: f64 = 0.0;
-                let mut total_events = 0usize;
-                let mut local_dur: HashMap<u32, Vec<f64>> = HashMap::new();
-                for track in &mut trace.tracks {
-                    track.label = format!("  Rank {} {}", rank, track.label);
-                    track.raw_buf_idx = raw_buf_idx;
-                    for ev in &mut track.events {
-                        ev.ts += time_offset;
-                        ev.name = name_remap[ev.name as usize];
-                        ev.cat = cat_remap[ev.cat as usize];
-                        max_ts = max_ts.max(ev.ts + ev.dur);
-                        local_dur.entry(ev.name).or_default().push(ev.dur);
-                    }
-                    total_events += track.events.len();
+    let remapped: Vec<_> = traces.into_iter().zip(remap_info).enumerate()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(trace_idx, ((rank, mut trace), (name_remap, cat_remap, time_offset)))| {
+            let raw_buf_idx = trace_idx as u8;
+            let mut max_ts: f64 = 0.0;
+            let mut total_events = 0usize;
+            let mut local_dur: HashMap<u32, Vec<f64>> = HashMap::new();
+            for track in &mut trace.tracks {
+                track.label = format!("  Rank {} {}", rank, track.label);
+                track.raw_buf_idx = raw_buf_idx;
+                for ev in &mut track.events {
+                    ev.ts += time_offset;
+                    ev.name = name_remap[ev.name as usize];
+                    ev.cat = cat_remap[ev.cat as usize];
+                    max_ts = max_ts.max(ev.ts + ev.dur);
+                    local_dur.entry(ev.name).or_default().push(ev.dur);
                 }
+                total_events += track.events.len();
+            }
 
-                for f in &mut trace.flow_pairs {
-                    f.src_ts += time_offset;
-                    f.dst_ts += time_offset;
-                }
+            for f in &mut trace.flow_pairs {
+                f.src_ts += time_offset;
+                f.dst_ts += time_offset;
+            }
 
-                (trace.tracks, trace.raw_bufs, max_ts, total_events, local_dur, trace.flow_pairs)
-            })
-        }).collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
-    });
+            (trace.tracks, trace.raw_bufs, max_ts, total_events, local_dur, trace.flow_pairs)
+        })
+        .collect();
 
     let mut all_tracks: Vec<Track> = Vec::new();
     let mut all_flow_pairs: Vec<FlowPair> = Vec::new();
@@ -1769,15 +1804,24 @@ pub fn load_multi_progressive(
     }
 
     let cd = cache_dir.map(|s| s.to_string());
-    let results: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = rank_paths.iter().map(|(rank, path)| {
-            let r = *rank;
-            let ctr = counter.clone();
-            let cd_ref = cd.as_deref();
-            s.spawn(move || (r, load_trace(path, &ctr, tpf, cd_ref)))
-        }).collect();
-        handles.into_iter().filter_map(|h| h.join().ok()).collect()
-    });
+    // Preserve the previous std::thread::scope + JoinHandle::join().ok()
+    // behavior: a rank whose load panics is dropped (with a message) rather
+    // than taking the whole multi-rank load down with it.
+    let results: Vec<(usize, Result<Trace, String>)> = rank_paths.par_iter().filter_map(|(rank, path)| {
+        let r = *rank;
+        let ctr = counter.clone();
+        let cd_ref = cd.as_deref();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_trace(path, &ctr, tpf, cd_ref))) {
+            Ok(result) => Some((r, result)),
+            Err(e) => {
+                let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                eprintln!("  rank {r} load thread panicked: {msg}");
+                None
+            }
+        }
+    }).collect();
     let mut traces = Vec::new();
     for (rank, result) in results {
         match result {

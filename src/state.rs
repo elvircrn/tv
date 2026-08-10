@@ -3,6 +3,35 @@ use crate::types::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
+/// Fires off a trace-load job that reports its result via an mpsc channel
+/// (polled every frame by `poll_loading`), mirroring the old
+/// `std::thread::spawn(move || { ... })` background-job shape.
+///
+/// Native: `rayon::spawn` onto rayon's global pool — real worker threads
+/// continuously service that pool's injector queue, so this runs
+/// asynchronously in the background exactly like the `std::thread::spawn` it
+/// replaces.
+///
+/// wasm32: NOT `rayon::spawn`. Confirmed empirically (a throwaway
+/// wasm-bindgen + Node harness) that on wasm's no-real-threads fallback, a
+/// bare `rayon::spawn` job is never picked up — not synchronously, and not
+/// even as a side effect of later, unrelated rayon calls — because nothing
+/// ever runs a worker-thread loop to service the global queue there (unlike
+/// `join`/`scope`/`par_iter`, where the *calling* thread itself executes the
+/// work as part of the blocking call). Shipping `rayon::spawn` verbatim here
+/// would silently hang every wasm trace load forever (the channel never
+/// receives anything, so `poll_loading` waits indefinitely). Until real wasm
+/// threading lands (a later phase — wasm-bindgen-rayon + an atomics build),
+/// there's no way to background this on wasm at all, so run it synchronously
+/// inline instead: blocks the tab for the load's duration, but at least
+/// completes and reports a result instead of hanging.
+fn spawn_load_job(job: impl FnOnce() + Send + 'static) {
+    #[cfg(not(target_arch = "wasm32"))]
+    rayon::spawn(job);
+    #[cfg(target_arch = "wasm32")]
+    job();
+}
+
 /// Interned name indices matching vLLM's per-generation `execute_context_*`
 /// wrapper span. Pulled out as a pure function so it's testable without
 /// spinning up the loader pipeline, and so `poll_loading` can compute it once
@@ -254,7 +283,7 @@ impl Pane {
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
         let cd = self.cache_dir.clone();
-        std::thread::spawn(move || {
+        spawn_load_job(move || {
             load_trace_progressive(&path, &counter, 0, &tx, cd.as_deref());
         });
     }
@@ -276,7 +305,7 @@ impl Pane {
         let counter = self.loading_events.clone();
         let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / n).max(2);
         let cd = self.cache_dir.clone();
-        std::thread::spawn(move || {
+        spawn_load_job(move || {
             load_multi_progressive(rank_paths, &counter, tpf, &tx, cd.as_deref(), false);
         });
     }
@@ -305,12 +334,12 @@ impl Pane {
         let cd = self.cache_dir.clone();
         if paths.len() == 1 {
             let path = paths[0].1.clone();
-            std::thread::spawn(move || {
+            spawn_load_job(move || {
                 load_trace_progressive(&path, &counter, 0, &tx, cd.as_deref());
             });
         } else {
             let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / paths.len()).max(1);
-            std::thread::spawn(move || {
+            spawn_load_job(move || {
                 load_multi_progressive(paths, &counter, tpf, &tx, cd.as_deref(), true);
             });
         }

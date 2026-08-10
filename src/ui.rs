@@ -207,21 +207,15 @@ pub fn draw_hidden_clear(ui: &imgui::Ui, spacing: f32, hidden_names: &mut [bool]
 /// thread spawn overhead would dominate the actual work.
 pub(crate) fn parallel_occ_limit<'a>(n: usize, f: &(impl Fn(usize) -> (&'a str, bool) + Sync)) -> Vec<(&'a str, bool)> {
     const MIN_PARALLEL: usize = 20_000;
-    let n_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
-    if n < MIN_PARALLEL || n_threads <= 1 {
+    if n < MIN_PARALLEL {
         return (0..n).map(f).collect();
     }
-    let chunk = (n + n_threads - 1) / n_threads;
-    std::thread::scope(|s| {
-        let handles: Vec<_> = (0..n_threads)
-            .map(|t| {
-                let start = t * chunk;
-                let end = ((t + 1) * chunk).min(n);
-                s.spawn(move || (start..end).map(|i| f(i)).collect::<Vec<_>>())
-            })
-            .collect();
-        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
-    })
+    // rayon sizes its pool from the environment (== available_parallelism by
+    // default) and preserves index order on a range's `.collect()`, so the
+    // manual available_parallelism()-based chunking this replaced is
+    // redundant — rayon already splits/rebalances the range itself.
+    use rayon::prelude::*;
+    (0..n).into_par_iter().map(|i| f(i)).collect()
 }
 
 pub fn draw_stats_table(

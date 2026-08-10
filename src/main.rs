@@ -1520,19 +1520,25 @@ fn main() {
             let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len()).max(2);
             eprintln!("bench: {} threads per file", tpf);
             let t_load = Instant::now();
-            let results: Vec<_> = std::thread::scope(|s| {
-                let handles: Vec<_> = all_paths.iter().map(|(rank, path)| {
-                    let r = *rank;
-                    let ctr = counter.clone();
-                    s.spawn(move || {
-                        let t = Instant::now();
-                        let res = loader::load_trace(path, &ctr, tpf, None);
-                        let elapsed = t.elapsed().as_secs_f64();
-                        (r, res, elapsed)
-                    })
-                }).collect();
-                handles.into_iter().filter_map(|h| h.join().ok()).collect()
-            });
+            use rayon::prelude::*;
+            let results: Vec<_> = all_paths.par_iter().filter_map(|(rank, path)| {
+                let r = *rank;
+                let ctr = counter.clone();
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let t = Instant::now();
+                    let res = loader::load_trace(path, &ctr, tpf, None);
+                    (res, t.elapsed().as_secs_f64())
+                })) {
+                    Ok((res, elapsed)) => Some((r, res, elapsed)),
+                    Err(e) => {
+                        let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
+                            .or_else(|| e.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        eprintln!("  rank {r} load thread panicked: {msg}");
+                        None
+                    }
+                }
+            }).collect();
 
             let mut traces = Vec::new();
             let mut max_file_time = 0.0f64;
