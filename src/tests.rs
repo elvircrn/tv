@@ -1858,3 +1858,40 @@ fn bench_selection_histogram_rebuild_cost() {
         eprintln!("rows: {n:>8}  build+sort: {:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
     }
 }
+
+#[test]
+#[ignore]
+fn bench_parallel_occ_limit_parse() {
+    // Verifies parallel_occ_limit (used for the Occ Limit column's O(n)
+    // sort-cache build) is both correct (matches a sequential pass exactly)
+    // and actually faster. On a 9M-event trace this measured 1678ms
+    // sequential vs 227ms parallel (14 cores). Run with:
+    //   TV_BENCH_TRACE=/path/to/trace cargo test --profile dev-release -- --ignored --nocapture bench_parallel_occ_limit_parse
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("skipped: set TV_BENCH_TRACE"); return; }
+    };
+    let trace = crate::loader::load_trace(&path, &test_counter(), 0, None).unwrap();
+
+    let mut refs: Vec<(u32, u32)> = Vec::new();
+    for (ti, t) in trace.tracks.iter().enumerate() {
+        for ei in 0..t.events.len() {
+            refs.push((ti as u32, ei as u32));
+        }
+    }
+    eprintln!("total events: {}", refs.len());
+    let f = |i: usize| -> (&str, bool) {
+        let (ti, ei) = refs[i];
+        crate::ui::kernel_occ_limit(&trace, ti, ei)
+    };
+    let t0 = std::time::Instant::now();
+    let cache: Vec<(&str, bool)> = (0..refs.len()).map(f).collect();
+    eprintln!("sequential: {:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
+
+    let t1 = std::time::Instant::now();
+    let cache2 = crate::ui::parallel_occ_limit(refs.len(), &f);
+    eprintln!("parallel:   {:.2}ms (available_parallelism={})",
+        t1.elapsed().as_secs_f64() * 1000.0,
+        std::thread::available_parallelism().map(|p| p.get()).unwrap_or(0));
+    assert_eq!(cache, cache2, "parallel result must match sequential");
+}

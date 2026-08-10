@@ -200,6 +200,30 @@ pub fn draw_hidden_clear(ui: &imgui::Ui, spacing: f32, hidden_names: &mut [bool]
     }
 }
 
+/// Run `f` over `0..n` in parallel, splitting the range evenly across
+/// available cores — used for the Occ Limit column's per-row JSON parse,
+/// which is independent per row and CPU-bound (unlike the other columns'
+/// plain field reads). Falls back to sequential below `MIN_PARALLEL`, where
+/// thread spawn overhead would dominate the actual work.
+pub(crate) fn parallel_occ_limit<'a>(n: usize, f: &(impl Fn(usize) -> (&'a str, bool) + Sync)) -> Vec<(&'a str, bool)> {
+    const MIN_PARALLEL: usize = 20_000;
+    let n_threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    if n < MIN_PARALLEL || n_threads <= 1 {
+        return (0..n).map(f).collect();
+    }
+    let chunk = (n + n_threads - 1) / n_threads;
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..n_threads)
+            .map(|t| {
+                let start = t * chunk;
+                let end = ((t + 1) * chunk).min(n);
+                s.spawn(move || (start..end).map(|i| f(i)).collect::<Vec<_>>())
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    })
+}
+
 pub fn draw_stats_table(
     ui: &imgui::Ui,
     trace: &Trace,
@@ -305,17 +329,20 @@ pub fn draw_stats_table(
     // on a 1M-row selection even for a plain numeric column).
     let stats_is_individual = event_refs.is_some();
     let cache_key = (generation, *sort_col, *sort_asc, stats.len(), stats_is_individual);
-    if std::env::var_os("TV_DEBUG_SORT_CACHE").is_some() && buf.sort_cache_key != Some(cache_key) {
-        eprintln!("  sort_cache MISS: old={:?} new={:?}", buf.sort_cache_key, Some(cache_key));
-    }
     if buf.sort_cache_key != Some(cache_key) {
         // Sorting by Occ Limit naively (parsing each row's raw JSON args
         // inside the comparator) measured at 140ms for just 15k rows on its
         // own. Parse each row exactly once up front instead, only when it's
         // the active sort key; row *rendering* below still looks values up
-        // lazily (bounded by the clipper to the visible rows).
+        // lazily (bounded by the clipper to the visible rows). Even parsed
+        // once, this is a genuinely CPU-bound O(n) pass — GPU kernel events
+        // carry a much larger args blob (occupancy dict, grid/block arrays)
+        // than CPU ops, so a kernel-heavy selection can still cost 100ms+ at
+        // ~100k rows single-threaded. Each row is independent, so split the
+        // parse across threads the same way loader.rs parallelizes per-track
+        // work at load time.
         let occ_limit_sort_cache: Option<Vec<(&str, bool)>> = (*sort_col == 7)
-            .then(|| (0..stats.len()).map(occ_limit_uncached).collect());
+            .then(|| parallel_occ_limit(stats.len(), &occ_limit_uncached));
         let occ_limit_for_sort = |si: usize| -> (&str, bool) {
             match &occ_limit_sort_cache {
                 Some(cache) => cache[si],
