@@ -1,2 +1,17 @@
-[build]
+# `target-cpu=native` is meaningless for wasm32 (noisy: "apple-m4 is not a
+# recognized processor") and, worse, actually reaches rustc for the wasm32
+# build: Cargo's `[target.<triple>].rustflags = []` does NOT override a
+# non-empty `[build].rustflags` (an empty override list is treated as unset
+# and falls through), so a triple-specific empty override here is silently
+# ignored and `-C target-cpu=native` leaks into the wasm32-unknown-unknown
+# rustc invocation. That corrupts the target-feature baseline rustc picks
+# for wasm32 (LLVM can't resolve "native"/"apple-m4" as a wasm CPU), which
+# is why wasm-bindgen-cli fails with "failed to find the
+# `__wbindgen_externref_table_alloc` function" even though the module's
+# declared target_features section still lists reference-types as enabled.
+# Scoping the flag by `cfg(not(target_arch = "wasm32"))` instead of a
+# triple-specific table sidesteps the empty-override footgun entirely: for
+# wasm32 there's simply no matching section, so `[build].rustflags` (now
+# absent) has nothing to leak.
+[target.'cfg(not(target_arch = "wasm32"))']
 rustflags = ["-C", "target-cpu=native"]

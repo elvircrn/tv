@@ -1,4 +1,5 @@
 target/
+dist/
 fuzz/artifacts/
 fuzz/corpus/
 **/*.rs.bk

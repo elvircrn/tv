@@ -1,0 +1,12 @@
+[build]
+target = "index.html"
+
+[serve]
+open = false
+
+# Required for the real-multithreading phase (SharedArrayBuffer needs
+# cross-origin isolation). Harmless before then — the app doesn't load
+# anything cross-origin.
+[serve.headers]
+"Cross-Origin-Opener-Policy" = "same-origin"
+"Cross-Origin-Embedder-Policy" = "require-corp"

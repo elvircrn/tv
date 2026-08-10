@@ -1077,6 +1077,168 @@ fn load_cache_from_mmap(mmap: memmap2::Mmap) -> Option<Trace> {
     })
 }
 
+// Loads a `.tvcache` binary blob already in memory (e.g. read via the
+// browser's File API) instead of a live JSON trace — there's no mmap on
+// wasm32, so there's no fixed on-disk path to open. Mirrors
+// `load_cache_from_mmap`'s binary layout exactly but reads from a plain byte
+// slice and copies the args range into `ArgsBuf::Heap` instead of keeping an
+// mmap alive. Sequential (not `std::thread::scope`) since real threads panic
+// on wasm32 without the atomics build from the real-threading phase.
+// Not yet wired to any caller — lands with Phase 3's drag-and-drop loading.
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+pub fn load_cache_from_bytes(d: &[u8]) -> Option<Trace> {
+    if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
+
+    let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
+    let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
+    let rf64 = |off: usize| f64::from_le_bytes(d[off..off + 8].try_into().unwrap());
+    if r32(4) > CACHE_VERSION { return None; }
+
+    let max_ts = rf64(24);
+    let min_ts = rf64(32);
+    let total_events = r64(40) as usize;
+    let n_tracks = r32(48) as usize;
+    let n_names = r32(52) as usize;
+    let n_cats = r32(56) as usize;
+    let n_stats = r32(60) as usize;
+    let _device_len = r32(64) as usize;
+    let args_len = r64(68) as usize;
+
+    let mut pos = 80usize;
+
+    let read_strings = |pos: &mut usize, count: usize| -> Option<Vec<String>> {
+        let mut v = Vec::with_capacity(count);
+        for _ in 0..count {
+            if *pos + 4 > d.len() { return None; }
+            let len = u32::from_le_bytes(d[*pos..*pos + 4].try_into().unwrap()) as usize;
+            *pos += 4;
+            if *pos + len > d.len() { return None; }
+            v.push(String::from_utf8_lossy(&d[*pos..*pos + len]).into_owned());
+            *pos += len;
+        }
+        Some(v)
+    };
+
+    let names = read_strings(&mut pos, n_names)?;
+    let cats = read_strings(&mut pos, n_cats)?;
+
+    if pos + 4 > d.len() { return None; }
+    let dev_len = u32::from_le_bytes(d[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    if pos + dev_len > d.len() { return None; }
+    let device = String::from_utf8_lossy(&d[pos..pos + dev_len]).into_owned();
+    pos += dev_len;
+
+    struct TrackHdr { label: String, gpu: bool, max_depth: u16, event_count: usize }
+    let mut track_hdrs: Vec<TrackHdr> = Vec::with_capacity(n_tracks);
+    let mut total_check: usize = 0;
+    for _ in 0..n_tracks {
+        if pos + 13 > d.len() { return None; }
+        let label_len = u16::from_le_bytes(d[pos..pos + 2].try_into().unwrap()) as usize;
+        let gpu = d[pos + 2] != 0;
+        let max_depth = u16::from_le_bytes(d[pos + 3..pos + 5].try_into().unwrap());
+        let event_count = u64::from_le_bytes(d[pos + 5..pos + 13].try_into().unwrap()) as usize;
+        pos += 13;
+        if pos + label_len > d.len() { return None; }
+        let label = String::from_utf8_lossy(&d[pos..pos + label_len]).into_owned();
+        pos += label_len;
+        total_check += event_count;
+        track_hdrs.push(TrackHdr { label, gpu, max_depth, event_count });
+    }
+    if total_check != total_events { return None; }
+
+    if pos % 8 != 0 { pos += 8 - pos % 8; }
+
+    let ev_size = std::mem::size_of::<Event>();
+    let events_bytes = total_events * ev_size;
+    if pos + events_bytes > d.len() { return None; }
+    let all_events: &[Event] = unsafe {
+        std::slice::from_raw_parts(d[pos..].as_ptr() as *const Event, total_events)
+    };
+    pos += events_bytes;
+
+    let pmd_bytes = total_events * 8;
+    if pos + pmd_bytes > d.len() { return None; }
+    let all_pmd: &[f64] = unsafe {
+        std::slice::from_raw_parts(d[pos..].as_ptr() as *const f64, total_events)
+    };
+    pos += pmd_bytes;
+
+    let stats_size = std::mem::size_of::<KernelStats>();
+    let stats_bytes = n_stats * stats_size;
+    if pos + stats_bytes > d.len() { return None; }
+    let stats: Vec<KernelStats> = unsafe {
+        std::slice::from_raw_parts(d[pos..].as_ptr() as *const KernelStats, n_stats)
+    }.to_vec();
+    pos += stats_bytes;
+
+    if pos + args_len > d.len() { return None; }
+    let args_offset = pos;
+    let after_args = pos + args_len;
+
+    let mut offsets = Vec::with_capacity(n_tracks);
+    let mut ev_off = 0usize;
+    for hdr in &track_hdrs {
+        offsets.push(ev_off);
+        ev_off += hdr.event_count;
+    }
+
+    let tracks: Vec<Track> = track_hdrs.into_iter().zip(offsets).map(|(hdr, off)| {
+        let n = hdr.event_count;
+        Track {
+            label: hdr.label,
+            gpu: hdr.gpu,
+            events: all_events[off..off + n].to_vec(),
+            max_depth: hdr.max_depth,
+            prefix_max_dur: all_pmd[off..off + n].to_vec(),
+            raw_buf_idx: 0,
+        }
+    }).collect();
+
+    let fp_size = std::mem::size_of::<FlowPair>();
+    let mut flow_pairs = Vec::new();
+    let mut fpos = after_args;
+    if fpos + 4 <= d.len() {
+        let n_flows = u32::from_le_bytes(d[fpos..fpos + 4].try_into().unwrap()) as usize;
+        fpos += 4;
+        if fpos + n_flows * fp_size <= d.len() {
+            flow_pairs.reserve(n_flows);
+            for i in 0..n_flows {
+                let off = fpos + i * fp_size;
+                let src_track = u32::from_le_bytes(d[off..off+4].try_into().unwrap());
+                let dst_track = u32::from_le_bytes(d[off+4..off+8].try_into().unwrap());
+                let src_ts = f64::from_le_bytes(d[off+8..off+16].try_into().unwrap());
+                let dst_ts = f64::from_le_bytes(d[off+16..off+24].try_into().unwrap());
+                flow_pairs.push(FlowPair { src_track, dst_track, src_ts, dst_ts });
+            }
+            fpos += n_flows * fp_size;
+        }
+    }
+
+    let mut vllm_version = String::new();
+    if fpos + 4 <= d.len() {
+        let vlen = u32::from_le_bytes(d[fpos..fpos + 4].try_into().unwrap()) as usize;
+        fpos += 4;
+        if fpos + vlen <= d.len() {
+            vllm_version = String::from_utf8_lossy(&d[fpos..fpos + vlen]).into_owned();
+            fpos += vlen;
+        }
+    }
+
+    let (mut dist_rank, mut dist_world) = (-1i32, 0i32);
+    if fpos + 8 <= d.len() {
+        dist_rank = i32::from_le_bytes(d[fpos..fpos + 4].try_into().unwrap());
+        dist_world = i32::from_le_bytes(d[fpos + 4..fpos + 8].try_into().unwrap());
+    }
+
+    Some(Trace {
+        tracks, names, cats,
+        raw_bufs: vec![Arc::new(ArgsBuf::Heap(d[args_offset..args_offset + args_len].to_vec()))],
+        stats, max_ts, min_ts, total_events, device, vllm_version, dist_rank, dist_world, flow_pairs,
+    })
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn load_cache_direct(cache_path: &str) -> Option<Trace> {
     let file = std::fs::File::open(cache_path).ok()?;

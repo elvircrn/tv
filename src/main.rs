@@ -4,6 +4,8 @@ mod types;
 mod renderer;
 #[cfg(target_arch = "wasm32")]
 mod renderer_web;
+#[cfg(target_arch = "wasm32")]
+mod wasm_libc_shims;
 mod loader;
 mod state;
 mod ui;
@@ -91,6 +93,15 @@ struct App {
     nav_pan_vel: f64,
     nav_zoom_vel: f64,
     last_reload: Instant,
+    // winit's web backend never resizes the canvas on its own when the
+    // browser window/viewport changes — unlike native windows, a <canvas>
+    // has no OS-level "this window got resized" notion, so nothing calls
+    // `request_inner_size` for us. We listen for the DOM `resize` event
+    // ourselves (registered in `resumed()`) and use this proxy to hop back
+    // onto the winit event loop and issue that resize request from
+    // `user_event()`, where `self.window` is reachable.
+    #[cfg(target_arch = "wasm32")]
+    event_loop_proxy: Option<winit::event_loop::EventLoopProxy<()>>,
 }
 
 impl App {
@@ -127,6 +138,8 @@ impl App {
             nav_pan_vel: 0.0,
             nav_zoom_vel: 0.0,
             last_reload: Instant::now(),
+            #[cfg(target_arch = "wasm32")]
+            event_loop_proxy: None,
         }
     }
 }
@@ -174,16 +187,71 @@ impl imgui::ClipboardBackend for WebClipboard {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Native gets a fixed initial size (there's no "browser viewport" to
+        // match). On web, opening at a hardcoded 1400x800 regardless of the
+        // actual browser window would leave the canvas mismatched with the
+        // page until the first manual resize, so seed it from the real
+        // viewport size when we can read one.
+        #[cfg(not(target_arch = "wasm32"))]
+        let (init_w, init_h) = (INITIAL_WIN_W, INITIAL_WIN_H);
+        #[cfg(target_arch = "wasm32")]
+        let (init_w, init_h) = {
+            let win = web_sys::window();
+            let w = win.as_ref().and_then(|w| w.inner_width().ok()).and_then(|v| v.as_f64());
+            let h = win.as_ref().and_then(|w| w.inner_height().ok()).and_then(|v| v.as_f64());
+            (w.unwrap_or(INITIAL_WIN_W as f64) as f32, h.unwrap_or(INITIAL_WIN_H as f64) as f32)
+        };
         let attrs = Window::default_attributes()
             .with_title("Trace Viewer")
-            .with_inner_size(winit::dpi::LogicalSize::new(INITIAL_WIN_W, INITIAL_WIN_H));
+            .with_inner_size(winit::dpi::LogicalSize::new(init_w, init_h));
         #[cfg(target_arch = "wasm32")]
         let attrs = {
             use winit::platform::web::WindowAttributesExtWebSys;
-            attrs.with_append(true)
+            // Without a tabindex, a <canvas> is not a focusable element, so
+            // it can never become `document.activeElement` and therefore
+            // never receives "keydown"/"keyup" DOM events at all (they're
+            // only dispatched to the focused element or its ancestors).
+            // winit's web backend registers its keyboard listeners directly
+            // on the canvas (see Canvas::on_keyboard_press/release), so
+            // without this, WindowEvent::KeyboardInput never fires — no
+            // amount of correct event-loop/control-flow handling on our end
+            // can compensate. `with_focusable(true)` makes winit set
+            // `tabindex="0"` on the canvas at creation time.
+            attrs.with_append(true).with_focusable(true)
         };
         let window = event_loop.create_window(attrs).unwrap();
         self.scale_factor = window.scale_factor();
+
+        // Unlike a native OS window, a <canvas> has no concept of being
+        // resized by the user dragging its edges — winit's web backend only
+        // resizes the canvas when *we* tell it to (via `request_inner_size`,
+        // see `user_event` below). Nothing does that on its own, so without
+        // this listener the canvas would stay locked at its creation size
+        // forever, and the app would never re-layout when the browser
+        // window/tab is resized. `resize` fires on `window`, not the canvas,
+        // so this can't be wired through winit's per-window event
+        // registration — we listen ourselves and hop back onto the winit
+        // event loop via a proxy, since `self` isn't reachable from this
+        // 'static JS closure.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(proxy) = self.event_loop_proxy.clone() {
+            use wasm_bindgen::JsCast;
+            if let Some(win) = web_sys::window() {
+                let closure = wasm_bindgen::closure::Closure::<dyn FnMut(_)>::new(
+                    move |_e: web_sys::Event| {
+                        let _ = proxy.send_event(());
+                    },
+                );
+                let _ = win.add_event_listener_with_callback(
+                    "resize",
+                    closure.as_ref().unchecked_ref(),
+                );
+                // Leaked deliberately: this listener must outlive `resumed`
+                // and live for the app's entire lifetime (there's exactly
+                // one `App` per page load, never torn down).
+                closure.forget();
+            }
+        }
 
         let mut imgui = imgui::Context::create();
         imgui.io_mut().config_mac_os_behaviors = true;
@@ -231,6 +299,21 @@ impl ApplicationHandler for App {
         if self.state.panes.len() > 1 {
             let size = self.window.as_ref().unwrap().inner_size();
             self.state.recompute_dividers(size.width as f32 / self.scale_factor as f32);
+        }
+    }
+
+    // Fired when the browser-side `resize` listener installed in `resumed()`
+    // hops back onto the winit event loop through the proxy. Re-reads the
+    // current viewport and asks winit to match it; winit's own resize
+    // machinery (ResizeObserver -> WindowEvent::Resized, handled below) takes
+    // it from there, same as a real OS window resize on native.
+    #[cfg(target_arch = "wasm32")]
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
+        let (Some(window), Some(win)) = (self.window.as_ref(), web_sys::window()) else { return };
+        let w = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let h = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+        if w > 0.0 && h > 0.0 {
+            let _ = window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
         }
     }
 
@@ -387,11 +470,24 @@ impl ApplicationHandler for App {
             }
             self.last_reload = Instant::now();
         }
+        // On web, the canvas reports a 0x0 size for a frame or two after
+        // creation — winit's real size only arrives once its ResizeObserver
+        // fires, asynchronously. Keep polling until a real size shows up, or
+        // a Wait-mode app would render one empty frame and then never redraw
+        // again (see WindowEvent::Resized below and WebGl2Renderer::render's
+        // zero-size early-return).
+        #[cfg(target_arch = "wasm32")]
+        let awaiting_real_size = self.window.as_ref()
+            .is_some_and(|w| { let s = w.inner_size(); s.width == 0 || s.height == 0 });
+        #[cfg(not(target_arch = "wasm32"))]
+        let awaiting_real_size = false;
+
         let needs_poll = self.state.panes.iter().any(|p| p.loading.is_some())
             || self.nav_keys != 0
             || self.nav_pan_vel.abs() > 1e-6
             || self.nav_zoom_vel.abs() > 1e-6
             || any_watching
+            || awaiting_real_size
             || self.state.panes.iter().any(|p| p.view.anim.is_some());
         if needs_poll {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
@@ -1481,7 +1577,11 @@ fn main() {
     console_error_panic_hook::set_once();
     use winit::platform::web::EventLoopExtWebSys;
     let event_loop = EventLoop::new().unwrap();
-    let app = App::new(Vec::new());
+    let mut app = App::new(Vec::new());
+    // `create_proxy` only exists on the owning `EventLoop`, not the
+    // `ActiveEventLoop` passed into `resumed()` — grab it here and stash it
+    // for `resumed()` to hand to the browser-resize listener it installs.
+    app.event_loop_proxy = Some(event_loop.create_proxy());
     event_loop.spawn_app(app);
 }
 
