@@ -498,23 +498,6 @@ fn decompress_parse_streaming(
     Ok((RawData::Vec(backing), chunks))
 }
 
-/// Read an integer value for `key` in the JSON object at/after `start`.
-/// Used for the small `distributedInfo` fields; None if not found/parsable.
-fn parse_int_after_key(raw: &[u8], start: usize, key: &[u8]) -> Option<i64> {
-    let kp = find_key(&raw[start..], key)? + start;
-    let mut q = kp + key.len() + 2; // past opening quote + key + closing quote
-    q = skip_ws(raw, q);
-    if q < raw.len() && raw[q] == b':' { q += 1; }
-    q = skip_ws(raw, q);
-    let neg = q < raw.len() && raw[q] == b'-';
-    if neg { q += 1; }
-    let s = q;
-    while q < raw.len() && raw[q].is_ascii_digit() { q += 1; }
-    if q == s { return None; }
-    let n: i64 = std::str::from_utf8(&raw[s..q]).ok()?.parse().ok()?;
-    Some(if neg { -n } else { n })
-}
-
 fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Instant) -> Result<Trace, String> {
     let mut names: Vec<String> = vec![String::new()];
     let mut name_idx: FnvMap<u32> = FnvMap::default();
@@ -590,8 +573,8 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     // the pg_config arrays use `"ranks"` (plural), which find_key won't match.
     let (mut dist_rank, mut dist_world) = (-1i32, 0i32);
     if let Some(di) = find_key(&raw, b"distributedInfo") {
-        if let Some(r) = parse_int_after_key(&raw, di, b"rank") { dist_rank = r as i32; }
-        if let Some(w) = parse_int_after_key(&raw, di, b"world_size") { dist_world = w as i32; }
+        if let Some(r) = find_int_field(&raw, di, b"rank") { dist_rank = r as i32; }
+        if let Some(w) = find_int_field(&raw, di, b"world_size") { dist_world = w as i32; }
     }
 
     eprintln!("  scan: {:.2}s ({} objects, {} events, {} names, {}x parallel)",

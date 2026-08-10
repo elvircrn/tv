@@ -141,8 +141,43 @@ pub fn draw_selection_histogram(
 }
 
 /// Column order for the stats table. Also the sort key indices persisted in
-/// `Pane::sort_col`, so keep the two in sync.
-const STATS_HEADERS: [&str; 7] = ["Name", "Count", "Total", "%", "Mean", "Median", "Max"];
+/// `Pane::sort_col`, so keep the two in sync. "Occ Limit" is always present
+/// (so a persisted sort_col/column layout survives switching aggregate modes)
+/// but is only ever populated in individual-row mode, since an aggregate row
+/// can span kernel launches with different limiting factors.
+const STATS_HEADERS: [&str; 8] = ["Name", "Count", "Total", "%", "Mean", "Median", "Max", "Occ Limit"];
+
+/// CUDA's default static shared-memory-per-block cap (48KB) on every
+/// architecture since Kepler. A kernel that opts into more via
+/// `cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` — routine for
+/// GEMM/attention/NCCL kernels — makes CUPTI's launch-config occupancy
+/// calculator check against this (wrong, too-low) ceiling instead, which
+/// falsely reports "SMEM" as the limiting factor with zero active blocks.
+const CUDA_DEFAULT_SHARED_MEM_PER_BLOCK: u64 = 49152;
+
+/// Look up CUPTI's `occupancy.limitingFactors` (e.g. "WARPS", "SMEM",
+/// "REGS|BLOCKS") for one event from its raw args JSON, and whether it's
+/// likely a calculator artifact rather than a real occupancy limit (see
+/// `CUDA_DEFAULT_SHARED_MEM_PER_BLOCK`). Returns ("", false) for anything
+/// that isn't a CUDA kernel launch (CPU ops, no args, etc) — most events
+/// simply don't have this field, which isn't an error.
+pub(crate) fn kernel_occ_limit(trace: &Trace, track_idx: u32, event_idx: u32) -> (&str, bool) {
+    if track_idx == u32::MAX { return ("", false); }
+    let track = match trace.tracks.get(track_idx as usize) { Some(t) => t, None => return ("", false) };
+    let ev = match track.events.get(event_idx as usize) { Some(e) => e, None => return ("", false) };
+    if ev.args_off == 0 { return ("", false); }
+    let raw = match trace.raw_bufs.get(track.raw_buf_idx as usize) { Some(r) => r, None => return ("", false) };
+    let off = ev.args_off as usize;
+    if off >= raw.len() { return ("", false); }
+    let end = crate::parse::skip_value(raw, off);
+    let args = &raw[off..end];
+    let limit = crate::parse::find_str_field(args, b"limitingFactors").unwrap_or("");
+    let suspect = limit.contains("SMEM")
+        && crate::parse::find_int_field(args, 0, b"shared memory")
+            .map(|smem| smem as u64 > CUDA_DEFAULT_SHARED_MEM_PER_BLOCK)
+            .unwrap_or(false);
+    (limit, suspect)
+}
 
 /// Renders the "N hidden" indicator and its "Clear" (unhide-all) button, placed
 /// on the current row after `spacing` px. Draws nothing when nothing is hidden.
@@ -169,6 +204,10 @@ pub fn draw_stats_table(
     ui: &imgui::Ui,
     trace: &Trace,
     stats: &[KernelStats],
+    // (track_idx, event_idx) parallel to `stats`, for the Occ Limit column.
+    // `None` in aggregate mode, where a row can span many launches and no
+    // single limiting factor applies.
+    event_refs: Option<&[(u32, u32)]>,
     search: &mut String,
     search_changed: &mut bool,
     sort_col: &mut usize,
@@ -202,7 +241,9 @@ pub fn draw_stats_table(
     let num_w = ui
         .calc_text_size("0000.00 ms")[0]
         .max(ui.calc_text_size("Median")[0] + 22.0);
-    let cols: [TableColumnSetup<&str>; 7] = std::array::from_fn(|i| {
+    // "WARPS|BLOCKS" is the widest realistic limiting-factor combo.
+    let occ_w = ui.calc_text_size("WARPS|BLOCKS")[0] + 12.0;
+    let cols: [TableColumnSetup<&str>; 8] = std::array::from_fn(|i| {
         let mut c = TableColumnSetup::new(STATS_HEADERS[i]);
         if i == 0 {
             // The name is textual and usually long, so let it stretch to absorb
@@ -211,7 +252,7 @@ pub fn draw_stats_table(
             c.flags |= TableColumnFlags::WIDTH_STRETCH | TableColumnFlags::NO_HIDE;
         } else {
             c.flags |= TableColumnFlags::WIDTH_FIXED;
-            c.init_width_or_weight = num_w;
+            c.init_width_or_weight = if i == 7 { occ_w } else { num_w };
         }
         if i == *sort_col {
             c.flags |= TableColumnFlags::DEFAULT_SORT;
@@ -247,6 +288,13 @@ pub fn draw_stats_table(
     let avg = |s: &KernelStats| if s.count > 0 { s.total_dur / s.count as f64 } else { 0.0 };
     let pct = |s: &KernelStats| if total_sum > 0.0 { s.total_dur / total_sum } else { 0.0 };
 
+    let occ_limit = |si: usize| -> (&str, bool) {
+        match event_refs.and_then(|r| r.get(si)) {
+            Some(&(ti, ei)) => kernel_occ_limit(trace, ti, ei),
+            None => ("", false),
+        }
+    };
+
     buf.sort_idx.clear();
     buf.sort_idx.extend(0..stats.len());
     buf.sort_idx.sort_by(|&a, &b| {
@@ -258,7 +306,8 @@ pub fn draw_stats_table(
             3 => pct(sa).partial_cmp(&pct(sb)).unwrap(),
             4 => avg(sa).partial_cmp(&avg(sb)).unwrap(),
             5 => sa.median_dur.partial_cmp(&sb.median_dur).unwrap(),
-            _ => sa.max_dur.partial_cmp(&sb.max_dur).unwrap(),
+            6 => sa.max_dur.partial_cmp(&sb.max_dur).unwrap(),
+            _ => occ_limit(a).0.cmp(occ_limit(b).0),
         };
         if *sort_asc { ord } else { ord.reverse() }
     });
@@ -326,6 +375,29 @@ pub fn draw_stats_table(
             buf.fmt.clear();
             write_time(&mut buf.fmt, s.max_dur);
             ui.text(&buf.fmt);
+        }
+        if ui.table_set_column_index(7) {
+            let (limit, suspect) = occ_limit(si);
+            if !limit.is_empty() {
+                if suspect {
+                    ui.text_colored([1.0, 0.7, 0.3, 1.0], limit);
+                } else {
+                    ui.text(limit);
+                }
+                if ui.is_item_hovered() {
+                    if suspect {
+                        ui.tooltip_text("Likely a calculator artifact: this kernel \
+                            requests shared memory above CUDA's default 48KB static \
+                            limit (common for GEMM/attention/NCCL kernels), which \
+                            CUPTI's occupancy calculator checks against instead of \
+                            the larger opt-in limit the kernel actually used. Real \
+                            occupancy is probably higher than this implies.");
+                    } else {
+                        ui.tooltip_text("CUDA occupancy-limiting factor for this \
+                            launch, from CUPTI's launch-config calculator.");
+                    }
+                }
+            }
         }
     }
 }

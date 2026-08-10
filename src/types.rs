@@ -235,6 +235,11 @@ pub struct SelectionEntry {
     pub count: u32,
     pub total_dur: f64,
     pub durations: Vec<f64>,
+    /// (track_idx, event_idx) parallel to `durations`, so the individual-rows
+    /// stats table can look each event's raw args back up (e.g. to show its
+    /// CUDA occupancy-limiting factor). Empty for aggregation paths that don't
+    /// need it (there are none currently, but keep it optional-shaped).
+    pub event_refs: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -314,7 +319,7 @@ pub struct DrawBuf {
     pub last_px: Vec<i32>,
     pub fmt: String,
     pub sort_idx: Vec<usize>,
-    pub sel_map: HashMap<u32, (u32, f64, Vec<f64>)>,
+    pub sel_map: HashMap<u32, (u32, f64, Vec<f64>, Vec<(u32, u32)>)>,
     pub sel_bars: Vec<(f64, u32)>,
     pub detail_buf: String,
     pub merged_gpu_groups: Vec<MergedGpuGroup>,

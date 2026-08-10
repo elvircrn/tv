@@ -922,9 +922,9 @@ impl App {
                                 draw_selection_histogram(&ui, trace, &pane.selection_stats, pane.sel_aggregate, &mut state.buf);
                                 ui.separator();
                                 if pane.sel_aggregate {
-                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
+                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, None, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
                                 } else {
-                                    draw_stats_table(&ui, trace, &pane.sel_individual, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
+                                    draw_stats_table(&ui, trace, &pane.sel_individual, Some(&pane.sel_individual_refs), &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
                                 }
                             } else {
                                 ui.text_colored([0.5, 0.5, 0.5, 1.0], "Shift+drag to select a time range");

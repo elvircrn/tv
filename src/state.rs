@@ -50,6 +50,9 @@ pub struct Pane {
     pub sel_median: f64,
     pub sel_agg_stats: Vec<KernelStats>,
     pub sel_individual: Vec<KernelStats>,
+    /// (track_idx, event_idx) parallel to `sel_individual`, so the stats table
+    /// can look up each row's raw args (e.g. CUDA occupancy-limiting factor).
+    pub sel_individual_refs: Vec<(u32, u32)>,
     pub track_order: Vec<usize>,
     pub auto_reload: bool,
     pub reload_paths: Vec<(usize, String)>,
@@ -96,6 +99,7 @@ impl Pane {
             sel_median: 0.0,
             sel_agg_stats: Vec::new(),
             sel_individual: Vec::new(),
+            sel_individual_refs: Vec::new(),
             track_order: Vec::new(),
             auto_reload: false,
             reload_paths: Vec::new(),
@@ -128,6 +132,7 @@ impl Pane {
         self.sel_median = 0.0;
         self.sel_agg_stats.clear();
         self.sel_individual.clear();
+        self.sel_individual_refs.clear();
     }
 
     pub fn clear_search(&mut self) {
@@ -304,13 +309,13 @@ impl Pane {
         };
         let sel = match self.selection.or(self.finished_sel) {
             Some(s) => s,
-            None => { self.selection_stats.clear(); self.sel_agg_stats.clear(); self.sel_individual.clear(); self.sel_median = 0.0; return; }
+            None => { self.selection_stats.clear(); self.sel_agg_stats.clear(); self.sel_individual.clear(); self.sel_individual_refs.clear(); self.sel_median = 0.0; return; }
         };
         let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
         let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
 
         let map = &mut buf.sel_map;
-        for v in map.values_mut() { v.0 = 0; v.1 = 0.0; v.2.clear(); }
+        for v in map.values_mut() { v.0 = 0; v.1 = 0.0; v.2.clear(); v.3.clear(); }
 
         let mut total_scanned = 0usize;
         for vi in 0..self.geom.visible.len() {
@@ -332,10 +337,11 @@ impl Pane {
                     let ev_top = track_top + depth as f32 * sub_h;
                     let ev_bot = ev_top + sub_h;
                     if ev_bot < y0 || ev_top > y1 { continue; }
-                    let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new()));
+                    let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new(), Vec::new()));
                     e.0 += 1;
                     e.1 += ev.dur;
                     e.2.push(ev.dur);
+                    e.3.push((ti32, ei32));
                 }
             } else {
                 let ti = self.geom.visible[vi];
@@ -346,7 +352,7 @@ impl Pane {
                 let end = track.events.partition_point(|e| e.ts <= s1).max(start);
                 total_scanned += end - start;
                 let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
-                for ev in &track.events[start..end] {
+                for (local_i, ev) in track.events[start..end].iter().enumerate() {
                     if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
                     let ev_top = track_top + ev.depth as f32 * sub_h;
                     let ev_bot = ev_top + sub_h;
@@ -355,20 +361,22 @@ impl Pane {
                     if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
                         ancestor_sel[ev.depth as usize] = true;
                         if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
-                        let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new()));
+                        let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new(), Vec::new()));
                         e.0 += 1;
                         e.1 += ev.dur;
                         e.2.push(ev.dur);
+                        e.3.push((ti as u32, (start + local_i) as u32));
                     }
                 }
             }
         }
         self.selection_stats.clear();
-        for (&name, (count, total_dur, durations)) in map.iter_mut() {
+        for (&name, (count, total_dur, durations, event_refs)) in map.iter_mut() {
             if *count == 0 { continue; }
             self.selection_stats.push(SelectionEntry {
                 name, count: *count, total_dur: *total_dur,
                 durations: std::mem::take(durations),
+                event_refs: std::mem::take(event_refs),
             });
         }
         self.selection_stats.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap().then(a.name.cmp(&b.name)));
@@ -530,26 +538,28 @@ impl Pane {
         self.sel_mask.clear();
 
         let map = &mut buf.sel_map;
-        for v in map.values_mut() { v.0 = 0; v.1 = 0.0; v.2.clear(); }
+        for v in map.values_mut() { v.0 = 0; v.1 = 0.0; v.2.clear(); v.3.clear(); }
 
-        for track in &trace.tracks {
+        for (ti, track) in trace.tracks.iter().enumerate() {
             if !self.show_cpu && !track.gpu { continue; }
-            for ev in &track.events {
+            for (ei, ev) in track.events.iter().enumerate() {
                 if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
                 if self.search_mask[ev.name as usize] {
-                    let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new()));
+                    let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new(), Vec::new()));
                     e.0 += 1;
                     e.1 += ev.dur;
                     e.2.push(ev.dur);
+                    e.3.push((ti as u32, ei as u32));
                 }
             }
         }
         self.selection_stats.clear();
-        for (&name, (count, total_dur, durations)) in map.iter_mut() {
+        for (&name, (count, total_dur, durations, event_refs)) in map.iter_mut() {
             if *count == 0 { continue; }
             self.selection_stats.push(SelectionEntry {
                 name, count: *count, total_dur: *total_dur,
                 durations: std::mem::take(durations),
+                event_refs: std::mem::take(event_refs),
             });
         }
         self.selection_stats.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap().then(a.name.cmp(&b.name)));
@@ -572,18 +582,20 @@ impl Pane {
         let mut count = 0u32;
         let mut total_dur = 0.0f64;
         let mut durations = Vec::new();
-        for track in &trace.tracks {
+        let mut event_refs = Vec::new();
+        for (ti, track) in trace.tracks.iter().enumerate() {
             if !self.show_cpu && !track.gpu { continue; }
-            for ev in &track.events {
+            for (ei, ev) in track.events.iter().enumerate() {
                 if ev.name != name_id { continue; }
                 count += 1;
                 total_dur += ev.dur;
                 durations.push(ev.dur);
+                event_refs.push((ti as u32, ei as u32));
             }
         }
         self.selection_stats.clear();
         if count > 0 {
-            self.selection_stats.push(SelectionEntry { name: name_id, count, total_dur, durations });
+            self.selection_stats.push(SelectionEntry { name: name_id, count, total_dur, durations, event_refs });
         }
         self.compute_aggregates();
     }
@@ -687,13 +699,18 @@ impl Pane {
             }
         }).collect();
 
-        self.sel_individual.clear();
+        // Keep each row's (track_idx, event_idx) attached through the sort so
+        // the individual-mode table can look its raw args back up afterward.
+        let mut combined: Vec<(KernelStats, (u32, u32))> = Vec::new();
         for se in &self.selection_stats {
-            for &d in &se.durations {
-                self.sel_individual.push(KernelStats { name: se.name, count: 1, total_dur: d, median_dur: d, max_dur: d });
+            for (i, &d) in se.durations.iter().enumerate() {
+                let r = se.event_refs.get(i).copied().unwrap_or((u32::MAX, u32::MAX));
+                combined.push((KernelStats { name: se.name, count: 1, total_dur: d, median_dur: d, max_dur: d }, r));
             }
         }
-        self.sel_individual.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
+        combined.sort_unstable_by(|a, b| b.0.total_dur.partial_cmp(&a.0.total_dur).unwrap());
+        self.sel_individual = combined.iter().map(|(s, _)| s.clone()).collect();
+        self.sel_individual_refs = combined.iter().map(|(_, r)| *r).collect();
     }
 
 }

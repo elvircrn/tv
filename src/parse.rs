@@ -10,6 +10,42 @@ impl Hasher for IdentityHasher {
 }
 pub type FnvMap<V> = HashMap<u64, V, BuildHasherDefault<IdentityHasher>>;
 
+/// Find `"key": <integer>` at/after `start` in a JSON blob (works through
+/// nested objects, since `find_key` is a plain byte search). Returns None if
+/// absent or non-numeric.
+pub fn find_int_field(blob: &[u8], start: usize, key: &[u8]) -> Option<i64> {
+    let kp = find_key(&blob[start..], key)? + start;
+    let mut q = kp + key.len() + 2; // past `"key"`
+    q = skip_ws(blob, q);
+    if q < blob.len() && blob[q] == b':' { q += 1; }
+    q = skip_ws(blob, q);
+    let neg = q < blob.len() && blob[q] == b'-';
+    if neg { q += 1; }
+    let s = q;
+    while q < blob.len() && blob[q].is_ascii_digit() { q += 1; }
+    if q == s { return None; }
+    let n: i64 = std::str::from_utf8(&blob[s..q]).ok()?.parse().ok()?;
+    Some(if neg { -n } else { n })
+}
+
+/// Find `"key": "value"` anywhere in a small JSON blob and return the string
+/// value — including inside a nested object, since `find_key` is a plain byte
+/// search. Good enough for one-off lookups in per-event args (e.g. CUPTI's
+/// `occupancy.limitingFactors`) where a full nested-object parser would be
+/// overkill for a blob that's typically a few hundred bytes.
+pub fn find_str_field<'a>(blob: &'a [u8], key: &[u8]) -> Option<&'a str> {
+    let kp = find_key(blob, key)?;
+    let mut q = kp + key.len() + 2; // past `"key"`
+    q = skip_ws(blob, q);
+    if q < blob.len() && blob[q] == b':' { q += 1; }
+    q = skip_ws(blob, q);
+    if q < blob.len() && blob[q] == b'"' {
+        let end = skip_string(blob, q);
+        return std::str::from_utf8(&blob[q + 1..end - 1]).ok();
+    }
+    None
+}
+
 pub fn find_key(raw: &[u8], key: &[u8]) -> Option<usize> {
     let mut buf = [0u8; 66];
     let len = key.len() + 2;

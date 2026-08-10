@@ -1507,6 +1507,50 @@ fn test_rebuild_multi_select_stats_aggregates_by_name() {
 }
 
 #[test]
+fn test_individual_stats_occupancy_limit_lookup() {
+    use crate::ui::kernel_occ_limit;
+
+    // A normal small-grid kernel (WARPS-limited, trustworthy) and a
+    // large-shared-memory kernel whose "SMEM" verdict is a known calculator
+    // artifact (opts into more than the 48KB default static limit).
+    let json = r#"{"traceEvents": [
+        {"ph":"X","ts":100,"dur":10,"pid":1,"tid":1,"name":"warps_kernel","cat":"kernel",
+         "args":{"shared memory":1024,"occupancy":{"limitingFactors":"WARPS"}}},
+        {"ph":"X","ts":200,"dur":20,"pid":1,"tid":1,"name":"smem_kernel","cat":"kernel",
+         "args":{"shared memory":180000,"occupancy":{"limitingFactors":"SMEM"}}}
+    ]}"#;
+    let dir = std::env::temp_dir().join("tv_test_occ");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("occ.json");
+    std::fs::write(&path, json).unwrap();
+
+    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
+    let warps_name = trace.names.iter().position(|n| n == "warps_kernel").unwrap() as u32;
+    let smem_name = trace.names.iter().position(|n| n == "smem_kernel").unwrap() as u32;
+
+    let mut state = make_state(trace);
+    let pane = &mut state.panes[0];
+    pane.show_cpu = true; // both events land on a non-GPU track here
+
+    pane.multi_select_name = Some(warps_name);
+    pane.rebuild_multi_select_stats();
+    assert_eq!(pane.sel_individual_refs.len(), 1);
+    let (ti, ei) = pane.sel_individual_refs[0];
+    let (limit, suspect) = kernel_occ_limit(pane.trace.as_ref().unwrap(), ti, ei);
+    assert_eq!(limit, "WARPS");
+    assert!(!suspect, "1024B shared mem is under the 48KB default cap");
+
+    pane.multi_select_name = Some(smem_name);
+    pane.rebuild_multi_select_stats();
+    let (ti, ei) = pane.sel_individual_refs[0];
+    let (limit, suspect) = kernel_occ_limit(pane.trace.as_ref().unwrap(), ti, ei);
+    assert_eq!(limit, "SMEM");
+    assert!(suspect, "180000B shared mem exceeds the 48KB default cap");
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn test_copy_selection_text_survives_stale_selection() {
     // Regression: after a reload/merge the trace can shrink, leaving a stale
     // EventRef whose index is out of bounds. Indexing it must not panic.
