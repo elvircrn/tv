@@ -403,7 +403,7 @@ impl Pane {
     }
 
     pub fn rebuild_selection_stats(&mut self, buf: &mut DrawBuf) {
-        let t_start = std::time::Instant::now();
+        let t_start = crate::time::Instant::now();
         if self.trace.is_none() { return; }
         if self.finished_sel.is_none() {
             self.selection_stats.clear(); self.sel_agg_stats.clear(); self.sel_individual.clear(); self.sel_individual_refs.clear(); self.sel_median = 0.0;
@@ -440,7 +440,7 @@ impl Pane {
         let ev_count: u32 = self.selection_stats.iter().map(|e| e.count).sum();
         eprintln!("  select: {:.1}ms ({} events, {} names)", t_start.elapsed().as_secs_f64() * 1000.0, ev_count, self.selection_stats.len());
 
-        let t_agg = std::time::Instant::now();
+        let t_agg = crate::time::Instant::now();
         self.compute_aggregates();
         eprintln!("  aggregate: {:.1}ms ({} agg, {} individual)", t_agg.elapsed().as_secs_f64() * 1000.0, self.sel_agg_stats.len(), self.sel_individual.len());
     }

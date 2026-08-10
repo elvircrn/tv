@@ -1,27 +1,36 @@
 mod parse;
 mod types;
+#[cfg(not(target_arch = "wasm32"))]
 mod renderer;
+#[cfg(target_arch = "wasm32")]
+mod renderer_web;
 mod loader;
 mod state;
 mod ui;
 mod diff;
+mod time;
 
 use parse::{skip_value, parse_args_flat, FnvMap};
 use types::*;
-use renderer::MetalRenderer;
+#[cfg(not(target_arch = "wasm32"))]
+use renderer::MetalRenderer as PlatformRenderer;
+#[cfg(target_arch = "wasm32")]
+use renderer_web::WebGl2Renderer as PlatformRenderer;
 use state::*;
 use ui::*;
 
 use imgui::{ClipboardBackend, Condition, InputTextCallback, InputTextCallbackHandler, StyleColor, StyleVar, TextCallbackData, WindowFlags};
 use std::fmt::Write as FmtWrite;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::Write as IoWrite;
-use std::time::Instant;
+use crate::time::Instant;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+#[cfg(target_os = "macos")]
 extern "C" {
     fn objc_autoreleasePoolPush() -> *mut std::ffi::c_void;
     fn objc_autoreleasePoolPop(pool: *mut std::ffi::c_void);
@@ -66,7 +75,7 @@ fn rank_summary(fname: &str, dist_rank: i32, dist_world: i32) -> String {
 struct App {
     window: Option<Window>,
     imgui: Option<imgui::Context>,
-    renderer: Option<MetalRenderer>,
+    renderer: Option<PlatformRenderer>,
     state: AppState,
     last_frame: Instant,
     scale_factor: f64,
@@ -131,7 +140,9 @@ const NAV_DOWN: u8 = 32;
 const NAV_LEFT: u8 = 64;
 const NAV_RIGHT: u8 = 128;
 
+#[cfg(not(target_arch = "wasm32"))]
 struct MacClipboard;
+#[cfg(not(target_arch = "wasm32"))]
 impl imgui::ClipboardBackend for MacClipboard {
     fn get(&mut self) -> Option<String> {
         std::process::Command::new("pbpaste")
@@ -150,18 +161,37 @@ impl imgui::ClipboardBackend for MacClipboard {
     }
 }
 
+// Browser clipboard access is async (Clipboard API) and paste can't be
+// pulled synchronously through imgui's ClipboardBackend::get; real copy/paste
+// wiring (writeText + a canvas paste-event listener) lands in a later phase.
+#[cfg(target_arch = "wasm32")]
+struct WebClipboard;
+#[cfg(target_arch = "wasm32")]
+impl imgui::ClipboardBackend for WebClipboard {
+    fn get(&mut self) -> Option<String> { None }
+    fn set(&mut self, _value: &str) {}
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("Trace Viewer")
             .with_inner_size(winit::dpi::LogicalSize::new(INITIAL_WIN_W, INITIAL_WIN_H));
+        #[cfg(target_arch = "wasm32")]
+        let attrs = {
+            use winit::platform::web::WindowAttributesExtWebSys;
+            attrs.with_append(true)
+        };
         let window = event_loop.create_window(attrs).unwrap();
         self.scale_factor = window.scale_factor();
 
         let mut imgui = imgui::Context::create();
         imgui.io_mut().config_mac_os_behaviors = true;
+        #[cfg(not(target_arch = "wasm32"))]
         imgui.set_clipboard_backend(MacClipboard);
-        let renderer = MetalRenderer::new(&window, &mut imgui, self.scale_factor);
+        #[cfg(target_arch = "wasm32")]
+        imgui.set_clipboard_backend(WebClipboard);
+        let renderer = PlatformRenderer::new(&window, &mut imgui, self.scale_factor);
 
         self.window = Some(window);
         self.imgui = Some(imgui);
@@ -286,7 +316,10 @@ impl ApplicationHandler for App {
                         }
                         if code == KeyCode::KeyC {
                             if let Some(text) = self.state.panes[self.state.active].copy_selection_text() {
+                                #[cfg(not(target_arch = "wasm32"))]
                                 MacClipboard.set(&text);
+                                #[cfg(target_arch = "wasm32")]
+                                WebClipboard.set(&text);
                             }
                         }
                     }
@@ -328,8 +361,10 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                #[cfg(target_os = "macos")]
                 let pool = unsafe { objc_autoreleasePoolPush() };
                 self.render_frame();
+                #[cfg(target_os = "macos")]
                 unsafe { objc_autoreleasePoolPop(pool); }
                 return;
             }
@@ -1359,6 +1394,7 @@ impl App {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(|a| a.as_str()) == Some("--bench") {
@@ -1431,6 +1467,22 @@ fn main() {
     let event_loop = EventLoop::new().unwrap();
     let mut app = App::new(args);
     event_loop.run_app(&mut app).unwrap();
+}
+
+// `run_app` blocks the calling thread until the event loop exits, which is
+// how the native app runs its whole lifetime on the main thread. That's not
+// allowed on the web (there is no blocking the browser's main thread) —
+// `spawn_app` instead hands the app to the browser's own event loop and
+// returns immediately. wasm-bindgen's generated JS glue for a `[[bin]]`
+// crate calls this `main` automatically on load, same as native argv-based
+// startup — no `#[wasm_bindgen(start)]` needed.
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    console_error_panic_hook::set_once();
+    use winit::platform::web::EventLoopExtWebSys;
+    let event_loop = EventLoop::new().unwrap();
+    let app = App::new(Vec::new());
+    event_loop.spawn_app(app);
 }
 
 #[cfg(test)]

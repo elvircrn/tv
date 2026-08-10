@@ -4,10 +4,11 @@ use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use crate::time::Instant;
 
 pub enum RawData {
     Vec(Vec<u8>),
+    #[cfg(not(target_arch = "wasm32"))]
     Mmap(memmap2::Mmap),
 }
 
@@ -16,6 +17,7 @@ impl std::ops::Deref for RawData {
     fn deref(&self) -> &[u8] {
         match self {
             RawData::Vec(v) => v,
+            #[cfg(not(target_arch = "wasm32"))]
             RawData::Mmap(m) => m,
         }
     }
@@ -25,6 +27,7 @@ impl RawData {
     fn into_vec(self) -> Vec<u8> {
         match self {
             RawData::Vec(v) => v,
+            #[cfg(not(target_arch = "wasm32"))]
             RawData::Mmap(m) => m.to_vec(),
         }
     }
@@ -310,6 +313,7 @@ fn decompress_parse_seq(
     Ok((raw, chunks, n_chunks))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn try_libdeflate(compressed: &[u8], estimated: usize) -> Option<Vec<u8>> {
     let mut decompressor = libdeflater::Decompressor::new();
     let mut buf = vec![0u8; estimated];
@@ -318,6 +322,11 @@ fn try_libdeflate(compressed: &[u8], estimated: usize) -> Option<Vec<u8>> {
         Err(_) => None,
     }
 }
+
+// wasm has no libdeflate binding (it's a C library); fall back to the
+// flate2::GzDecoder path already used elsewhere in this file.
+#[cfg(target_arch = "wasm32")]
+fn try_libdeflate(_compressed: &[u8], _estimated: usize) -> Option<Vec<u8>> { None }
 
 fn decompress_parse_streaming(
     path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, t0: &Instant,
@@ -884,6 +893,7 @@ pub fn save_cache(trace: &Trace, source_path: &str, cache_dir: Option<&str>) {
     std::fs::rename(&tmp, &cp).ok();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_cache(source_path: &str, cache_dir: Option<&str>) -> Option<Trace> {
     let cp = cache_path(source_path, cache_dir);
     let (src_size, src_mtime) = source_meta(source_path)?;
@@ -897,6 +907,12 @@ pub fn load_cache(source_path: &str, cache_dir: Option<&str>) -> Option<Trace> {
     load_cache_from_mmap(mmap)
 }
 
+// No persistent disk cache on the web build (no filesystem) — every open
+// re-parses from scratch there.
+#[cfg(target_arch = "wasm32")]
+pub fn load_cache(_source_path: &str, _cache_dir: Option<&str>) -> Option<Trace> { None }
+
+#[cfg(not(target_arch = "wasm32"))]
 fn load_cache_from_mmap(mmap: memmap2::Mmap) -> Option<Trace> {
     let (tracks, names, cats, device, vllm_version, dist_rank, dist_world, stats, flow_pairs, max_ts, min_ts, total_events, args_offset, args_len) = {
         let d = &mmap[..];
@@ -1061,6 +1077,7 @@ fn load_cache_from_mmap(mmap: memmap2::Mmap) -> Option<Trace> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_cache_direct(cache_path: &str) -> Option<Trace> {
     let file = std::fs::File::open(cache_path).ok()?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
@@ -1068,6 +1085,9 @@ fn load_cache_direct(cache_path: &str) -> Option<Trace> {
     if u32::from_le_bytes(mmap[4..8].try_into().unwrap()) > CACHE_VERSION { return None; }
     load_cache_from_mmap(mmap)
 }
+
+#[cfg(target_arch = "wasm32")]
+fn load_cache_direct(_cache_path: &str) -> Option<Trace> { None }
 
 fn merged_cache_hash(cache_dir: &str) -> u64 {
     let mut entries: Vec<(String, u64)> = Vec::new();
@@ -1199,6 +1219,7 @@ fn save_merged_cache(trace: &Trace, cache_dir: &str) {
     std::fs::rename(&tmp, &cp).ok();
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn load_merged_cache(cache_dir: &str) -> Option<Trace> {
     let cp = format!("{cache_dir}/_merged.tvcache");
     let file = std::fs::File::open(&cp).ok()?;
@@ -1210,6 +1231,9 @@ fn load_merged_cache(cache_dir: &str) -> Option<Trace> {
     if stored_hash != current_hash { return None; }
     load_cache_from_mmap(mmap)
 }
+
+#[cfg(target_arch = "wasm32")]
+fn load_merged_cache(_cache_dir: &str) -> Option<Trace> { None }
 
 fn decompress_parse(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, t0: &Instant) -> Result<(RawData, Vec<ChunkState>, usize), String> {
     let use_streaming = path.ends_with(".json.gz") && max_parse_threads != 1;
@@ -1687,9 +1711,16 @@ pub fn read_bytes(path: &str) -> Result<RawData, String> {
             .map_err(|e| format!("{path}: {e}"))?;
         Ok(RawData::Vec(buf))
     } else {
-        let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
-        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("mmap {path}: {e}"))?;
-        mmap.advise(memmap2::Advice::Sequential).ok();
-        Ok(RawData::Mmap(mmap))
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+            let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("mmap {path}: {e}"))?;
+            mmap.advise(memmap2::Advice::Sequential).ok();
+            Ok(RawData::Mmap(mmap))
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(RawData::Vec(std::fs::read(path).map_err(|e| format!("{path}: {e}"))?))
+        }
     }
 }

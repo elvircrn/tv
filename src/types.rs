@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 pub enum ArgsBuf {
     Heap(Vec<u8>),
+    #[cfg(not(target_arch = "wasm32"))]
     Mmap { mmap: memmap2::Mmap, offset: usize, len: usize },
 }
 
@@ -12,6 +13,7 @@ impl std::ops::Deref for ArgsBuf {
     fn deref(&self) -> &[u8] {
         match self {
             ArgsBuf::Heap(v) => v,
+            #[cfg(not(target_arch = "wasm32"))]
             ArgsBuf::Mmap { mmap, offset, len } => &mmap[*offset..*offset + *len],
         }
     }

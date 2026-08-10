@@ -13,17 +13,42 @@ path = "src/lib.rs"
 
 [dependencies]
 imgui = { version = "0.12", features = ["tables-api"] }
-imgui-sys = { version = "0.12", features = ["freetype"] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+raw-window-handle = "0.6"
+memchr = "2"
+tar = "0.4"
+rayon = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+imgui-sys = { version = "0.12", features = ["freetype"] }
 metal = "0.33"
 raw-window-metal = "1"
-raw-window-handle = "0.6"
 core-graphics-types = "0.2"
-memchr = "2"
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 libdeflater = "1"
-tar = "0.4"
 memmap2 = "0.9"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Plain imgui-sys (stb_truetype rasterizer, no freetype) — freetype needs a
+# C toolchain/sysroot for the target, and wasm doesn't read the SF Mono font
+# from disk anyway (see renderer_web.rs: DefaultFontData).
+imgui-sys = "0.12"
+flate2 = { version = "1", features = ["rust_backend"], default-features = false }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+# wasm-bindgen-rayon lands in the real-threading phase — it requires an
+# atomics/bulk-memory nightly build (see plan), which would break this
+# stable-toolchain compile check.
+js-sys = "0.3"
+web-time = "1"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = [
+    "HtmlCanvasElement", "WebGl2RenderingContext", "WebGlProgram", "WebGlShader",
+    "WebGlBuffer", "WebGlTexture", "WebGlUniformLocation", "WebGlVertexArrayObject",
+    "File", "FileList", "FileReader", "DataTransfer", "DragEvent",
+    "Clipboard", "ClipboardEvent", "DataTransferItem", "DataTransferItemList",
+    "Navigator", "Performance", "HtmlInputElement", "Window", "Document", "Element",
+] }
 
 [profile.dev-release]
 inherits = "release"
