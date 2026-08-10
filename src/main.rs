@@ -111,6 +111,15 @@ struct App {
     // `user_event()` once the async read(s) finish and wake the event loop.
     #[cfg(target_arch = "wasm32")]
     pending_web_files: std::rc::Rc<std::cell::RefCell<Vec<(String, Vec<u8>)>>>,
+    // imgui's ClipboardBackend::get is synchronous, but the Clipboard API's
+    // readText() is Promise-based — there's no way to serve a paste request
+    // through that trait at all. Instead we listen for the browser's own
+    // native "paste" event on the canvas (registered in `resumed()`), which
+    // hands over the pasted text synchronously as part of the event, and
+    // feed it into imgui's IO directly from `user_event()` (same hop-via-
+    // proxy pattern as the resize/drop workarounds) as if it had been typed.
+    #[cfg(target_arch = "wasm32")]
+    pending_paste: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
 impl App {
@@ -151,6 +160,8 @@ impl App {
             event_loop_proxy: None,
             #[cfg(target_arch = "wasm32")]
             pending_web_files: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            #[cfg(target_arch = "wasm32")]
+            pending_paste: std::rc::Rc::new(std::cell::RefCell::new(None)),
         }
     }
 }
@@ -192,8 +203,20 @@ impl imgui::ClipboardBackend for MacClipboard {
 struct WebClipboard;
 #[cfg(target_arch = "wasm32")]
 impl imgui::ClipboardBackend for WebClipboard {
+    // The Clipboard API's readText()/writeText() are both Promise-based, but
+    // ClipboardBackend::get is synchronous — there's no way to actually wait
+    // for a read here. Paste is handled separately (see the canvas "paste"
+    // listener in resumed(), which gets pasted text synchronously from the
+    // browser's native paste event instead of round-tripping through this
+    // trait at all).
     fn get(&mut self) -> Option<String> { None }
-    fn set(&mut self, _value: &str) {}
+    fn set(&mut self, value: &str) {
+        let Some(clipboard) = web_sys::window().map(|w| w.navigator().clipboard()) else { return };
+        let value = value.to_string();
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = wasm_bindgen_futures::JsFuture::from(clipboard.write_text(&value)).await;
+        });
+    }
 }
 
 impl ApplicationHandler for App {
@@ -287,6 +310,7 @@ impl ApplicationHandler for App {
                 );
                 dragover.forget();
 
+                let paste_proxy = proxy.clone();
                 let pending = self.pending_web_files.clone();
                 let drop_listener = wasm_bindgen::closure::Closure::<dyn FnMut(_)>::new(
                     move |e: web_sys::DragEvent| {
@@ -314,6 +338,29 @@ impl ApplicationHandler for App {
                     "drop", drop_listener.as_ref().unchecked_ref(),
                 );
                 drop_listener.forget();
+
+                // Native's Cmd+V handling (see `WindowEvent::KeyboardInput`
+                // below) calls `copy_selection_text`/`PlatformClipboard`
+                // directly — there's no equivalent for paste since imgui's
+                // `ClipboardBackend::get` can't do anything async. The
+                // browser's own "paste" event hands over the clipboard text
+                // synchronously (unlike the Clipboard API's readText()), so
+                // we take it straight from there instead.
+                let pending_paste = self.pending_paste.clone();
+                let paste_listener = wasm_bindgen::closure::Closure::<dyn FnMut(_)>::new(
+                    move |e: web_sys::ClipboardEvent| {
+                        let Some(dt) = e.clipboard_data() else { return };
+                        let Ok(text) = dt.get_data("text/plain") else { return };
+                        if text.is_empty() { return }
+                        e.prevent_default();
+                        *pending_paste.borrow_mut() = Some(text);
+                        let _ = paste_proxy.send_event(());
+                    },
+                );
+                let _ = canvas.add_event_listener_with_callback(
+                    "paste", paste_listener.as_ref().unchecked_ref(),
+                );
+                paste_listener.forget();
             }
         }
 
@@ -394,6 +441,18 @@ impl ApplicationHandler for App {
                 };
                 self.state.active = target;
                 self.state.panes[target].open_from_bytes(name, bytes);
+            }
+            if let Some(w) = &self.window { w.request_redraw(); }
+        }
+
+        if let Some(text) = self.pending_paste.borrow_mut().take() {
+            if let Some(imgui) = self.imgui.as_mut() {
+                let io = imgui.io_mut();
+                for ch in text.chars() {
+                    if ch >= ' ' && ch != '\x7f' {
+                        io.add_input_character(ch);
+                    }
+                }
             }
             if let Some(w) = &self.window { w.request_redraw(); }
         }
