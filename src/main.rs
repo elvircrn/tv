@@ -1121,9 +1121,21 @@ impl App {
                 let double = double_clicks[pi];
                 pane.multi_select_name = if double { Some(ev.name) } else { None };
                 pane.selected = Some(c);
-                pane.clear_selection();
+                // Clicking a single event to inspect it (Detail tab) must not
+                // blow away an active region selection's Selection-tab table —
+                // that used to happen unconditionally here, so switching back
+                // to Selection after clicking any event elsewhere showed
+                // nothing. A double-click still replaces the Selection tab's
+                // contents via rebuild_multi_select_stats below.
                 state.active = pi;
                 if double {
+                    // Double-click replaces any drag-region selection with a
+                    // by-name multi-select, so clear the region's visual
+                    // rectangle (rebuild_multi_select_stats overwrites the
+                    // Selection tab's data itself, but not this highlight).
+                    pane.selection = None;
+                    pane.finished_sel = None;
+                    pane.sel_mask.clear();
                     // Double-click selects every event of this name: populate the
                     // Selection tab with that kernel's aggregate + distribution.
                     pane.rebuild_multi_select_stats();

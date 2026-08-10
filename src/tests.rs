@@ -1796,3 +1796,35 @@ fn bench_merge_gpu_collect_cost() {
         );
     }
 }
+
+#[test]
+#[ignore]
+fn bench_selection_histogram_rebuild_cost() {
+    // Profiling harness: measures draw_selection_histogram's per-frame cost
+    // (buf.sel_bars rebuild + sort_unstable_by), which — unlike the stats
+    // table — has no generation-based cache and reruns on every redraw
+    // regardless of whether the selection changed. Run with:
+    //   TV_BENCH_TRACE=/path/to/trace.json.gz cargo test --release -- --ignored --nocapture bench_selection_histogram_rebuild_cost
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("skipped: set TV_BENCH_TRACE"); return; }
+    };
+    let trace = load_trace(&path, &test_counter(), 0, None).unwrap();
+
+    let mut all_durs: Vec<(f64, u32)> = Vec::new();
+    for track in &trace.tracks {
+        for ev in &track.events {
+            all_durs.push((ev.dur, ev.name));
+        }
+    }
+
+    for &n in &[15_000usize, 71_000, 100_000, all_durs.len()] {
+        let n = n.min(all_durs.len());
+        let src = &all_durs[..n];
+        let t0 = std::time::Instant::now();
+        let mut sel_bars: Vec<(f64, u32)> = Vec::with_capacity(n);
+        for &(d, name) in src { sel_bars.push((d, name)); }
+        sel_bars.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        eprintln!("rows: {n:>8}  build+sort: {:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
+    }
+}
