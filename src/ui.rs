@@ -305,6 +305,9 @@ pub fn draw_stats_table(
     // on a 1M-row selection even for a plain numeric column).
     let stats_is_individual = event_refs.is_some();
     let cache_key = (generation, *sort_col, *sort_asc, stats.len(), stats_is_individual);
+    if std::env::var_os("TV_DEBUG_SORT_CACHE").is_some() && buf.sort_cache_key != Some(cache_key) {
+        eprintln!("  sort_cache MISS: old={:?} new={:?}", buf.sort_cache_key, Some(cache_key));
+    }
     if buf.sort_cache_key != Some(cache_key) {
         // Sorting by Occ Limit naively (parsing each row's raw JSON args
         // inside the comparator) measured at 140ms for just 15k rows on its
