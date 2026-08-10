@@ -102,6 +102,15 @@ struct App {
     // `user_event()`, where `self.window` is reachable.
     #[cfg(target_arch = "wasm32")]
     event_loop_proxy: Option<winit::event_loop::EventLoopProxy<()>>,
+    // winit's web backend doesn't implement WindowEvent::DroppedFile at all —
+    // there's no OS-level file-drop concept for a <canvas> the way there is
+    // for a real window. We register our own "dragover"/"drop" DOM listeners
+    // (see `resumed()`) and read each dropped File's bytes asynchronously
+    // (File::array_buffer() is JS-Promise-based); completed (name, bytes)
+    // pairs land here, then get drained and routed into panes from
+    // `user_event()` once the async read(s) finish and wake the event loop.
+    #[cfg(target_arch = "wasm32")]
+    pending_web_files: std::rc::Rc<std::cell::RefCell<Vec<(String, Vec<u8>)>>>,
 }
 
 impl App {
@@ -140,6 +149,8 @@ impl App {
             last_reload: Instant::now(),
             #[cfg(target_arch = "wasm32")]
             event_loop_proxy: None,
+            #[cfg(target_arch = "wasm32")]
+            pending_web_files: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         }
     }
 }
@@ -253,6 +264,59 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Drag-and-drop file loading. winit's web backend has no
+        // WindowEvent::DroppedFile at all (see the App::pending_web_files
+        // field comment), so this is wired entirely by hand: a "dragover"
+        // listener suppresses the browser's default (reject-drop) behavior
+        // — without `prevent_default()`, "drop" never fires at all — and a
+        // "drop" listener reads each dropped File's bytes (async: File's
+        // `array_buffer()` is a JS Promise) and, once ready, stashes them in
+        // the shared queue and wakes the winit event loop via the same
+        // proxy the resize listener uses, so `user_event` can route them
+        // into panes on the next tick.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(proxy) = self.event_loop_proxy.clone() {
+            use wasm_bindgen::JsCast;
+            use winit::platform::web::WindowExtWebSys;
+            if let Some(canvas) = window.canvas() {
+                let dragover = wasm_bindgen::closure::Closure::<dyn FnMut(_)>::new(
+                    |e: web_sys::DragEvent| { e.prevent_default(); },
+                );
+                let _ = canvas.add_event_listener_with_callback(
+                    "dragover", dragover.as_ref().unchecked_ref(),
+                );
+                dragover.forget();
+
+                let pending = self.pending_web_files.clone();
+                let drop_listener = wasm_bindgen::closure::Closure::<dyn FnMut(_)>::new(
+                    move |e: web_sys::DragEvent| {
+                        e.prevent_default();
+                        let Some(dt) = e.data_transfer() else { return };
+                        let Some(files) = dt.files() else { return };
+                        for i in 0..files.length() {
+                            let Some(file) = files.get(i) else { continue };
+                            let pending = pending.clone();
+                            let proxy = proxy.clone();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                let name = file.name();
+                                let buf = match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
+                                    Ok(b) => b,
+                                    Err(_) => return,
+                                };
+                                let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+                                pending.borrow_mut().push((name, bytes));
+                                let _ = proxy.send_event(());
+                            });
+                        }
+                    },
+                );
+                let _ = canvas.add_event_listener_with_callback(
+                    "drop", drop_listener.as_ref().unchecked_ref(),
+                );
+                drop_listener.forget();
+            }
+        }
+
         let mut imgui = imgui::Context::create();
         imgui.io_mut().config_mac_os_behaviors = true;
         #[cfg(not(target_arch = "wasm32"))]
@@ -309,11 +373,29 @@ impl ApplicationHandler for App {
     // it from there, same as a real OS window resize on native.
     #[cfg(target_arch = "wasm32")]
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: ()) {
-        let (Some(window), Some(win)) = (self.window.as_ref(), web_sys::window()) else { return };
-        let w = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let h = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-        if w > 0.0 && h > 0.0 {
-            let _ = window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
+        if let (Some(window), Some(win)) = (self.window.as_ref(), web_sys::window()) {
+            let w = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let h = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if w > 0.0 && h > 0.0 {
+                let _ = window.request_inner_size(winit::dpi::LogicalSize::new(w, h));
+            }
+        }
+
+        let files = std::mem::take(&mut *self.pending_web_files.borrow_mut());
+        if !files.is_empty() {
+            let display_w = self.window.as_ref()
+                .map(|w| w.inner_size().width as f32 / self.scale_factor as f32)
+                .unwrap_or(INITIAL_WIN_W);
+            for (name, bytes) in files {
+                let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
+                let target = if let Some(i) = empty { i } else {
+                    self.state.add_pane(display_w);
+                    self.state.panes.len() - 1
+                };
+                self.state.active = target;
+                self.state.panes[target].open_from_bytes(name, bytes);
+            }
+            if let Some(w) = &self.window { w.request_redraw(); }
         }
     }
 

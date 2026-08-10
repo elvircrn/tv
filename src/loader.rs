@@ -1930,3 +1930,106 @@ pub fn read_bytes(path: &str) -> Result<RawData, String> {
         }
     }
 }
+
+/// `read_bytes`'s decompression dispatch, but for a file already read into
+/// memory (e.g. via the browser's File API, which hands back bytes with no
+/// filesystem path attached) instead of a filesystem path to open. Dispatches
+/// on `name` (typically `File::name()`) the same way `read_bytes` dispatches
+/// on the path's suffix.
+#[cfg(target_arch = "wasm32")]
+fn read_bytes_named(name: &str, raw: Vec<u8>) -> Result<RawData, String> {
+    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(raw));
+        let mut archive = tar::Archive::new(gz);
+        let entries = archive.entries().map_err(|e| format!("tar {name}: {e}"))?;
+        for entry in entries {
+            let mut entry = entry.map_err(|e| format!("tar entry: {e}"))?;
+            let ename = entry.path().map_err(|e| format!("tar path: {e}"))?.to_string_lossy().to_string();
+            if ename.ends_with(".json.gz") {
+                let buf = read_gz_tolerant(&mut entry).map_err(|e| format!("{ename}: {e}"))?;
+                eprintln!("  extracted: {ename}");
+                return Ok(RawData::Vec(buf));
+            } else if ename.ends_with(".json") {
+                let mut buf = Vec::new();
+                match entry.read_to_end(&mut buf) {
+                    Ok(_) => {}
+                    Err(e) if buf.is_empty() => return Err(format!("read {ename}: {e}")),
+                    Err(e) => eprintln!("  truncated tar entry after {} bytes: {e}", buf.len()),
+                }
+                eprintln!("  extracted: {ename}");
+                return Ok(RawData::Vec(buf));
+            }
+        }
+        Err(format!("no .json or .json.gz file found in {name}"))
+    } else if name.ends_with(".gz") {
+        let buf = read_gz_tolerant(&raw[..]).map_err(|e| format!("{name}: {e}"))?;
+        Ok(RawData::Vec(buf))
+    } else {
+        Ok(RawData::Vec(raw))
+    }
+}
+
+/// wasm equivalent of `load_trace_progressive`: takes bytes already read into
+/// memory (there's no filesystem path to open on wasm32) instead of a path.
+/// No disk cache to check/write (no filesystem in the browser — see
+/// `load_cache`'s wasm stub) and no "instant preview then compact" double
+/// send (there's no real background thread on wasm yet — see
+/// `state::spawn_load_job` — so the job already runs to completion before
+/// `poll_loading` gets a chance to observe an intermediate state).
+#[cfg(target_arch = "wasm32")]
+pub fn load_trace_from_bytes_progressive(
+    name: &str, raw_input: Vec<u8>, counter: &Arc<AtomicUsize>,
+    tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
+) {
+    let t0 = Instant::now();
+
+    if name.ends_with(".tvcache") {
+        match load_cache_from_bytes(&raw_input) {
+            Some(trace) => {
+                eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                let _ = tx.send(Ok(trace));
+            }
+            None => { let _ = tx.send(Err(format!("{name}: invalid or corrupt .tvcache file"))); }
+        }
+        return;
+    }
+
+    let raw = match read_bytes_named(name, raw_input) {
+        Ok(r) => r,
+        Err(e) => { let _ = tx.send(Err(e)); return; }
+    };
+    eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
+
+    let te = match find_key(&raw, b"traceEvents") {
+        Some(v) => v,
+        None => { let _ = tx.send(Err(format!("{name}: no traceEvents found"))); return; }
+    };
+    let mut pos = te + "\"traceEvents\"".len();
+    pos = skip_ws(&raw, pos);
+    if pos < raw.len() && raw[pos] == b':' { pos += 1; }
+    pos = skip_ws(&raw, pos);
+    if pos >= raw.len() || raw[pos] != b'[' {
+        let _ = tx.send(Err(format!("{name}: malformed traceEvents")));
+        return;
+    }
+    let array_start = pos + 1;
+    let n_threads = calc_n_threads(raw.len(), 0);
+    let split_points = find_split_points(&raw, array_start, n_threads);
+    let n_chunks = split_points.len() - 1;
+    let chunks = parse_chunks_parallel(n_chunks, |i| {
+        let start = split_points[i];
+        let end = split_points[i + 1];
+        let mut state = ChunkState::new();
+        parse_chunk(&raw, start, end, &mut state, counter);
+        state
+    });
+
+    match build_trace(raw, chunks, n_chunks, &t0) {
+        Ok(mut trace) => {
+            compact_args(&mut trace);
+            eprintln!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
+            let _ = tx.send(Ok(trace));
+        }
+        Err(e) => { let _ = tx.send(Err(e)); }
+    }
+}

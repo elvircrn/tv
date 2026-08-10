@@ -288,6 +288,25 @@ impl Pane {
         });
     }
 
+    /// wasm equivalent of `open`: takes bytes already read into memory (e.g.
+    /// via the browser's drag-and-drop/file-picker File API) instead of a
+    /// filesystem path — there's no mmap/filesystem on wasm32 to open a path
+    /// against. `name` is the dropped/picked file's name (e.g.
+    /// `File::name()`), used only to sniff the format (.tvcache/.tar.gz/.gz
+    /// vs plain JSON), same role a real path's suffix plays natively.
+    #[cfg(target_arch = "wasm32")]
+    pub fn open_from_bytes(&mut self, name: String, bytes: Vec<u8>) {
+        let (tx, rx) = mpsc::channel();
+        self.loading = Some(rx);
+        self.error = None;
+        self.trace_path = name.clone();
+        self.loading_events = Arc::new(AtomicUsize::new(0));
+        let counter = self.loading_events.clone();
+        spawn_load_job(move || {
+            crate::loader::load_trace_from_bytes_progressive(&name, bytes, &counter, &tx);
+        });
+    }
+
     pub fn open_multi(&mut self, rank_paths: Vec<(usize, String)>) {
         let (tx, rx) = mpsc::channel();
         let n = rank_paths.len();
