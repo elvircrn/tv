@@ -386,15 +386,20 @@ pub fn draw_stats_table(
                 }
                 if ui.is_item_hovered() {
                     if suspect {
-                        ui.tooltip_text("Likely a calculator artifact: this kernel \
-                            requests shared memory above CUDA's default 48KB static \
-                            limit (common for GEMM/attention/NCCL kernels), which \
-                            CUPTI's occupancy calculator checks against instead of \
-                            the larger opt-in limit the kernel actually used. Real \
-                            occupancy is probably higher than this implies.");
+                        ui.tooltip_text(
+                            "Likely a calculator artifact.\n\n\
+                            This kernel requests shared memory above CUDA's default\n\
+                            48KB static limit (common for GEMM/attention/NCCL\n\
+                            kernels). CUPTI's occupancy calculator checks against\n\
+                            that default instead of the larger opt-in limit the\n\
+                            kernel actually used.\n\n\
+                            Real occupancy is probably higher than this implies.",
+                        );
                     } else {
-                        ui.tooltip_text("CUDA occupancy-limiting factor for this \
-                            launch, from CUPTI's launch-config calculator.");
+                        ui.tooltip_text(
+                            "CUDA occupancy-limiting factor for this launch,\n\
+                            from CUPTI's launch-config calculator.",
+                        );
                     }
                 }
             }
