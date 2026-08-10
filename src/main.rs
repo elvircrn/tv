@@ -1653,16 +1653,23 @@ fn main() {
     event_loop.run_app(&mut app).unwrap();
 }
 
+// Re-exporting this (rather than only calling it below) is what makes
+// wasm-bindgen actually emit the `init_thread_pool`/`initThreadPool` glue and
+// the worker-entry exports (`wbg_rayon_start_worker` etc.) into the compiled
+// module at all — wasm-bindgen's CLI post-processing pass discovers
+// `#[wasm_bindgen]` items via reachability from the crate, and a bin crate's
+// `main` alone doesn't reach into an otherwise-unused dependency's items just
+// by calling one function from it the way a `pub use` guarantees.
+#[cfg(all(target_arch = "wasm32", feature = "mt"))]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
 // `run_app` blocks the calling thread until the event loop exits, which is
 // how the native app runs its whole lifetime on the main thread. That's not
 // allowed on the web (there is no blocking the browser's main thread) —
 // `spawn_app` instead hands the app to the browser's own event loop and
-// returns immediately. wasm-bindgen's generated JS glue for a `[[bin]]`
-// crate calls this `main` automatically on load, same as native argv-based
-// startup — no `#[wasm_bindgen(start)]` needed.
+// returns immediately.
 #[cfg(target_arch = "wasm32")]
-fn main() {
-    console_error_panic_hook::set_once();
+fn build_and_run_app() {
     use winit::platform::web::EventLoopExtWebSys;
     let event_loop = EventLoop::new().unwrap();
     let mut app = App::new(Vec::new());
@@ -1671,6 +1678,51 @@ fn main() {
     // for `resumed()` to hand to the browser-resize listener it installs.
     app.event_loop_proxy = Some(event_loop.create_proxy());
     event_loop.spawn_app(app);
+}
+
+// `fn main()` on wasm32 can't just be `async fn main()` — wasm-bindgen's
+// generated glue for a `[[bin]]` crate's `data-type="main"` auto-invokes the
+// plain synchronous `main` export during module instantiation, with no hook
+// for awaiting anything first. Rayon needs its Web Worker pool up and
+// running *before* any `par_iter`/`scope`/`spawn` call, or those calls
+// silently execute on the calling thread alone (rayon's wasm fallback for
+// "no pool yet" is sequential, not an error) — so the entire existing
+// startup sequence gets deferred into a `spawn_local` future that awaits
+// `initThreadPool` first. `main` itself returns immediately after kicking
+// that future off, same as it always effectively did once `spawn_app` handed
+// control back to the browser's own event loop.
+#[cfg(all(target_arch = "wasm32", feature = "mt"))]
+fn main() {
+    console_error_panic_hook::set_once();
+    wasm_bindgen_futures::spawn_local(async {
+        // `navigator.hardwareConcurrency` is 0/unavailable in vanishingly
+        // rare embeddings (per spec it's a `f64`, not guaranteed >= 1) —
+        // fall back to a small fixed pool rather than requesting a
+        // zero-thread pool, which `wasm_bindgen_rayon::init_thread_pool`
+        // hard-panics on.
+        let threads = web_sys::window()
+            .map(|w| w.navigator().hardware_concurrency())
+            .filter(|n| *n >= 1.0)
+            .map(|n| n as usize)
+            .unwrap_or(4);
+        if let Err(e) = wasm_bindgen_futures::JsFuture::from(init_thread_pool(threads)).await {
+            // Not fatal: every rayon call site on wasm32 already tolerates
+            // running sequentially (that was the *only* mode before this
+            // phase) — worst case without a working pool is the old
+            // single-threaded behavior, not a crash.
+            web_sys::console::error_1(&e);
+        }
+        build_and_run_app();
+    });
+}
+
+// Plain stable-toolchain build (scripts/build-wasm.sh / serve-wasm.sh):
+// no thread pool to wait on, so this can stay fully synchronous exactly as
+// before the `mt` feature existed.
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+fn main() {
+    console_error_panic_hook::set_once();
+    build_and_run_app();
 }
 
 #[cfg(test)]

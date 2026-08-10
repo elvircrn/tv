@@ -15,3 +15,22 @@
 # absent) has nothing to leak.
 [target.'cfg(not(target_arch = "wasm32"))']
 rustflags = ["-C", "target-cpu=native"]
+
+# `build-std` for scripts/build-wasm-mt.sh / serve-wasm-mt.sh (the
+# atomics/bulk-memory real-Web-Worker-threading build): the prebuilt wasm32
+# `std` Rust ships is compiled *without* atomics, so any crate requesting
+# `target-feature=+atomics` (set via RUSTFLAGS in that script, not here — see
+# its comments for why it can't live in this file) needs `std`/`core`/`alloc`
+# themselves rebuilt from source with the same feature flags, which is what
+# `-Z build-std` does.
+#
+# This table is inert everywhere else: Cargo only reads `[unstable]` config
+# entries at all when running under a nightly toolchain (or with
+# `RUSTC_BOOTSTRAP=1`); on the default stable toolchain that every other
+# build in this repo uses (native `cargo build`/`cargo test`, and even the
+# single-threaded stable wasm build in scripts/build-wasm.sh), Cargo silently
+# ignores this table — verified empirically, not just assumed, since a wrong
+# guess here would risk breaking the stable-toolchain builds this repo
+# otherwise never asks for nightly at all.
+[unstable]
+build-std = ["panic_abort", "std"]

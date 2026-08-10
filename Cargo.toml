@@ -19,6 +19,13 @@ memchr = "2"
 tar = "0.4"
 rayon = "1"
 
+# Enabled only by scripts/build-wasm-mt.sh / serve-wasm-mt.sh, the
+# atomics/bulk-memory nightly build that gets real Web Worker parallelism —
+# see the wasm-bindgen-rayon dependency comment below for why it must be
+# strictly opt-in rather than always-on for wasm32.
+[features]
+mt = ["dep:wasm-bindgen-rayon"]
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 imgui-sys = { version = "0.12", features = ["freetype"] }
 metal = "0.33"
@@ -36,9 +43,30 @@ imgui-sys = "0.12"
 flate2 = { version = "1", features = ["rust_backend"], default-features = false }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-# wasm-bindgen-rayon lands in the real-threading phase — it requires an
-# atomics/bulk-memory nightly build (see plan), which would break this
-# stable-toolchain compile check.
+# Real Web Worker-backed rayon parallelism — only for the atomics/bulk-memory
+# nightly build (scripts/build-wasm-mt.sh / serve-wasm-mt.sh). Must be
+# `optional` (gated behind the `mt` feature below, only turned on by those
+# scripts) rather than an unconditional wasm32 dependency: the crate has a
+# hard `compile_error!` that fires for *any* wasm32 compile lacking
+# `target_feature = "atomics"`, which would otherwise break the plain
+# stable-toolchain build (scripts/build-wasm.sh) the moment this dependency
+# entered the graph at all, whether or not any of its items were reachable.
+# `no-bundler`: Trunk serves generated JS/wasm as static files with no
+# webpack/vite-style import-rewriting pass, which the default "bundler" JS
+# snippet's `new URL('./workerHelpers.js', import.meta.url)` Worker
+# construction depends on to resolve; the `no-bundler` variant instead
+# `fetch`es its own script text via `import.meta.url` and spawns the Worker
+# from a blob URL, which works under plain static hosting.
+wasm-bindgen-rayon = { version = "1.3", optional = true, features = ["no-bundler"] }
+# rayon's default lock implementation calls `std::thread::park`, which wasm32
+# threads *can* do once atomics are enabled (Workers can block on
+# `Atomics.wait`) — except the main thread, which browsers forbid from
+# blocking that way. `web_spin_lock` swaps rayon's internal locks for a
+# spin-loop instead, avoiding that deadlock. Scoped to wasm32 only (via this
+# target-specific re-declaration; Cargo's resolver-v2 feature unification
+# keeps it out of the native build's feature set) since native's real OS
+# threads have no such restriction and spinning would just waste cycles.
+rayon = { version = "1", features = ["web_spin_lock"] }
 js-sys = "0.3"
 web-time = "1"
 console_error_panic_hook = "0.1"

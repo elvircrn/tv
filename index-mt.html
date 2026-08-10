@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Trace Viewer (multi-threaded)</title>
+  <style>
+    html, body { margin: 0; padding: 0; overflow: hidden; background: #161616; }
+    canvas { display: block; outline: none; }
+  </style>
+  <!--
+    Separate entry point from index.html, built only by
+    scripts/build-wasm-mt.sh / serve-wasm-mt.sh (the atomics/bulk-memory
+    nightly build with real Web Worker rayon parallelism — see Cargo.toml's
+    `mt` feature and scripts/wasm-env-mt.sh). Kept as its own HTML file
+    rather than a flag on index.html so the plain stable single-threaded
+    build (scripts/build-wasm.sh / serve-wasm.sh) never has to know this
+    exists — same reasoning as keeping the two build scripts separate.
+
+    data-cargo-features="mt": enables the `mt` Cargo feature, which is what
+    pulls in wasm-bindgen-rayon at all (see Cargo.toml comment on why it
+    can't be unconditional for wasm32).
+
+    data-bindgen-target="web": wasm-bindgen-rayon requires `--target web`
+    output (an ES module, so `import.meta.url` is available) — Trunk's
+    default `no-modules` target doesn't support the JS snippet feature this
+    depends on. This also has to agree with the `no-bundler` Cargo feature
+    enabled on the wasm-bindgen-rayon dependency itself: Trunk statically
+    serves generated JS/wasm files as-is with no webpack/vite-style import
+    rewriting pass, so the crate's default "bundler" JS glue (which relies on
+    that rewriting to resolve `new Worker(new URL(...))`) won't work here —
+    the `no-bundler` variant instead `fetch`es its own script text via
+    `import.meta.url` at runtime, which is compatible with plain static
+    hosting.
+  -->
+  <!--
+    data-wasm-opt-params: same reasoning as index.html's, plus
+    --enable-threads (atomics) and --enable-bulk-memory for the shared-
+    memory/Worker-visible module this build produces (see wasm-env-mt.sh).
+  -->
+  <link data-trunk rel="rust" data-bin="tv" data-type="main"
+        data-cargo-features="mt" data-bindgen-target="web"
+        data-wasm-opt-params="--enable-threads --enable-nontrapping-float-to-int --enable-bulk-memory --enable-sign-ext --enable-mutable-globals" />
+</head>
+<body></body>
+</html>
