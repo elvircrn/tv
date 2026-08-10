@@ -307,6 +307,28 @@ impl Pane {
         });
     }
 
+    /// wasm equivalent of `open_multi`: each rank's bytes are already in
+    /// memory (e.g. from walking a dropped folder via the browser's File and
+    /// Directory Entries API — see main.rs), so there's no path to re-read
+    /// from, and no `reload_dir`/`reload_paths` equivalent since a browser
+    /// drop can't be "re-opened" the way a filesystem directory can.
+    #[cfg(target_arch = "wasm32")]
+    pub fn open_multi_from_bytes(&mut self, rank_named_bytes: Vec<(usize, String, Vec<u8>)>) {
+        let (tx, rx) = mpsc::channel();
+        let n = rank_named_bytes.len();
+        let fname = rank_named_bytes[0].1.rsplit('/').next().unwrap_or(&rank_named_bytes[0].1);
+        let prefix = fname.find("-rank-").map(|p| fname[..p].to_string())
+            .unwrap_or_else(|| "multi-rank".to_string());
+        self.trace_path = format!("{} ranks: {}", n, prefix);
+        self.loading = Some(rx);
+        self.error = None;
+        self.loading_events = Arc::new(AtomicUsize::new(0));
+        let counter = self.loading_events.clone();
+        spawn_load_job(move || {
+            crate::loader::load_multi_from_bytes_progressive(rank_named_bytes, &counter, &tx);
+        });
+    }
+
     pub fn open_multi(&mut self, rank_paths: Vec<(usize, String)>) {
         let (tx, rx) = mpsc::channel();
         let n = rank_paths.len();

@@ -219,6 +219,84 @@ impl imgui::ClipboardBackend for WebClipboard {
     }
 }
 
+// The File and Directory Entries API (webkitGetAsEntry and friends) predates
+// Promises on the web platform, so every step is success/error-callback
+// based. Wrapping each callback in a one-shot `js_sys::Promise` lets the
+// directory walk below read as ordinary (if boxed, for the recursive case)
+// async Rust instead of a hand-rolled callback pyramid.
+#[cfg(target_arch = "wasm32")]
+async fn read_all_directory_entries(reader: &web_sys::FileSystemDirectoryReader) -> Vec<web_sys::FileSystemEntry> {
+    use wasm_bindgen::JsCast;
+    // readEntries() only returns a batch at a time (spec-mandated, to bound
+    // memory for huge directories) — empty result means "no more entries",
+    // not "empty directory" necessarily, so this must loop until empty.
+    let mut all = Vec::new();
+    loop {
+        let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+            let cb = wasm_bindgen::closure::Closure::once(move |entries: js_sys::Array| {
+                let _ = resolve.call1(&wasm_bindgen::JsValue::NULL, &entries);
+            });
+            let _ = reader.read_entries_with_callback(cb.as_ref().unchecked_ref());
+            cb.forget();
+        });
+        let Ok(result) = wasm_bindgen_futures::JsFuture::from(promise).await else { break };
+        let arr: js_sys::Array = result.unchecked_into();
+        if arr.length() == 0 { break; }
+        for i in 0..arr.length() {
+            all.push(arr.get(i).unchecked_into::<web_sys::FileSystemEntry>());
+        }
+    }
+    all
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn file_from_entry(entry: &web_sys::FileSystemFileEntry) -> Option<web_sys::File> {
+    use wasm_bindgen::JsCast;
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let cb = wasm_bindgen::closure::Closure::once(move |file: web_sys::File| {
+            let _ = resolve.call1(&wasm_bindgen::JsValue::NULL, &file);
+        });
+        entry.file_with_callback(cb.as_ref().unchecked_ref());
+        cb.forget();
+    });
+    wasm_bindgen_futures::JsFuture::from(promise).await.ok().map(|v| v.unchecked_into())
+}
+
+/// Recursively walks a dropped `FileSystemEntry` (a file, or a folder that
+/// may itself contain rank files and/or subfolders), collecting (name,
+/// bytes) for every trace-like file found. `.tvcache` *directories* are
+/// skipped (native's disk-cache dirs — meaningless on wasm, see
+/// `loader::load_cache`'s stub, and not real trace data); a `.tvcache`
+/// *file* is still accepted, same as `loader::is_trace_file`.
+/// Boxed because async fns can't recurse directly — the resulting future's
+/// size would depend on its own size.
+#[cfg(target_arch = "wasm32")]
+fn walk_dropped_entry(entry: web_sys::FileSystemEntry) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<(String, Vec<u8>)>>>> {
+    use wasm_bindgen::JsCast;
+    Box::pin(async move {
+        if entry.is_file() {
+            let file_entry: web_sys::FileSystemFileEntry = entry.unchecked_into();
+            let Some(file) = file_from_entry(&file_entry).await else { return Vec::new() };
+            let name = file.name();
+            if !crate::loader::is_trace_file(&name) { return Vec::new(); }
+            let Ok(buf) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await else { return Vec::new() };
+            vec![(name, js_sys::Uint8Array::new(&buf).to_vec())]
+        } else if entry.is_directory() {
+            let name = entry.name();
+            if name.ends_with(".tvcache") { return Vec::new(); }
+            let dir_entry: web_sys::FileSystemDirectoryEntry = entry.unchecked_into();
+            let reader = dir_entry.create_reader();
+            let mut out = Vec::new();
+            for sub_entry in read_all_directory_entries(&reader).await {
+                out.extend(walk_dropped_entry(sub_entry).await);
+            }
+            out
+        } else {
+            Vec::new()
+        }
+    })
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Native gets a fixed initial size (there's no "browser viewport" to
@@ -316,22 +394,34 @@ impl ApplicationHandler for App {
                     move |e: web_sys::DragEvent| {
                         e.prevent_default();
                         let Some(dt) = e.data_transfer() else { return };
-                        let Some(files) = dt.files() else { return };
-                        for i in 0..files.length() {
-                            let Some(file) = files.get(i) else { continue };
-                            let pending = pending.clone();
-                            let proxy = proxy.clone();
-                            wasm_bindgen_futures::spawn_local(async move {
-                                let name = file.name();
-                                let buf = match wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await {
-                                    Ok(b) => b,
-                                    Err(_) => return,
-                                };
-                                let bytes = js_sys::Uint8Array::new(&buf).to_vec();
-                                pending.borrow_mut().push((name, bytes));
-                                let _ = proxy.send_event(());
-                            });
+                        let items = dt.items();
+                        // webkitGetAsEntry() must be called synchronously,
+                        // here, while the DataTransfer is still valid (it's
+                        // invalidated as soon as this handler returns) — the
+                        // resulting FileSystemEntry handles stay valid for
+                        // the async directory walk below, which is what
+                        // needs to happen to support dropping a *folder*
+                        // (dt.files() alone can't see into one at all: a
+                        // bare File object can't represent a directory).
+                        let mut entries = Vec::new();
+                        for i in 0..items.length() {
+                            let Some(item) = items.get(i) else { continue };
+                            if let Ok(Some(entry)) = item.webkit_get_as_entry() {
+                                entries.push(entry);
+                            }
                         }
+                        let pending = pending.clone();
+                        let proxy = proxy.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            let mut files = Vec::new();
+                            for entry in entries {
+                                files.extend(walk_dropped_entry(entry).await);
+                            }
+                            if !files.is_empty() {
+                                pending.borrow_mut().extend(files);
+                                let _ = proxy.send_event(());
+                            }
+                        });
                     },
                 );
                 let _ = canvas.add_event_listener_with_callback(
@@ -433,7 +523,22 @@ impl ApplicationHandler for App {
             let display_w = self.window.as_ref()
                 .map(|w| w.inner_size().width as f32 / self.scale_factor as f32)
                 .unwrap_or(INITIAL_WIN_W);
-            for (name, bytes) in files {
+            // A dropped folder's files land here as one flat batch (see
+            // walk_dropped_entry) — group same-run rank files (e.g.
+            // "...-rank-0.json.gz", "...-rank-1.json.gz") into a single
+            // merged multi-rank pane instead of opening each rank as its
+            // own separate trace, matching native's drag-drop behavior.
+            let (rank_groups, standalone) = crate::loader::group_by_rank_bytes(files);
+            for group in rank_groups {
+                let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
+                let target = if let Some(i) = empty { i } else {
+                    self.state.add_pane(display_w);
+                    self.state.panes.len() - 1
+                };
+                self.state.active = target;
+                self.state.panes[target].open_multi_from_bytes(group);
+            }
+            for (name, bytes) in standalone {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
                 let target = if let Some(i) = empty { i } else {
                     self.state.add_pane(display_w);

@@ -2033,3 +2033,74 @@ pub fn load_trace_from_bytes_progressive(
         Err(e) => { let _ = tx.send(Err(e)); }
     }
 }
+
+/// wasm equivalent of `detect_rank_groups`'s grouping logic (the part after
+/// `expand_dirs`, which is fs-based and doesn't apply here — the caller
+/// already resolved a dropped folder into a flat file list via the
+/// browser's File and Directory Entries API, see main.rs's directory-entry
+/// walk). Reuses the same `extract_rank` filename convention natively uses.
+#[cfg(target_arch = "wasm32")]
+pub fn group_by_rank_bytes(
+    files: Vec<(String, Vec<u8>)>,
+) -> (Vec<Vec<(usize, String, Vec<u8>)>>, Vec<(String, Vec<u8>)>) {
+    let mut groups: HashMap<String, Vec<(usize, String, Vec<u8>)>> = HashMap::new();
+    let mut standalone = Vec::new();
+
+    for (name, bytes) in files {
+        let fname = name.rsplit('/').next().unwrap_or(&name);
+        if let Some((key, rank)) = extract_rank(fname) {
+            groups.entry(key).or_default().push((rank, name, bytes));
+        } else {
+            standalone.push((name, bytes));
+        }
+    }
+
+    let mut rank_groups: Vec<Vec<(usize, String, Vec<u8>)>> = Vec::new();
+    for mut group in groups.into_values() {
+        if group.len() > 1 {
+            group.sort_by_key(|(rank, _, _)| *rank);
+            rank_groups.push(group);
+        } else {
+            let (_, name, bytes) = group.remove(0);
+            standalone.push((name, bytes));
+        }
+    }
+
+    (rank_groups, standalone)
+}
+
+/// wasm equivalent of `load_multi_progressive`: takes each rank's bytes
+/// already in memory instead of a path, and skips the merged-cache round
+/// trip entirely (no persistent cache on wasm — see `load_cache`'s stub).
+#[cfg(target_arch = "wasm32")]
+pub fn load_multi_from_bytes_progressive(
+    rank_named_bytes: Vec<(usize, String, Vec<u8>)>,
+    counter: &Arc<AtomicUsize>,
+    tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
+) {
+    let t0 = Instant::now();
+
+    let results: Vec<(usize, Result<Trace, String>)> = rank_named_bytes.into_par_iter()
+        .map(|(rank, name, bytes)| {
+            let (tx2, rx2) = std::sync::mpsc::channel();
+            load_trace_from_bytes_progressive(&name, bytes, counter, &tx2);
+            let result = rx2.try_recv().unwrap_or_else(|_| Err(format!("{name}: no result")));
+            (rank, result)
+        })
+        .collect();
+
+    let mut traces = Vec::new();
+    for (rank, result) in results {
+        match result {
+            Ok(t) => traces.push((rank, t)),
+            Err(e) => eprintln!("  rank {rank}: {e}"),
+        }
+    }
+    if traces.is_empty() {
+        let _ = tx.send(Err("all ranks failed to load".into()));
+        return;
+    }
+    let trace = merge_traces(traces);
+    eprintln!("  merged: {:.2}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
+    let _ = tx.send(Ok(trace));
+}

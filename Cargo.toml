@@ -75,6 +75,7 @@ web-sys = { version = "0.3", features = [
     "WebGlBuffer", "WebGlTexture", "WebGlUniformLocation", "WebGlVertexArrayObject",
     "File", "FileList", "FileReader", "DataTransfer", "DragEvent", "Blob", "Event",
     "Clipboard", "ClipboardEvent", "DataTransferItem", "DataTransferItemList",
+    "FileSystemEntry", "FileSystemDirectoryEntry", "FileSystemDirectoryReader", "FileSystemFileEntry",
     "Navigator", "Performance", "HtmlInputElement", "Window", "Document", "Element",
 ] }
 
