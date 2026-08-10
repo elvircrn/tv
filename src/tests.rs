@@ -1654,3 +1654,58 @@ fn test_zoom_to_search_no_matches_no_anim() {
     pane.zoom_to_search();
     assert!(pane.view.anim.is_none());
 }
+
+#[test]
+#[ignore]
+fn bench_stats_sort_cost() {
+    // Profiling harness (not part of the normal suite): measures the actual
+    // cost of one `draw_stats_table` resort at realistic row counts, using
+    // real trace data through the real `kernel_occ_limit` code path. Run with:
+    //   TV_BENCH_TRACE=/path/to/trace.json.gz cargo test --release -- --ignored --nocapture bench_stats_sort_cost
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("skipped: set TV_BENCH_TRACE"); return; }
+    };
+    let trace = load_trace(&path, &test_counter(), 0, None).unwrap();
+
+    let mut all_stats: Vec<KernelStats> = Vec::new();
+    let mut all_refs: Vec<(u32, u32)> = Vec::new();
+    for (ti, track) in trace.tracks.iter().enumerate() {
+        for (ei, ev) in track.events.iter().enumerate() {
+            all_stats.push(KernelStats { name: ev.name, count: 1, total_dur: ev.dur, median_dur: ev.dur, max_dur: ev.dur });
+            all_refs.push((ti as u32, ei as u32));
+        }
+    }
+
+    for &n in &[15_000usize, 100_000, all_stats.len()] {
+        let n = n.min(all_stats.len());
+        let stats = &all_stats[..n];
+        let refs = &all_refs[..n];
+        eprintln!("--- rows: {} ---", n);
+
+        // Baseline: sort by Total (column 2), a plain float compare.
+        let mut idx: Vec<usize> = (0..n).collect();
+        let t0 = std::time::Instant::now();
+        idx.sort_by(|&a, &b| stats[a].total_dur.partial_cmp(&stats[b].total_dur).unwrap());
+        eprintln!("  sort by Total:     {:.2}ms", t0.elapsed().as_secs_f64() * 1000.0);
+
+        // Occ Limit column, naive: parses each event's raw args JSON on every
+        // comparison (the bug this benchmark exists to catch a regression of).
+        let occ_limit = |si: usize| -> &str {
+            let (ti, ei) = refs[si];
+            crate::ui::kernel_occ_limit(&trace, ti, ei).0
+        };
+        let mut idx2: Vec<usize> = (0..n).collect();
+        let t1 = std::time::Instant::now();
+        idx2.sort_by(|&a, &b| occ_limit(a).cmp(occ_limit(b)));
+        eprintln!("  sort by Occ Limit (naive):  {:.2}ms", t1.elapsed().as_secs_f64() * 1000.0);
+
+        // Occ Limit column, fixed: parse once (O(n)), then sort the cache —
+        // what draw_stats_table actually does now.
+        let mut idx3: Vec<usize> = (0..n).collect();
+        let t2 = std::time::Instant::now();
+        let cache: Vec<&str> = (0..n).map(occ_limit).collect();
+        idx3.sort_by(|&a, &b| cache[a].cmp(cache[b]));
+        eprintln!("  sort by Occ Limit (cached): {:.2}ms", t2.elapsed().as_secs_f64() * 1000.0);
+    }
+}

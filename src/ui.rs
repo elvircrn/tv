@@ -288,10 +288,24 @@ pub fn draw_stats_table(
     let avg = |s: &KernelStats| if s.count > 0 { s.total_dur / s.count as f64 } else { 0.0 };
     let pct = |s: &KernelStats| if total_sum > 0.0 { s.total_dur / total_sum } else { 0.0 };
 
-    let occ_limit = |si: usize| -> (&str, bool) {
+    let occ_limit_uncached = |si: usize| -> (&str, bool) {
         match event_refs.and_then(|r| r.get(si)) {
             Some(&(ti, ei)) => kernel_occ_limit(trace, ti, ei),
             None => ("", false),
+        }
+    };
+    // Sorting by Occ Limit naively (parsing each row's raw JSON args inside
+    // the O(n log n) comparator) measured at 140ms for just 15k rows — a
+    // guaranteed stall on every redraw while that column is sorted, since
+    // this table resorts on every call. Parse each row exactly once up front
+    // instead; row *rendering* below still looks values up lazily (bounded by
+    // the clipper to the visible rows, so it doesn't need the same fix).
+    let occ_limit_cache: Option<Vec<(&str, bool)>> = (*sort_col == 7)
+        .then(|| (0..stats.len()).map(occ_limit_uncached).collect());
+    let occ_limit = |si: usize| -> (&str, bool) {
+        match &occ_limit_cache {
+            Some(cache) => cache[si],
+            None => occ_limit_uncached(si),
         }
     };
 
