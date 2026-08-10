@@ -565,7 +565,13 @@ pub fn draw_timeline(
     shift: bool,
     search_mask: &[bool],
     selection: Option<[f64; 4]>,
-    finished_sel: Option<[f64; 4]>,
+    // The frozen (track_idx, event_idx) set a finished region-selection
+    // refers to (see `Pane::capture_sel_events`, `Pane::finished_sel`). Used
+    // instead of re-deriving track membership from the selection's raw Y
+    // range against the CURRENT layout, which would silently reassign the
+    // highlight to different tracks after Show CPU toggles, track
+    // reordering, or height changes.
+    finished_sel_events: &std::collections::HashSet<(u32, u32)>,
     collapsed: &mut Vec<bool>,
     hidden_names: &[bool],
     selected: Option<EventRef>,
@@ -740,7 +746,6 @@ pub fn draw_timeline(
     for g in &buf.merged_gpu_groups {
         geom.merged.push(MergedGeom {
             vi: g.vi,
-            max_depth: g.max_depth,
             events: g.events.clone(),
         });
     }
@@ -908,12 +913,24 @@ pub fn draw_timeline(
     let filtering = searching || has_sel_mask;
 
     let active_sel = sel_change.unwrap_or(selection);
-    let highlight_sel = active_sel.or(finished_sel);
-    let sel_bounds: Option<(f64, f64, f32, f32)> = highlight_sel.map(|[s0, s1, y0, y1]| {
+    // A LIVE drag tests events against raw pixel Y — the layout can't
+    // meaningfully change mid-drag, so this is simple and exact. A FINISHED
+    // selection instead looks up the frozen (track_idx, event_idx) set
+    // captured when the drag ended (see Pane::capture_sel_events) — testing
+    // finished_sel's raw Y range against the CURRENT layout here would
+    // silently reassign the highlight to whatever tracks now occupy those
+    // pixels after a Show CPU toggle, track reorder, or height change.
+    let active_bounds: Option<(f64, f64, f32, f32)> = active_sel.map(|[s0, s1, y0, y1]| {
         let (sa, sb) = if s0 <= s1 { (s0, s1) } else { (s1, s0) };
         let (ya, yb) = if y0 <= y1 { (y0 as f32, y1 as f32) } else { (y1 as f32, y0 as f32) };
         (sa, sb, ya, yb)
     });
+    let is_selected = |ti: u32, ei: u32, ev_top: f32, sub_h: f32, ts: f64, dur: f64| -> bool {
+        if let Some((sa, sb, ya, yb)) = active_bounds {
+            return ts + dur >= sa && ts <= sb && ev_top + sub_h >= ya && ev_top <= yb;
+        }
+        finished_sel_events.contains(&(ti, ei))
+    };
 
     dl.with_clip_rect([tl_left, tracks_top], [rect[2], rect[3]], || {
         let interval = nice_interval(view.t1 - view.t0);
@@ -989,11 +1006,8 @@ pub fn draw_timeline(
 
                     let is_primary = selected.map_or(false, |s| s.track_idx == ti32 && s.event_idx == ei32);
                     let is_multi = multi_select_name.map_or(false, |n| ev.name == n);
-                    let is_selected = sel_bounds.map_or(false, |(sa, sb, ya, yb)| {
-                        let ev_track_y = buf.y_offsets[vi] + eff_depth as f32 * sub_h;
-                        let ev_bot = ev_track_y + sub_h;
-                        ev.ts + ev.dur >= sa && ev.ts <= sb && ev_bot >= ya && ev_track_y <= yb
-                    });
+                    let ev_track_y = buf.y_offsets[vi] + eff_depth as f32 * sub_h;
+                    let is_selected = is_selected(ti32, ei32, ev_track_y, sub_h, ev.ts, ev.dur);
                     let is_sel_mask = !sel_mask.is_empty() && sel_mask.get(ev.name as usize).copied().unwrap_or(false);
 
                     let fill = if is_hovered { brighten(color, 30) } else if is_selected || is_sel_mask { brighten(color, 20) } else { color };
@@ -1089,11 +1103,8 @@ pub fn draw_timeline(
 
                     let is_primary = selected.map_or(false, |s| s.track_idx == orig_ti as u32 && s.event_idx == ei as u32);
                     let is_multi = multi_select_name.map_or(false, |n| ev.name == n);
-                    let is_selected = sel_bounds.map_or(false, |(sa, sb, ya, yb)| {
-                        let ev_track_y = buf.y_offsets[vi] + ev.depth as f32 * sub_h;
-                        let ev_bot = ev_track_y + sub_h;
-                        ev.ts + ev.dur >= sa && ev.ts <= sb && ev_bot >= ya && ev_track_y <= yb
-                    });
+                    let ev_track_y = buf.y_offsets[vi] + ev.depth as f32 * sub_h;
+                    let is_selected = is_selected(orig_ti as u32, ei as u32, ev_track_y, sub_h, ev.ts, ev.dur);
                     let is_sel_mask = !sel_mask.is_empty() && sel_mask.get(ev.name as usize).copied().unwrap_or(false);
 
                     let fill = if is_hovered { brighten(color, 30) } else if is_selected || is_sel_mask { brighten(color, 20) } else { color };

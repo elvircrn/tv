@@ -302,7 +302,6 @@ pub struct PaneGeom {
 
 pub struct MergedGeom {
     pub vi: usize,
-    pub max_depth: u16,
     /// Packed `(track_idx, event_idx, packed_depth)` triples — exactly the events
     /// drawn in the merged row. The Tetris packing in `draw_timeline` already
     /// stripped grandparent wrappers (whole-stream spans) and hidden names, so a

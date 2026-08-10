@@ -275,7 +275,7 @@ fn test_selection_stats_basic() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.selection = Some([0.0, 40.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
+    p.finish_selection(&mut state.buf);
 
     assert_eq!(p.selection_stats.len(), 2);
     let a = p.selection_stats.iter().find(|s| s.name == 1).unwrap();
@@ -292,7 +292,7 @@ fn test_selection_stats_respects_hidden() {
     let p = &mut state.panes[0];
     p.hidden_names[1] = true;
     p.selection = Some([0.0, 30.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
+    p.finish_selection(&mut state.buf);
 
     assert_eq!(p.selection_stats.len(), 1);
     assert_eq!(p.selection_stats[0].name, 2);
@@ -309,10 +309,48 @@ fn test_selection_stats_cpu_hidden() {
     let p = &mut state.panes[0];
     p.show_cpu = false;
     p.selection = Some([0.0, 10.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
+    p.finish_selection(&mut state.buf);
 
     assert_eq!(p.selection_stats.len(), 1);
     assert_eq!(p.selection_stats[0].name, 1);
+}
+
+// Regression: a finished selection used to be a raw pixel Y range, re-tested
+// against whatever the CURRENT layout happened to be every time it was read.
+// Toggling Show CPU (inserting/removing tracks), reordering tracks, or
+// resizing the bottom panel (which can change per-track heights) would then
+// silently reassign an existing selection to different tracks, without the
+// user doing anything to their selection. capture_sel_events resolves a
+// finished selection to a frozen (track_idx, event_idx) set at drag-finish
+// time instead, so it must survive layout changes unchanged.
+#[test]
+fn test_selection_survives_layout_change() {
+    let trace = make_trace(
+        vec!["", "gpu_kern", "cpu_kern"],
+        vec![
+            ("GPU 0", true, vec![ev(0.0, 10.0, 1, 0)]),
+            ("Thread 1", false, vec![ev(0.0, 10.0, 2, 0)]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    // Select just the GPU row's own Y span.
+    let gpu_h = p.geom.heights[0] as f64;
+    p.selection = Some([0.0, 10.0, 0.0, gpu_h]);
+    p.finish_selection(&mut state.buf);
+    let before = p.extract_selection_events();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].0, "gpu_kern");
+
+    // Simulate a layout change after the selection was made: tracks
+    // reordered and the previously-selected row's height/offset changed —
+    // exactly what enabling Show CPU or resizing the bottom panel can do.
+    p.geom.visible = vec![1, 0];
+    p.geom.y_offsets = vec![0.0, 500.0];
+    p.geom.heights = vec![gpu_h as f32, 999.0];
+
+    let after = p.extract_selection_events();
+    assert_eq!(after, before, "a finished selection must not change when the layout changes");
 }
 
 // --- Selection state machine ---
@@ -706,7 +744,7 @@ fn test_select_from_search_no_match_keeps_old() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.selection = Some([0.0, 10.0, 0.0, 1e9]);
-    p.rebuild_selection_stats(&mut state.buf);
+    p.finish_selection(&mut state.buf);
     assert_eq!(p.selection_stats.len(), 1);
 
     p.search = "nonexistent".to_string();
@@ -927,6 +965,7 @@ fn test_diff_extract_selection_events() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.finished_sel = Some([0.0, 20.0, 0.0, 100.0]);
+    p.finished_sel_events = p.capture_sel_events(p.finished_sel.unwrap()).into_iter().collect();
     let events = p.extract_selection_events();
     assert_eq!(events.len(), 3);
     assert_eq!(events[0].0, "matmul");
@@ -948,6 +987,7 @@ fn test_diff_extract_selection_respects_hidden() {
     let p = &mut state.panes[0];
     p.hidden_names[1] = true;
     p.finished_sel = Some([0.0, 20.0, 0.0, 100.0]);
+    p.finished_sel_events = p.capture_sel_events(p.finished_sel.unwrap()).into_iter().collect();
     let events = p.extract_selection_events();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].0, "matmul");
@@ -967,6 +1007,7 @@ fn test_diff_extract_selection_partial_time_range() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.finished_sel = Some([5.0, 12.0, 0.0, 100.0]);
+    p.finished_sel_events = p.capture_sel_events(p.finished_sel.unwrap()).into_iter().collect();
     let events = p.extract_selection_events();
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].0, "matmul");
@@ -986,6 +1027,7 @@ fn test_diff_extract_selection_sorted_by_timestamp() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.finished_sel = Some([0.0, 30.0, 0.0, 100.0]);
+    p.finished_sel_events = p.capture_sel_events(p.finished_sel.unwrap()).into_iter().collect();
     let events = p.extract_selection_events();
     assert_eq!(events[0].0, "early");
     assert_eq!(events[1].0, "mid");
@@ -993,11 +1035,11 @@ fn test_diff_extract_selection_sorted_by_timestamp() {
 }
 
 // Merged rows Tetris-pack their events and strip grandparent wrappers (whole-
-// stream spans). A selection over a merged row must read the packed set that was
-// actually drawn — not re-scan the raw track — or it picks up "ghost" wrappers
-// that were never rendered. `geom.merged` here mimics draw_timeline's snapshot:
-// the raw track has a `wrapper` span at index 0, but it is absent from the packed
-// events, so selection must never return it.
+// stream spans). capture_sel_events reads the SAME packed geom.merged
+// snapshot the renderer just drew from, so a selection matches the rendered
+// row precisely instead of sweeping in ghost events that were never drawn —
+// and because it's captured ONCE (not re-derived later), it stays correct
+// regardless of what the layout does afterward.
 #[test]
 fn test_merged_selection_excludes_unrendered_wrapper() {
     let trace = make_trace(
@@ -1011,12 +1053,13 @@ fn test_merged_selection_excludes_unrendered_wrapper() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     // Packed row: kA at depth 0, kB at depth 1; wrapper (idx 0) intentionally omitted.
-    p.geom.merged = vec![MergedGeom { vi: 0, max_depth: 2, events: vec![(0, 1, 0), (0, 2, 1)] }];
+    p.geom.merged = vec![MergedGeom { vi: 0, events: vec![(0, 1, 0), (0, 2, 1)] }];
     p.geom.heights[0] = 40.0; // max_depth 2 * SUB_LANE_H(20)
     p.geom.y_offsets[0] = 0.0;
 
     // Full-height selection over the whole time range: kA + kB, never the wrapper.
     p.finished_sel = Some([0.0, 30.0, 0.0, 40.0]);
+    p.finished_sel_events = p.capture_sel_events(p.finished_sel.unwrap()).into_iter().collect();
     let events = p.extract_selection_events();
     assert_eq!(events.len(), 2);
     assert!(events.iter().all(|(n, _)| n != "wrapper"));
@@ -1025,9 +1068,11 @@ fn test_merged_selection_excludes_unrendered_wrapper() {
 }
 
 // The renderer only highlights packed events whose depth lane intersects the
-// selection rectangle; the stats/extract must apply the same y-test so they stay
-// in sync with the highlight. sub_h = 40/2 = 20, so a y-range of [0,10] hits only
-// depth-0 (kA), not depth-1 (kB).
+// selection rectangle; stats/extract must apply the same y-test so they stay
+// in sync with the highlight — this is the exact precision that regressed
+// when an earlier version of this fix dropped merged-row depth matching
+// entirely ("selecting one item selected all items"). sub_h = 40/2 = 20, so a
+// y-range of [0,10] hits only depth-0 (kA), not depth-1 (kB).
 #[test]
 fn test_merged_selection_respects_depth_yrange() {
     let trace = make_trace(
@@ -1040,11 +1085,12 @@ fn test_merged_selection_respects_depth_yrange() {
     );
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
-    p.geom.merged = vec![MergedGeom { vi: 0, max_depth: 2, events: vec![(0, 1, 0), (0, 2, 1)] }];
+    p.geom.merged = vec![MergedGeom { vi: 0, events: vec![(0, 1, 0), (0, 2, 1)] }];
     p.geom.heights[0] = 40.0;
     p.geom.y_offsets[0] = 0.0;
 
     p.finished_sel = Some([0.0, 30.0, 0.0, 10.0]);
+    p.finished_sel_events = p.capture_sel_events(p.finished_sel.unwrap()).into_iter().collect();
     let events = p.extract_selection_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].0, "kA");
@@ -1539,7 +1585,7 @@ fn test_sel_generation_bumps_on_every_rebuild() {
     assert!(g2 > g1, "a second rebuild must advance the generation again");
 
     pane.selection = Some([0.0, 5.0, 0.0, 100.0]);
-    pane.rebuild_selection_stats(&mut state.buf);
+    pane.finish_selection(&mut state.buf);
     assert!(state.panes[0].sel_generation > g2);
 }
 

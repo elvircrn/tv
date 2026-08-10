@@ -1098,7 +1098,7 @@ impl App {
                         shift,
                         &pane.search_mask,
                         pane.selection,
-                        pane.finished_sel,
+                        &pane.finished_sel_events,
                         &mut pane.collapsed,
                         &pane.hidden_names,
                         pane.selected,

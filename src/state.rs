@@ -42,6 +42,15 @@ pub struct Pane {
     pub prev_search: String,
     pub selection: Option<[f64; 4]>,
     pub finished_sel: Option<[f64; 4]>,
+    /// The concrete `(track_idx, event_idx)` set `finished_sel` refers to,
+    /// resolved once when the drag finishes (see `capture_sel_events`). Every
+    /// consumer of `finished_sel` after that point (stats, extract, copy, the
+    /// rendered highlight) reads this frozen set instead of re-deriving track
+    /// membership from `finished_sel`'s raw Y range against whatever the
+    /// CURRENT layout happens to be — otherwise toggling Show CPU, reordering
+    /// tracks, or resizing the bottom panel (which can change track heights)
+    /// silently changes which events are "selected".
+    pub finished_sel_events: std::collections::HashSet<(u32, u32)>,
     pub selection_stats: Vec<SelectionEntry>,
     pub selection_dirty: bool,
     pub sel_mask: Vec<bool>,
@@ -104,6 +113,7 @@ impl Pane {
             prev_search: String::new(),
             selection: None,
             finished_sel: None,
+            finished_sel_events: std::collections::HashSet::new(),
             selection_stats: Vec::new(),
             selection_dirty: false,
             sel_mask: Vec::new(),
@@ -151,6 +161,7 @@ impl Pane {
     pub fn clear_selection(&mut self) {
         self.selection = None;
         self.finished_sel = None;
+        self.finished_sel_events.clear();
         self.selection_stats.clear();
         self.sel_mask.clear();
         self.sel_median = 0.0;
@@ -169,9 +180,69 @@ impl Pane {
 
     pub fn finish_selection(&mut self, buf: &mut DrawBuf) {
         self.finished_sel = self.selection;
+        self.finished_sel_events = self.selection.map(|s| self.capture_sel_events(s).into_iter().collect()).unwrap_or_default();
         self.selection = None;
         self.rebuild_selection_stats(buf);
         self.sel_mask.clear();
+    }
+
+    /// Resolve a raw pixel-space selection rectangle into the concrete set of
+    /// `(track_idx, event_idx)` pairs it covers, using `self.geom`/
+    /// `hidden_names`/`show_cpu` exactly as they are right now (drag-finish
+    /// time) — full precision, including which merged-row depth lane the drag
+    /// covered. The result is frozen from this point on: nothing that happens
+    /// afterward (Show CPU toggle, track reorder/resize, hiding a name) can
+    /// retroactively add, remove, or reassign what this selection refers to.
+    /// That freezing is the fix — the old code re-derived "what's selected"
+    /// from the raw Y range against whatever the CURRENT layout was on every
+    /// read, which silently changed the answer as the layout changed.
+    pub(crate) fn capture_sel_events(&self, sel: [f64; 4]) -> Vec<(u32, u32)> {
+        let trace = match &self.trace { Some(t) => t, None => return Vec::new() };
+        let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
+        let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
+        let mut out = Vec::new();
+        for vi in 0..self.geom.visible.len() {
+            let track_top = self.geom.y_offsets[vi];
+            let track_h = self.geom.heights[vi];
+            let track_bot = track_top + track_h;
+            if track_bot < y0 || track_top > y1 { continue; }
+
+            if let Some(group) = self.geom.merged.iter().find(|g| g.vi == vi) {
+                // Match the rendered merged row: iterate the packed events
+                // (wrappers stripped) and apply the renderer's depth/y test.
+                let max_depth = group.events.iter().map(|&(_, _, d)| d).max().map(|d| d + 1).unwrap_or(1);
+                let sub_h = track_h / max_depth.max(1) as f32;
+                for &(ti32, ei32, depth) in &group.events {
+                    let ev = &trace.tracks[ti32 as usize].events[ei32 as usize];
+                    if !(ev.ts + ev.dur >= s0 && ev.ts <= s1) { continue; }
+                    let ev_top = track_top + depth as f32 * sub_h;
+                    let ev_bot = ev_top + sub_h;
+                    if ev_bot < y0 || ev_top > y1 { continue; }
+                    out.push((ti32, ei32));
+                }
+            } else {
+                let ti = self.geom.visible[vi];
+                let track = &trace.tracks[ti];
+                if !self.show_cpu && !track.gpu { continue; }
+                let sub_h = track_h / track.max_depth.max(1) as f32;
+                let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
+                let end = track.events.partition_point(|e| e.ts <= s1).max(start);
+                let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
+                for (local_i, ev) in track.events[start..end].iter().enumerate() {
+                    if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                    let ev_top = track_top + ev.depth as f32 * sub_h;
+                    let ev_bot = ev_top + sub_h;
+                    for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
+                    if ev_bot < y0 || ev_top > y1 { continue; }
+                    if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
+                        ancestor_sel[ev.depth as usize] = true;
+                        if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
+                        out.push((ti as u32, (start + local_i) as u32));
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub fn open(&mut self, path: String) {
@@ -333,72 +404,28 @@ impl Pane {
 
     pub fn rebuild_selection_stats(&mut self, buf: &mut DrawBuf) {
         let t_start = std::time::Instant::now();
-        let trace = match &self.trace {
-            Some(t) => t,
-            None => return,
-        };
-        let sel = match self.selection.or(self.finished_sel) {
-            Some(s) => s,
-            None => { self.selection_stats.clear(); self.sel_agg_stats.clear(); self.sel_individual.clear(); self.sel_individual_refs.clear(); self.sel_median = 0.0; return; }
-        };
-        let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
-        let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
+        if self.trace.is_none() { return; }
+        if self.finished_sel.is_none() {
+            self.selection_stats.clear(); self.sel_agg_stats.clear(); self.sel_individual.clear(); self.sel_individual_refs.clear(); self.sel_median = 0.0;
+            return;
+        }
+        // finished_sel_events is the frozen (track_idx, event_idx) set
+        // resolved when the drag finished (see capture_sel_events) — reading
+        // it directly instead of re-deriving track membership from the raw
+        // selection rectangle keeps this stable across later layout changes
+        // (Show CPU toggle, track reorder/resize).
+        let trace = self.trace.as_ref().unwrap();
 
         let map = &mut buf.sel_map;
         for v in map.values_mut() { v.0 = 0; v.1 = 0.0; v.2.clear(); v.3.clear(); }
 
-        let mut total_scanned = 0usize;
-        for vi in 0..self.geom.visible.len() {
-            let track_top = self.geom.y_offsets[vi];
-            let track_h = self.geom.heights[vi];
-            let track_bot = track_top + track_h;
-            if track_bot < y0 || track_top > y1 { continue; }
-
-            if let Some(group) = self.geom.merged.iter().find(|g| g.vi == vi) {
-                // Iterate the packed events that were actually drawn in the merged
-                // row (grandparent wrappers already stripped), and apply the same
-                // depth/y test the renderer uses for its selection highlight, so
-                // the stats match the visible rectangle exactly.
-                let sub_h = track_h / group.max_depth.max(1) as f32;
-                total_scanned += group.events.len();
-                for &(ti32, ei32, depth) in &group.events {
-                    let ev = &trace.tracks[ti32 as usize].events[ei32 as usize];
-                    if !(ev.ts + ev.dur >= s0 && ev.ts <= s1) { continue; }
-                    let ev_top = track_top + depth as f32 * sub_h;
-                    let ev_bot = ev_top + sub_h;
-                    if ev_bot < y0 || ev_top > y1 { continue; }
-                    let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new(), Vec::new()));
-                    e.0 += 1;
-                    e.1 += ev.dur;
-                    e.2.push(ev.dur);
-                    e.3.push((ti32, ei32));
-                }
-            } else {
-                let ti = self.geom.visible[vi];
-                let track = &trace.tracks[ti];
-                if !self.show_cpu && !track.gpu { continue; }
-                let sub_h = track_h / track.max_depth.max(1) as f32;
-                let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
-                let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-                total_scanned += end - start;
-                let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
-                for (local_i, ev) in track.events[start..end].iter().enumerate() {
-                    if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                    let ev_top = track_top + ev.depth as f32 * sub_h;
-                    let ev_bot = ev_top + sub_h;
-                    for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
-                    if ev_bot < y0 || ev_top > y1 { continue; }
-                    if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                        ancestor_sel[ev.depth as usize] = true;
-                        if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
-                        let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new(), Vec::new()));
-                        e.0 += 1;
-                        e.1 += ev.dur;
-                        e.2.push(ev.dur);
-                        e.3.push((ti as u32, (start + local_i) as u32));
-                    }
-                }
-            }
+        for &(ti, ei) in &self.finished_sel_events {
+            let ev = &trace.tracks[ti as usize].events[ei as usize];
+            let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new(), Vec::new()));
+            e.0 += 1;
+            e.1 += ev.dur;
+            e.2.push(ev.dur);
+            e.3.push((ti, ei));
         }
         self.selection_stats.clear();
         for (&name, (count, total_dur, durations, event_refs)) in map.iter_mut() {
@@ -411,7 +438,7 @@ impl Pane {
         }
         self.selection_stats.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap().then(a.name.cmp(&b.name)));
         let ev_count: u32 = self.selection_stats.iter().map(|e| e.count).sum();
-        eprintln!("  select: {:.1}ms ({} events, {} names, {} scanned)", t_start.elapsed().as_secs_f64() * 1000.0, ev_count, self.selection_stats.len(), total_scanned);
+        eprintln!("  select: {:.1}ms ({} events, {} names)", t_start.elapsed().as_secs_f64() * 1000.0, ev_count, self.selection_stats.len());
 
         let t_agg = std::time::Instant::now();
         self.compute_aggregates();
@@ -423,54 +450,12 @@ impl Pane {
             Some(t) => t,
             None => return Vec::new(),
         };
-        let sel = match self.finished_sel {
-            Some(s) => s,
-            None => return Vec::new(),
-        };
-        let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
-        let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
+        if self.finished_sel.is_none() { return Vec::new(); }
 
-        let mut events: Vec<(f64, String, f64)> = Vec::new();
-        for vi in 0..self.geom.visible.len() {
-            let track_top = self.geom.y_offsets[vi];
-            let track_h = self.geom.heights[vi];
-            let track_bot = track_top + track_h;
-            if track_bot < y0 || track_top > y1 { continue; }
-
-            if let Some(group) = self.geom.merged.iter().find(|g| g.vi == vi) {
-                // Match the rendered merged row: iterate the packed events (wrappers
-                // stripped) and apply the renderer's depth/y test.
-                let sub_h = track_h / group.max_depth.max(1) as f32;
-                for &(ti32, ei32, depth) in &group.events {
-                    let ev = &trace.tracks[ti32 as usize].events[ei32 as usize];
-                    if !(ev.ts + ev.dur >= s0 && ev.ts <= s1) { continue; }
-                    let ev_top = track_top + depth as f32 * sub_h;
-                    let ev_bot = ev_top + sub_h;
-                    if ev_bot < y0 || ev_top > y1 { continue; }
-                    events.push((ev.ts, trace.names[ev.name as usize].clone(), ev.dur));
-                }
-            } else {
-                let ti = self.geom.visible[vi];
-                let track = &trace.tracks[ti];
-                if !self.show_cpu && !track.gpu { continue; }
-                let sub_h = track_h / track.max_depth.max(1) as f32;
-                let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
-                let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-                let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
-                for ev in &track.events[start..end] {
-                    if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                    let ev_top = track_top + ev.depth as f32 * sub_h;
-                    let ev_bot = ev_top + sub_h;
-                    for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
-                    if ev_bot < y0 || ev_top > y1 { continue; }
-                    if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                        ancestor_sel[ev.depth as usize] = true;
-                        if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
-                        events.push((ev.ts, trace.names[ev.name as usize].clone(), ev.dur));
-                    }
-                }
-            }
-        }
+        let mut events: Vec<(f64, String, f64)> = self.finished_sel_events.iter().map(|&(ti, ei)| {
+            let ev = &trace.tracks[ti as usize].events[ei as usize];
+            (ev.ts, trace.names[ev.name as usize].clone(), ev.dur)
+        }).collect();
         events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         events.into_iter().map(|(_, name, dur)| (name, dur)).collect()
     }
@@ -480,48 +465,9 @@ impl Pane {
         let mut events: Vec<(f64, &str, f64)> = Vec::new();
 
         if self.finished_sel.is_some() {
-            let sel = self.finished_sel.unwrap();
-            let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
-            let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
-            for vi in 0..self.geom.visible.len() {
-                let track_top = self.geom.y_offsets[vi];
-                let track_h = self.geom.heights[vi];
-                let track_bot = track_top + track_h;
-                if track_bot < y0 || track_top > y1 { continue; }
-
-                if let Some(group) = self.geom.merged.iter().find(|g| g.vi == vi) {
-                    // Match the rendered merged row: iterate the packed events
-                    // (wrappers stripped) and apply the renderer's depth/y test.
-                    let sub_h = track_h / group.max_depth.max(1) as f32;
-                    for &(ti32, ei32, depth) in &group.events {
-                        let ev = &trace.tracks[ti32 as usize].events[ei32 as usize];
-                        if !(ev.ts + ev.dur >= s0 && ev.ts <= s1) { continue; }
-                        let ev_top = track_top + depth as f32 * sub_h;
-                        let ev_bot = ev_top + sub_h;
-                        if ev_bot < y0 || ev_top > y1 { continue; }
-                        events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
-                    }
-                } else {
-                    let ti = self.geom.visible[vi];
-                    let track = &trace.tracks[ti];
-                    if !self.show_cpu && !track.gpu { continue; }
-                    let sub_h = track_h / track.max_depth.max(1) as f32;
-                    let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
-                    let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-                    let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
-                    for ev in &track.events[start..end] {
-                        if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                        let ev_top = track_top + ev.depth as f32 * sub_h;
-                        let ev_bot = ev_top + sub_h;
-                        for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
-                        if ev_bot < y0 || ev_top > y1 { continue; }
-                        if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                            ancestor_sel[ev.depth as usize] = true;
-                            if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
-                            events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
-                        }
-                    }
-                }
+            for &(ti, ei) in &self.finished_sel_events {
+                let ev = &trace.tracks[ti as usize].events[ei as usize];
+                events.push((ev.ts, &trace.names[ev.name as usize], ev.dur));
             }
         } else if let Some(name_id) = self.multi_select_name {
             for track in &trace.tracks {
