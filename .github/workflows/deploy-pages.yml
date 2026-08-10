@@ -49,7 +49,15 @@ jobs:
       - name: Build
         run: |
           source scripts/wasm-env.sh
-          trunk build --release
+          # This is a GitHub Pages *project* site (elvircrn.github.io/tv/,
+          # not a root user/org site), but trunk's default asset URLs are
+          # root-absolute ("/tv-xxx.js") — correct for local dev
+          # (127.0.0.1:8080/) but wrong here, resolving to
+          # elvircrn.github.io/tv-xxx.js (404, nothing renders). --public-url
+          # prefixes generated asset paths with the actual subpath instead;
+          # left off scripts/build-wasm.sh's local build entirely so that one
+          # isn't tied to this repo's specific Pages URL.
+          trunk build --release --public-url /tv/
 
       - uses: actions/upload-pages-artifact@v3
         with:
