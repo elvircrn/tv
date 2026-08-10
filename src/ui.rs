@@ -345,7 +345,16 @@ pub fn draw_stats_table(
 
     let row_h = ui.current_font_size() + ROW_PAD;
     let dl = ui.get_window_draw_list();
-    let clipper = imgui::ListClipper::new(buf.sort_idx.len() as i32).begin(ui);
+    // Without an explicit item height, ImGuiListClipper auto-detects it by
+    // measuring one throwaway row — which doesn't reliably skip ahead when
+    // interleaved with table_next_row(), degrading to visiting every row
+    // (not just the visible ones) regardless of total count. This was the
+    // real cost behind "sorting is slow": it ran unconditionally on every
+    // call, independent of the sort cache above, so it stayed slow even on a
+    // cache hit. Measured at 112k rows: this alone was ~160ms.
+    let clipper = imgui::ListClipper::new(buf.sort_idx.len() as i32)
+        .items_height(row_h)
+        .begin(ui);
     for row in clipper.iter() {
         let si = buf.sort_idx[row as usize];
         let s = &stats[si];

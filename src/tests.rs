@@ -1744,6 +1744,36 @@ fn bench_stats_sort_cost() {
         let cache: Vec<&str> = (0..n).map(occ_limit).collect();
         idx3.sort_by(|&a, &b| cache[a].cmp(cache[b]));
         eprintln!("  sort by Occ Limit (cached): {:.2}ms", t2.elapsed().as_secs_f64() * 1000.0);
+
+        // Exact comparator SHAPE from draw_stats_table's sort_by (the 8-way
+        // match, with avg/pct closures alive in scope) sorting by Max (column
+        // 6) — a plain f64 field, same as Total, but through the real match
+        // arm structure instead of an isolated closure. Checks whether the
+        // extra branches/closures cost something under lower optimization
+        // (the real app runs dev-release: opt-level=2, no LTO, 16 codegen
+        // units) even on a numeric column that never touches Occ Limit.
+        let total_sum: f64 = stats.iter().map(|s| s.total_dur).sum();
+        let avg = |s: &KernelStats| if s.count > 0 { s.total_dur / s.count as f64 } else { 0.0 };
+        let pct = |s: &KernelStats| if total_sum > 0.0 { s.total_dur / total_sum } else { 0.0 };
+        let sort_col = 6usize;
+        let sort_asc = true;
+        let mut idx4: Vec<usize> = (0..n).collect();
+        let t3 = std::time::Instant::now();
+        idx4.sort_by(|&a, &b| {
+            let (sa, sb) = (&stats[a], &stats[b]);
+            let ord = match sort_col {
+                0 => trace.names[sa.name as usize].cmp(&trace.names[sb.name as usize]),
+                1 => sa.count.cmp(&sb.count),
+                2 => sa.total_dur.partial_cmp(&sb.total_dur).unwrap(),
+                3 => pct(sa).partial_cmp(&pct(sb)).unwrap(),
+                4 => avg(sa).partial_cmp(&avg(sb)).unwrap(),
+                5 => sa.median_dur.partial_cmp(&sb.median_dur).unwrap(),
+                6 => sa.max_dur.partial_cmp(&sb.max_dur).unwrap(),
+                _ => occ_limit(a).cmp(occ_limit(b)),
+            };
+            if sort_asc { ord } else { ord.reverse() }
+        });
+        eprintln!("  sort by Max via full match arm:  {:.2}ms", t3.elapsed().as_secs_f64() * 1000.0);
     }
 }
 
