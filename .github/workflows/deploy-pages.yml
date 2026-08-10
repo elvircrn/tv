@@ -1,0 +1,66 @@
+name: Deploy to GitHub Pages
+
+# Builds the single-threaded wasm build (scripts/serve-wasm.sh's toolchain,
+# just non-interactive) and publishes it to GitHub Pages. Not the
+# multi-threaded (`mt`) build: that needs Cross-Origin-Isolation headers for
+# SharedArrayBuffer, which GitHub Pages can't set — would need a
+# coi-serviceworker shim layered on top, left for later if wanted.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Reused rather than re-derived: same toolchain workaround
+      # scripts/wasm-env.sh documents and uses locally (Apple's clang has no
+      # wasm32 backend at all, which doesn't apply on Linux, but Homebrew's
+      # `llvm` + `wasi-libc` formulas are what wasm-env.sh's CXX/CXXFLAGS
+      # actually point at either way, and Homebrew runs on Linux too — this
+      # keeps CI on the exact same, already-verified toolchain instead of
+      # guessing at a differently-laid-out Linux equivalent).
+      - uses: Homebrew/actions/setup-homebrew@master
+
+      - name: Install LLVM + wasi-libc
+        run: brew install llvm wasi-libc
+
+      - name: Install trunk
+        run: |
+          curl -sL https://github.com/trunk-rs/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz | tar xz
+          sudo mv trunk /usr/local/bin/trunk
+
+      - name: Build
+        run: |
+          source scripts/wasm-env.sh
+          trunk build --release
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
