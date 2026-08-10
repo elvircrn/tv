@@ -3,6 +3,17 @@ use crate::types::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
+/// Interned name indices matching vLLM's per-generation `execute_context_*`
+/// wrapper span. Pulled out as a pure function so it's testable without
+/// spinning up the loader pipeline, and so `poll_loading` can compute it once
+/// per trace load instead of every toolbar frame.
+pub(crate) fn find_exec_context_names(names: &[String]) -> Vec<usize> {
+    names.iter().enumerate()
+        .filter(|(_, n)| n.contains("execute_context"))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 pub(crate) fn parse_rank(label: &str) -> Option<usize> {
     let l = label.trim_start();
     if l.starts_with("Rank ") {
@@ -39,6 +50,10 @@ pub struct Pane {
     pub even_spacing: bool,
     pub geom: PaneGeom,
     pub hidden_names: Vec<bool>,
+    /// Interned name indices matching "execute_context" — vLLM's per-generation
+    /// wrapper span. Computed once per trace load (see `poll_loading`), not
+    /// per toolbar frame, since it only depends on `trace.names`.
+    pub exec_context_names: Vec<usize>,
     pub pending_tab: Option<BottomTab>,
     /// Track index whose row draw_timeline should scroll into view as part of an
     /// in-flight search zoom. Consumed (cleared) on the next timeline draw.
@@ -53,6 +68,13 @@ pub struct Pane {
     /// (track_idx, event_idx) parallel to `sel_individual`, so the stats table
     /// can look up each row's raw args (e.g. CUDA occupancy-limiting factor).
     pub sel_individual_refs: Vec<(u32, u32)>,
+    /// Bumped every time `compute_aggregates` rebuilds `sel_agg_stats` /
+    /// `sel_individual`. `draw_stats_table` uses this to skip re-sorting on
+    /// redraws where the selection hasn't actually changed — the table
+    /// otherwise re-sorted unconditionally on every redraw (which fires on
+    /// every mouse-move event, not just clicks), measured at ~120ms for a
+    /// 1M-row selection even on a plain numeric column.
+    pub sel_generation: u64,
     pub track_order: Vec<usize>,
     pub auto_reload: bool,
     pub reload_paths: Vec<(usize, String)>,
@@ -90,6 +112,7 @@ impl Pane {
             even_spacing: false,
             geom: PaneGeom::default(),
             hidden_names: Vec::new(),
+            exec_context_names: Vec::new(),
             pending_tab: Some(BottomTab::Detail),
             pending_focus: None,
             sort_col: 2,
@@ -100,6 +123,7 @@ impl Pane {
             sel_agg_stats: Vec::new(),
             sel_individual: Vec::new(),
             sel_individual_refs: Vec::new(),
+            sel_generation: 0,
             track_order: Vec::new(),
             auto_reload: false,
             reload_paths: Vec::new(),
@@ -260,6 +284,12 @@ impl Pane {
                     self.hidden_names = vec![false; trace.names.len()];
                     self.trace = Some(trace);
                 }
+                // Computed once per load instead of every toolbar frame — the
+                // "Hide Execute Context" button's name list only ever needs
+                // this trace's `names`, which don't change until the next load.
+                self.exec_context_names = self.trace.as_ref()
+                    .map(|t| find_exec_context_names(&t.names))
+                    .unwrap_or_default();
             }
             Ok(Err(e)) => {
                 self.error = Some(e);
@@ -682,6 +712,7 @@ impl Pane {
     }
 
     fn compute_aggregates(&mut self) {
+        self.sel_generation = self.sel_generation.wrapping_add(1);
         let mut all_durs: Vec<f64> = self.selection_stats.iter().flat_map(|s| s.durations.iter().copied()).collect();
         all_durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let n = all_durs.len();

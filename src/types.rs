@@ -317,6 +317,13 @@ pub struct DrawBuf {
     pub heights: Vec<f32>,
     pub y_offsets: Vec<f32>,
     pub last_px: Vec<i32>,
+    /// (generation, sort_col, sort_asc, row count, is_individual_mode) from
+    /// the last time `sort_idx` was actually recomputed. `draw_stats_table`
+    /// reuses `sort_idx` as-is when this key is unchanged, since the table
+    /// resorts on every call (i.e. every redraw, which fires on every
+    /// mouse-move) and re-sorting unconditionally was measured to cost
+    /// ~120ms for a 1M-row selection even on a plain numeric column.
+    pub sort_cache_key: Option<(u64, usize, bool, usize, bool)>,
     pub fmt: String,
     pub sort_idx: Vec<usize>,
     pub sel_map: HashMap<u32, (u32, f64, Vec<f64>, Vec<(u32, u32)>)>,

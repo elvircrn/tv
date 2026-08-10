@@ -1,7 +1,7 @@
 use super::*;
 use crate::parse::*;
 use crate::loader::{load_trace, detect_rank_groups, merge_traces};
-use crate::state::parse_rank;
+use crate::state::{parse_rank, find_exec_context_names};
 use imgui::ImColor32;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
@@ -563,6 +563,15 @@ fn test_rank_summary() {
     assert_eq!(rank_summary("chrome_trace.json", -1, 0), "");
     // dcp shown when non-zero.
     assert_eq!(rank_summary("tp1_dcp2_ep0", -1, 0), "tp1 ep0 dcp2");
+}
+
+#[test]
+fn test_find_exec_context_names() {
+    let names: Vec<String> = ["", "foo", "execute_context_0(0)_generation_15(15)", "bar",
+        "execute_context_0(0)_generation_16(16)"]
+        .iter().map(|s| s.to_string()).collect();
+    assert_eq!(find_exec_context_names(&names), vec![2, 4]);
+    assert!(find_exec_context_names(&["foo".to_string(), "bar".to_string()]).is_empty());
 }
 
 #[test]
@@ -1507,6 +1516,34 @@ fn test_rebuild_multi_select_stats_aggregates_by_name() {
 }
 
 #[test]
+fn test_sel_generation_bumps_on_every_rebuild() {
+    // draw_stats_table's sort cache is keyed on this counter to avoid
+    // re-sorting on every redraw when the selection hasn't changed — it must
+    // advance on every real rebuild (so a genuinely new selection is never
+    // mistaken for a stale one) and never go backwards.
+    let trace = make_trace(
+        vec!["", "foo"],
+        vec![("GPU 0", true, vec![ev(0.0, 5.0, 1, 0), ev(10.0, 5.0, 1, 0)])],
+    );
+    let mut state = make_state(trace);
+    let pane = &mut state.panes[0];
+    assert_eq!(pane.sel_generation, 0);
+
+    pane.multi_select_name = Some(1);
+    pane.rebuild_multi_select_stats();
+    let g1 = pane.sel_generation;
+    assert!(g1 > 0);
+
+    pane.rebuild_multi_select_stats();
+    let g2 = pane.sel_generation;
+    assert!(g2 > g1, "a second rebuild must advance the generation again");
+
+    pane.selection = Some([0.0, 5.0, 0.0, 100.0]);
+    pane.rebuild_selection_stats(&mut state.buf);
+    assert!(state.panes[0].sel_generation > g2);
+}
+
+#[test]
 fn test_individual_stats_occupancy_limit_lookup() {
     use crate::ui::kernel_occ_limit;
 
@@ -1707,5 +1744,55 @@ fn bench_stats_sort_cost() {
         let cache: Vec<&str> = (0..n).map(occ_limit).collect();
         idx3.sort_by(|&a, &b| cache[a].cmp(cache[b]));
         eprintln!("  sort by Occ Limit (cached): {:.2}ms", t2.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_merge_gpu_collect_cost() {
+    // Profiling harness: measures collect_merged_track_events (the merged/
+    // Tetris-packed-view row builder that runs every redraw when "Merge
+    // Streams" is on) over every real GPU stream track in a trace, with
+    // execute_context wrapper spans visible vs. hidden. Its has_grandchild
+    // check scans forward from each surviving event to its own end, so a
+    // whole-generation-step wrapper (hundreds of ms, spanning thousands of
+    // descendants) is the worst case for that scan. Run with:
+    //   TV_BENCH_TRACE=/path/to/trace.json.gz cargo test --release -- --ignored --nocapture bench_merge_gpu_collect_cost
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("skipped: set TV_BENCH_TRACE"); return; }
+    };
+    let trace = load_trace(&path, &test_counter(), 0, None).unwrap();
+
+    let exec_names: std::collections::HashSet<u32> = trace.names.iter().enumerate()
+        .filter(|(_, n)| n.contains("execute_context"))
+        .map(|(i, _)| i as u32)
+        .collect();
+    eprintln!("names matching execute_context: {}", exec_names.len());
+
+    let mut hidden_none = vec![false; trace.names.len()];
+    let mut hidden_exec = vec![false; trace.names.len()];
+    for &n in &exec_names { hidden_exec[n as usize] = true; }
+    let _ = &mut hidden_none;
+
+    for (ti, track) in trace.tracks.iter().enumerate() {
+        if !track.gpu || track.events.len() < 1000 { continue; }
+        let n_exec_here = track.events.iter().filter(|e| exec_names.contains(&e.name)).count();
+        let mut out = Vec::new();
+        let t0 = std::time::Instant::now();
+        crate::ui::collect_merged_track_events(track, ti, trace.min_ts, trace.max_ts, &hidden_none, &mut out);
+        let visible_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let kept_visible = out.len();
+
+        out.clear();
+        let t1 = std::time::Instant::now();
+        crate::ui::collect_merged_track_events(track, ti, trace.min_ts, trace.max_ts, &hidden_exec, &mut out);
+        let hidden_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        let kept_hidden = out.len();
+
+        eprintln!(
+            "track {ti} ({} events, {n_exec_here} execute_context): visible={visible_ms:.2}ms (kept {kept_visible})  hidden={hidden_ms:.2}ms (kept {kept_hidden})",
+            track.events.len(),
+        );
     }
 }

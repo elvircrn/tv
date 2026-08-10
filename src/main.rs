@@ -687,21 +687,15 @@ impl App {
 
                         // vLLM traces emit a per-generation `execute_context_N(N)_generation_M(M)`
                         // span on every stream — one toggle hides/shows them all. Only shown
-                        // when the trace actually contains such names.
-                        let exec_names: Vec<usize> = match pane.trace.as_ref() {
-                            Some(trace) => trace.names.iter().enumerate()
-                                .filter(|(_, n)| n.contains("execute_context"))
-                                .map(|(i, _)| i)
-                                .collect(),
-                            None => Vec::new(),
-                        };
-                        if !exec_names.is_empty() {
-                            let all_hidden = exec_names.iter()
+                        // when the trace actually contains such names (computed once at load,
+                        // in `poll_loading`, not recomputed every toolbar frame).
+                        if !pane.exec_context_names.is_empty() {
+                            let all_hidden = pane.exec_context_names.iter()
                                 .all(|&i| pane.hidden_names.get(i).copied().unwrap_or(false));
                             ui.same_line_with_spacing(0.0, 10.0);
                             let label = if all_hidden { "Show Execute Context" } else { "Hide Execute Context" };
                             if ui.button(label) {
-                                for &i in &exec_names {
+                                for &i in &pane.exec_context_names {
                                     if let Some(h) = pane.hidden_names.get_mut(i) { *h = !all_hidden; }
                                 }
                                 if !pane.search.is_empty() { pane.rebuild_search(); }
@@ -922,9 +916,9 @@ impl App {
                                 draw_selection_histogram(&ui, trace, &pane.selection_stats, pane.sel_aggregate, &mut state.buf);
                                 ui.separator();
                                 if pane.sel_aggregate {
-                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, None, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
+                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, None, pane.sel_generation, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
                                 } else {
-                                    draw_stats_table(&ui, trace, &pane.sel_individual, Some(&pane.sel_individual_refs), &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
+                                    draw_stats_table(&ui, trace, &pane.sel_individual, Some(&pane.sel_individual_refs), pane.sel_generation, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
                                 }
                             } else {
                                 ui.text_colored([0.5, 0.5, 0.5, 1.0], "Shift+drag to select a time range");

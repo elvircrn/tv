@@ -208,6 +208,10 @@ pub fn draw_stats_table(
     // `None` in aggregate mode, where a row can span many launches and no
     // single limiting factor applies.
     event_refs: Option<&[(u32, u32)]>,
+    // Bumped by `compute_aggregates` whenever the selection is rebuilt; part
+    // of the sort cache key (see `DrawBuf::sort_cache_key`) so an unchanged
+    // selection doesn't get re-sorted every redraw.
+    generation: u64,
     search: &mut String,
     search_changed: &mut bool,
     sort_col: &mut usize,
@@ -294,37 +298,47 @@ pub fn draw_stats_table(
             None => ("", false),
         }
     };
-    // Sorting by Occ Limit naively (parsing each row's raw JSON args inside
-    // the O(n log n) comparator) measured at 140ms for just 15k rows — a
-    // guaranteed stall on every redraw while that column is sorted, since
-    // this table resorts on every call. Parse each row exactly once up front
-    // instead; row *rendering* below still looks values up lazily (bounded by
-    // the clipper to the visible rows, so it doesn't need the same fix).
-    let occ_limit_cache: Option<Vec<(&str, bool)>> = (*sort_col == 7)
-        .then(|| (0..stats.len()).map(occ_limit_uncached).collect());
-    let occ_limit = |si: usize| -> (&str, bool) {
-        match &occ_limit_cache {
-            Some(cache) => cache[si],
-            None => occ_limit_uncached(si),
-        }
-    };
-
-    buf.sort_idx.clear();
-    buf.sort_idx.extend(0..stats.len());
-    buf.sort_idx.sort_by(|&a, &b| {
-        let (sa, sb) = (&stats[a], &stats[b]);
-        let ord = match *sort_col {
-            0 => trace.names[sa.name as usize].cmp(&trace.names[sb.name as usize]),
-            1 => sa.count.cmp(&sb.count),
-            2 => sa.total_dur.partial_cmp(&sb.total_dur).unwrap(),
-            3 => pct(sa).partial_cmp(&pct(sb)).unwrap(),
-            4 => avg(sa).partial_cmp(&avg(sb)).unwrap(),
-            5 => sa.median_dur.partial_cmp(&sb.median_dur).unwrap(),
-            6 => sa.max_dur.partial_cmp(&sb.max_dur).unwrap(),
-            _ => occ_limit(a).0.cmp(occ_limit(b).0),
+    // This table resorts on every call — i.e. every redraw, which fires on
+    // every mouse-move, not just when the user actually changes the sort or
+    // the selection. Skip the O(n log n) sort_by entirely when nothing that
+    // could change the order has changed (measured ~120ms wasted per redraw
+    // on a 1M-row selection even for a plain numeric column).
+    let stats_is_individual = event_refs.is_some();
+    let cache_key = (generation, *sort_col, *sort_asc, stats.len(), stats_is_individual);
+    if buf.sort_cache_key != Some(cache_key) {
+        // Sorting by Occ Limit naively (parsing each row's raw JSON args
+        // inside the comparator) measured at 140ms for just 15k rows on its
+        // own. Parse each row exactly once up front instead, only when it's
+        // the active sort key; row *rendering* below still looks values up
+        // lazily (bounded by the clipper to the visible rows).
+        let occ_limit_sort_cache: Option<Vec<(&str, bool)>> = (*sort_col == 7)
+            .then(|| (0..stats.len()).map(occ_limit_uncached).collect());
+        let occ_limit_for_sort = |si: usize| -> (&str, bool) {
+            match &occ_limit_sort_cache {
+                Some(cache) => cache[si],
+                None => occ_limit_uncached(si),
+            }
         };
-        if *sort_asc { ord } else { ord.reverse() }
-    });
+
+        buf.sort_idx.clear();
+        buf.sort_idx.extend(0..stats.len());
+        buf.sort_idx.sort_by(|&a, &b| {
+            let (sa, sb) = (&stats[a], &stats[b]);
+            let ord = match *sort_col {
+                0 => trace.names[sa.name as usize].cmp(&trace.names[sb.name as usize]),
+                1 => sa.count.cmp(&sb.count),
+                2 => sa.total_dur.partial_cmp(&sb.total_dur).unwrap(),
+                3 => pct(sa).partial_cmp(&pct(sb)).unwrap(),
+                4 => avg(sa).partial_cmp(&avg(sb)).unwrap(),
+                5 => sa.median_dur.partial_cmp(&sb.median_dur).unwrap(),
+                6 => sa.max_dur.partial_cmp(&sb.max_dur).unwrap(),
+                _ => occ_limit_for_sort(a).0.cmp(occ_limit_for_sort(b).0),
+            };
+            if *sort_asc { ord } else { ord.reverse() }
+        });
+        buf.sort_cache_key = Some(cache_key);
+    }
+    let occ_limit = occ_limit_uncached;
 
     let row_h = ui.current_font_size() + ROW_PAD;
     let dl = ui.get_window_draw_list();
@@ -458,6 +472,40 @@ pub fn winit_to_imgui(code: KeyCode) -> Option<imgui::Key> {
     })
 }
 
+/// Collect one GPU stream track's events for the merged/Tetris-packed view:
+/// visible (not hidden by name) within the current time window, and not a
+/// "grandparent" wrapper (an event that itself has a child with a further
+/// child) — those would each claim their own tetris row while contributing
+/// no information beyond their descendants', so they're stripped. Appends
+/// (ts, dur, track_idx, event_idx) tuples to `out`.
+///
+/// The `has_grandchild` check scans forward from each surviving event to its
+/// own end (`take_while ts <= ev.ts + ev.dur`), so its cost scales with how
+/// many descendants fall inside that window — cheap for ordinary short
+/// kernels, but a whole-generation-step wrapper spanning hundreds of
+/// milliseconds forces a scan across everything nested under it. Hiding such
+/// a wrapper by name (see `hidden_names`) skips it before this scan runs.
+pub(crate) fn collect_merged_track_events(
+    gt: &Track,
+    ti: usize,
+    view_t0: f64,
+    view_t1: f64,
+    hidden_names: &[bool],
+    out: &mut Vec<(f64, f64, u32, u32)>,
+) {
+    let start = bisect_overlap(&gt.events, &gt.prefix_max_dur, view_t0);
+    let end = gt.events.partition_point(|e| e.ts <= view_t1);
+    for ei in start..end {
+        let ev = &gt.events[ei];
+        if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+        let has_grandchild = gt.events[ei + 1..].iter()
+            .take_while(|e2| e2.ts <= ev.ts + ev.dur)
+            .any(|e2| e2.depth > ev.depth + 1);
+        if has_grandchild { continue; }
+        out.push((ev.ts, ev.dur, ti as u32, ei as u32));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn draw_timeline(
     ui: &imgui::Ui,
@@ -577,22 +625,7 @@ pub fn draw_timeline(
                 let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
                 for &ti in &group_tracks {
                     let gt = &trace.tracks[ti];
-                    let start = bisect_overlap(&gt.events, &gt.prefix_max_dur, view.t0);
-                    let end = gt.events.partition_point(|e| e.ts <= view.t1);
-                    for ei in start..end {
-                        let ev = &gt.events[ei];
-                        if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
-                        // Keep leaf events and their direct parents; strip only
-                        // grandparent+ wrappers (e.g. whole-stream spans) that would
-                        // bloat the tetris packing. Leaf-only silently hid the
-                        // parent kernel blocks; keeping one level costs ~+0.15ms/build
-                        // at full zoom and does not increase the packed row depth.
-                        let has_grandchild = gt.events[ei + 1..].iter()
-                            .take_while(|e2| e2.ts <= ev.ts + ev.dur)
-                            .any(|e2| e2.depth > ev.depth + 1);
-                        if has_grandchild { continue; }
-                        ev_list.push((ev.ts, ev.dur, ti as u32, ei as u32));
-                    }
+                    collect_merged_track_events(gt, ti, view.t0, view.t1, hidden_names, &mut ev_list);
                 }
                 ev_list.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
                 let mut depth_ends: Vec<f64> = Vec::new();
