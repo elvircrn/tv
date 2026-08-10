@@ -79,18 +79,26 @@ impl WebGl2Renderer {
         let u_proj = gl.get_uniform_location(&program, "uProj").expect("uProj not found");
         let u_tex = gl.get_uniform_location(&program, "uTex");
 
-        // Font atlas: plain stb_truetype-rasterized default font (no
-        // filesystem access in the browser), same alpha gamma lift used on
-        // native to keep thin glyph edges from reading muddy on the dark
+        // Font atlas: imgui's bundled `DefaultFontData` is a tiny pixel font
+        // (ProggyClean) meant for a native-resolution, unscaled UI — it reads
+        // as blurry/blocky once stb_truetype rasterizes it at a real HiDPI
+        // pixel size. There's no filesystem to read a system font from in
+        // the browser (see renderer.rs's SF Mono read, native-only), so
+        // DejaVu Sans Mono is vendored instead (third-party/, Bitstream
+        // Vera/DejaVu license — explicitly redistributable, unlike Apple's
+        // SF Mono). Same oversampling/gamma-lift config as native's SF Mono
+        // setup to keep thin glyph edges from reading muddy on the dark
         // theme.
+        const FONT_TTF: &[u8] = include_bytes!("../third-party/DejaVuSansMono.ttf");
         let hidpi_size = (15.0 * scale_factor as f32).round();
-        imgui.fonts().add_font(&[FontSource::DefaultFontData {
+        imgui.fonts().add_font(&[FontSource::TtfData {
+            data: FONT_TTF,
+            size_pixels: hidpi_size,
             config: Some(imgui::FontConfig {
                 oversample_h: 3,
                 oversample_v: 1,
                 pixel_snap_h: true,
                 rasterizer_multiply: 1.5,
-                size_pixels: hidpi_size,
                 ..Default::default()
             }),
         }]);

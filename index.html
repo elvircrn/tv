@@ -7,7 +7,19 @@
     html, body { margin: 0; padding: 0; overflow: hidden; background: #161616; }
     canvas { display: block; outline: none; }
   </style>
-  <link data-trunk rel="rust" data-bin="tv" data-type="main" />
+  <!--
+    data-wasm-opt-params: `trunk build/serve --release` runs wasm-opt on the
+    output. Rust's wasm32-unknown-unknown target enables a few WebAssembly
+    feature proposals by default (nontrapping-fptoint, bulk-memory,
+    sign-ext, mutable-globals) that the cached wasm-opt binary doesn't
+    auto-detect from the module's own target_features section — without
+    this, `--release` fails validation ("all used features should be
+    allowed") on code as simple as an `as i32` float cast. Debug builds
+    (plain `trunk build`/`trunk serve`, no `--release`) don't run wasm-opt
+    at all, so they're unaffected either way.
+  -->
+  <link data-trunk rel="rust" data-bin="tv" data-type="main"
+        data-wasm-opt-params="--enable-nontrapping-float-to-int --enable-bulk-memory --enable-sign-ext --enable-mutable-globals" />
 </head>
 <body></body>
 </html>

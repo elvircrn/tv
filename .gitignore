@@ -1,5 +1,6 @@
 target/
 dist/
+dist-mt/
 fuzz/artifacts/
 fuzz/corpus/
 **/*.rs.bk
