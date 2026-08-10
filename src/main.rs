@@ -913,13 +913,23 @@ impl App {
                                 write_time(&mut state.buf.fmt, pane.sel_median);
                                 write!(state.buf.fmt, " median").unwrap();
                                 ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
+                                // Fine-grained timing (separate from the coarse "bottom"
+                                // mark! bucket) so a slow Selection tab shows exactly
+                                // which piece is responsible instead of one lump sum.
+                                let t_hist = Instant::now();
                                 draw_selection_histogram(&ui, trace, &pane.selection_stats, pane.sel_aggregate, &mut state.buf);
+                                let hist_ms = t_hist.elapsed().as_secs_f64() * 1000.0;
+                                if hist_ms > 10.0 { eprintln!("  histogram:{:.0} ({} entries)", hist_ms, pane.selection_stats.iter().map(|s| s.durations.len()).sum::<usize>()); }
                                 ui.separator();
+                                let t_tbl = Instant::now();
                                 if pane.sel_aggregate {
                                     draw_stats_table(&ui, trace, &pane.sel_agg_stats, None, pane.sel_generation, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
                                 } else {
                                     draw_stats_table(&ui, trace, &pane.sel_individual, Some(&pane.sel_individual_refs), pane.sel_generation, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
                                 }
+                                let tbl_ms = t_tbl.elapsed().as_secs_f64() * 1000.0;
+                                let tbl_rows = if pane.sel_aggregate { pane.sel_agg_stats.len() } else { pane.sel_individual.len() };
+                                if tbl_ms > 10.0 { eprintln!("  stats_table:{:.0} ({} rows, aggregate={})", tbl_ms, tbl_rows, pane.sel_aggregate); }
                             } else {
                                 ui.text_colored([0.5, 0.5, 0.5, 1.0], "Shift+drag to select a time range");
                                 draw_hidden_clear(&ui, 16.0, &mut pane.hidden_names, &mut state.buf.fmt);
