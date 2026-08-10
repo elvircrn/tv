@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Trace Viewer</title>
+  <style>
+    html, body { margin: 0; padding: 0; overflow: hidden; background: #161616; }
+    canvas { display: block; outline: none; }
+  </style>
+  <!--
+    data-wasm-opt-params: `trunk build/serve --release` runs wasm-opt on the
+    output. Rust's wasm32-unknown-unknown target enables a few WebAssembly
+    feature proposals by default (nontrapping-fptoint, bulk-memory,
+    sign-ext, mutable-globals) that the cached wasm-opt binary doesn't
+    auto-detect from the module's own target_features section — without
+    this, `--release` fails validation ("all used features should be
+    allowed") on code as simple as an `as i32` float cast. Debug builds
+    (plain `trunk build`/`trunk serve`, no `--release`) don't run wasm-opt
+    at all, so they're unaffected either way.
+  -->
+  
+<script type="module">
+import init, * as bindings from '/tv/tv-5217c048d402e52a.js';
+const wasm = await init({ module_or_path: '/tv/tv-5217c048d402e52a_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+<link rel="modulepreload" href="/tv/tv-5217c048d402e52a.js" crossorigin="anonymous" integrity="sha384-9nr7cKJLza86eYzUvJ5S0WCHL42opUdA9xGYGg1Ua7cpGXPmTv4s1cuNRHivAIcA"><link rel="preload" href="/tv/tv-5217c048d402e52a_bg.wasm" crossorigin="anonymous" integrity="sha384-oIeEo4fYzZcnWNtccnnKQ6pFsE63j5EswGIUHbhz6K+PFtuLZY4qE6YH0pCCgkCT" as="fetch" type="application/wasm"></head>
+<body></body>
+</html>
