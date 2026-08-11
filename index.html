@@ -5,7 +5,7 @@
   <title>Trace Viewer</title>
   <style>
     html, body { margin: 0; padding: 0; overflow: hidden; background: #161616; }
-    canvas { display: block; outline: none; }
+    canvas { display: block; outline: none; touch-action: none; }
   </style>
   <!--
     data-wasm-opt-params: `trunk build/serve --release` runs wasm-opt on the
@@ -20,8 +20,8 @@
   -->
   
 <script type="module">
-import init, * as bindings from '/tv/tv-d735f0d314207090.js';
-const wasm = await init({ module_or_path: '/tv/tv-d735f0d314207090_bg.wasm' });
+import init, * as bindings from '/tv/tv-e607c2ce5cabada4.js';
+const wasm = await init({ module_or_path: '/tv/tv-e607c2ce5cabada4_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -30,6 +30,6 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-<link rel="modulepreload" href="/tv/tv-d735f0d314207090.js" crossorigin="anonymous" integrity="sha384-wAWljIGffEvm3HcgG28EfZYSTvPb6FrDvWDrmZBEv3P1YA1piI229bWK/Zeelxq3"><link rel="preload" href="/tv/tv-d735f0d314207090_bg.wasm" crossorigin="anonymous" integrity="sha384-gRilcKDgJV4DrSfzQLJI8XN7FM1AHc9XBQEKdbA8NLQ+cJth/FHHaqxhjG0VtNJO" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/tv/tv-e607c2ce5cabada4.js" crossorigin="anonymous" integrity="sha384-IR11loG5eE0s5NGCMZsMulcR6bI69Wk8mGnDa2quje3/EiPE/cOjxGvM5rUr+PYM"><link rel="preload" href="/tv/tv-e607c2ce5cabada4_bg.wasm" crossorigin="anonymous" integrity="sha384-qea28bi7CB/YSs6WRFKybv16mT5AwkbUDIUbAl3C/W+G4TSoAw+fZo/pnaDYvd95" as="fetch" type="application/wasm"></head>
 <body></body>
 </html>
