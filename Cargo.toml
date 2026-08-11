@@ -81,6 +81,7 @@ web-sys = { version = "0.3", features = [
     "Clipboard", "ClipboardEvent", "DataTransferItem", "DataTransferItemList",
     "FileSystemEntry", "FileSystemDirectoryEntry", "FileSystemDirectoryReader", "FileSystemFileEntry",
     "Navigator", "Performance", "HtmlInputElement", "Window", "Document", "Element",
+    "Location", "UrlSearchParams", "Response",
 ] }
 
 [profile.dev-release]

@@ -120,6 +120,14 @@ struct App {
     // proxy pattern as the resize/drop workarounds) as if it had been typed.
     #[cfg(target_arch = "wasm32")]
     pending_paste: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    // Shareable-link loading: `?src=<url>` is fetched once at startup (see
+    // `resumed()`). A successful fetch's bytes go through the same
+    // `pending_web_files` queue a dropped file would; a failed fetch (bad
+    // URL, 404, CORS rejection) has nothing to hand `open_from_bytes`, so it
+    // needs its own slot to report the error back once the async fetch
+    // settles — same Rc<RefCell> + proxy-wake hop as `pending_paste`.
+    #[cfg(target_arch = "wasm32")]
+    pending_src_error: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
 impl App {
@@ -162,6 +170,8 @@ impl App {
             pending_web_files: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             #[cfg(target_arch = "wasm32")]
             pending_paste: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            #[cfg(target_arch = "wasm32")]
+            pending_src_error: std::rc::Rc::new(std::cell::RefCell::new(None)),
         }
     }
 }
@@ -247,6 +257,28 @@ async fn read_all_directory_entries(reader: &web_sys::FileSystemDirectoryReader)
         }
     }
     all
+}
+
+/// Fetches `url` and returns its response body as bytes — used for the
+/// `?src=<url>` shareable-link feature (see `resumed()`). `url` must serve
+/// permissive CORS headers (`Access-Control-Allow-Origin`) since this is a
+/// cross-origin `fetch()` from the page's own JS context; a gist raw URL or
+/// a repo's `raw.githubusercontent.com` file both do this by default.
+#[cfg(target_arch = "wasm32")]
+async fn fetch_bytes(win: &web_sys::Window, url: &str) -> Result<Vec<u8>, String> {
+    use wasm_bindgen::JsCast;
+    let resp_value = wasm_bindgen_futures::JsFuture::from(win.fetch_with_str(url))
+        .await
+        .map_err(|_| "network request failed (bad URL, CORS, or offline)".to_string())?;
+    let resp: web_sys::Response = resp_value.unchecked_into();
+    if !resp.ok() {
+        return Err(format!("server returned HTTP {}", resp.status()));
+    }
+    let buf_promise = resp.array_buffer().map_err(|_| "response has no body".to_string())?;
+    let buf_value = wasm_bindgen_futures::JsFuture::from(buf_promise)
+        .await
+        .map_err(|_| "failed reading response body".to_string())?;
+    Ok(js_sys::Uint8Array::new(&buf_value).to_vec())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -454,6 +486,42 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Shareable-link loading: a `?src=<url>` query param (e.g. a gist or
+        // repo raw-file URL — anything that serves permissive CORS headers)
+        // is fetched once at startup and dropped into the same
+        // `pending_web_files` queue a real file drop would use, so it's
+        // routed into a pane by the exact same code in `user_event` below.
+        // A failed fetch (bad URL, 404, CORS rejection) has no bytes to hand
+        // that queue, so it reports through `pending_src_error` instead.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(proxy) = self.event_loop_proxy.clone() {
+            if let Some(win) = web_sys::window() {
+                let search = win.location().search().unwrap_or_default();
+                let src = web_sys::UrlSearchParams::new_with_str(&search)
+                    .ok()
+                    .and_then(|p| p.get("src"));
+                if let Some(url) = src {
+                    let pending = self.pending_web_files.clone();
+                    let pending_err = self.pending_src_error.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match fetch_bytes(&win, &url).await {
+                            Ok(bytes) => {
+                                let name = url.rsplit('/').next()
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("shared-trace")
+                                    .to_string();
+                                pending.borrow_mut().push((name, bytes));
+                            }
+                            Err(e) => {
+                                *pending_err.borrow_mut() = Some(format!("?src= link failed to load: {e}"));
+                            }
+                        }
+                        let _ = proxy.send_event(());
+                    });
+                }
+            }
+        }
+
         let mut imgui = imgui::Context::create();
         imgui.io_mut().config_mac_os_behaviors = true;
         #[cfg(not(target_arch = "wasm32"))]
@@ -559,6 +627,13 @@ impl ApplicationHandler for App {
                     }
                 }
             }
+            if let Some(w) = &self.window { w.request_redraw(); }
+        }
+
+        if let Some(msg) = self.pending_src_error.borrow_mut().take() {
+            let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
+            let target = empty.unwrap_or(self.state.active);
+            self.state.panes[target].error = Some(msg);
             if let Some(w) = &self.window { w.request_redraw(); }
         }
     }
