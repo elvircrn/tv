@@ -34,6 +34,10 @@ core-graphics-types = "0.2"
 flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
 libdeflater = "1"
 memmap2 = "0.9"
+# Used only by loader::export_gpu_only's .tvcache.xz output — measured
+# directly against a real 87MB args blob: xz gets ~265x vs gzip's ~65x
+# (see that function's doc comment), which is why this isn't flate2/gzip.
+xz2 = "0.1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Plain imgui-sys (stb_truetype rasterizer, no freetype) — freetype needs a

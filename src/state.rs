@@ -206,7 +206,7 @@ impl Pane {
             }
         };
 
-        let out_path = parent.join(format!("{stem}-gpu-only")).join("gpu-only.tvcache");
+        let out_path = parent.join(format!("{stem}-gpu-only")).join("gpu-only.tvcache.xz");
         let out_str = out_path.to_str().ok_or_else(|| "non-UTF-8 destination path".to_string())?;
         crate::loader::export_gpu_only(trace, out_str)?;
         Ok(out_path.to_string_lossy().into_owned())
