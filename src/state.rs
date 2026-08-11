@@ -123,6 +123,20 @@ pub struct Pane {
     /// error) — shown next to the button until the next click replaces it.
     #[cfg(not(target_arch = "wasm32"))]
     pub export_message: Option<(bool, String)>,
+    /// Background `gh`/`git`-based gist upload started by "Share via Gist"
+    /// (see `start_share_upload`) — `None` once no upload is in flight.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub share_link_job: Option<mpsc::Receiver<Result<String, String>>>,
+    /// Result of the last "Share via Gist" click (the finished `?gist=`
+    /// link, or an error) — shown next to the button until replaced.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub share_link_result: Option<(bool, String)>,
+    /// "Include CPU data" checkbox next to "Share via Gist" — persisted
+    /// across frames like any other UI toggle. When set, uploads the whole
+    /// trace (`export_full_web`) instead of the GPU-only, args-stripped
+    /// default (`export_gpu_only_web`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub share_include_cpu: bool,
 }
 
 impl Pane {
@@ -175,6 +189,12 @@ impl Pane {
             loading_events: Arc::new(AtomicUsize::new(0)),
             #[cfg(not(target_arch = "wasm32"))]
             export_message: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            share_link_job: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            share_link_result: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            share_include_cpu: false,
         }
     }
 
@@ -212,18 +232,16 @@ impl Pane {
         Ok(out_path.to_string_lossy().into_owned())
     }
 
-    /// Same as `export_gpu_only`, but via `loader::export_gpu_only_web`
-    /// (plain layout, gzip instead of xz) so the result can be uploaded
-    /// somewhere with permissive CORS and opened through the web build's
-    /// `?src=<url>` shareable-link loader, which has no LZMA decoder and
-    /// can't reverse `export_gpu_only`'s columnar/kernel-grouped encoding.
+    /// Sibling-folder naming shared by `export_gpu_only_web`/`export_full_web`:
+    /// derived from the source path (or the merge directory's own name for a
+    /// multi-rank trace, since `reload_paths` for those points at individual
+    /// rank files, not the folder the user actually opened).
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn export_gpu_only_web(&self) -> Result<String, String> {
-        let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;
+    fn export_web_paths(&self) -> Result<(std::path::PathBuf, String), String> {
         let sample_path = self.reload_paths.first().map(|(_, p)| p.as_str())
             .ok_or_else(|| "no source file path available for this trace".to_string())?;
         let base = std::path::Path::new(sample_path);
-        let parent = base.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let parent = base.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
 
         let stem = match &self.reload_dir {
             Some(dir) => std::path::Path::new(dir).file_name()
@@ -233,11 +251,80 @@ impl Pane {
                 s.strip_suffix(".json").or_else(|| s.strip_suffix(".tar")).unwrap_or(s).to_string()
             }
         };
+        Ok((parent, stem))
+    }
 
+    /// Same as `export_gpu_only`, but via `loader::export_gpu_only_web`
+    /// (plain layout, gzip instead of xz) so the result can be uploaded
+    /// somewhere with permissive CORS and opened through the web build's
+    /// `?src=<url>` shareable-link loader, which has no LZMA decoder and
+    /// can't reverse `export_gpu_only`'s columnar/kernel-grouped encoding.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn export_gpu_only_web(&self) -> Result<String, String> {
+        let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;
+        let (parent, stem) = self.export_web_paths()?;
         let out_path = parent.join(format!("{stem}-gpu-only")).join("gpu-only-web.tvcache.gz");
         let out_str = out_path.to_str().ok_or_else(|| "non-UTF-8 destination path".to_string())?;
         crate::loader::export_gpu_only_web(trace, out_str)?;
         Ok(out_path.to_string_lossy().into_owned())
+    }
+
+    /// Exports the whole trace (CPU and GPU tracks, args left intact — see
+    /// `loader::export_full_web`) rather than `export_gpu_only_web`'s
+    /// deliberately stripped-down version. Much larger, but complete —
+    /// for when you want to share the actual trace, not just GPU timings.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn export_full_web(&self) -> Result<String, String> {
+        let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;
+        let (parent, stem) = self.export_web_paths()?;
+        let out_path = parent.join(format!("{stem}-full-export")).join("full-trace.tvcache");
+        let out_str = out_path.to_str().ok_or_else(|| "non-UTF-8 destination path".to_string())?;
+        crate::loader::export_full_web(trace, out_str)?;
+        Ok(out_path.to_string_lossy().into_owned())
+    }
+
+    /// Exports (via `export_gpu_only_web`, or `export_full_web` when
+    /// `include_cpu` is set) and, on a background thread, uploads the
+    /// result to a new secret GitHub gist through the locally authenticated
+    /// `gh` CLI — no browser OAuth flow or pasted token involved, since
+    /// this only runs on native where `gh`'s own stored credentials are
+    /// already available. The export itself is fast (local disk only) and
+    /// stays synchronous; only the network upload (`loader::upload_gist`)
+    /// is backgrounded, since that can take a few seconds and shouldn't
+    /// freeze the UI.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start_share_upload(&mut self, include_cpu: bool) {
+        if self.share_link_job.is_some() { return; }
+        let path = match if include_cpu { self.export_full_web() } else { self.export_gpu_only_web() } {
+            Ok(p) => p,
+            Err(e) => { self.share_link_result = Some((false, e)); return; }
+        };
+        let (tx, rx) = mpsc::channel();
+        self.share_link_job = Some(rx);
+        self.share_link_result = Some((true, "Uploading to gist...".to_string()));
+        rayon::spawn(move || {
+            let _ = tx.send(crate::loader::upload_gist(&path));
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn poll_share_upload(&mut self) {
+        let rx = match &self.share_link_job {
+            Some(rx) => rx,
+            None => return,
+        };
+        match rx.try_recv() {
+            Ok(Ok(link)) => {
+                self.share_link_result = Some((true, link));
+                self.share_link_job = None;
+            }
+            Ok(Err(e)) => {
+                self.share_link_result = Some((false, e));
+                self.share_link_job = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => { self.share_link_job = None; }
+        }
     }
 
     pub fn loading_progress_text(&self) -> String {

@@ -1101,7 +1101,11 @@ impl App {
             }
         }
 
-        for p in &mut self.state.panes { p.poll_loading(); }
+        for p in &mut self.state.panes {
+            p.poll_loading();
+            #[cfg(not(target_arch = "wasm32"))]
+            p.poll_share_upload();
+        }
 
         let scroll = self.scroll_accum;
         self.scroll_accum = [0.0; 2];
@@ -1416,6 +1420,42 @@ impl App {
                                 let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
                                 ui.align_text_to_frame_padding();
                                 ui.text_colored(color, msg);
+                            }
+                            ui.same_line_with_spacing(0.0, 8.0);
+                            let uploading = pane.share_link_job.is_some();
+                            let include_cpu = pane.share_include_cpu;
+                            ui.disabled(uploading, || {
+                                if ui.button("Share via Gist") {
+                                    pane.start_share_upload(include_cpu);
+                                }
+                            });
+                            if ui.is_item_hovered() {
+                                let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "Export GPU (web)" };
+                                ui.tooltip_text(&format!("Export {what}, then upload it to a new secret GitHub gist via your locally logged-in `gh` CLI, and show a copyable ?gist= link — no browser login or pasted token, but it does need `gh auth login` already done on this machine"));
+                            }
+                            ui.same_line_with_spacing(0.0, 8.0);
+                            ui.checkbox("Include CPU data##sharecpu", &mut pane.share_include_cpu);
+                            if ui.is_item_hovered() {
+                                ui.tooltip_text("Upload the whole trace (all CPU and GPU tracks, args left intact, not stripped) instead of just GPU-only timings — much larger, but complete");
+                            }
+                            match &pane.share_link_result {
+                                Some((true, link)) if link.starts_with("https://") => {
+                                    ui.same_line_with_spacing(0.0, 8.0);
+                                    ui.align_text_to_frame_padding();
+                                    ui.text_colored([0.4, 0.85, 0.4, 1.0], link);
+                                    ui.same_line_with_spacing(0.0, 8.0);
+                                    if ui.small_button("Copy##sharelink") {
+                                        #[cfg(not(target_arch = "wasm32"))]
+                                        MacClipboard.set(link);
+                                    }
+                                }
+                                Some((ok, msg)) => {
+                                    ui.same_line_with_spacing(0.0, 8.0);
+                                    let color = if *ok { [0.8, 0.8, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
+                                    ui.align_text_to_frame_padding();
+                                    ui.text_colored(color, msg);
+                                }
+                                None => {}
                             }
                         }
                         if pi == 0 {

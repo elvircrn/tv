@@ -1446,6 +1446,192 @@ pub fn export_gpu_only_web(trace: &Trace, dest_path: &str) -> Result<(), String>
     Ok(())
 }
 
+/// Exports the *entire* trace — every track (CPU and GPU) with args left
+/// completely intact — as a wasm-loadable `.tvcache`, unlike
+/// `export_gpu_only_web`'s deliberately stripped-down (GPU tracks only, no
+/// args at all) sibling. "Args intact" doesn't mean skipping the
+/// python_function synth-args compaction `save_cache` already uses for the
+/// main cache: that encoding is fully lossless (verified byte-for-byte
+/// elsewhere in this file) and dramatically smaller, so there's no reason
+/// not to use it here too — it's not "scrubbing," every original arg value
+/// is still recoverable exactly. Reuses the same on-disk layout `save_cache`
+/// writes (so the ordinary `load_cache_from_bytes` path reads it back with
+/// no special-casing) and the same zstd wrapping, which is why this needs
+/// no new wasm-side support: `load_trace_from_bytes_progressive`'s
+/// `.tvcache` branch already knows how to decompress it via `ruzstd`.
+/// `source_size`/`source_mtime` are written as 0 (there's no live source
+/// file to freshness-check an export against, same as `export_gpu_only`).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn export_full_web(trace: &Trace, dest_path: &str) -> Result<(), String> {
+    let dest = std::path::Path::new(dest_path);
+    let dir = dest.parent().ok_or_else(|| "invalid destination path".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create dir: {e}"))?;
+    let io_err = |e: std::io::Error| e.to_string();
+    let mut w: Vec<u8> = Vec::new();
+
+    let total_events: u64 = trace.tracks.iter().map(|t| t.events.len() as u64).sum();
+    let orig_args_buf = trace.raw_bufs.first().map(|b| &b[..]).unwrap_or(&[]);
+    let (args_buf, modified_events, synth_template, synth_records) =
+        build_synth_and_compact_args(&trace.tracks, orig_args_buf);
+
+    w.write_all(CACHE_MAGIC).map_err(io_err)?;
+    write_u32(&mut w, CACHE_VERSION);
+    write_u64(&mut w, 0);
+    write_u64(&mut w, 0);
+    write_f64(&mut w, trace.max_ts);
+    write_f64(&mut w, trace.min_ts);
+    write_u64(&mut w, total_events);
+    write_u32(&mut w, trace.tracks.len() as u32);
+    write_u32(&mut w, trace.names.len() as u32);
+    write_u32(&mut w, trace.cats.len() as u32);
+    write_u32(&mut w, trace.stats.len() as u32);
+    write_u32(&mut w, trace.device.len() as u32);
+    write_u64(&mut w, args_buf.len() as u64);
+    write_u32(&mut w, 0);
+
+    let mut written = 80usize;
+    write_strings(&mut w, &trace.names);
+    written += trace.names.iter().map(|s| 4 + s.len()).sum::<usize>();
+    write_strings(&mut w, &trace.cats);
+    written += trace.cats.iter().map(|s| 4 + s.len()).sum::<usize>();
+    write_u32(&mut w, trace.device.len() as u32);
+    w.write_all(trace.device.as_bytes()).map_err(io_err)?;
+    written += 4 + trace.device.len();
+
+    for t in &trace.tracks {
+        let label = t.label.as_bytes();
+        let mut hdr = [0u8; 13];
+        hdr[0..2].copy_from_slice(&(label.len() as u16).to_le_bytes());
+        hdr[2] = t.gpu as u8;
+        hdr[3..5].copy_from_slice(&t.max_depth.to_le_bytes());
+        hdr[5..13].copy_from_slice(&(t.events.len() as u64).to_le_bytes());
+        w.write_all(&hdr).map_err(io_err)?;
+        w.write_all(label).map_err(io_err)?;
+        written += 13 + label.len();
+    }
+
+    pad_to_8(&mut w, written);
+
+    for events in &modified_events {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(events.as_ptr() as *const u8, events.len() * std::mem::size_of::<Event>())
+        };
+        w.write_all(bytes).map_err(io_err)?;
+    }
+    for t in &trace.tracks {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(t.prefix_max_dur.as_ptr() as *const u8, t.prefix_max_dur.len() * 8)
+        };
+        w.write_all(bytes).map_err(io_err)?;
+    }
+    let stats_bytes = unsafe {
+        std::slice::from_raw_parts(trace.stats.as_ptr() as *const u8, trace.stats.len() * std::mem::size_of::<KernelStats>())
+    };
+    w.write_all(stats_bytes).map_err(io_err)?;
+    w.write_all(&args_buf).map_err(io_err)?;
+
+    write_u32(&mut w, trace.flow_pairs.len() as u32);
+    if !trace.flow_pairs.is_empty() {
+        let flow_bytes = unsafe {
+            std::slice::from_raw_parts(trace.flow_pairs.as_ptr() as *const u8, trace.flow_pairs.len() * std::mem::size_of::<FlowPair>())
+        };
+        w.write_all(flow_bytes).map_err(io_err)?;
+    }
+
+    write_u32(&mut w, trace.vllm_version.len() as u32);
+    w.write_all(trace.vllm_version.as_bytes()).map_err(io_err)?;
+    write_u32(&mut w, trace.dist_rank as u32);
+    write_u32(&mut w, trace.dist_world as u32);
+    write_synth_python_trailer(&mut w, &synth_template, &synth_records);
+
+    let compressed = maybe_compress_cache(w);
+    let tmp = format!("{dest_path}.tmp");
+    std::fs::write(&tmp, &compressed).map_err(|e| format!("write: {e}"))?;
+    std::fs::rename(&tmp, dest).map_err(|e| format!("rename: {e}"))?;
+    Ok(())
+}
+
+/// Uploads `file_path` (an `export_gpu_only_web` or `export_full_web`
+/// output) to a new secret GitHub gist via the locally authenticated `gh`
+/// CLI, and returns a
+/// `?gist=<id>` shareable link for this app's own live site. Deliberately
+/// shells out rather than calling GitHub's API directly: `gh` already has
+/// the user's credentials configured (`gh auth login`), so this needs no
+/// browser OAuth flow or pasted personal access token — the credential
+/// never passes through this app at all.
+///
+/// `gh gist create` refuses binary content outright (it checks for valid
+/// UTF-8 client-side before ever making a request, and a gzip-compressed
+/// file reliably isn't), so this creates an empty placeholder gist through
+/// that command first — trivially valid as plain text — then clones it as
+/// the ordinary git repository every gist actually is under the hood and
+/// pushes the real binary bytes via `git`, which never cares about
+/// encoding. Requires `gh auth setup-git` to have registered a git
+/// credential helper for gist.github.com; this runs it defensively (a
+/// harmless no-op if already done) before attempting the clone.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn upload_gist(file_path: &str) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+
+    fn run(cmd: &mut Command) -> Result<std::process::Output, String> {
+        let program = cmd.get_program().to_string_lossy().into_owned();
+        cmd.output().map_err(|e| format!("failed to run {program}: {e}"))
+    }
+
+    fn run_ok(cmd: &mut Command) -> Result<(), String> {
+        let program = cmd.get_program().to_string_lossy().into_owned();
+        let out = run(cmd)?;
+        if !out.status.success() {
+            return Err(format!("{program} failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(())
+    }
+
+    let file_name = std::path::Path::new(file_path).file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "invalid export file path".to_string())?
+        .to_string();
+
+    let mut create = Command::new("gh");
+    create.args(["gist", "create", "--desc", "trace-viewer GPU export (shared)", "-f", "placeholder.txt", "-"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = create.spawn().map_err(|e| format!("failed to run gh (is it installed?): {e}"))?;
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(b"placeholder\n").map_err(|e| format!("gh stdin: {e}"))?;
+    }
+    let create_out = child.wait_with_output().map_err(|e| format!("gh gist create: {e}"))?;
+    if !create_out.status.success() {
+        return Err(format!("gh gist create failed: {}", String::from_utf8_lossy(&create_out.stderr).trim()));
+    }
+    let gist_url = String::from_utf8_lossy(&create_out.stdout).trim().to_string();
+    let gist_id = gist_url.rsplit('/').next()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("couldn't parse gist id from gh output: {gist_url:?}"))?
+        .to_string();
+
+    run(&mut Command::new("gh").args(["auth", "setup-git"])).ok();
+
+    let tmp_dir = std::env::temp_dir().join(format!("tv-gist-upload-{gist_id}"));
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create temp dir: {e}"))?;
+
+    let result: Result<(), String> = (|| {
+        run_ok(Command::new("git")
+            .args(["clone", &format!("https://gist.github.com/{gist_id}.git"), "."])
+            .current_dir(&tmp_dir))?;
+        std::fs::copy(file_path, tmp_dir.join(&file_name)).map_err(|e| format!("copy export into gist checkout: {e}"))?;
+        std::fs::remove_file(tmp_dir.join("placeholder.txt")).ok();
+        run_ok(Command::new("git").args(["add", "-A"]).current_dir(&tmp_dir))?;
+        run_ok(Command::new("git").args(["commit", "-q", "-m", "Add GPU export"]).current_dir(&tmp_dir))?;
+        run_ok(Command::new("git").args(["push", "-q"]).current_dir(&tmp_dir))?;
+        Ok(())
+    })();
+    std::fs::remove_dir_all(&tmp_dir).ok();
+    result?;
+
+    Ok(format!("https://elvircrn.github.io/tv/?gist={gist_id}"))
+}
+
 pub fn save_cache(trace: &Trace, source_path: &str, cache_dir: Option<&str>) {
     if source_path.is_empty() { return; }
     let cp = cache_path(source_path, cache_dir);
