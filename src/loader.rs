@@ -1032,6 +1032,122 @@ pub fn export_gpu_only(trace: &Trace, dest_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Same GPU-only, args-stripped filtering as `export_gpu_only`, but written
+/// in the plain interleaved-AoS layout `load_cache_from_bytes` already
+/// understands natively, then gzip- (not xz-) compressed, as `.tvcache.gz`.
+/// Exists solely for sharing: the wasm build's `?src=<url>` loader has no
+/// LZMA decoder and can't reverse `export_gpu_only`'s columnar/kernel-
+/// grouped encoding, so a `.tvcache.xz` export can't be opened over the
+/// web. gzip (`flate2`) and this plain layout both already work unchanged
+/// on both platforms, at the cost of a several-times-larger file than
+/// `export_gpu_only` produces (no columnar/precision/grouping tricks, and
+/// gzip's smaller window loses to xz) — the right tradeoff for a one-off
+/// shared link over a local re-import.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn export_gpu_only_web(trace: &Trace, dest_path: &str) -> Result<(), String> {
+    let gpu_tracks: Vec<Track> = trace.tracks.iter()
+        .filter(|t| t.gpu)
+        .map(|t| Track {
+            label: t.label.clone(),
+            gpu: true,
+            events: t.events.iter().map(|e| Event { args_off: 0, args_len: 0, ..*e }).collect(),
+            max_depth: t.max_depth,
+            prefix_max_dur: t.prefix_max_dur.clone(),
+            raw_buf_idx: 0,
+        })
+        .collect();
+    if gpu_tracks.is_empty() {
+        return Err("this trace has no GPU tracks".to_string());
+    }
+
+    let total_events: u64 = gpu_tracks.iter().map(|t| t.events.len() as u64).sum();
+    let (mut min_ts, mut max_ts) = (f64::MAX, f64::MIN);
+    for t in &gpu_tracks {
+        for e in &t.events {
+            min_ts = min_ts.min(e.ts);
+            max_ts = max_ts.max(e.ts + e.dur);
+        }
+    }
+
+    let dest = std::path::Path::new(dest_path);
+    let dir = dest.parent().ok_or_else(|| "invalid destination path".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create dir: {e}"))?;
+    let io_err = |e: std::io::Error| e.to_string();
+    let mut w: Vec<u8> = Vec::new();
+
+    w.write_all(CACHE_MAGIC).map_err(io_err)?;
+    write_u32(&mut w, CACHE_VERSION);
+    write_u64(&mut w, 0);
+    write_u64(&mut w, 0);
+    write_f64(&mut w, max_ts);
+    write_f64(&mut w, min_ts);
+    write_u64(&mut w, total_events);
+    write_u32(&mut w, gpu_tracks.len() as u32);
+    write_u32(&mut w, trace.names.len() as u32);
+    write_u32(&mut w, trace.cats.len() as u32);
+    write_u32(&mut w, 0);
+    write_u32(&mut w, trace.device.len() as u32);
+    write_u64(&mut w, 0);
+    write_u32(&mut w, 0);
+
+    let mut written = 80usize;
+    write_strings(&mut w, &trace.names);
+    written += trace.names.iter().map(|s| 4 + s.len()).sum::<usize>();
+    write_strings(&mut w, &trace.cats);
+    written += trace.cats.iter().map(|s| 4 + s.len()).sum::<usize>();
+    write_u32(&mut w, trace.device.len() as u32);
+    w.write_all(trace.device.as_bytes()).map_err(io_err)?;
+    written += 4 + trace.device.len();
+
+    for t in &gpu_tracks {
+        let label = t.label.as_bytes();
+        let mut hdr = [0u8; 13];
+        hdr[0..2].copy_from_slice(&(label.len() as u16).to_le_bytes());
+        hdr[2] = 1; // gpu
+        hdr[3..5].copy_from_slice(&t.max_depth.to_le_bytes());
+        hdr[5..13].copy_from_slice(&(t.events.len() as u64).to_le_bytes());
+        w.write_all(&hdr).map_err(io_err)?;
+        w.write_all(label).map_err(io_err)?;
+        written += 13 + label.len();
+    }
+
+    pad_to_8(&mut w, written);
+
+    for t in &gpu_tracks {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                t.events.as_ptr() as *const u8,
+                t.events.len() * std::mem::size_of::<Event>(),
+            )
+        };
+        w.write_all(bytes).map_err(io_err)?;
+    }
+    for t in &gpu_tracks {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                t.prefix_max_dur.as_ptr() as *const u8,
+                t.prefix_max_dur.len() * 8,
+            )
+        };
+        w.write_all(bytes).map_err(io_err)?;
+    }
+    write_u32(&mut w, 0); // no flow pairs
+
+    write_u32(&mut w, trace.vllm_version.len() as u32);
+    w.write_all(trace.vllm_version.as_bytes()).map_err(io_err)?;
+    write_u32(&mut w, trace.dist_rank as u32);
+    write_u32(&mut w, trace.dist_world as u32);
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&w).map_err(io_err)?;
+    let compressed = encoder.finish().map_err(io_err)?;
+
+    let tmp = format!("{dest_path}.tmp");
+    std::fs::write(&tmp, &compressed).map_err(|e| format!("write: {e}"))?;
+    std::fs::rename(&tmp, dest).map_err(|e| format!("rename: {e}"))?;
+    Ok(())
+}
+
 pub fn save_cache(trace: &Trace, source_path: &str, cache_dir: Option<&str>) {
     if source_path.is_empty() { return; }
     let cp = cache_path(source_path, cache_dir);
@@ -1631,6 +1747,18 @@ fn load_cache_xz(cache_path: &str) -> Option<Trace> {
     load_cache_from_bytes(&expanded)
 }
 
+/// Reads an `export_gpu_only_web` output (`.tvcache.gz`) — plain standard
+/// AoS layout under gzip, so unlike `load_cache_xz` this needs no inverse
+/// transform before `load_cache_from_bytes`.
+#[cfg(not(target_arch = "wasm32"))]
+fn load_cache_gz(cache_path: &str) -> Option<Trace> {
+    let file = std::fs::File::open(cache_path).ok()?;
+    let mut decoder = flate2::read::GzDecoder::new(BufReader::new(file));
+    let mut buf = Vec::new();
+    decoder.read_to_end(&mut buf).ok()?;
+    load_cache_from_bytes(&buf)
+}
+
 fn merged_cache_hash(cache_dir: &str) -> u64 {
     let mut entries: Vec<(String, u64)> = Vec::new();
     if let Ok(dir) = std::fs::read_dir(cache_dir) {
@@ -1798,6 +1926,12 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
             .ok_or_else(|| "invalid or corrupt .tvcache.xz file".to_string())
             .inspect(|t| eprintln!("  cache (xz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events));
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if path.ends_with(".tvcache.gz") {
+        return load_cache_gz(path)
+            .ok_or_else(|| "invalid or corrupt .tvcache.gz file".to_string())
+            .inspect(|t| eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events));
+    }
     if path.ends_with(".tvcache") {
         return load_cache_direct(path)
             .ok_or_else(|| "invalid or corrupt .tvcache file".to_string())
@@ -1873,6 +2007,17 @@ pub fn load_trace_progressive(
         }
         return;
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    if path.ends_with(".tvcache.gz") {
+        match load_cache_gz(path) {
+            Some(trace) => {
+                eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                let _ = tx.send(Ok(trace));
+            }
+            None => { let _ = tx.send(Err("invalid or corrupt .tvcache.gz file".into())); }
+        }
+        return;
+    }
     if path.ends_with(".tvcache") {
         match load_cache_direct(path) {
             Some(trace) => {
@@ -1903,7 +2048,7 @@ pub fn load_trace_progressive(
 pub(crate) fn is_trace_file(name: &str) -> bool {
     name.ends_with(".json") || name.ends_with(".json.gz")
         || name.ends_with(".tar.gz") || name.ends_with(".tgz")
-        || name.ends_with(".tvcache") || name.ends_with(".tvcache.xz")
+        || name.ends_with(".tvcache") || name.ends_with(".tvcache.xz") || name.ends_with(".tvcache.gz")
 }
 
 fn expand_dirs(paths: &[String]) -> Vec<String> {
@@ -2344,6 +2489,18 @@ pub fn load_trace_from_bytes_progressive(
 ) {
     let t0 = Instant::now();
 
+    if name.ends_with(".tvcache.gz") {
+        let mut decoder = flate2::read::GzDecoder::new(&raw_input[..]);
+        let mut buf = Vec::new();
+        match decoder.read_to_end(&mut buf).ok().and_then(|_| load_cache_from_bytes(&buf)) {
+            Some(trace) => {
+                eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                let _ = tx.send(Ok(trace));
+            }
+            None => { let _ = tx.send(Err(format!("{name}: invalid or corrupt .tvcache.gz file"))); }
+        }
+        return;
+    }
     if name.ends_with(".tvcache") {
         match load_cache_from_bytes(&raw_input) {
             Some(trace) => {

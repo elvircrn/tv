@@ -212,6 +212,34 @@ impl Pane {
         Ok(out_path.to_string_lossy().into_owned())
     }
 
+    /// Same as `export_gpu_only`, but via `loader::export_gpu_only_web`
+    /// (plain layout, gzip instead of xz) so the result can be uploaded
+    /// somewhere with permissive CORS and opened through the web build's
+    /// `?src=<url>` shareable-link loader, which has no LZMA decoder and
+    /// can't reverse `export_gpu_only`'s columnar/kernel-grouped encoding.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn export_gpu_only_web(&self) -> Result<String, String> {
+        let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;
+        let sample_path = self.reload_paths.first().map(|(_, p)| p.as_str())
+            .ok_or_else(|| "no source file path available for this trace".to_string())?;
+        let base = std::path::Path::new(sample_path);
+        let parent = base.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+        let stem = match &self.reload_dir {
+            Some(dir) => std::path::Path::new(dir).file_name()
+                .and_then(|s| s.to_str()).unwrap_or("trace").to_string(),
+            None => {
+                let s = base.file_stem().and_then(|s| s.to_str()).unwrap_or("trace");
+                s.strip_suffix(".json").or_else(|| s.strip_suffix(".tar")).unwrap_or(s).to_string()
+            }
+        };
+
+        let out_path = parent.join(format!("{stem}-gpu-only")).join("gpu-only-web.tvcache.gz");
+        let out_str = out_path.to_str().ok_or_else(|| "non-UTF-8 destination path".to_string())?;
+        crate::loader::export_gpu_only_web(trace, out_str)?;
+        Ok(out_path.to_string_lossy().into_owned())
+    }
+
     pub fn loading_progress_text(&self) -> String {
         let n = self.loading_events.load(Ordering::Relaxed);
         if n == 0 {

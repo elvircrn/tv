@@ -1177,6 +1177,16 @@ impl App {
                             if ui.is_item_hovered() {
                                 ui.tooltip_text("Export GPU-only timings (no args) to a sibling folder");
                             }
+                            ui.same_line_with_spacing(0.0, 8.0);
+                            if ui.button("Export GPU (web)") {
+                                pane.export_message = Some(match pane.export_gpu_only_web() {
+                                    Ok(path) => (true, format!("Exported to {path}")),
+                                    Err(e) => (false, format!("Export failed: {e}")),
+                                });
+                            }
+                            if ui.is_item_hovered() {
+                                ui.tooltip_text("Same, but gzip instead of xz — larger file, but openable via the web build's ?src= shareable link");
+                            }
                             if let Some((ok, msg)) = &pane.export_message {
                                 ui.same_line_with_spacing(0.0, 8.0);
                                 let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
