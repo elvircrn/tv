@@ -1083,6 +1083,32 @@ impl App {
                             ui.same_line_with_spacing(0.0, 10.0);
                             ui.checkbox("Watch", &mut pane.auto_reload);
                         }
+                        // Only offered when there's a real source file to
+                        // derive the sibling export folder from, and the
+                        // trace actually has GPU tracks to export. Native
+                        // only — there's no filesystem to export a folder
+                        // to on wasm (see loader::export_gpu_only).
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if !pane.reload_paths.is_empty()
+                            && pane.trace.as_ref().is_some_and(|t| t.tracks.iter().any(|tr| tr.gpu))
+                        {
+                            ui.same_line_with_spacing(0.0, 10.0);
+                            if ui.button("Export GPU") {
+                                pane.export_message = Some(match pane.export_gpu_only() {
+                                    Ok(path) => (true, format!("Exported to {path}")),
+                                    Err(e) => (false, format!("Export failed: {e}")),
+                                });
+                            }
+                            if ui.is_item_hovered() {
+                                ui.tooltip_text("Export GPU-only timings (no args) to a sibling folder");
+                            }
+                            if let Some((ok, msg)) = &pane.export_message {
+                                ui.same_line_with_spacing(0.0, 8.0);
+                                let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
+                                ui.align_text_to_frame_padding();
+                                ui.text_colored(color, msg);
+                            }
+                        }
                         if pi == 0 {
                             ui.same_line_with_spacing(0.0, 16.0);
                             ui.align_text_to_frame_padding();

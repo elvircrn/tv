@@ -119,6 +119,10 @@ pub struct Pane {
     pub reload_dir: Option<String>,
     pub cache_dir: Option<String>,
     pub loading_events: Arc<AtomicUsize>,
+    /// Result of the last "Export GPU" click (success message, or an
+    /// error) — shown next to the button until the next click replaces it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub export_message: Option<(bool, String)>,
 }
 
 impl Pane {
@@ -169,10 +173,44 @@ impl Pane {
             reload_dir: None,
             cache_dir: None,
             loading_events: Arc::new(AtomicUsize::new(0)),
+            #[cfg(not(target_arch = "wasm32"))]
+            export_message: None,
         }
     }
 
     pub fn has_trace(&self) -> bool { self.trace.is_some() }
+
+    /// Exports this pane's GPU tracks (timings only, args stripped — see
+    /// `loader::export_gpu_only`) to a sibling "<name>-gpu-only/" folder next
+    /// to wherever the trace was actually opened from. `reload_paths` (set
+    /// by every native open path — `open`, `open_multi`, and CLI/drag-drop
+    /// in main.rs) always has at least one real file path even for a
+    /// multi-rank trace, unlike `trace_path`, which is a synthetic "N ranks:
+    /// ..." label in that case, not a real filesystem path.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn export_gpu_only(&self) -> Result<String, String> {
+        let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;
+        let sample_path = self.reload_paths.first().map(|(_, p)| p.as_str())
+            .ok_or_else(|| "no source file path available for this trace".to_string())?;
+        let base = std::path::Path::new(sample_path);
+        let parent = base.parent().unwrap_or_else(|| std::path::Path::new("."));
+
+        let stem = match &self.reload_dir {
+            Some(dir) => std::path::Path::new(dir).file_name()
+                .and_then(|s| s.to_str()).unwrap_or("trace").to_string(),
+            None => {
+                let s = base.file_stem().and_then(|s| s.to_str()).unwrap_or("trace");
+                // file_stem() on "trace.json.gz" only strips ".gz" -> "trace.json";
+                // peel one more layer so the export folder name reads cleanly.
+                s.strip_suffix(".json").or_else(|| s.strip_suffix(".tar")).unwrap_or(s).to_string()
+            }
+        };
+
+        let out_path = parent.join(format!("{stem}-gpu-only")).join("gpu-only.tvcache");
+        let out_str = out_path.to_str().ok_or_else(|| "non-UTF-8 destination path".to_string())?;
+        crate::loader::export_gpu_only(trace, out_str)?;
+        Ok(out_path.to_string_lossy().into_owned())
+    }
 
     pub fn loading_progress_text(&self) -> String {
         let n = self.loading_events.load(Ordering::Relaxed);

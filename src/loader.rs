@@ -823,6 +823,119 @@ fn pad_to_8(w: &mut impl std::io::Write, written: usize) {
     }
 }
 
+/// Writes a GPU-only ".tvcache" containing just the GPU tracks' timing
+/// skeleton (ts/dur/name/cat/depth) with every event's args stripped
+/// (args_off/args_len zeroed) — the args blob is typically the bulk of a
+/// trace's size (kernel launch params etc.), and isn't "timing," which is
+/// the whole point of this export. Also drops kernel stats and flow pairs
+/// (CPU<->GPU launch correlations, meaningless without the CPU side).
+/// Deliberately a standalone writer rather than sharing `save_cache`'s
+/// body: that function silently swallows I/O errors (`.ok()`) since it's a
+/// best-effort background cache, whereas this is a user-initiated export
+/// that should surface a real error if it fails.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn export_gpu_only(trace: &Trace, dest_path: &str) -> Result<(), String> {
+    let gpu_tracks: Vec<Track> = trace.tracks.iter()
+        .filter(|t| t.gpu)
+        .map(|t| Track {
+            label: t.label.clone(),
+            gpu: true,
+            events: t.events.iter().map(|e| Event { args_off: 0, args_len: 0, ..*e }).collect(),
+            max_depth: t.max_depth,
+            prefix_max_dur: t.prefix_max_dur.clone(),
+            raw_buf_idx: 0,
+        })
+        .collect();
+    if gpu_tracks.is_empty() {
+        return Err("this trace has no GPU tracks".to_string());
+    }
+
+    let total_events: u64 = gpu_tracks.iter().map(|t| t.events.len() as u64).sum();
+    let (mut min_ts, mut max_ts) = (f64::MAX, f64::MIN);
+    for t in &gpu_tracks {
+        for e in &t.events {
+            min_ts = min_ts.min(e.ts);
+            max_ts = max_ts.max(e.ts + e.dur);
+        }
+    }
+
+    let dest = std::path::Path::new(dest_path);
+    let dir = dest.parent().ok_or_else(|| "invalid destination path".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create dir: {e}"))?;
+    let tmp = format!("{dest_path}.tmp");
+    let file = std::fs::File::create(&tmp).map_err(|e| format!("create file: {e}"))?;
+    let mut w = BufWriter::new(file);
+    let io_err = |e: std::io::Error| e.to_string();
+
+    w.write_all(CACHE_MAGIC).map_err(io_err)?;
+    write_u32(&mut w, CACHE_VERSION);
+    write_u64(&mut w, 0); // no live source file to validate freshness against
+    write_u64(&mut w, 0);
+    write_f64(&mut w, max_ts);
+    write_f64(&mut w, min_ts);
+    write_u64(&mut w, total_events);
+    write_u32(&mut w, gpu_tracks.len() as u32);
+    write_u32(&mut w, trace.names.len() as u32);
+    write_u32(&mut w, trace.cats.len() as u32);
+    write_u32(&mut w, 0); // no kernel stats in a timing-only export
+    write_u32(&mut w, trace.device.len() as u32);
+    write_u64(&mut w, 0); // no args buffer
+    write_u32(&mut w, 0); // padding to 80
+
+    let mut written = 80usize;
+    write_strings(&mut w, &trace.names);
+    written += trace.names.iter().map(|s| 4 + s.len()).sum::<usize>();
+    write_strings(&mut w, &trace.cats);
+    written += trace.cats.iter().map(|s| 4 + s.len()).sum::<usize>();
+    write_u32(&mut w, trace.device.len() as u32);
+    w.write_all(trace.device.as_bytes()).map_err(io_err)?;
+    written += 4 + trace.device.len();
+
+    for t in &gpu_tracks {
+        let label = t.label.as_bytes();
+        let mut hdr = [0u8; 13];
+        hdr[0..2].copy_from_slice(&(label.len() as u16).to_le_bytes());
+        hdr[2] = 1; // gpu
+        hdr[3..5].copy_from_slice(&t.max_depth.to_le_bytes());
+        hdr[5..13].copy_from_slice(&(t.events.len() as u64).to_le_bytes());
+        w.write_all(&hdr).map_err(io_err)?;
+        w.write_all(label).map_err(io_err)?;
+        written += 13 + label.len();
+    }
+
+    pad_to_8(&mut w, written);
+
+    for t in &gpu_tracks {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                t.events.as_ptr() as *const u8,
+                t.events.len() * std::mem::size_of::<Event>(),
+            )
+        };
+        w.write_all(bytes).map_err(io_err)?;
+    }
+    for t in &gpu_tracks {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                t.prefix_max_dur.as_ptr() as *const u8,
+                t.prefix_max_dur.len() * 8,
+            )
+        };
+        w.write_all(bytes).map_err(io_err)?;
+    }
+    // No stats bytes (count written as 0 above) and no args buffer (len 0).
+    write_u32(&mut w, 0); // no flow pairs — CPU<->GPU correlations don't apply here
+
+    write_u32(&mut w, trace.vllm_version.len() as u32);
+    w.write_all(trace.vllm_version.as_bytes()).map_err(io_err)?;
+    write_u32(&mut w, trace.dist_rank as u32);
+    write_u32(&mut w, trace.dist_world as u32);
+
+    drop(w);
+    std::fs::rename(&tmp, dest).map_err(|e| format!("rename: {e}"))?;
+    Ok(())
+}
+
 pub fn save_cache(trace: &Trace, source_path: &str, cache_dir: Option<&str>) {
     if source_path.is_empty() { return; }
     let cp = cache_path(source_path, cache_dir);
