@@ -20,8 +20,8 @@
   -->
   
 <script type="module">
-import init, * as bindings from '/tv/tv-4d7cd7438524a192.js';
-const wasm = await init({ module_or_path: '/tv/tv-4d7cd7438524a192_bg.wasm' });
+import init, * as bindings from '/tv/tv-d735f0d314207090.js';
+const wasm = await init({ module_or_path: '/tv/tv-d735f0d314207090_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -30,6 +30,6 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-<link rel="modulepreload" href="/tv/tv-4d7cd7438524a192.js" crossorigin="anonymous" integrity="sha384-Oa0rSUY/PieIKuCaV79dXh2/FfLTJDQPsYJxlB7IxCDPjlzfXo5QksOfYJRrHyA0"><link rel="preload" href="/tv/tv-4d7cd7438524a192_bg.wasm" crossorigin="anonymous" integrity="sha384-YC1w1bTK0NTqZdT8GMMhPG5mX+F5UPFWgKYMwGkS+Ld5zhhYs/mk0dAiXASoByqL" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/tv/tv-d735f0d314207090.js" crossorigin="anonymous" integrity="sha384-wAWljIGffEvm3HcgG28EfZYSTvPb6FrDvWDrmZBEv3P1YA1piI229bWK/Zeelxq3"><link rel="preload" href="/tv/tv-d735f0d314207090_bg.wasm" crossorigin="anonymous" integrity="sha384-gRilcKDgJV4DrSfzQLJI8XN7FM1AHc9XBQEKdbA8NLQ+cJth/FHHaqxhjG0VtNJO" as="fetch" type="application/wasm"></head>
 <body></body>
 </html>
