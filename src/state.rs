@@ -52,6 +52,22 @@ pub(crate) fn parse_rank(label: &str) -> Option<usize> {
     }
 }
 
+/// Default view-level track order: a stable sort by numeric rank (via
+/// `parse_rank`), not by track index or label text. Deliberately computed
+/// here rather than relying on `merge_traces` writing tracks in the right
+/// order to begin with — this way the *view* is always correct regardless
+/// of how the underlying `Trace` was produced, including a `.tvcache`
+/// export that was itself built and saved before a rank-ordering fix
+/// existed (the label text it stored still has the numeric rank in it;
+/// only the on-disk *track order* predates the fix). A trace with no
+/// "Rank N" labels at all (not a multi-rank merge) gets the same `None`
+/// key for every track, so the stable sort leaves it in its original order.
+pub(crate) fn default_track_order(tracks: &[Track]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..tracks.len()).collect();
+    order.sort_by_key(|&i| parse_rank(&tracks[i].label).unwrap_or(usize::MAX));
+    order
+}
+
 pub struct Pane {
     pub trace: Option<Trace>,
     pub view: View,
@@ -553,7 +569,7 @@ impl Pane {
                     self.collapsed.resize(n_tracks, false);
                     self.track_scales.resize(n_tracks, 1.0);
                     if self.track_order.len() != n_tracks {
-                        self.track_order = (0..n_tracks).collect();
+                        self.track_order = default_track_order(&trace.tracks);
                     }
                     self.hidden_names.resize(n_names, false);
                     self.search_mask.clear();
@@ -574,7 +590,7 @@ impl Pane {
                     self.view.scroll_y = 0.0;
                     self.collapsed = vec![false; trace.tracks.len()];
                     self.track_scales = vec![1.0; trace.tracks.len()];
-                    self.track_order = (0..trace.tracks.len()).collect();
+                    self.track_order = default_track_order(&trace.tracks);
                     self.hidden_names = vec![false; trace.names.len()];
                     self.trace = Some(trace);
                 }

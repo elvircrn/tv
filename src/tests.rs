@@ -1,7 +1,7 @@
 use super::*;
 use crate::parse::*;
 use crate::loader::{load_trace, detect_rank_groups, merge_traces};
-use crate::state::{parse_rank, find_exec_context_names};
+use crate::state::{parse_rank, find_exec_context_names, default_track_order};
 use imgui::ImColor32;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
@@ -1324,6 +1324,26 @@ fn test_merge_traces_sorts_ranks_numerically_not_lexicographically() {
     for (i, track) in merged.tracks.iter().enumerate() {
         assert!(track.label.contains(&format!("Rank {i} ")), "position {i} should be rank {i}, got {:?}", track.label);
     }
+}
+
+// The actual user-visible fix: even a Trace whose *stored* track order is
+// already wrong (e.g. a .tvcache exported before merge_traces sorted
+// correctly — the label text still has the real rank in it, only the
+// on-disk order predates the fix) should still *display* in rank order,
+// because the view computes its own default order rather than trusting
+// storage order. Deliberately construct tracks in bad (lexicographic)
+// order here to simulate that old-file case.
+#[test]
+fn test_default_track_order_fixes_bad_stored_order() {
+    let bad_order = ["Rank 0", "Rank 1", "Rank 10", "Rank 11", "Rank 2"];
+    let tracks: Vec<Track> = bad_order.iter().map(|r| Track {
+        label: format!("  {r} GPU 0"), gpu: true, events: Vec::new(),
+        max_depth: 0, prefix_max_dur: Vec::new(), raw_buf_idx: 0,
+    }).collect();
+
+    let order = default_track_order(&tracks);
+    let visible_ranks: Vec<usize> = order.iter().map(|&i| parse_rank(&tracks[i].label).unwrap()).collect();
+    assert_eq!(visible_ranks, vec![0, 1, 2, 10, 11], "view should show ranks in numeric order regardless of storage order");
 }
 
 // Measures the per-frame cost of the merged-GPU buffer build for two depth
