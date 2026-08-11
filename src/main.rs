@@ -281,6 +281,45 @@ async fn fetch_bytes(win: &web_sys::Window, url: &str) -> Result<Vec<u8>, String
     Ok(js_sys::Uint8Array::new(&buf_value).to_vec())
 }
 
+/// Resolves a bare gist ID (from `?gist=<id>`) to its one file's raw URL via
+/// GitHub's gist API, which serves permissive CORS and — unlike the raw
+/// content host — knows the filename without it being spelled out in the
+/// link. Lets a shareable link be the short `?gist=<id>` instead of a fully
+/// spelled-out, percent-encoded `?src=<raw-url>`. Picks the first file if a
+/// gist somehow has more than one (this app always creates single-file
+/// gists via "Export GPU (web)").
+#[cfg(target_arch = "wasm32")]
+async fn resolve_gist_raw_url(win: &web_sys::Window, gist_id: &str) -> Result<String, String> {
+    use wasm_bindgen::JsCast;
+    let api_url = format!("https://api.github.com/gists/{gist_id}");
+    let resp_value = wasm_bindgen_futures::JsFuture::from(win.fetch_with_str(&api_url))
+        .await
+        .map_err(|_| "gist lookup failed (network or bad gist id)".to_string())?;
+    let resp: web_sys::Response = resp_value.unchecked_into();
+    if !resp.ok() {
+        return Err(format!("gist lookup returned HTTP {} (check the gist id)", resp.status()));
+    }
+    let text_promise = resp.text().map_err(|_| "gist response has no body".to_string())?;
+    let text_value = wasm_bindgen_futures::JsFuture::from(text_promise)
+        .await
+        .map_err(|_| "failed reading gist response body".to_string())?;
+    let text = text_value.as_string().ok_or_else(|| "gist response wasn't text".to_string())?;
+    let json = js_sys::JSON::parse(&text).map_err(|_| "gist response wasn't valid JSON".to_string())?;
+    let files = js_sys::Reflect::get(&json, &"files".into())
+        .map_err(|_| "gist response missing 'files'".to_string())?;
+    let keys = js_sys::Object::keys(files.unchecked_ref::<js_sys::Object>());
+    let first_key = keys.get(0);
+    if first_key.is_undefined() {
+        return Err("gist has no files".to_string());
+    }
+    let file_info = js_sys::Reflect::get(&files, &first_key)
+        .map_err(|_| "gist file entry missing".to_string())?;
+    js_sys::Reflect::get(&file_info, &"raw_url".into())
+        .ok()
+        .and_then(|v| v.as_string())
+        .ok_or_else(|| "gist file entry missing raw_url".to_string())
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn file_from_entry(entry: &web_sys::FileSystemFileEntry) -> Option<web_sys::File> {
     use wasm_bindgen::JsCast;
@@ -486,26 +525,37 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Shareable-link loading: a `?src=<url>` query param (e.g. a gist or
-        // repo raw-file URL — anything that serves permissive CORS headers)
-        // is fetched once at startup and dropped into the same
-        // `pending_web_files` queue a real file drop would use, so it's
-        // routed into a pane by the exact same code in `user_event` below.
-        // A failed fetch (bad URL, 404, CORS rejection) has no bytes to hand
-        // that queue, so it reports through `pending_src_error` instead.
+        // Shareable-link loading: either a `?src=<url>` query param (e.g. a
+        // repo raw-file URL — anything serving permissive CORS headers) or
+        // the shorter `?gist=<id>` (resolved to its raw file URL via
+        // resolve_gist_raw_url first) is fetched once at startup and
+        // dropped into the same `pending_web_files` queue a real file drop
+        // would use, so it's routed into a pane by the exact same code in
+        // `user_event` below. A failed fetch (bad URL/id, 404, CORS
+        // rejection) has no bytes to hand that queue, so it reports through
+        // `pending_src_error` instead.
         #[cfg(target_arch = "wasm32")]
         if let Some(proxy) = self.event_loop_proxy.clone() {
             if let Some(win) = web_sys::window() {
                 let search = win.location().search().unwrap_or_default();
-                let src = web_sys::UrlSearchParams::new_with_str(&search)
-                    .ok()
-                    .and_then(|p| p.get("src"));
-                if let Some(url) = src {
+                let params = web_sys::UrlSearchParams::new_with_str(&search).ok();
+                let src = params.as_ref().and_then(|p| p.get("src"));
+                let gist = params.as_ref().and_then(|p| p.get("gist"));
+                if src.is_some() || gist.is_some() {
                     let pending = self.pending_web_files.clone();
                     let pending_err = self.pending_src_error.clone();
                     wasm_bindgen_futures::spawn_local(async move {
-                        match fetch_bytes(&win, &url).await {
-                            Ok(bytes) => {
+                        let url_result = match (src, gist) {
+                            (Some(url), _) => Ok(url),
+                            (None, Some(id)) => resolve_gist_raw_url(&win, &id).await,
+                            (None, None) => unreachable!(),
+                        };
+                        let result = match url_result {
+                            Ok(url) => fetch_bytes(&win, &url).await.map(|bytes| (url, bytes)),
+                            Err(e) => Err(e),
+                        };
+                        match result {
+                            Ok((url, bytes)) => {
                                 let name = url.rsplit('/').next()
                                     .filter(|s| !s.is_empty())
                                     .unwrap_or("shared-trace")
@@ -513,7 +563,7 @@ impl ApplicationHandler for App {
                                 pending.borrow_mut().push((name, bytes));
                             }
                             Err(e) => {
-                                *pending_err.borrow_mut() = Some(format!("?src= link failed to load: {e}"));
+                                *pending_err.borrow_mut() = Some(format!("shareable link failed to load: {e}"));
                             }
                         }
                         let _ = proxy.send_event(());
