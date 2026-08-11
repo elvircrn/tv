@@ -128,6 +128,13 @@ struct App {
     // settles — same Rc<RefCell> + proxy-wake hop as `pending_paste`.
     #[cfg(target_arch = "wasm32")]
     pending_src_error: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    // Populated during a `?src=`/`?gist=` download (see `fetch_bytes_with_progress`)
+    // so the empty-pane placeholder can show a live "Downloading: X / Y" line
+    // instead of the page looking frozen for as long as the fetch takes.
+    // Cleared once the fetch settles either way (bytes land in
+    // `pending_web_files`, or an error lands in `pending_src_error`).
+    #[cfg(target_arch = "wasm32")]
+    pending_download_progress: std::rc::Rc<std::cell::RefCell<Option<DownloadProgress>>>,
 }
 
 impl App {
@@ -172,6 +179,8 @@ impl App {
             pending_paste: std::rc::Rc::new(std::cell::RefCell::new(None)),
             #[cfg(target_arch = "wasm32")]
             pending_src_error: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            #[cfg(target_arch = "wasm32")]
+            pending_download_progress: std::rc::Rc::new(std::cell::RefCell::new(None)),
         }
     }
 }
@@ -259,13 +268,45 @@ async fn read_all_directory_entries(reader: &web_sys::FileSystemDirectoryReader)
     all
 }
 
-/// Fetches `url` and returns its response body as bytes — used for the
-/// `?src=<url>` shareable-link feature (see `resumed()`). `url` must serve
-/// permissive CORS headers (`Access-Control-Allow-Origin`) since this is a
-/// cross-origin `fetch()` from the page's own JS context; a gist raw URL or
-/// a repo's `raw.githubusercontent.com` file both do this by default.
+/// Formats a live `DownloadProgress` for the empty-pane placeholder text
+/// (see `render_frame`) — a byte count alone when the server didn't send
+/// `Content-Length` (chunked/unknown-length responses), a percentage too
+/// when it did.
 #[cfg(target_arch = "wasm32")]
-async fn fetch_bytes(win: &web_sys::Window, url: &str) -> Result<Vec<u8>, String> {
+fn download_progress_text(p: &DownloadProgress) -> String {
+    let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+    match p.total {
+        Some(total) if total > 0 => format!(
+            "Downloading: {:.1} MB / {:.1} MB ({:.0}%)",
+            mb(p.received), mb(total), 100.0 * p.received as f64 / total as f64,
+        ),
+        _ => format!("Downloading: {:.1} MB", mb(p.received)),
+    }
+}
+
+/// Bytes received so far and, if the server sent `Content-Length`, the
+/// total — the total is `None` for chunked/unknown-length responses, in
+/// which case the UI shows a byte count instead of a percentage.
+#[cfg(target_arch = "wasm32")]
+pub struct DownloadProgress {
+    pub received: u64,
+    pub total: Option<u64>,
+}
+
+/// Fetches `url` and returns its response body as bytes — used for the
+/// `?src=<url>`/`?gist=<id>` shareable-link feature (see `resumed()`).
+/// `url` must serve permissive CORS headers (`Access-Control-Allow-Origin`)
+/// since this is a cross-origin `fetch()` from the page's own JS context; a
+/// gist raw URL or a repo's `raw.githubusercontent.com` file both do this
+/// by default. Reads the response body incrementally via its
+/// `ReadableStream` rather than waiting for the whole thing to land in one
+/// `array_buffer()` Promise, so `on_progress` can report bytes-received as
+/// they arrive instead of the download being an opaque black box until
+/// it's entirely done.
+#[cfg(target_arch = "wasm32")]
+async fn fetch_bytes_with_progress(
+    win: &web_sys::Window, url: &str, on_progress: Option<&dyn Fn(DownloadProgress)>,
+) -> Result<Vec<u8>, String> {
     use wasm_bindgen::JsCast;
     let resp_value = wasm_bindgen_futures::JsFuture::from(win.fetch_with_str(url))
         .await
@@ -274,11 +315,35 @@ async fn fetch_bytes(win: &web_sys::Window, url: &str) -> Result<Vec<u8>, String
     if !resp.ok() {
         return Err(format!("server returned HTTP {}", resp.status()));
     }
-    let buf_promise = resp.array_buffer().map_err(|_| "response has no body".to_string())?;
-    let buf_value = wasm_bindgen_futures::JsFuture::from(buf_promise)
-        .await
-        .map_err(|_| "failed reading response body".to_string())?;
-    Ok(js_sys::Uint8Array::new(&buf_value).to_vec())
+
+    let total: Option<u64> = resp.headers().get("content-length").ok().flatten()
+        .and_then(|s| s.parse().ok());
+
+    let body = match resp.body() {
+        Some(b) => b,
+        None => return Ok(Vec::new()),
+    };
+    let reader: web_sys::ReadableStreamDefaultReader = body.get_reader().unchecked_into();
+
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        let chunk_value = wasm_bindgen_futures::JsFuture::from(reader.read())
+            .await
+            .map_err(|_| "failed reading response stream".to_string())?;
+        let done = js_sys::Reflect::get(&chunk_value, &"done".into())
+            .ok().and_then(|v| v.as_bool()).unwrap_or(true);
+        if done { break; }
+        if let Ok(value) = js_sys::Reflect::get(&chunk_value, &"value".into()) {
+            let chunk: js_sys::Uint8Array = value.unchecked_into();
+            let start = bytes.len();
+            bytes.resize(start + chunk.length() as usize, 0);
+            chunk.copy_to(&mut bytes[start..]);
+            if let Some(f) = on_progress {
+                f(DownloadProgress { received: bytes.len() as u64, total });
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 /// Resolves a bare gist ID (from `?gist=<id>`) to its one file's raw URL via
@@ -544,6 +609,7 @@ impl ApplicationHandler for App {
                 if src.is_some() || gist.is_some() {
                     let pending = self.pending_web_files.clone();
                     let pending_err = self.pending_src_error.clone();
+                    let pending_progress = self.pending_download_progress.clone();
                     wasm_bindgen_futures::spawn_local(async move {
                         let url_result = match (src, gist) {
                             (Some(url), _) => Ok(url),
@@ -551,9 +617,19 @@ impl ApplicationHandler for App {
                             (None, None) => unreachable!(),
                         };
                         let result = match url_result {
-                            Ok(url) => fetch_bytes(&win, &url).await.map(|bytes| (url, bytes)),
+                            Ok(url) => {
+                                let progress_proxy = proxy.clone();
+                                let progress_slot = pending_progress.clone();
+                                let on_progress = move |p: DownloadProgress| {
+                                    *progress_slot.borrow_mut() = Some(p);
+                                    let _ = progress_proxy.send_event(());
+                                };
+                                fetch_bytes_with_progress(&win, &url, Some(&on_progress)).await
+                                    .map(|bytes| (url, bytes))
+                            }
                             Err(e) => Err(e),
                         };
+                        *pending_progress.borrow_mut() = None;
                         match result {
                             Ok((url, bytes)) => {
                                 let name = url.rsplit('/').next()
@@ -684,6 +760,13 @@ impl ApplicationHandler for App {
             let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
             let target = empty.unwrap_or(self.state.active);
             self.state.panes[target].error = Some(msg);
+            if let Some(w) = &self.window { w.request_redraw(); }
+        }
+
+        // Each downloaded chunk wakes this via the proxy purely to get a
+        // redraw of the "Downloading: X / Y" placeholder text — there's no
+        // state here to drain/consume, just a live progress value to reflect.
+        if self.pending_download_progress.borrow().is_some() {
             if let Some(w) = &self.window { w.request_redraw(); }
         }
     }
@@ -1298,7 +1381,13 @@ impl App {
                         ui.text(&pane.loading_progress_text());
                     } else {
                         ui.align_text_to_frame_padding();
-                        ui.text("Drop a trace file here, or: tv <file.json[.gz]>");
+                        #[cfg(target_arch = "wasm32")]
+                        let placeholder = self.pending_download_progress.borrow().as_ref()
+                            .map(download_progress_text)
+                            .unwrap_or_else(|| "Drop a trace file here, or: tv <file.json[.gz]>".to_string());
+                        #[cfg(not(target_arch = "wasm32"))]
+                        let placeholder = "Drop a trace file here, or: tv <file.json[.gz]>".to_string();
+                        ui.text(&placeholder);
                     }
                     if let Some(e) = &pane.error {
                         let _c = ui.push_style_color(StyleColor::Text, [1.0, 0.4, 0.4, 1.0]);
