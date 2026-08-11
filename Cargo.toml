@@ -38,6 +38,16 @@ memmap2 = "0.9"
 # directly against a real 87MB args blob: xz gets ~265x vs gzip's ~65x
 # (see that function's doc comment), which is why this isn't flate2/gzip.
 xz2 = "0.1"
+# Wraps the main .tvcache/_merged.tvcache cache (save_cache/save_merged_cache/
+# load_cache*) — unlike export_gpu_only's xz, this needs to compress AND
+# decompress fast enough to stay invisible on every trace load/save, not
+# just an occasional export. Measured directly on a real 234MB (post synth-
+# args-encoding) cache: zstd level 3 compresses in ~0.1s and decompresses in
+# ~0.1s, for a 9.4x additional reduction (234MB -> 25MB) — xz/gzip get a
+# similar ratio only at 10-70x the compress time, and zstd's decompress side
+# is competitive with gzip's regardless of level, so there's no ratio/speed
+# tradeoff to make on the read side, only on how hard to compress on write.
+zstd = "0.13"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Plain imgui-sys (stb_truetype rasterizer, no freetype) — freetype needs a
