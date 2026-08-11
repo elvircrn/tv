@@ -27,7 +27,7 @@ use std::fmt::Write as FmtWrite;
 use std::io::Write as IoWrite;
 use crate::time::Instant;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseScrollDelta, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -90,6 +90,20 @@ struct App {
     pending_drops: Vec<String>,
     last_mouse_x: f32,
     nav_keys: u8,
+    // Touch support (mobile browsers): imgui only understands a mouse
+    // position + button state, so a single active touch is translated into
+    // synthesized CursorMoved/MouseInput events through the exact same IO
+    // calls real mouse input uses — every existing mouse-driven interaction
+    // (pan, select, resize dividers) works unmodified once fed that way. A
+    // second simultaneous touch means the user is pinching, not dragging,
+    // so it releases the synthesized button and switches to feeding
+    // `pinch_accum` (macOS's native PinchGesture never fires on web) from
+    // the frame-to-frame relative change in inter-touch distance, matching
+    // the same "relative growth factor" semantics PinchGesture's `delta`
+    // already has (see the zoom-factor computation in ui.rs).
+    active_touches: std::collections::HashMap<u64, (f32, f32)>,
+    primary_touch_id: Option<u64>,
+    last_pinch_dist: Option<f32>,
     nav_pan_vel: f64,
     nav_zoom_vel: f64,
     last_reload: Instant,
@@ -171,6 +185,9 @@ impl App {
             nav_pan_vel: 0.0,
             nav_zoom_vel: 0.0,
             last_reload: Instant::now(),
+            active_touches: std::collections::HashMap::new(),
+            primary_touch_id: None,
+            last_pinch_dist: None,
             #[cfg(target_arch = "wasm32")]
             event_loop_proxy: None,
             #[cfg(target_arch = "wasm32")]
@@ -893,6 +910,67 @@ impl ApplicationHandler for App {
                 self.pinch_accum += delta as f32;
             }
 
+            WindowEvent::Touch(Touch { phase, location, id, .. }) => {
+                let s = self.scale_factor as f32;
+                let pos = (location.x as f32 / s, location.y as f32 / s);
+                match phase {
+                    TouchPhase::Started => {
+                        self.active_touches.insert(id, pos);
+                        if self.active_touches.len() == 1 {
+                            self.primary_touch_id = Some(id);
+                            io.add_mouse_pos_event([pos.0, pos.1]);
+                            io.add_mouse_button_event(imgui::MouseButton::Left, true);
+                            self.last_mouse_x = pos.0;
+                        } else if self.active_touches.len() == 2 {
+                            // A second finger means this is a pinch, not a
+                            // drag — release the synthesized button so it
+                            // doesn't keep panning/selecting underneath the
+                            // zoom gesture.
+                            if self.primary_touch_id.take().is_some() {
+                                io.add_mouse_button_event(imgui::MouseButton::Left, false);
+                            }
+                            self.last_pinch_dist = self.two_touch_distance();
+                        }
+                    }
+                    TouchPhase::Moved => {
+                        self.active_touches.insert(id, pos);
+                        if self.active_touches.len() == 1 && self.primary_touch_id == Some(id) {
+                            io.add_mouse_pos_event([pos.0, pos.1]);
+                            self.last_mouse_x = pos.0;
+                        } else if self.active_touches.len() == 2 {
+                            if let Some(dist) = self.two_touch_distance() {
+                                if let Some(last) = self.last_pinch_dist {
+                                    if last > 0.0 {
+                                        self.pinch_accum += dist / last - 1.0;
+                                    }
+                                }
+                                self.last_pinch_dist = Some(dist);
+                            }
+                        }
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        self.active_touches.remove(&id);
+                        if self.primary_touch_id == Some(id) {
+                            self.primary_touch_id = None;
+                            io.add_mouse_button_event(imgui::MouseButton::Left, false);
+                        }
+                        if self.active_touches.len() < 2 {
+                            self.last_pinch_dist = None;
+                        }
+                        // If a pinch just ended and exactly one finger is
+                        // still down, resume dragging from where it already
+                        // is instead of requiring a fresh tap.
+                        if self.active_touches.len() == 1 && self.primary_touch_id.is_none() {
+                            let (&remaining_id, &remaining_pos) = self.active_touches.iter().next().unwrap();
+                            self.primary_touch_id = Some(remaining_id);
+                            io.add_mouse_pos_event([remaining_pos.0, remaining_pos.1]);
+                            io.add_mouse_button_event(imgui::MouseButton::Left, true);
+                            self.last_mouse_x = remaining_pos.0;
+                        }
+                    }
+                }
+            }
+
             WindowEvent::DroppedFile(path) => {
                 self.pending_drops.push(path.to_string_lossy().into());
             }
@@ -955,6 +1033,19 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// Distance between the two active touches, or `None` unless exactly
+    /// two are down. Pairs them by touch id (not raw `HashMap` iteration
+    /// order, which isn't guaranteed stable) so frame-to-frame distance
+    /// comparisons in the `WindowEvent::Touch` handler always diff the same
+    /// two physical fingers.
+    fn two_touch_distance(&self) -> Option<f32> {
+        if self.active_touches.len() != 2 { return None; }
+        let mut pts: Vec<(u64, (f32, f32))> = self.active_touches.iter().map(|(&k, &v)| (k, v)).collect();
+        pts.sort_by_key(|(id, _)| *id);
+        let (a, b) = (pts[0].1, pts[1].1);
+        Some(((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt())
+    }
+
     fn render_frame(&mut self) {
         let imgui = match self.imgui.as_mut() {
             Some(ctx) => ctx,
