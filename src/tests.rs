@@ -1309,6 +1309,23 @@ fn test_merge_traces() {
     assert!(r0_ev.ts < r1_ev.ts, "rank 0 event should be earlier");
 }
 
+// A merged multi-rank view used to sort tracks lexicographically by their
+// "  Rank {N} ..." label string, so "Rank 10" sorted before "Rank 2" (both
+// start with a smaller leading digit character). 12 ranks (0..=11) is
+// enough to actually exercise that: fewer than 10 ranks never hits a
+// two-digit-vs-one-digit comparison at all.
+#[test]
+fn test_merge_traces_sorts_ranks_numerically_not_lexicographically() {
+    let traces: Vec<(usize, Trace)> = (0..12).map(|r| {
+        (r, make_trace(vec!["", "k"], vec![("GPU 0", true, vec![ev(r as f64, 1.0, 1, 0)])]))
+    }).collect();
+    let merged = merge_traces(traces);
+    assert_eq!(merged.tracks.len(), 12);
+    for (i, track) in merged.tracks.iter().enumerate() {
+        assert!(track.label.contains(&format!("Rank {i} ")), "position {i} should be rank {i}, got {:?}", track.label);
+    }
+}
+
 // Measures the per-frame cost of the merged-GPU buffer build for two depth
 // filters: leaf-only (delta=0, current) vs. keep-one-parent-level (delta=1,
 // the 047226a design that un-hides parent blocks). Run with:

@@ -2467,6 +2467,21 @@ fn merge_intern_direct(
     remap
 }
 
+/// Numeric rank parsed back out of a merged track's `"  Rank {N} ..."`
+/// label prefix (see the labeling loop below) — used to sort tracks by
+/// actual rank *value* instead of lexicographically by the whole label
+/// string, which would put "Rank 10" before "Rank 2" (both start with the
+/// character '1' < '2' before any digit count is considered). Anything
+/// that doesn't match the expected prefix sorts last rather than panicking
+/// (shouldn't happen — every track here was just labeled by this same
+/// function — but this isn't a hot path worth an `unwrap`).
+fn merged_track_rank(label: &str) -> u32 {
+    label.strip_prefix("  Rank ")
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(u32::MAX)
+}
+
 pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     let global_min = traces.iter().map(|(_, t)| t.min_ts).fold(f64::MAX, f64::min);
 
@@ -2562,8 +2577,14 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
         }
     }
 
+    // Stable sort by rank *number* only (not the whole label string — see
+    // merged_track_rank): tracks already arrive in a sensible per-rank
+    // order (GPU-first, busiest first — each individual trace's own sort
+    // in build_trace), and a stable sort preserves that within each rank
+    // while fixing the cross-rank order to be numeric instead of
+    // lexicographic.
     let mut sort_perm: Vec<usize> = (0..all_tracks.len()).collect();
-    sort_perm.sort_by(|&a, &b| all_tracks[a].label.cmp(&all_tracks[b].label));
+    sort_perm.sort_by_key(|&i| merged_track_rank(&all_tracks[i].label));
     let mut old_to_new = vec![0u32; all_tracks.len()];
     for (new_i, &old_i) in sort_perm.iter().enumerate() {
         old_to_new[old_i] = new_i as u32;
