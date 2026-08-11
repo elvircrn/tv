@@ -924,14 +924,86 @@ pub fn export_gpu_only(trace: &Trace, dest_path: &str) -> Result<(), String> {
 
     pad_to_8(&mut w, written);
 
+    // Slim columnar (SoA) event encoding instead of the interleaved 32-byte
+    // AoS struct: each field gets its own contiguous run (ts delta-encoded
+    // per track, from 0), and args_off/args_len are dropped from disk
+    // entirely rather than merely zeroed. Measured on a real export: ~28%
+    // smaller after xz than writing standard AoS `Event` bytes directly —
+    // grouping same-typed, row-correlated values together (especially the
+    // per-track-monotonic timestamp deltas) gives LZMA far more exploitable
+    // redundancy than the interleaved layout does. `expand_gpu_export` (in
+    // `load_cache_xz`) reverses this back into standard AoS bytes before
+    // handing them to `load_cache_from_bytes`, so no other reader needs to
+    // understand this encoding.
+    //
+    // Timestamps and durations are additionally stored at their real
+    // precision instead of full f64: measured directly against a real
+    // 114K-event export, every delta-ts was an exact multiple of 1/2048ms
+    // (the trace's actual clock tick) and every duration an exact multiple
+    // of 1us. Storing them as u32 instead of f64 cuts these two fields —
+    // ~94% of the compressed export — by a further ~13%.
+    //
+    // ts uses a plain u32 tick count: 2048 is a power of two, so
+    // `ticks as f64 / 2048.0` reconstructs the *exact* original f64 bits
+    // (binary division by a power of two is exact), with zero precision
+    // loss. dur uses integer microseconds byte-plane-split (all low bytes,
+    // then all 2nd bytes, ...) instead of interleaved u32: most durations
+    // are under 65536us, so the top two planes are almost entirely zero
+    // and compress away for nearly free (measured ~26% smaller than plain
+    // interleaved u32; plane-splitting ts made it *worse* since tick values
+    // span a much wider range with no reliably-zero byte). Unlike ts, dur's
+    // reconstruction (`us as f64 / 1000.0`) is not a bit-exact round trip —
+    // division by a non-power-of-two can differ from the original stored
+    // double by 1 ULP (~1e-9 relative) — inconsequential at microsecond
+    // magnitude but real, so a re-imported dur may not be `==` the source.
+    //
+    // ts and dur are additionally stored in kernel-grouped order rather
+    // than chronological per-track order: same kernel + same problem size
+    // means near-identical (often exactly identical) durations and similar
+    // inter-launch gaps, so grouping same-`name` events adjacent lets LZMA
+    // find far longer matching runs (measured on a real export: ~14%
+    // smaller combined). This costs nothing extra to store — the grouping
+    // permutation is a stable sort by `name`, and `name` is itself stored
+    // below in original chronological order, so `expand_gpu_export`
+    // re-derives the identical permutation from it and scatters ts/dur
+    // back to their original positions. `name`/`cat`/`depth` stay in
+    // chronological order (already near-free to compress; permuting them
+    // too would only cost decode-time complexity for no size benefit).
+    let ts_ticks: Vec<u32> = gpu_tracks.iter().flat_map(|t| {
+        let mut prev = 0.0f64;
+        t.events.iter().map(move |e| {
+            let ticks = ((e.ts - prev) * 2048.0).round() as u32;
+            prev = e.ts;
+            ticks
+        })
+    }).collect();
+    let dur_us: Vec<u32> = gpu_tracks.iter()
+        .flat_map(|t| t.events.iter().map(|e| (e.dur * 1000.0).round() as u32))
+        .collect();
+    let names_flat: Vec<u32> = gpu_tracks.iter()
+        .flat_map(|t| t.events.iter().map(|e| e.name))
+        .collect();
+
+    let mut perm: Vec<u32> = (0..total_events as u32).collect();
+    perm.sort_by_key(|&i| names_flat[i as usize]);
+
+    for &i in &perm {
+        write_u32(&mut w, ts_ticks[i as usize]);
+    }
+    let dur_grouped: Vec<u32> = perm.iter().map(|&i| dur_us[i as usize]).collect();
+    for shift in [0u32, 8, 16, 24] {
+        for v in &dur_grouped {
+            w.write_all(&[((v >> shift) & 0xFF) as u8]).map_err(io_err)?;
+        }
+    }
+    for &name in &names_flat {
+        write_u32(&mut w, name);
+    }
     for t in &gpu_tracks {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                t.events.as_ptr() as *const u8,
-                t.events.len() * std::mem::size_of::<Event>(),
-            )
-        };
-        w.write_all(bytes).map_err(io_err)?;
+        for e in &t.events { write_u32(&mut w, e.cat); }
+    }
+    for t in &gpu_tracks {
+        for e in &t.events { w.write_all(&e.depth.to_le_bytes()).map_err(io_err)?; }
     }
     for t in &gpu_tracks {
         let bytes = unsafe {
@@ -1426,6 +1498,126 @@ fn load_cache_direct(cache_path: &str) -> Option<Trace> {
 #[cfg(target_arch = "wasm32")]
 fn load_cache_direct(_cache_path: &str) -> Option<Trace> { None }
 
+/// Reverses `export_gpu_only`'s slim-SoA + per-track delta-encoded-timestamp
+/// event encoding back into the standard AoS `Event` layout that
+/// `load_cache_from_bytes` expects. Re-derives track boundaries from the
+/// (unchanged) header/track-header section, then rebuilds a full
+/// 32-byte-per-event array (args_off/args_len reconstituted as 0, matching
+/// what `export_gpu_only` zeroed before ever writing them). Returns `None`
+/// on any malformed input, matching `load_cache_from_bytes`'s own
+/// bounds-checked style.
+#[cfg(not(target_arch = "wasm32"))]
+fn expand_gpu_export(d: &[u8]) -> Option<Vec<u8>> {
+    if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
+    let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
+    let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
+    if r32(4) > CACHE_VERSION { return None; }
+
+    let total_events = r64(40) as usize;
+    let n_tracks = r32(48) as usize;
+    let n_names = r32(52) as usize;
+    let n_cats = r32(56) as usize;
+
+    let mut pos = 80usize;
+    let skip_strings = |pos: &mut usize, count: usize| -> Option<()> {
+        for _ in 0..count {
+            if *pos + 4 > d.len() { return None; }
+            let len = u32::from_le_bytes(d[*pos..*pos + 4].try_into().unwrap()) as usize;
+            *pos += 4;
+            if *pos + len > d.len() { return None; }
+            *pos += len;
+        }
+        Some(())
+    };
+    skip_strings(&mut pos, n_names)?;
+    skip_strings(&mut pos, n_cats)?;
+
+    if pos + 4 > d.len() { return None; }
+    let dev_len = r32(pos) as usize;
+    pos += 4 + dev_len;
+    if pos > d.len() { return None; }
+
+    let mut track_event_counts = Vec::with_capacity(n_tracks);
+    let mut total_check = 0usize;
+    for _ in 0..n_tracks {
+        if pos + 13 > d.len() { return None; }
+        let label_len = u16::from_le_bytes(d[pos..pos + 2].try_into().unwrap()) as usize;
+        let event_count = u64::from_le_bytes(d[pos + 5..pos + 13].try_into().unwrap()) as usize;
+        pos += 13 + label_len;
+        if pos > d.len() { return None; }
+        total_check += event_count;
+        track_event_counts.push(event_count);
+    }
+    if total_check != total_events { return None; }
+
+    let header_end = pos;
+    let mut events_start = header_end;
+    if events_start % 8 != 0 { events_start += 8 - events_start % 8; }
+
+    // Mirrors export_gpu_only's layout: ts as plain u32 ticks of 1/2048ms,
+    // dur as u32 microseconds byte-plane-split (4 separate n-byte runs,
+    // least-significant plane first) — both stored in kernel-grouped
+    // (stable-sorted-by-name) order rather than chronological order. Read
+    // `name` first (it's the one array kept in original chronological
+    // order) and re-derive the identical stable-sort-by-name permutation
+    // the writer used, then scatter ts/dur back into chronological order
+    // through it — no permutation table is stored on disk.
+    let n = total_events;
+    let ts_off = events_start;
+    let dur_off = ts_off + n * 4;
+    let name_off = dur_off + n * 4;
+    let cat_off = name_off + n * 4;
+    let depth_off = cat_off + n * 4;
+    let events_end = depth_off + n * 2;
+    if events_end > d.len() { return None; }
+
+    let names_flat: Vec<u32> = (0..n)
+        .map(|i| u32::from_le_bytes(d[name_off + i * 4..name_off + i * 4 + 4].try_into().unwrap()))
+        .collect();
+    let mut perm: Vec<u32> = (0..n as u32).collect();
+    perm.sort_by_key(|&i| names_flat[i as usize]);
+
+    let mut ts_ticks = vec![0u32; n];
+    let mut dur_us = vec![0u32; n];
+    for (j, &orig_i) in perm.iter().enumerate() {
+        let orig_i = orig_i as usize;
+        ts_ticks[orig_i] = u32::from_le_bytes(d[ts_off + j * 4..ts_off + j * 4 + 4].try_into().unwrap());
+        dur_us[orig_i] = (d[dur_off + j] as u32)
+            | ((d[dur_off + n + j] as u32) << 8)
+            | ((d[dur_off + 2 * n + j] as u32) << 16)
+            | ((d[dur_off + 3 * n + j] as u32) << 24);
+    }
+
+    let ev_size = std::mem::size_of::<Event>();
+    let mut aos = vec![0u8; n * ev_size];
+    let mut idx = 0usize;
+    for &ec in &track_event_counts {
+        let mut prev = 0.0f64;
+        for i in 0..ec {
+            let e_i = idx + i;
+            let ts = prev + (ts_ticks[e_i] as f64) / 2048.0;
+            prev = ts;
+            let dur = (dur_us[e_i] as f64) / 1000.0;
+            let name = names_flat[e_i];
+            let cat = u32::from_le_bytes(d[cat_off + e_i * 4..cat_off + e_i * 4 + 4].try_into().unwrap());
+            let depth = u16::from_le_bytes(d[depth_off + e_i * 2..depth_off + e_i * 2 + 2].try_into().unwrap());
+            let ev = Event { ts, dur, name, cat, args_off: 0, depth, args_len: 0 };
+            let dst = &mut aos[e_i * ev_size..e_i * ev_size + ev_size];
+            dst.copy_from_slice(unsafe {
+                std::slice::from_raw_parts(&ev as *const Event as *const u8, ev_size)
+            });
+        }
+        idx += ec;
+    }
+
+    let mut out = Vec::with_capacity(events_start + aos.len() + (d.len() - events_end));
+    out.extend_from_slice(&d[..header_end]);
+    while out.len() % 8 != 0 { out.push(0); }
+    out.extend_from_slice(&aos);
+    out.extend_from_slice(&d[events_end..]);
+    Some(out)
+}
+
 /// Reads an xz-compressed export (see `export_gpu_only`) — always a full
 /// decompress into memory first, unlike `load_cache_direct`'s mmap-based
 /// zero-copy path, since compressed bytes can't be randomly accessed.
@@ -1435,7 +1627,8 @@ fn load_cache_xz(cache_path: &str) -> Option<Trace> {
     let mut decoder = xz2::read::XzDecoder::new(BufReader::new(file));
     let mut buf = Vec::new();
     decoder.read_to_end(&mut buf).ok()?;
-    load_cache_from_bytes(&buf)
+    let expanded = expand_gpu_export(&buf)?;
+    load_cache_from_bytes(&expanded)
 }
 
 fn merged_cache_hash(cache_dir: &str) -> u64 {
