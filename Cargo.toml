@@ -55,6 +55,13 @@ zstd = "0.13"
 # from disk anyway (see renderer_web.rs: DefaultFontData).
 imgui-sys = "0.12"
 flate2 = { version = "1", features = ["rust_backend"], default-features = false }
+# Decode-only counterpart to native's `zstd` (which wraps the real C library
+# via zstd-sys — needs a C toolchain to cross-compile to wasm32, unlike this).
+# The web build only ever needs to *read* a zstd-compressed .tvcache/
+# _merged.tvcache — compression only happens when the native app saves one —
+# and a pure-Rust decoder is all that needs. Verified directly: decodes a
+# real cache file produced by the native `zstd` crate byte-for-byte.
+ruzstd = "0.7"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 # Real Web Worker-backed rayon parallelism — only for the atomics/bulk-memory

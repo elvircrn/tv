@@ -828,7 +828,10 @@ fn pad_to_8(w: &mut impl std::io::Write, written: usize) {
 /// already-on-disk uncompressed one written before this existed (still
 /// valid — just starts with `CACHE_MAGIC` directly instead), so existing
 /// caches don't need to be invalidated for this change to take effect.
-#[cfg(not(target_arch = "wasm32"))]
+/// Shared across platforms: native detects it in `read_and_decompress_cache`
+/// (real `zstd` crate), wasm in `load_trace_from_bytes_progressive` (the
+/// pure-Rust `ruzstd` decoder — verified directly against real output from
+/// the native encoder byte-for-byte before wiring this in).
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Wraps the main `.tvcache`/`_merged.tvcache` cache format in zstd —
@@ -2631,7 +2634,24 @@ pub fn load_trace_from_bytes_progressive(
         return;
     }
     if name.ends_with(".tvcache") {
-        match load_cache_from_bytes(&raw_input) {
+        // Same zstd-detection `read_and_decompress_cache` does natively,
+        // via the pure-Rust `ruzstd` decoder instead of the C-backed `zstd`
+        // crate (no C toolchain available for a wasm32-unknown-unknown
+        // cross-compile) — an uncompressed legacy cache passes through
+        // unchanged, same as on native.
+        let decompressed = if raw_input.len() >= 4 && raw_input[0..4] == ZSTD_FRAME_MAGIC {
+            let mut out = Vec::new();
+            match ruzstd::StreamingDecoder::new(&raw_input[..])
+                .ok()
+                .and_then(|mut d| d.read_to_end(&mut out).ok())
+            {
+                Some(_) => out,
+                None => { let _ = tx.send(Err(format!("{name}: corrupt zstd-compressed .tvcache file"))); return; }
+            }
+        } else {
+            raw_input
+        };
+        match load_cache_from_bytes(&decompressed) {
             Some(trace) => {
                 eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
