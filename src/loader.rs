@@ -768,7 +768,7 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     cats.shrink_to_fit();
 
     eprintln!("  lanes: {:.2}s ({} tracks, {} flow_pairs)", t2.elapsed().as_secs_f64(), tracks.len(), flow_pairs.len());
-    Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, vllm_version, dist_rank, dist_world, flow_pairs })
+    Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, vllm_version, dist_rank, dist_world, flow_pairs, rank_paths: Vec::new() })
 }
 
 const CACHE_MAGIC: &[u8; 4] = b"TRV2";
@@ -1035,6 +1035,64 @@ fn build_synth_and_compact_args(
         modified.push(track_events);
     }
     (new_args, modified, template, records)
+}
+
+/// 4-byte tag identifying the optional `Trace::rank_paths` trailer (see
+/// `write_rank_paths_trailer`/`read_rank_paths_trailer`). Unlike this
+/// format's other optional trailing fields (vLLM version, dist_rank/world),
+/// which are told apart purely by "are there enough bytes left", this one
+/// is self-tagged: it's written between dist_rank/world and the
+/// synth-python-args trailer, exactly where older caches (written before
+/// this field existed) already have the synth trailer's leading `n_synth`
+/// u32. A plain length-prefix there could occasionally misparse as a
+/// plausible-looking rank_paths section (`n_synth == 0`, the overwhelmingly
+/// common case, would parse as "zero rank_paths" harmlessly — but a nonzero
+/// `n_synth` risks reading garbage). The magic tag makes the two
+/// unambiguous: on read, older files' `n_synth` bytes won't coincidentally
+/// equal this exact 4-byte string.
+const RANK_PATHS_MAGIC: [u8; 4] = *b"RKPT";
+
+/// Writes `Trace::rank_paths` as an optional trailing section, tagged with
+/// `RANK_PATHS_MAGIC` so `read_rank_paths_trailer` can tell it apart from
+/// older caches' synth-args trailer occupying the same relative position.
+/// Skips writing anything at all for the common case (single-rank trace,
+/// nothing to persist) — `read_rank_paths_trailer` treats a missing tag the
+/// same as an explicit empty list.
+fn write_rank_paths_trailer(w: &mut impl std::io::Write, rank_paths: &[(usize, String)]) {
+    if rank_paths.is_empty() { return; }
+    w.write_all(&RANK_PATHS_MAGIC).ok();
+    write_u32(w, rank_paths.len() as u32);
+    for (rank, path) in rank_paths {
+        write_u32(w, *rank as u32);
+        write_u32(w, path.len() as u32);
+        w.write_all(path.as_bytes()).ok();
+    }
+}
+
+/// Reverses `write_rank_paths_trailer`. Returns the parsed list (empty if
+/// the tag isn't present, e.g. an older cache or a single-rank trace) and
+/// the position immediately after the section, so the caller can keep
+/// reading whatever optional trailer comes next from the right offset.
+fn read_rank_paths_trailer(d: &[u8], fpos: usize) -> (Vec<(usize, String)>, usize) {
+    if fpos + 4 > d.len() || d[fpos..fpos + 4] != RANK_PATHS_MAGIC {
+        return (Vec::new(), fpos);
+    }
+    let mut p = fpos + 4;
+    if p + 4 > d.len() { return (Vec::new(), fpos); }
+    let n = u32::from_le_bytes(d[p..p + 4].try_into().unwrap()) as usize;
+    p += 4;
+    let mut rank_paths = Vec::with_capacity(n);
+    for _ in 0..n {
+        if p + 8 > d.len() { return (Vec::new(), fpos); }
+        let rank = u32::from_le_bytes(d[p..p + 4].try_into().unwrap()) as usize;
+        let plen = u32::from_le_bytes(d[p + 4..p + 8].try_into().unwrap()) as usize;
+        p += 8;
+        if p + plen > d.len() { return (Vec::new(), fpos); }
+        let path = String::from_utf8_lossy(&d[p..p + plen]).into_owned();
+        p += plen;
+        rank_paths.push((rank, path));
+    }
+    (rank_paths, p)
 }
 
 /// Writes the trailing section `expand_synth_python_args` reads: a count,
@@ -1319,6 +1377,7 @@ pub fn export_gpu_only(trace: &Trace, dest_path: &str) -> Result<(), String> {
     w.write_all(trace.vllm_version.as_bytes()).map_err(io_err)?;
     write_u32(&mut w, trace.dist_rank as u32);
     write_u32(&mut w, trace.dist_world as u32);
+    write_rank_paths_trailer(&mut w, &trace.rank_paths);
 
     let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 9);
     encoder.write_all(&w).map_err(io_err)?;
@@ -1435,6 +1494,7 @@ pub fn export_gpu_only_web(trace: &Trace, dest_path: &str) -> Result<(), String>
     w.write_all(trace.vllm_version.as_bytes()).map_err(io_err)?;
     write_u32(&mut w, trace.dist_rank as u32);
     write_u32(&mut w, trace.dist_world as u32);
+    write_rank_paths_trailer(&mut w, &trace.rank_paths);
 
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     encoder.write_all(&w).map_err(io_err)?;
@@ -1542,6 +1602,7 @@ pub fn export_full_web(trace: &Trace, dest_path: &str) -> Result<(), String> {
     w.write_all(trace.vllm_version.as_bytes()).map_err(io_err)?;
     write_u32(&mut w, trace.dist_rank as u32);
     write_u32(&mut w, trace.dist_world as u32);
+    write_rank_paths_trailer(&mut w, &trace.rank_paths);
     write_synth_python_trailer(&mut w, &synth_template, &synth_records);
 
     let compressed = maybe_compress_cache(w);
@@ -1733,6 +1794,7 @@ pub fn save_cache(trace: &Trace, source_path: &str, cache_dir: Option<&str>) {
     w.write_all(trace.vllm_version.as_bytes()).ok();
     write_u32(&mut w, trace.dist_rank as u32);
     write_u32(&mut w, trace.dist_world as u32);
+    write_rank_paths_trailer(&mut w, &trace.rank_paths);
     write_synth_python_trailer(&mut w, &synth_template, &synth_records);
 
     let compressed = maybe_compress_cache(w);
@@ -1916,6 +1978,8 @@ pub fn load_cache_from_bytes(d: &[u8]) -> Option<Trace> {
         fpos += 8;
     }
 
+    let (rank_paths, fpos) = read_rank_paths_trailer(d, fpos);
+
     let base_args = d[args_offset..args_offset + args_len].to_vec();
     let synth_expanded = expand_synth_python_args(d, fpos, &base_args, &mut tracks);
     let raw_bufs = vec![Arc::new(ArgsBuf::Heap(synth_expanded.unwrap_or(base_args)))];
@@ -1923,6 +1987,7 @@ pub fn load_cache_from_bytes(d: &[u8]) -> Option<Trace> {
     Some(Trace {
         tracks, names, cats, raw_bufs,
         stats, max_ts, min_ts, total_events, device, vllm_version, dist_rank, dist_world, flow_pairs,
+        rank_paths,
     })
 }
 
@@ -2200,6 +2265,7 @@ fn save_merged_cache(trace: &Trace, cache_dir: &str) {
     w.write_all(trace.vllm_version.as_bytes()).ok();
     write_u32(&mut w, trace.dist_rank as u32);
     write_u32(&mut w, trace.dist_world as u32);
+    write_rank_paths_trailer(&mut w, &trace.rank_paths);
     write_synth_python_trailer(&mut w, &synth_template, &synth_records);
 
     let compressed = maybe_compress_cache(w);
@@ -2292,6 +2358,7 @@ fn clone_trace(t: &Trace) -> Trace {
         dist_rank: t.dist_rank,
         dist_world: t.dist_world,
         flow_pairs: t.flow_pairs.clone(),
+        rank_paths: t.rank_paths.clone(),
     }
 }
 
@@ -2608,6 +2675,7 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
         tracks: sorted_tracks, names, cats, raw_bufs: all_raw_bufs, stats,
         max_ts, min_ts: global_min, total_events, device, vllm_version,
         dist_rank: -1, dist_world, flow_pairs: all_flow_pairs,
+        rank_paths: Vec::new(),
     };
     compact_args(&mut trace);
     trace
@@ -2827,7 +2895,11 @@ pub fn load_multi_progressive(
         let _ = tx.send(Err("all ranks failed to load".into()));
         return;
     }
-    let trace = merge_traces(traces);
+    let succeeded: std::collections::HashSet<usize> = traces.iter().map(|(r, _)| *r).collect();
+    let merged_rank_paths: Vec<(usize, String)> =
+        rank_paths.into_iter().filter(|(r, _)| succeeded.contains(r)).collect();
+    let mut trace = merge_traces(traces);
+    trace.rank_paths = merged_rank_paths;
     eprintln!("  merged: {:.2}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
     if let Some(cd) = cache_dir {
         save_merged_cache(&trace, cd);

@@ -1365,7 +1365,9 @@ impl App {
                                 }
                                 None => {}
                             }
-                            if pane.reload_paths.len() >= 2 {
+                            let multi_rank = pane.reload_paths.len() >= 2
+                                || pane.trace.as_ref().is_some_and(|t| t.rank_paths.len() >= 2);
+                            if multi_rank {
                                 ui.same_line_with_spacing(0.0, 16.0);
                                 if ui.button("Sync Clocks") {
                                     pane.sync_message = Some(match pane.sync_clocks() {

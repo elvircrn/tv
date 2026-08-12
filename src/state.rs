@@ -309,19 +309,31 @@ impl Pane {
     /// trace — see `loader::sync_multi_rank_clocks` for the full algorithm
     /// (a Rust port of `sync_traces.py`, applied in memory instead of
     /// writing shifted files to disk). Only meaningful for an actual
-    /// multi-rank merge (`reload_paths` has more than one entry).
-    /// Deliberately leaves the view's pan/zoom untouched — the user is
-    /// likely already looking at the region they care about (e.g. the very
-    /// marker event this aligns on) and a shift on the order of hundreds of
-    /// microseconds shouldn't visibly move anything at whatever zoom level
-    /// made that visible in the first place.
+    /// multi-rank merge. Deliberately leaves the view's pan/zoom untouched —
+    /// the user is likely already looking at the region they care about
+    /// (e.g. the very marker event this aligns on) and a shift on the order
+    /// of hundreds of microseconds shouldn't visibly move anything at
+    /// whatever zoom level made that visible in the first place.
+    ///
+    /// Prefers `reload_paths` (the live per-rank source files, when this
+    /// pane was opened as a directory/rank list) but falls back to the
+    /// merged trace's own `rank_paths` — the same rank/filename pairs,
+    /// persisted into the `.tvcache` format at export time — so this still
+    /// works after reopening an already-merged cache file directly, when
+    /// there's no directory of per-rank JSON to re-derive them from.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn sync_clocks(&mut self) -> Result<String, String> {
-        if self.reload_paths.len() < 2 {
-            return Err("not a multi-rank trace".to_string());
-        }
+        let rank_paths: Vec<(usize, String)> = if self.reload_paths.len() >= 2 {
+            self.reload_paths.clone()
+        } else {
+            let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;
+            if trace.rank_paths.len() < 2 {
+                return Err("not a multi-rank trace".to_string());
+            }
+            trace.rank_paths.clone()
+        };
         let trace = self.trace.as_mut().ok_or_else(|| "no trace loaded".to_string())?;
-        crate::loader::sync_multi_rank_clocks(trace, &self.reload_paths, crate::loader::DEFAULT_SYNC_MARKER)
+        crate::loader::sync_multi_rank_clocks(trace, &rank_paths, crate::loader::DEFAULT_SYNC_MARKER)
     }
 
     /// Exports (via `export_gpu_only_web`, or `export_full_web` when

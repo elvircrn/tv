@@ -117,6 +117,13 @@ pub struct Trace {
     /// Total ranks in the job from `distributedInfo.world_size`, or 0 if absent.
     pub dist_world: i32,
     pub flow_pairs: Vec<FlowPair>,
+    /// `(rank, source file path/name)` for each rank folded into this trace
+    /// by `merge_traces` — empty for a single-rank trace. Persisted in the
+    /// on-disk/exported cache format so `Pane::sync_clocks` can still group
+    /// ranks by DP/TP (parsed from these filenames) after reopening a
+    /// `.tvcache` directly, when `Pane::reload_paths` no longer has the
+    /// original per-rank paths (e.g. it points at just the one cache file).
+    pub rank_paths: Vec<(usize, String)>,
 }
 
 #[derive(Clone, Copy)]

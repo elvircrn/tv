@@ -42,6 +42,7 @@ fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace 
         vllm_version: String::new(),
         dist_rank: -1, dist_world: 0,
         flow_pairs: Vec::new(),
+        rank_paths: Vec::new(),
     }
 }
 
@@ -582,6 +583,54 @@ fn test_cache_roundtrip() {
     let cached_args = &cached.raw_bufs[0];
     assert_eq!(orig_args.len(), cached_args.len());
     assert_eq!(&orig_args[..], &cached_args[..]);
+
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&cache_path).ok();
+}
+
+#[test]
+fn test_rank_paths_trailer_roundtrip() {
+    let mut trace = make_trace(
+        vec!["kern_a"],
+        vec![("  Rank 0 GPU", true, vec![Event { ts: 0.0, dur: 1.0, name: 0, cat: 0, args_off: 0, depth: 0, args_len: 0 }])],
+    );
+    trace.rank_paths = vec![(0, "dp0_tp0_rank0.json".to_string()), (1, "dp0_tp1_rank1.json".to_string())];
+
+    let dir = std::env::temp_dir().join("tv_test_rank_paths_trailer");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("rank_paths_test.json");
+    std::fs::write(&path, "{}").unwrap();
+    let path_str = path.to_str().unwrap();
+
+    crate::loader::save_cache(&trace, path_str, None);
+    let cache_path = format!("{path_str}.tvcache");
+    let cached = crate::loader::load_cache(path_str, None).expect("cache should load");
+    assert_eq!(cached.rank_paths, trace.rank_paths);
+
+    std::fs::remove_file(&path).ok();
+    std::fs::remove_file(&cache_path).ok();
+}
+
+#[test]
+fn test_rank_paths_trailer_absent_is_empty() {
+    // A trace with no rank_paths (the common single-rank case) must not
+    // write/read back a spurious nonempty section.
+    let trace = make_trace(
+        vec!["kern_a"],
+        vec![("gpu0", true, vec![Event { ts: 0.0, dur: 1.0, name: 0, cat: 0, args_off: 0, depth: 0, args_len: 0 }])],
+    );
+    assert!(trace.rank_paths.is_empty());
+
+    let dir = std::env::temp_dir().join("tv_test_rank_paths_absent");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("rank_paths_absent_test.json");
+    std::fs::write(&path, "{}").unwrap();
+    let path_str = path.to_str().unwrap();
+
+    crate::loader::save_cache(&trace, path_str, None);
+    let cache_path = format!("{path_str}.tvcache");
+    let cached = crate::loader::load_cache(path_str, None).expect("cache should load");
+    assert!(cached.rank_paths.is_empty());
 
     std::fs::remove_file(&path).ok();
     std::fs::remove_file(&cache_path).ok();
