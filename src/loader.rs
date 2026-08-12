@@ -2613,6 +2613,168 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     trace
 }
 
+/// Default marker substring used to align DP groups — see
+/// `sync_multi_rank_clocks`. A DeepEP `combine` kernel launch is a good
+/// sync point because every rank in a run reaches it early and reliably.
+#[cfg(not(target_arch = "wasm32"))]
+pub const DEFAULT_SYNC_MARKER: &str = "deep_ep::elastic::combine_impl";
+
+/// Extracts `(dp, tp)` from a rank's source filename, e.g.
+/// `dp2_pp0_tp5_dcp0_ep17_rank1....json` -> `(Some(2), Some(5))`. Mirrors
+/// `sync_traces.py`'s `parse_dp_tp` regex (`\bdp(\d+)`, `\btp(\d+)`): a
+/// literal "dp"/"tp" not immediately preceded by an alphanumeric
+/// character, followed by one or more digits.
+///
+/// Not `cfg`-gated to native for any technical reason (it's pure string
+/// parsing) — only `sync_multi_rank_clocks`'s caller (`Pane::sync_clocks`)
+/// needs `reload_paths`, which has no wasm equivalent (see its own doc
+/// comment), so there's nothing to call this from there yet.
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_dp_tp(fname: &str) -> (Option<u32>, Option<u32>) {
+    fn find(fname: &str, pfx: &str) -> Option<u32> {
+        let bytes = fname.as_bytes();
+        let pb = pfx.as_bytes();
+        let mut i = 0;
+        while i + pb.len() < bytes.len() {
+            let boundary_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            if boundary_ok && &bytes[i..i + pb.len()] == pb && bytes[i + pb.len()].is_ascii_digit() {
+                let start = i + pb.len();
+                let mut end = start;
+                while end < bytes.len() && bytes[end].is_ascii_digit() { end += 1; }
+                return fname[start..end].parse().ok();
+            }
+            i += 1;
+        }
+        None
+    }
+    (find(fname, "dp"), find(fname, "tp"))
+}
+
+/// Corrects INTER-node clock skew across an already-merged multi-rank
+/// trace, entirely in memory — a Rust port of `sync_traces.py`, which does
+/// the same computation but writes shifted copies of the source JSON
+/// files to disk. The skew is inter-node (inter-DP-group): each DP pod
+/// runs on its own machine with its own clock, so traces from different DP
+/// groups start at different absolute times. It is NOT intra-node: the TP
+/// ranks inside one pod share the same host clock, so their relative
+/// timing is already exact and must not be adjusted independently — only
+/// one shift per DP group, applied uniformly to every TP member, corrects
+/// the inter-node skew without distorting correct intra-node relationships.
+///
+/// Finds each rank's first (by ts) event whose interned name contains
+/// `marker`, groups ranks by the `dp` index parsed from `rank_paths`'
+/// filenames (a rank with no parseable `dp` becomes its own singleton
+/// group, so it's still aligned rather than ignored — matching
+/// `sync_traces.py`'s `solo:<filename>` fallback key), and takes each
+/// group's reference as its lowest-`tp` member's marker-event end time
+/// (`ts + dur`). All groups are anchored to the *latest* group reference,
+/// so every shift is >= 0, matching the script exactly.
+///
+/// Mutates every affected track's events in place, then the flow pairs
+/// (whose `src_ts`/`dst_ts` need the shift of whichever track they
+/// reference, not necessarily the same shift as each other), then
+/// recomputes `trace.max_ts` (used directly for the view's zoom bounds) —
+/// `min_ts` is left alone, since nothing outside this file's own
+/// merge/serialize logic reads it. A uniform per-track shift changes
+/// nothing about event order or duration, so `prefix_max_dur` (built from
+/// durations, not timestamps) stays valid without recomputation.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn sync_multi_rank_clocks(trace: &mut Trace, rank_paths: &[(usize, String)], marker: &str) -> Result<String, String> {
+    let matching_names: std::collections::HashSet<u32> = trace.names.iter().enumerate()
+        .filter(|(_, n)| n.contains(marker))
+        .map(|(i, _)| i as u32)
+        .collect();
+    if matching_names.is_empty() {
+        return Err(format!("no event name contains {marker:?} in this trace"));
+    }
+
+    struct RankInfo { rank: usize, dp: Option<u32>, tp: Option<u32>, end: f64 }
+    let mut infos: Vec<RankInfo> = Vec::new();
+    for (rank, path) in rank_paths {
+        let fname = std::path::Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path);
+        let (dp, tp) = parse_dp_tp(fname);
+        let prefix = format!("  Rank {rank} ");
+        let mut best: Option<(f64, f64)> = None;
+        for t in &trace.tracks {
+            if !t.label.starts_with(&prefix) { continue; }
+            for e in &t.events {
+                if matching_names.contains(&e.name) {
+                    let is_earlier = match best { None => true, Some((bts, _)) => e.ts < bts };
+                    if is_earlier { best = Some((e.ts, e.dur)); }
+                }
+            }
+        }
+        if let Some((ts, dur)) = best {
+            infos.push(RankInfo { rank: *rank, dp, tp, end: ts + dur });
+        }
+    }
+    if infos.is_empty() {
+        return Err(format!("no rank had an event containing {marker:?}"));
+    }
+
+    #[derive(PartialEq, Eq, Hash, Clone, Copy)]
+    enum GroupKey { Dp(u32), Solo(usize) }
+    let key_of = |info: &RankInfo| match info.dp {
+        Some(dp) => GroupKey::Dp(dp),
+        None => GroupKey::Solo(info.rank),
+    };
+
+    let mut groups: HashMap<GroupKey, Vec<usize>> = HashMap::new();
+    for (i, info) in infos.iter().enumerate() {
+        groups.entry(key_of(info)).or_default().push(i);
+    }
+    let mut group_ref: HashMap<GroupKey, f64> = HashMap::new();
+    for (key, idxs) in &groups {
+        let rep = idxs.iter().min_by_key(|&&i| infos[i].tp.unwrap_or(0)).unwrap();
+        group_ref.insert(*key, infos[*rep].end);
+    }
+    let target = group_ref.values().copied().fold(f64::MIN, f64::max);
+
+    let mut rank_shift: HashMap<usize, f64> = HashMap::new();
+    let mut summary = String::new();
+    for key in groups.keys() {
+        use std::fmt::Write;
+        let shift = target - group_ref[key];
+        let members: Vec<&RankInfo> = groups[key].iter().map(|&i| &infos[i]).collect();
+        let label = match key { GroupKey::Dp(d) => format!("dp{d}"), GroupKey::Solo(_) => "solo".to_string() };
+        let _ = writeln!(summary, "{label}: shift={shift:+.1}us ({} rank{})",
+            members.len(), if members.len() == 1 { "" } else { "s" });
+        for m in members {
+            rank_shift.insert(m.rank, shift);
+        }
+    }
+
+    let mut track_shift = vec![0.0f64; trace.tracks.len()];
+    for (ti, t) in trace.tracks.iter().enumerate() {
+        if let Some(r) = crate::state::parse_rank(&t.label) {
+            if let Some(&shift) = rank_shift.get(&r) {
+                track_shift[ti] = shift;
+            }
+        }
+    }
+    for (ti, t) in trace.tracks.iter_mut().enumerate() {
+        let shift = track_shift[ti];
+        if shift != 0.0 {
+            for e in &mut t.events { e.ts += shift; }
+        }
+    }
+    for f in &mut trace.flow_pairs {
+        f.src_ts += track_shift[f.src_track as usize];
+        f.dst_ts += track_shift[f.dst_track as usize];
+    }
+
+    let mut max_ts = f64::MIN;
+    for t in &trace.tracks {
+        for e in &t.events {
+            max_ts = max_ts.max(e.ts + e.dur);
+        }
+    }
+    trace.max_ts = max_ts;
+
+    Ok(format!("Aligned {} ranks across {} DP group{} on {marker:?}:\n{summary}",
+        infos.len(), groups.len(), if groups.len() == 1 { "" } else { "s" }))
+}
+
 pub fn load_multi_progressive(
     rank_paths: Vec<(usize, String)>, counter: &Arc<AtomicUsize>, tpf: usize,
     tx: &std::sync::mpsc::Sender<Result<Trace, String>>,

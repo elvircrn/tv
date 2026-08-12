@@ -153,6 +153,10 @@ pub struct Pane {
     /// default (`export_gpu_only_web`).
     #[cfg(not(target_arch = "wasm32"))]
     pub share_include_cpu: bool,
+    /// Result of the last "Sync Clocks" click (success summary, or an
+    /// error) — shown next to the button until the next click replaces it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub sync_message: Option<(bool, String)>,
 }
 
 impl Pane {
@@ -211,6 +215,8 @@ impl Pane {
             share_link_result: None,
             #[cfg(not(target_arch = "wasm32"))]
             share_include_cpu: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            sync_message: None,
         }
     }
 
@@ -297,6 +303,25 @@ impl Pane {
         let out_str = out_path.to_str().ok_or_else(|| "non-UTF-8 destination path".to_string())?;
         crate::loader::export_full_web(trace, out_str)?;
         Ok(out_path.to_string_lossy().into_owned())
+    }
+
+    /// Corrects inter-node clock skew across this pane's merged multi-rank
+    /// trace — see `loader::sync_multi_rank_clocks` for the full algorithm
+    /// (a Rust port of `sync_traces.py`, applied in memory instead of
+    /// writing shifted files to disk). Only meaningful for an actual
+    /// multi-rank merge (`reload_paths` has more than one entry).
+    /// Deliberately leaves the view's pan/zoom untouched — the user is
+    /// likely already looking at the region they care about (e.g. the very
+    /// marker event this aligns on) and a shift on the order of hundreds of
+    /// microseconds shouldn't visibly move anything at whatever zoom level
+    /// made that visible in the first place.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn sync_clocks(&mut self) -> Result<String, String> {
+        if self.reload_paths.len() < 2 {
+            return Err("not a multi-rank trace".to_string());
+        }
+        let trace = self.trace.as_mut().ok_or_else(|| "no trace loaded".to_string())?;
+        crate::loader::sync_multi_rank_clocks(trace, &self.reload_paths, crate::loader::DEFAULT_SYNC_MARKER)
     }
 
     /// Exports (via `export_gpu_only_web`, or `export_full_web` when

@@ -1257,12 +1257,16 @@ impl App {
                 .build(|| {
                     let pane = &mut state.panes[pi];
                     if pane.trace.is_some() {
-                        let max_ts = pane.trace.as_ref().unwrap().max_ts;
-                        // Vertically center the row's widgets within the toolbar. Frame
-                        // widgets (input, buttons, checkboxes) are `frame_height` tall;
-                        // the square close button is `TOOLBAR_ROW` tall.
+                        // Two vertically-stacked rows: row 1 (top) is the
+                        // export/share/sync-clocks controls, row 2 (bottom)
+                        // is everything else. Frame widgets (input, buttons,
+                        // checkboxes) are `frame_height` tall; the square
+                        // close button is `TOOLBAR_ROW` tall and stays
+                        // centered across the whole (now two-row) toolbar.
                         let frame_h = ui.frame_height();
-                        let row_y = ((TOOLBAR_H - frame_h) * 0.5).max(0.0);
+                        let row_gap = 4.0;
+                        let row1_y = ((TOOLBAR_H - 2.0 * frame_h - row_gap) * 0.5).max(0.0);
+                        let row2_y = row1_y + frame_h + row_gap;
                         {
                             let win_size = ui.window_size();
                             let btn = TOOLBAR_ROW; // square hit target
@@ -1289,102 +1293,7 @@ impl App {
                             dl.add_line([a[0], a[1]], [b[0], b[1]], stroke).thickness(2.0).build();
                             dl.add_line([a[0], b[1]], [b[0], a[1]], stroke).thickness(2.0).build();
                             drop(dl);
-                            ui.set_cursor_pos([ui.cursor_start_pos()[0], row_y]);
-                        }
-
-                        // Search
-                        if pane.search_focus {
-                            ui.set_keyboard_focus_here();
-                            pane.search_focus = false;
-                        }
-                        ui.set_next_item_width(SEARCH_W);
-                        let prev_len = pane.prev_search.len();
-                        struct SelectAllCb<'a>(&'a mut bool);
-                        impl InputTextCallbackHandler for SelectAllCb<'_> {
-                            fn on_always(&mut self, mut data: TextCallbackData) {
-                                if *self.0 { data.select_all(); *self.0 = false; }
-                            }
-                        }
-                        let enter = ui.input_text("##search", &mut pane.search)
-                            .hint("Search (/) ")
-                            .flags(imgui::InputTextFlags::ENTER_RETURNS_TRUE
-                                | imgui::InputTextFlags::AUTO_SELECT_ALL)
-                            .callback(InputTextCallback::ALWAYS, SelectAllCb(&mut pane.select_all_pending))
-                            .build();
-                        if pane.search.len() != prev_len || pane.search != pane.prev_search {
-                            search_changed[pi] = true;
-                            pane.prev_search.clear();
-                            pane.prev_search.push_str(&pane.search);
-                        }
-                        if enter && !pane.search.trim().is_empty() {
-                            if search_changed[pi] {
-                                pane.rebuild_search();
-                                search_changed[pi] = false;
-                            }
-                            pane.select_from_search(&mut state.buf);
-                            pane.zoom_to_search();
-                            pane.pending_tab = Some(BottomTab::Selection);
-                        }
-                        let search_active = pane.search_mask.iter().any(|&m| m);
-                        if search_active {
-                            let has_matches = !pane.search_nav.is_empty();
-                            ui.same_line_with_spacing(0.0, 6.0);
-                            ui.enabled(has_matches, || {
-                                if ui.small_button("<##prevmatch") { pane.nav_search(false); }
-                            });
-                            if ui.is_item_hovered() { ui.tooltip_text("Previous match (Shift+N)"); }
-                            ui.same_line_with_spacing(0.0, 2.0);
-                            ui.enabled(has_matches, || {
-                                if ui.small_button(">##nextmatch") { pane.nav_search(true); }
-                            });
-                            if ui.is_item_hovered() { ui.tooltip_text("Next match (N)"); }
-                            ui.same_line_with_spacing(0.0, 6.0);
-                            ui.align_text_to_frame_padding();
-                            state.buf.fmt.clear();
-                            write!(state.buf.fmt, "{} matches", pane.search_nav.len()).unwrap();
-                            ui.text_colored([0.6, 0.8, 1.0, 1.0], &state.buf.fmt);
-                        }
-
-                        // Controls: view actions first, then display toggles.
-                        ui.same_line_with_spacing(0.0, 16.0);
-                        if ui.button("Fit") {
-                            let pad = max_ts * FIT_PAD_FRAC;
-                            pane.view.t0 = -pad;
-                            pane.view.t1 = max_ts + pad;
-                            pane.view.scroll_y = 0.0;
-                            pane.view.anim = None;
-                        }
-                        if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
-                            ui.same_line_with_spacing(0.0, 8.0);
-                            if ui.button("Diff") {
-                                diff_clicked_against = Some(pi);
-                            }
-                        }
-                        ui.same_line_with_spacing(0.0, 16.0);
-                        ui.checkbox("Show CPU trace", &mut pane.show_cpu);
-                        ui.same_line_with_spacing(0.0, 10.0);
-                        ui.checkbox("Merge Streams", &mut pane.merge_gpu);
-
-                        // vLLM traces emit a per-generation `execute_context_N(N)_generation_M(M)`
-                        // span on every stream — one toggle hides/shows them all. Only shown
-                        // when the trace actually contains such names (computed once at load,
-                        // in `poll_loading`, not recomputed every toolbar frame).
-                        if !pane.exec_context_names.is_empty() {
-                            let all_hidden = pane.exec_context_names.iter()
-                                .all(|&i| pane.hidden_names.get(i).copied().unwrap_or(false));
-                            ui.same_line_with_spacing(0.0, 10.0);
-                            let label = if all_hidden { "Show Execute Context" } else { "Hide Execute Context" };
-                            if ui.button(label) {
-                                for &i in &pane.exec_context_names {
-                                    if let Some(h) = pane.hidden_names.get_mut(i) { *h = !all_hidden; }
-                                }
-                                if !pane.search.is_empty() { pane.rebuild_search(); }
-                            }
-                        }
-
-                        if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
-                            ui.same_line_with_spacing(0.0, 10.0);
-                            ui.checkbox("Watch", &mut pane.auto_reload);
+                            ui.set_cursor_pos([ui.cursor_start_pos()[0], row1_y]);
                         }
                         // Only offered when there's a real source file to
                         // derive the sibling export folder from, and the
@@ -1395,7 +1304,6 @@ impl App {
                         if !pane.reload_paths.is_empty()
                             && pane.trace.as_ref().is_some_and(|t| t.tracks.iter().any(|tr| tr.gpu))
                         {
-                            ui.same_line_with_spacing(0.0, 10.0);
                             if ui.button("Export GPU") {
                                 pane.export_message = Some(match pane.export_gpu_only() {
                                     Ok(path) => (true, format!("Exported to {path}")),
@@ -1457,6 +1365,115 @@ impl App {
                                 }
                                 None => {}
                             }
+                            if pane.reload_paths.len() >= 2 {
+                                ui.same_line_with_spacing(0.0, 16.0);
+                                if ui.button("Sync Clocks") {
+                                    pane.sync_message = Some(match pane.sync_clocks() {
+                                        Ok(msg) => (true, msg),
+                                        Err(e) => (false, format!("Sync failed: {e}")),
+                                    });
+                                }
+                                if ui.is_item_hovered() {
+                                    ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) — aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
+                                }
+                                if let Some((ok, msg)) = &pane.sync_message {
+                                    ui.same_line_with_spacing(0.0, 8.0);
+                                    let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
+                                    ui.align_text_to_frame_padding();
+                                    ui.text_colored(color, msg.lines().next().unwrap_or(msg));
+                                    if ui.is_item_hovered() && msg.contains('\n') {
+                                        ui.tooltip_text(msg);
+                                    }
+                                }
+                            }
+                        }
+
+                        ui.set_cursor_pos([ui.cursor_start_pos()[0], row2_y]);
+                        // Search
+                        if pane.search_focus {
+                            ui.set_keyboard_focus_here();
+                            pane.search_focus = false;
+                        }
+                        ui.set_next_item_width(SEARCH_W);
+                        let prev_len = pane.prev_search.len();
+                        struct SelectAllCb<'a>(&'a mut bool);
+                        impl InputTextCallbackHandler for SelectAllCb<'_> {
+                            fn on_always(&mut self, mut data: TextCallbackData) {
+                                if *self.0 { data.select_all(); *self.0 = false; }
+                            }
+                        }
+                        let enter = ui.input_text("##search", &mut pane.search)
+                            .hint("Search (/) ")
+                            .flags(imgui::InputTextFlags::ENTER_RETURNS_TRUE
+                                | imgui::InputTextFlags::AUTO_SELECT_ALL)
+                            .callback(InputTextCallback::ALWAYS, SelectAllCb(&mut pane.select_all_pending))
+                            .build();
+                        if pane.search.len() != prev_len || pane.search != pane.prev_search {
+                            search_changed[pi] = true;
+                            pane.prev_search.clear();
+                            pane.prev_search.push_str(&pane.search);
+                        }
+                        if enter && !pane.search.trim().is_empty() {
+                            if search_changed[pi] {
+                                pane.rebuild_search();
+                                search_changed[pi] = false;
+                            }
+                            pane.select_from_search(&mut state.buf);
+                            pane.zoom_to_search();
+                            pane.pending_tab = Some(BottomTab::Selection);
+                        }
+                        let search_active = pane.search_mask.iter().any(|&m| m);
+                        if search_active {
+                            let has_matches = !pane.search_nav.is_empty();
+                            ui.same_line_with_spacing(0.0, 6.0);
+                            ui.enabled(has_matches, || {
+                                if ui.small_button("<##prevmatch") { pane.nav_search(false); }
+                            });
+                            if ui.is_item_hovered() { ui.tooltip_text("Previous match (Shift+N)"); }
+                            ui.same_line_with_spacing(0.0, 2.0);
+                            ui.enabled(has_matches, || {
+                                if ui.small_button(">##nextmatch") { pane.nav_search(true); }
+                            });
+                            if ui.is_item_hovered() { ui.tooltip_text("Next match (N)"); }
+                            ui.same_line_with_spacing(0.0, 6.0);
+                            ui.align_text_to_frame_padding();
+                            state.buf.fmt.clear();
+                            write!(state.buf.fmt, "{} matches", pane.search_nav.len()).unwrap();
+                            ui.text_colored([0.6, 0.8, 1.0, 1.0], &state.buf.fmt);
+                        }
+
+                        // Controls: view actions first, then display toggles.
+                        if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
+                            ui.same_line_with_spacing(0.0, 16.0);
+                            if ui.button("Diff") {
+                                diff_clicked_against = Some(pi);
+                            }
+                        }
+                        ui.same_line_with_spacing(0.0, 16.0);
+                        ui.checkbox("Show CPU trace", &mut pane.show_cpu);
+                        ui.same_line_with_spacing(0.0, 10.0);
+                        ui.checkbox("Merge Streams", &mut pane.merge_gpu);
+
+                        // vLLM traces emit a per-generation `execute_context_N(N)_generation_M(M)`
+                        // span on every stream — one toggle hides/shows them all. Only shown
+                        // when the trace actually contains such names (computed once at load,
+                        // in `poll_loading`, not recomputed every toolbar frame).
+                        if !pane.exec_context_names.is_empty() {
+                            let all_hidden = pane.exec_context_names.iter()
+                                .all(|&i| pane.hidden_names.get(i).copied().unwrap_or(false));
+                            ui.same_line_with_spacing(0.0, 10.0);
+                            let label = if all_hidden { "Show Execute Context" } else { "Hide Execute Context" };
+                            if ui.button(label) {
+                                for &i in &pane.exec_context_names {
+                                    if let Some(h) = pane.hidden_names.get_mut(i) { *h = !all_hidden; }
+                                }
+                                if !pane.search.is_empty() { pane.rebuild_search(); }
+                            }
+                        }
+
+                        if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
+                            ui.same_line_with_spacing(0.0, 10.0);
+                            ui.checkbox("Watch", &mut pane.auto_reload);
                         }
                         if pi == 0 {
                             ui.same_line_with_spacing(0.0, 16.0);
