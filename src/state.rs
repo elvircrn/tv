@@ -155,7 +155,6 @@ pub struct Pane {
     pub share_include_cpu: bool,
     /// Result of the last "Sync Clocks" click (success summary, or an
     /// error) — shown next to the button until the next click replaces it.
-    #[cfg(not(target_arch = "wasm32"))]
     pub sync_message: Option<(bool, String)>,
 }
 
@@ -215,7 +214,6 @@ impl Pane {
             share_link_result: None,
             #[cfg(not(target_arch = "wasm32"))]
             share_include_cpu: false,
-            #[cfg(not(target_arch = "wasm32"))]
             sync_message: None,
         }
     }
@@ -320,8 +318,10 @@ impl Pane {
     /// merged trace's own `rank_paths` — the same rank/filename pairs,
     /// persisted into the `.tvcache` format at export time — so this still
     /// works after reopening an already-merged cache file directly, when
-    /// there's no directory of per-rank JSON to re-derive them from.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// there's no directory of per-rank JSON to re-derive them from — the
+    /// latter is the only path available on wasm (`reload_paths` is always
+    /// empty there), but it's enough: any `.tvcache` merged natively and
+    /// then opened in the browser carries its `rank_paths` with it.
     pub fn sync_clocks(&mut self) -> Result<String, String> {
         let rank_paths: Vec<(usize, String)> = if self.reload_paths.len() >= 2 {
             self.reload_paths.clone()

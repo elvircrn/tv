@@ -2684,20 +2684,18 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
 /// Default marker substring used to align DP groups — see
 /// `sync_multi_rank_clocks`. A DeepEP `combine` kernel launch is a good
 /// sync point because every rank in a run reaches it early and reliably.
-#[cfg(not(target_arch = "wasm32"))]
 pub const DEFAULT_SYNC_MARKER: &str = "deep_ep::elastic::combine_impl";
 
 /// Extracts `(dp, tp)` from a rank's source filename, e.g.
 /// `dp2_pp0_tp5_dcp0_ep17_rank1....json` -> `(Some(2), Some(5))`. Mirrors
 /// `sync_traces.py`'s `parse_dp_tp` regex (`\bdp(\d+)`, `\btp(\d+)`): a
 /// literal "dp"/"tp" not immediately preceded by an alphanumeric
-/// character, followed by one or more digits.
-///
-/// Not `cfg`-gated to native for any technical reason (it's pure string
-/// parsing) — only `sync_multi_rank_clocks`'s caller (`Pane::sync_clocks`)
-/// needs `reload_paths`, which has no wasm equivalent (see its own doc
-/// comment), so there's nothing to call this from there yet.
-#[cfg(not(target_arch = "wasm32"))]
+/// character, followed by one or more digits. Pure string parsing, so this
+/// (and `sync_multi_rank_clocks`) builds and runs on wasm too — `Pane::
+/// sync_clocks` sources rank/filename pairs from either `reload_paths`
+/// (native directory opens) or the merged trace's own persisted
+/// `rank_paths` (works after loading an already-merged `.tvcache`, native
+/// or web).
 fn parse_dp_tp(fname: &str) -> (Option<u32>, Option<u32>) {
     fn find(fname: &str, pfx: &str) -> Option<u32> {
         let bytes = fname.as_bytes();
@@ -2746,7 +2744,6 @@ fn parse_dp_tp(fname: &str) -> (Option<u32>, Option<u32>) {
 /// merge/serialize logic reads it. A uniform per-track shift changes
 /// nothing about event order or duration, so `prefix_max_dur` (built from
 /// durations, not timestamps) stays valid without recomputation.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn sync_multi_rank_clocks(trace: &mut Trace, rank_paths: &[(usize, String)], marker: &str) -> Result<String, String> {
     let matching_names: std::collections::HashSet<u32> = trace.names.iter().enumerate()
         .filter(|(_, n)| n.contains(marker))

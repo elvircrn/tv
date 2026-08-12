@@ -1295,6 +1295,13 @@ impl App {
                             drop(dl);
                             ui.set_cursor_pos([ui.cursor_start_pos()[0], row1_y]);
                         }
+                        // Tracks whether the Export/Share controls below drew
+                        // anything, so the (cross-platform) Sync Clocks button
+                        // below knows whether it needs a leading same_line or
+                        // is the first thing on this row — e.g. always true on
+                        // wasm, since that whole block is native-only.
+                        #[allow(unused_mut, unused_assignments)]
+                        let mut row1_has_content = false;
                         // Only offered when there's a real source file to
                         // derive the sibling export folder from, and the
                         // trace actually has GPU tracks to export. Native
@@ -1304,6 +1311,7 @@ impl App {
                         if !pane.reload_paths.is_empty()
                             && pane.trace.as_ref().is_some_and(|t| t.tracks.iter().any(|tr| tr.gpu))
                         {
+                            row1_has_content = true;
                             if ui.button("Export GPU") {
                                 pane.export_message = Some(match pane.export_gpu_only() {
                                     Ok(path) => (true, format!("Exported to {path}")),
@@ -1365,27 +1373,34 @@ impl App {
                                 }
                                 None => {}
                             }
-                            let multi_rank = pane.reload_paths.len() >= 2
-                                || pane.trace.as_ref().is_some_and(|t| t.rank_paths.len() >= 2);
-                            if multi_rank {
+                        }
+                        // Cross-platform: sync_clocks sources rank/filename
+                        // pairs from either reload_paths (native directory
+                        // opens) or the trace's own persisted rank_paths
+                        // (works after loading an already-merged .tvcache,
+                        // native or web — see loader::sync_multi_rank_clocks).
+                        let multi_rank = pane.reload_paths.len() >= 2
+                            || pane.trace.as_ref().is_some_and(|t| t.rank_paths.len() >= 2);
+                        if multi_rank {
+                            if row1_has_content {
                                 ui.same_line_with_spacing(0.0, 16.0);
-                                if ui.button("Sync Clocks") {
-                                    pane.sync_message = Some(match pane.sync_clocks() {
-                                        Ok(msg) => (true, msg),
-                                        Err(e) => (false, format!("Sync failed: {e}")),
-                                    });
-                                }
-                                if ui.is_item_hovered() {
-                                    ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) — aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
-                                }
-                                if let Some((ok, msg)) = &pane.sync_message {
-                                    ui.same_line_with_spacing(0.0, 8.0);
-                                    let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
-                                    ui.align_text_to_frame_padding();
-                                    ui.text_colored(color, msg.lines().next().unwrap_or(msg));
-                                    if ui.is_item_hovered() && msg.contains('\n') {
-                                        ui.tooltip_text(msg);
-                                    }
+                            }
+                            if ui.button("Sync Clocks") {
+                                pane.sync_message = Some(match pane.sync_clocks() {
+                                    Ok(msg) => (true, msg),
+                                    Err(e) => (false, format!("Sync failed: {e}")),
+                                });
+                            }
+                            if ui.is_item_hovered() {
+                                ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) — aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
+                            }
+                            if let Some((ok, msg)) = &pane.sync_message {
+                                ui.same_line_with_spacing(0.0, 8.0);
+                                let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
+                                ui.align_text_to_frame_padding();
+                                ui.text_colored(color, msg.lines().next().unwrap_or(msg));
+                                if ui.is_item_hovered() && msg.contains('\n') {
+                                    ui.tooltip_text(msg);
                                 }
                             }
                         }
