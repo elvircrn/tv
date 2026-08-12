@@ -1837,36 +1837,33 @@ fn truncated_text(ui: &imgui::Ui, buf: &mut DrawBuf, name: &str, max_chars: usiz
     }
 }
 
+/// Side length of the logical box `draw_vllm_logo`'s vertex coordinates are
+/// normalized to — exposed so callers can compute the logo's on-screen size
+/// (`VLLM_LOGO_GRID * scale`) without duplicating that number.
+pub const VLLM_LOGO_GRID: f32 = 32.0;
+
+/// Exact vector geometry (not a rasterized approximation) of the official
+/// mark, from `vLLM-Logo.svg` in `vllm-project/media-kit` (96x96 viewBox: a
+/// yellow triangle and a blue convex quadrilateral). Coordinates are that
+/// SVG's own path data, tightly cropped to the mark's bounding box (plus a
+/// small margin) and rescaled so the box is `VLLM_LOGO_GRID` units square —
+/// `scale` then maps 1 unit to 1 pixel, same convention the old pixel-grid
+/// version used. `YELLOW`/`BLUE` are the exact fill colors from that SVG
+/// (`#fdb515`/`#30a2ff`).
 pub fn draw_vllm_logo(dl: &imgui::DrawListMut, x: f32, y: f32, scale: f32) {
-    const ICON: [[u8; 16]; 16] = [
-        [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2],
-        [0,0,0,0,0,0,0,0,0,0,0,0,0,2,2,2],
-        [0,0,0,0,0,0,0,0,0,0,0,2,2,2,2,0],
-        [1,1,1,1,1,1,0,0,0,0,2,2,2,2,2,0],
-        [0,1,1,1,1,1,0,0,0,0,2,2,2,2,2,0],
-        [0,1,1,1,1,1,0,0,0,2,2,2,2,2,0,0],
-        [0,0,1,1,1,1,0,0,0,2,2,2,2,2,0,0],
-        [0,0,1,1,1,1,0,0,0,2,2,2,2,2,0,0],
-        [0,0,0,1,1,1,0,0,0,2,2,2,2,2,0,0],
-        [0,0,0,1,1,1,0,0,2,2,2,2,2,0,0,0],
-        [0,0,0,0,1,1,0,0,2,2,2,2,2,0,0,0],
-        [0,0,0,0,1,1,0,0,2,2,2,2,2,0,0,0],
-        [0,0,0,0,0,1,0,2,2,2,2,2,2,0,0,0],
-        [0,0,0,0,0,1,0,2,2,2,2,2,0,0,0,0],
-        [0,0,0,0,0,0,0,2,2,2,2,2,0,0,0,0],
-        [0,0,0,0,0,0,0,2,2,2,2,2,0,0,0,0],
-    ];
     const YELLOW: ImColor32 = ImColor32::from_rgba(253, 181, 21, 255);
     const BLUE: ImColor32 = ImColor32::from_rgba(48, 162, 255, 255);
-    for (r, row) in ICON.iter().enumerate() {
-        for (c, &v) in row.iter().enumerate() {
-            if v == 0 { continue; }
-            let color = if v == 1 { YELLOW } else { BLUE };
-            let px = x + c as f32 * scale;
-            let py = y + r as f32 * scale;
-            dl.add_rect([px, py], [px + scale, py + scale], color).filled(true).build();
-        }
-    }
+    const YELLOW_PTS: [[f32; 2]; 3] = [[13.417, 7.835], [13.417, 30.286], [2.191, 7.835]];
+    const BLUE_PTS: [[f32; 2]; 4] =
+        [[13.416, 30.286], [22.237, 30.286], [29.809, 1.714], [19.427, 7.179]];
+
+    let tp = |p: [f32; 2]| [x + p[0] * scale, y + p[1] * scale];
+    dl.add_triangle(tp(YELLOW_PTS[0]), tp(YELLOW_PTS[1]), tp(YELLOW_PTS[2]), YELLOW)
+        .filled(true)
+        .build();
+    dl.add_polyline(BLUE_PTS.iter().map(|&p| tp(p)).collect::<Vec<_>>(), BLUE)
+        .filled(true)
+        .build();
 }
 
 pub fn device_name_color() -> ImColor32 {

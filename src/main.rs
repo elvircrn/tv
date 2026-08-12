@@ -1750,8 +1750,8 @@ impl App {
                     }
                     dl.add_text([win_pos[0] + 8.0, cy], col32(153, 153, 153, 255), &state.buf.fmt);
 
-                    let logo_scale = text_h / 16.0;
-                    let logo_w = 16.0 * logo_scale;
+                    let logo_scale = text_h / VLLM_LOGO_GRID;
+                    let logo_w = VLLM_LOGO_GRID * logo_scale;
                     let mut right_x = win_pos[0] + win_size[0] - 8.0;
                     if !t.device.is_empty() {
                         let dev_size = ui.calc_text_size(&t.device);
@@ -1801,9 +1801,11 @@ impl App {
                         let dl = ui.get_window_draw_list();
                         let win_pos = ui.window_pos();
                         let avail = ui.content_region_avail();
-                        let logo_scale = 6.0;
-                        let logo_w = 16.0 * logo_scale;
-                        let logo_h = 16.0 * logo_scale;
+                        // Same on-screen size as before (16*6 == 32*3 == 96px):
+                        // only the grid's resolution doubled, not the logo's footprint.
+                        let logo_scale = 3.0;
+                        let logo_w = VLLM_LOGO_GRID * logo_scale;
+                        let logo_h = VLLM_LOGO_GRID * logo_scale;
                         let cx = win_pos[0] + (avail[0] - logo_w) * 0.5;
                         let mut cy = win_pos[1] + (avail[1] - logo_h) * 0.5;
                         if state.panes[pi].error.is_some() {
