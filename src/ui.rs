@@ -632,13 +632,13 @@ pub fn draw_timeline(
                     g.vi = 0;
                     g.label.clear();
                     match rank {
-                        Some(r) => write!(g.label, "  Rank {} GPU (merged)", r).ok(),
-                        None => write!(g.label, "GPU (merged)").ok(),
+                        Some(r) => write!(g.label, "  Rank {}", r).ok(),
+                        None => write!(g.label, "GPU").ok(),
                     };
                 } else {
                     let label = match rank {
-                        Some(r) => format!("  Rank {} GPU (merged)", r),
-                        None => "GPU (merged)".to_string(),
+                        Some(r) => format!("  Rank {}", r),
+                        None => "GPU".to_string(),
                     };
                     buf.merged_gpu_groups.push(MergedGpuGroup {
                         tracks: vec![i], events: Vec::new(), max_depth: 0, vi: 0, label,
@@ -1874,17 +1874,37 @@ pub fn col32(r: u8, g: u8, b: u8, a: u8) -> ImColor32 {
     ImColor32::from_rgba(r, g, b, a)
 }
 
+/// How much further each channel is pushed from the color's own max channel
+/// (i.e. away from gray, at constant hue/value) — a cheap saturation boost
+/// that needs no HSV round-trip. 1.0 leaves `PALETTE` (a deliberately muted
+/// Tableau-style set) unchanged; higher values pull the three channels
+/// apart, making different tracks/kernels easier to tell apart at a glance.
+const SATURATION_BOOST: f32 = 1.15;
+
+fn boost_saturation(r: u8, g: u8, b: u8, factor: f32) -> (u8, u8, u8) {
+    let max = r.max(g).max(b) as f32;
+    if max == 0.0 { return (r, g, b); }
+    let push = |c: u8| (max - (max - c as f32) * factor).clamp(0.0, 255.0) as u8;
+    (push(r), push(g), push(b))
+}
+
 pub fn palette_color(name: &str, brightness: u32) -> ImColor32 {
     let h = fnv1a(name.as_bytes()) as usize;
     let c = PALETTE[h % PALETTE.len()];
-    let r = ((c >> 16) & 0xFF) * brightness / 255;
-    let g = ((c >> 8) & 0xFF) * brightness / 255;
-    let b = (c & 0xFF) * brightness / 255;
+    let (pr, pg, pb) = boost_saturation(
+        ((c >> 16) & 0xFF) as u8,
+        ((c >> 8) & 0xFF) as u8,
+        (c & 0xFF) as u8,
+        SATURATION_BOOST,
+    );
+    let r = pr as u32 * brightness / 255;
+    let g = pg as u32 * brightness / 255;
+    let b = pb as u32 * brightness / 255;
     ImColor32::from_rgba(r as u8, g as u8, b as u8, 255)
 }
 
-pub fn name_color(name: &str) -> ImColor32 { palette_color(name, 140) }
-pub fn dim_color(name: &str) -> ImColor32 { palette_color(name, 77) }
+pub fn name_color(name: &str) -> ImColor32 { palette_color(name, 155) }
+pub fn dim_color(name: &str) -> ImColor32 { palette_color(name, 85) }
 
 pub fn brighten(c: ImColor32, amt: u8) -> ImColor32 {
     let v: u32 = c.into();

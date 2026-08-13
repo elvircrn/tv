@@ -244,11 +244,14 @@ fn test_name_color_deterministic() {
 
 #[test]
 fn test_name_color_darkened() {
+    // name_color scales the (saturation-boosted) palette color by a 155/255
+    // brightness multiplier, so no channel can exceed that ceiling — still
+    // "darkened" relative to a raw, undimmed palette color (255 max).
     let c: u32 = name_color("x").into();
     let r = c & 0xFF;
     let g = (c >> 8) & 0xFF;
     let b = (c >> 16) & 0xFF;
-    assert!(r <= 140 && g <= 140 && b <= 140, "colors should be darkened to <=140");
+    assert!(r <= 155 && g <= 155 && b <= 155, "colors should be darkened to <=155");
 }
 
 #[test]

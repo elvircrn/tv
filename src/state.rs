@@ -167,7 +167,7 @@ impl Pane {
             error: None,
             trace_path: String::new(),
             show_cpu: false,
-            merge_gpu: false,
+            merge_gpu: true,
             selected: None,
             multi_select_name: None,
             search: String::with_capacity(256),
