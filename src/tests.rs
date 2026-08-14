@@ -640,6 +640,53 @@ fn test_rank_paths_trailer_absent_is_empty() {
 }
 
 #[test]
+fn test_even_spacing_heights_all_content_is_uniform() {
+    let has_content = vec![true; 4];
+    let heights = crate::ui::even_spacing_heights(&has_content, 100.0);
+    assert_eq!(heights, vec![25.0; 4]);
+}
+
+#[test]
+fn test_even_spacing_heights_all_empty_is_uniform() {
+    // Nothing to expand into the freed space, so this must not collapse
+    // every row to the empty-strip height and lose the rest of the viewport.
+    let has_content = vec![false; 4];
+    let heights = crate::ui::even_spacing_heights(&has_content, 100.0);
+    assert_eq!(heights, vec![25.0; 4]);
+}
+
+#[test]
+fn test_even_spacing_heights_one_of_many_fills_the_rest() {
+    // The scenario the merged multi-rank view actually hits: 8 rank rows,
+    // only one has an event in the current (zoomed-in) view window.
+    let mut has_content = vec![false; 8];
+    has_content[3] = true;
+    let heights = crate::ui::even_spacing_heights(&has_content, 100.0);
+    for (i, &h) in heights.iter().enumerate() {
+        if i == 3 {
+            assert_eq!(h, 100.0 - 7.0 * 6.0, "the one non-empty row should get the freed height");
+        } else {
+            assert_eq!(h, 6.0, "empty rows should collapse to the thin strip");
+        }
+    }
+}
+
+#[test]
+fn test_even_spacing_heights_empty_strip_never_exceeds_uniform_share() {
+    // A tiny viewport with many rows: EMPTY_ROW_H (6.0) alone would exceed
+    // an equal per-row share, which must clamp instead of overflowing avail.
+    let has_content = vec![false, true, false, false, false, false, false, false, false, false];
+    let heights = crate::ui::even_spacing_heights(&has_content, 10.0);
+    let total: f32 = heights.iter().sum();
+    assert!(total <= 10.0 + 1e-4, "collapsed rows must not overflow the available height: {total}");
+}
+
+#[test]
+fn test_even_spacing_heights_empty_input() {
+    assert!(crate::ui::even_spacing_heights(&[], 100.0).is_empty());
+}
+
+#[test]
 fn test_rank_summary() {
     use crate::rank_summary;
     let fname = "dp0_pp0_tp3_dcp0_ep3_rank3.1786304095590565996.pt.trace.json.gz";
@@ -1910,6 +1957,29 @@ fn bench_stats_sort_cost() {
         });
         eprintln!("  sort by Max via full match arm:  {:.2}ms", t3.elapsed().as_secs_f64() * 1000.0);
     }
+}
+
+#[test]
+fn test_collect_merged_track_events_excludes_events_before_view_t0() {
+    // bisect_overlap's starting index is a conservative lower bound: it
+    // accounts for the longest duration seen up to any given index, not
+    // that specific event's own duration. A long early event (A) can make
+    // the bisect land on index 0, after which collect_merged_track_events
+    // used to include every subsequent event up to view_t1 without checking
+    // whether each one individually still overlapped the window — so a
+    // short, long-since-finished event (B) got swept in as if it were
+    // visible at the current (zoomed-in) time, well after it actually ended.
+    let names = vec!["a", "b"];
+    let events = vec![
+        ev(0.0, 5000.0, 0, 0),  // A: ends at 5000, legitimately overlaps below
+        ev(100.0, 1.0, 1, 0),   // B: ends at 101, long over by the window below
+    ];
+    let trace = make_trace(names, vec![("GPU 0", true, events)]);
+    let hidden = vec![false; trace.names.len()];
+    let mut out = Vec::new();
+    crate::ui::collect_merged_track_events(&trace.tracks[0], 0, 4500.0, 4600.0, &hidden, &mut out);
+    assert_eq!(out.len(), 1, "only A should overlap [4500, 4600], not B: {out:?}");
+    assert_eq!(out[0].3, 0, "the surviving event should be A (event index 0)");
 }
 
 #[test]

@@ -530,6 +530,14 @@ pub(crate) fn collect_merged_track_events(
     let end = gt.events.partition_point(|e| e.ts <= view_t1);
     for ei in start..end {
         let ev = &gt.events[ei];
+        // bisect_overlap's `start` is a conservative lower bound (it accounts
+        // for the longest duration seen up to any given index, not this
+        // event's own), so it can land well before events that don't
+        // actually reach view_t0 — a single long-running event earlier in
+        // the stream is enough to pull in everything after it, regardless of
+        // whether each one individually overlaps the current window. Skip
+        // those explicitly instead of treating "start..end" as "overlapping".
+        if ev.ts + ev.dur < view_t0 { continue; }
         if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
         let has_grandchild = gt.events[ei + 1..].iter()
             .take_while(|e2| e2.ts <= ev.ts + ev.dur)
@@ -537,6 +545,31 @@ pub(crate) fn collect_merged_track_events(
         if has_grandchild { continue; }
         out.push((ev.ts, ev.dur, ti as u32, ei as u32));
     }
+}
+
+/// Row heights for "even spacing" mode: `has_content[vi]` says whether row
+/// `vi` has any event in the current view window. Rows without one collapse
+/// to a thin fixed strip (`EMPTY_ROW_H`, clamped so it can't itself exceed
+/// an equal share if `avail` is very small); the height freed by collapsing
+/// them is split evenly among the rows that do have content — so, e.g., a
+/// zoomed-in merged multi-rank view with only one rank active at this
+/// instant lets that one row fill nearly the whole available height instead
+/// of splitting it uniformly with dozens of blank rank rows. Falls back to
+/// a plain uniform split if every row (or no row) has content, since
+/// there's nothing to collapse into.
+pub(crate) fn even_spacing_heights(has_content: &[bool], avail: f32) -> Vec<f32> {
+    let n = has_content.len();
+    if n == 0 { return Vec::new(); }
+    const EMPTY_ROW_H: f32 = 6.0;
+    let n_empty = has_content.iter().filter(|&&c| !c).count();
+    let n_content = n - n_empty;
+    let empty_h = EMPTY_ROW_H.min(avail / n as f32);
+    let content_h = if n_content > 0 {
+        ((avail - n_empty as f32 * empty_h) / n_content as f32).max(0.0)
+    } else {
+        avail / n as f32
+    };
+    has_content.iter().map(|&c| if n_content > 0 && !c { empty_h } else { content_h }).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -650,6 +683,15 @@ pub fn draw_timeline(
     }
     buf.merged_gpu_groups.truncate(group_slot);
 
+    // Parallel to buf.visible/heights: whether each row has any event
+    // actually overlapping the current view window. Feeds the even-spacing
+    // pass below so rows with nothing to show at this zoom collapse instead
+    // of claiming an equal share of the height a row with real content
+    // could otherwise expand into — most useful in the merged multi-rank
+    // view, where ranks are rarely in perfect lockstep, so zooming in tight
+    // enough often leaves only one rank's row with anything visible while
+    // the rest sit empty.
+    let mut has_content: Vec<bool> = Vec::new();
     let mut emitted_ranks: Vec<bool> = vec![false; rank_group_idxs.len()];
     for &i in track_order.iter() {
         let t = &trace.tracks[i];
@@ -689,6 +731,7 @@ pub fn draw_timeline(
                 buf.visible.push(first);
                 buf.heights.push(h);
                 buf.y_offsets.push(cumulative);
+                has_content.push(!ev_list.is_empty());
                 cumulative += h;
             }
             continue;
@@ -702,23 +745,33 @@ pub fn draw_timeline(
         );
         buf.heights.push(h);
         buf.y_offsets.push(cumulative);
+        // Same conservative-lower-bound caveat as collect_merged_track_events:
+        // `start` can land on an event well before view.t0, so check each
+        // candidate's actual end time instead of assuming the first one
+        // (or its ts alone) means real overlap.
+        let start = bisect_overlap(&t.events, &t.prefix_max_dur, view.t0);
+        let end = t.events.partition_point(|e| e.ts <= view.t1);
+        has_content.push(t.events[start..end].iter().any(|e| e.ts + e.dur >= view.t0));
         cumulative += h;
     }
     let mut total_h = cumulative;
     let tracks_top = rect[1] + RULER_H;
 
-    // Even-spacing mode: override the drawn row heights so every visible track
-    // shares the viewport height equally, filling down to the bottom pane. It
-    // recomputes each frame from the current viewport, so dragging the bottom
-    // divider (which changes rect[3]) re-flows the lanes live. It intentionally
-    // does NOT touch track_scales, so toggling the mode off restores the manual
-    // layout — an easy undo. Toggled by double-clicking the last lane.
+    // Even-spacing mode: override the drawn row heights so visible tracks
+    // fill the viewport height, down to the bottom pane. It recomputes each
+    // frame from the current viewport, so dragging the bottom divider
+    // (which changes rect[3]) or panning/zooming (which changes which rows
+    // have anything in view) re-flows the lanes live. It intentionally does
+    // not touch track_scales, so toggling the mode off restores the manual
+    // layout — an easy undo. Toggled by double-clicking the last lane, or
+    // the bottom-divider icon. See `even_spacing_heights` for how rows with
+    // nothing in the current view collapse instead of claiming an equal
+    // share of the height.
     if *even_spacing && !buf.visible.is_empty() {
-        let n = buf.visible.len();
         let avail = (rect[3] - tracks_top).max(1.0);
-        let h = avail / n as f32;
+        let heights = even_spacing_heights(&has_content, avail);
         let mut cum = 0.0;
-        for vi in 0..n {
+        for (vi, &h) in heights.iter().enumerate() {
             buf.heights[vi] = h;
             buf.y_offsets[vi] = cum;
             cum += h;
