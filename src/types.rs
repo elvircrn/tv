@@ -21,8 +21,14 @@ pub const LABEL_W: f32 = 200.0;
 pub const MIN_EV_PX: f32 = 1.0;
 pub const TEXT_MIN_PX: f32 = 60.0;
 pub const TOOLBAR_ROW: f32 = 24.0;
-// Two rows: the export/share/sync-clocks row on top, everything else below.
+// Native: two rows (export/share/sync-clocks on top, everything else below).
+// Wasm has none of those row-1 controls (no filesystem, no `gh` CLI) — Sync
+// Clocks lives in the single row with everything else — so its toolbar is
+// only tall enough for one.
+#[cfg(not(target_arch = "wasm32"))]
 pub const TOOLBAR_H: f32 = TOOLBAR_ROW * 2.0 + 12.0;
+#[cfg(target_arch = "wasm32")]
+pub const TOOLBAR_H: f32 = TOOLBAR_ROW + 8.0;
 pub const STATUS_H: f32 = TOOLBAR_ROW + 4.0;
 pub const DETAIL_H: f32 = 200.0;
 pub const INITIAL_BUF: usize = 256 * 1024;

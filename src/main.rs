@@ -1291,16 +1291,26 @@ impl App {
                 .build(|| {
                     let pane = &mut state.panes[pi];
                     if pane.trace.is_some() {
-                        // Two vertically-stacked rows: row 1 (top) is the
-                        // export/share/sync-clocks controls, row 2 (bottom)
-                        // is everything else. Frame widgets (input, buttons,
-                        // checkboxes) are `frame_height` tall; the square
-                        // close button is `TOOLBAR_ROW` tall and stays
-                        // centered across the whole (now two-row) toolbar.
+                        // Native: two vertically-stacked rows — row 1 (top)
+                        // is the export/share/sync-clocks controls, row 2
+                        // (bottom) is everything else. Wasm has nothing in
+                        // row 1 (see TOOLBAR_H), so row1_y and row2_y both
+                        // collapse to the same single centered row there.
+                        // Frame widgets (input, buttons, checkboxes) are
+                        // `frame_height` tall; the square close button is
+                        // `TOOLBAR_ROW` tall and stays centered across the
+                        // whole toolbar regardless of row count.
                         let frame_h = ui.frame_height();
+                        #[cfg(not(target_arch = "wasm32"))]
                         let row_gap = 4.0;
+                        #[cfg(not(target_arch = "wasm32"))]
                         let row1_y = ((TOOLBAR_H - 2.0 * frame_h - row_gap) * 0.5).max(0.0);
+                        #[cfg(not(target_arch = "wasm32"))]
                         let row2_y = row1_y + frame_h + row_gap;
+                        #[cfg(target_arch = "wasm32")]
+                        let row1_y = ((TOOLBAR_H - frame_h) * 0.5).max(0.0);
+                        #[cfg(target_arch = "wasm32")]
+                        let row2_y = row1_y;
                         {
                             let win_size = ui.window_size();
                             let btn = TOOLBAR_ROW; // square hit target
