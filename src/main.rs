@@ -1148,7 +1148,41 @@ impl App {
             || (0..n_panes).any(|pi| state.panes[pi].selection_dirty);
         if any_has_trace && !state.diff_popup_open {
             let divider_y = display[1] - bottom_h - status_h;
-            let near_h = !selecting && (mouse_pos[1] - divider_y).abs() < DIVIDER_GRAB_PX && mouse_pos[1] > TOOLBAR_H;
+            // Small area around the lock icon itself: a plain single click
+            // there also toggles pin, on top of double-clicking anywhere
+            // else on the divider — same raw hit-test technique, excluded
+            // from the resize-drag strip so clicking the icon can't also
+            // start a resize.
+            let near_icon = (mouse_pos[0] - display[0] * 0.5).abs() < LOCK_ICON_RADIUS * 2.2
+                && (mouse_pos[1] - divider_y).abs() < DIVIDER_GRAB_PX;
+            let near_h = !selecting && !near_icon
+                && (mouse_pos[1] - divider_y).abs() < DIVIDER_GRAB_PX && mouse_pos[1] > TOOLBAR_H;
+
+            // Double-clicking the divider (or a single click right on the
+            // icon) toggles "even spacing" for the active pane — every
+            // visible track scales to evenly fill the space from the ruler
+            // down to this divider (see draw_timeline's even_spacing
+            // handling), so it reads as the tracks "auto-fitting" to the
+            // available height. This is the same toggle already reachable
+            // by double-clicking the last track row/empty space beneath it;
+            // the icon just makes it discoverable, especially in the merged
+            // multi-rank view where a handful of rank rows otherwise leave a
+            // lot of dead space below them.
+            let toggle_fit = (near_h && ui.is_mouse_double_clicked(imgui::MouseButton::Left))
+                || (near_icon && ui.is_mouse_clicked(imgui::MouseButton::Left));
+            if toggle_fit {
+                let pane = &mut state.panes[state.active];
+                pane.even_spacing = !pane.even_spacing;
+            }
+            if near_icon {
+                ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
+                let tip = if state.panes[state.active].even_spacing {
+                    "Tracks are fit to the visible height — click to go back to their normal (scrollable) sizes."
+                } else {
+                    "Fit all tracks to evenly fill the space down to this divider — handy for the merged view, where a few rank rows otherwise leave a lot of dead space. Double-clicking the divider does the same thing."
+                };
+                ui.tooltip_text(tip);
+            }
 
             if (near_h && !state.drag.is_active()) || state.drag == DragKind::BottomDivider {
                 ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeNS));
@@ -1305,39 +1339,12 @@ impl App {
                         // Only offered when there's a real source file to
                         // derive the sibling export folder from, and the
                         // trace actually has GPU tracks to export. Native
-                        // only — there's no filesystem to export a folder
-                        // to on wasm (see loader::export_gpu_only).
+                        // only — there's no filesystem to export to on wasm.
                         #[cfg(not(target_arch = "wasm32"))]
                         if !pane.reload_paths.is_empty()
                             && pane.trace.as_ref().is_some_and(|t| t.tracks.iter().any(|tr| tr.gpu))
                         {
                             row1_has_content = true;
-                            if ui.button("Export GPU") {
-                                pane.export_message = Some(match pane.export_gpu_only() {
-                                    Ok(path) => (true, format!("Exported to {path}")),
-                                    Err(e) => (false, format!("Export failed: {e}")),
-                                });
-                            }
-                            if ui.is_item_hovered() {
-                                ui.tooltip_text("Export GPU-only timings (no args) to a sibling folder");
-                            }
-                            ui.same_line_with_spacing(0.0, 8.0);
-                            if ui.button("Export GPU (web)") {
-                                pane.export_message = Some(match pane.export_gpu_only_web() {
-                                    Ok(path) => (true, format!("Exported to {path}")),
-                                    Err(e) => (false, format!("Export failed: {e}")),
-                                });
-                            }
-                            if ui.is_item_hovered() {
-                                ui.tooltip_text("Same, but gzip instead of xz — larger file, but openable via the web build's ?src= shareable link");
-                            }
-                            if let Some((ok, msg)) = &pane.export_message {
-                                ui.same_line_with_spacing(0.0, 8.0);
-                                let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
-                                ui.align_text_to_frame_padding();
-                                ui.text_colored(color, msg);
-                            }
-                            ui.same_line_with_spacing(0.0, 8.0);
                             let uploading = pane.share_link_job.is_some();
                             let include_cpu = pane.share_include_cpu;
                             ui.disabled(uploading, || {
@@ -1346,7 +1353,7 @@ impl App {
                                 }
                             });
                             if ui.is_item_hovered() {
-                                let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "Export GPU (web)" };
+                                let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "GPU-only timings (no args)" };
                                 ui.tooltip_text(&format!("Export {what}, then upload it to a new secret GitHub gist via your locally logged-in `gh` CLI, and show a copyable ?gist= link — no browser login or pasted token, but it does need `gh auth login` already done on this machine"));
                             }
                             ui.same_line_with_spacing(0.0, 8.0);
@@ -1593,6 +1600,7 @@ impl App {
                 let near = !selecting && ((mouse_pos[1] - divider_y).abs() < DIVIDER_GRAB_PX || state.drag == DragKind::BottomDivider);
                 let col = if near { col32(120, 120, 120, 255) } else { col32(60, 60, 60, 255) };
                 dl.add_line([0.0, divider_y], [display[0], divider_y], col).build();
+                draw_lock_icon(&dl, display[0] * 0.5, divider_y - 1.0, state.panes[state.active].even_spacing);
             }
             for (i, &dx) in state.divider_xs.iter().enumerate() {
                 let dl = ui.get_foreground_draw_list();
@@ -1916,6 +1924,7 @@ impl App {
         }
 
         mark!("timeline", t_section);
+
         // ---- Process click/selection results per pane ----
         for pi in 0..n_panes {
             if let Some(c) = click_results[pi] {

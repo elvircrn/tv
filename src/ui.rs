@@ -1866,6 +1866,40 @@ pub fn draw_vllm_logo(dl: &imgui::DrawListMut, x: f32, y: f32, scale: f32) {
         .build();
 }
 
+/// Radius of the lock icon's shackle circle, in pixels.
+pub const LOCK_ICON_RADIUS: f32 = 4.0;
+
+/// Draws the bottom divider's "fit tracks to the visible height" indicator
+/// (`Pane::even_spacing`, toggled by double-clicking the divider or this
+/// icon — see main.rs): a shackle (circle outline) sitting on a body
+/// (filled rounded rect), the classic padlock silhouette — the body's fill
+/// occludes the circle's lower half, so only the top arc reads as a loop,
+/// no arc-drawing primitive needed. Not itself an interactive element, just
+/// a visual indicator. `fit` controls both color (accent when on, gray when
+/// off) and the shackle's vertical offset: flush against the body when on,
+/// lifted with a visible gap when off — mirroring a closed vs. open padlock.
+pub fn draw_lock_icon(dl: &imgui::DrawListMut, cx: f32, cy: f32, fit: bool) {
+    let color = if fit { ACCENT_LINE } else { col32(120, 120, 120, 255) };
+    let body_w = 11.0;
+    let body_h = 8.0;
+    let body_top = cy + 1.0;
+    let shackle_gap = if fit { 0.0 } else { 2.5 };
+    let shackle_cy = body_top - LOCK_ICON_RADIUS * 0.9 - shackle_gap;
+
+    dl.add_circle([cx, shackle_cy], LOCK_ICON_RADIUS, color)
+        .thickness(1.6)
+        .num_segments(16)
+        .build();
+    dl.add_rect(
+        [cx - body_w * 0.5, body_top],
+        [cx + body_w * 0.5, body_top + body_h],
+        color,
+    )
+    .filled(true)
+    .rounding(1.5)
+    .build();
+}
+
 pub fn device_name_color() -> ImColor32 {
     ImColor32::from_rgba(118, 185, 0, 255)
 }
