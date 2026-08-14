@@ -552,6 +552,41 @@ fn decompress_parse_streaming(
     }
 }
 
+/// Per-kernel-name aggregate timing stats (count/total/median/max/min),
+/// sorted by total duration descending, from a map of name -> every
+/// duration recorded under that name.
+fn kernel_stats_from_dur_map(dur_map: HashMap<u32, Vec<f64>>) -> Vec<KernelStats> {
+    let mut stats: Vec<KernelStats> = dur_map.into_iter().map(|(name, mut durs)| {
+        let count = durs.len() as u32;
+        let total_dur: f64 = durs.iter().sum();
+        let max_dur = durs.iter().copied().fold(0.0f64, f64::max);
+        durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = durs.len();
+        let median_dur = if n % 2 == 1 { durs[n / 2] } else { (durs[n / 2 - 1] + durs[n / 2]) / 2.0 };
+        let min_dur = durs[0];
+        KernelStats { name, count, total_dur, median_dur, max_dur, min_dur }
+    }).collect();
+    stats.sort_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
+    stats
+}
+
+/// Recomputes `kernel_stats_from_dur_map` straight from a trace's tracks —
+/// used as a fallback in `load_cache_from_bytes` for cache files written
+/// before `KernelStats` gained `min_dur` (see CACHE_VERSION's history):
+/// their on-disk stats blob is the old, smaller layout, but the raw events
+/// it would have been computed from are unaffected by that change and
+/// always readable, so this reconstructs the exact same stats a fresh
+/// parse would produce instead of guessing or rejecting the file.
+pub(crate) fn compute_kernel_stats(tracks: &[Track]) -> Vec<KernelStats> {
+    let mut dur_map: HashMap<u32, Vec<f64>> = HashMap::new();
+    for t in tracks {
+        for ev in &t.events {
+            dur_map.entry(ev.name).or_default().push(ev.dur);
+        }
+    }
+    kernel_stats_from_dur_map(dur_map)
+}
+
 fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Instant) -> Result<Trace, String> {
     let mut names: Vec<String> = vec![String::new()];
     let mut name_idx: FnvMap<u32> = FnvMap::default();
@@ -753,17 +788,7 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
             dur_map.entry(ev.name).or_default().push(ev.dur);
         }
     }
-    let mut stats: Vec<KernelStats> = dur_map.into_iter().map(|(name, mut durs)| {
-        let count = durs.len() as u32;
-        let total_dur: f64 = durs.iter().sum();
-        let max_dur = durs.iter().copied().fold(0.0f64, f64::max);
-        durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = durs.len();
-        let median_dur = if n % 2 == 1 { durs[n / 2] } else { (durs[n / 2 - 1] + durs[n / 2]) / 2.0 };
-        let min_dur = durs[0];
-        KernelStats { name, count, total_dur, median_dur, max_dur, min_dur }
-    }).collect();
-    stats.sort_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
+    let stats = kernel_stats_from_dur_map(dur_map);
 
     names.shrink_to_fit();
     cats.shrink_to_fit();
@@ -778,15 +803,14 @@ const CACHE_MAGIC: &[u8; 4] = b"TRV2";
 // defaults it when missing, and loads accept any version <= this (older caches
 // simply lack the newer trailing fields). Only a newer-than-known cache is
 // rejected, since its layout may have diverged.
+// v4 grew `KernelStats` (added min_dur) — unlike the optional trailing
+// fields described above, it's a *fixed-size struct read via raw byte
+// reinterpretation* (`n_stats * size_of::<KernelStats>()`), so older caches
+// can't just be read with the new (larger) struct size. load_cache_from_bytes
+// handles this explicitly (skip the old-sized stats bytes, recompute stats
+// from the always-compatible raw events) rather than invalidating those
+// caches, so this bump didn't need a matching floor on how old is readable.
 const CACHE_VERSION: u32 = 4;
-// Below this, reject outright rather than "accept any version <=": v4 grew
-// `KernelStats` (added min_dur), which — unlike the optional trailing
-// fields the comment above describes — is a *fixed-size struct read via raw
-// byte reinterpretation* (`n_stats * size_of::<KernelStats>()`). A v3 cache
-// read with v4's larger struct size would misinterpret the stats bytes (and
-// everything after them) instead of just missing a field, so those caches
-// must be invalidated and re-parsed from source, not silently misread.
-const CACHE_MIN_VERSION: u32 = 4;
 
 fn cache_path(source: &str, cache_dir: Option<&str>) -> String {
     if let Some(dir) = cache_dir {
@@ -1821,7 +1845,7 @@ pub fn load_cache(source_path: &str, cache_dir: Option<&str>) -> Option<Trace> {
     if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
     let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
     let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
-    if r32(4) > CACHE_VERSION || r32(4) < CACHE_MIN_VERSION { return None; }
+    if r32(4) > CACHE_VERSION { return None; }
     if r64(8) != src_size || r64(16) != src_mtime { return None; }
     load_cache_from_bytes(&d)
 }
@@ -1847,7 +1871,8 @@ pub fn load_cache_from_bytes(d: &[u8]) -> Option<Trace> {
     let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
     let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
     let rf64 = |off: usize| f64::from_le_bytes(d[off..off + 8].try_into().unwrap());
-    if r32(4) > CACHE_VERSION || r32(4) < CACHE_MIN_VERSION { return None; }
+    let version = r32(4);
+    if version > CACHE_VERSION { return None; }
 
     let max_ts = rf64(24);
     let min_ts = rf64(32);
@@ -1919,12 +1944,16 @@ pub fn load_cache_from_bytes(d: &[u8]) -> Option<Trace> {
     };
     pos += pmd_bytes;
 
-    let stats_size = std::mem::size_of::<KernelStats>();
+    // v4 grew KernelStats (added min_dur). Files written before that (any
+    // version < 4) have the old, smaller per-entry layout on disk — skip
+    // over those bytes using their real (old) size and recompute stats
+    // after `tracks` is built below, instead of misreading them with the
+    // current (larger) struct size or rejecting the file outright.
+    const OLD_KERNEL_STATS_SIZE: usize = 32; // name:u32,count:u32,total/median/max:f64 each, no padding
+    let stats_size = if version >= 4 { std::mem::size_of::<KernelStats>() } else { OLD_KERNEL_STATS_SIZE };
     let stats_bytes = n_stats * stats_size;
     if pos + stats_bytes > d.len() { return None; }
-    let stats: Vec<KernelStats> = unsafe {
-        std::slice::from_raw_parts(d[pos..].as_ptr() as *const KernelStats, n_stats)
-    }.to_vec();
+    let stats_offset = pos;
     pos += stats_bytes;
 
     if pos + args_len > d.len() { return None; }
@@ -1949,6 +1978,14 @@ pub fn load_cache_from_bytes(d: &[u8]) -> Option<Trace> {
             raw_buf_idx: 0,
         }
     }).collect();
+
+    let stats: Vec<KernelStats> = if version >= 4 {
+        unsafe {
+            std::slice::from_raw_parts(d[stats_offset..].as_ptr() as *const KernelStats, n_stats)
+        }.to_vec()
+    } else {
+        compute_kernel_stats(&tracks)
+    };
 
     let fp_size = std::mem::size_of::<FlowPair>();
     let mut flow_pairs = Vec::new();
@@ -2002,17 +2039,12 @@ pub fn load_cache_from_bytes(d: &[u8]) -> Option<Trace> {
 
 /// A clearer error than "invalid or corrupt" for a `.tvcache`-family file
 /// that failed to parse, when the reason is identifiable: a cache format
-/// version this build won't read (see CACHE_VERSION/CACHE_MIN_VERSION).
-/// That's fixable (re-export it, update Trace Viewer, or reopen the
-/// original trace files) — worth telling apart from genuine corruption.
+/// newer than this build understands (see CACHE_VERSION) — older caches are
+/// handled directly in `load_cache_from_bytes` instead of being rejected,
+/// so reaching here with an old version means something else is wrong.
 fn cache_load_error(d: &[u8]) -> String {
     if d.len() >= 8 && d[0..4] == *CACHE_MAGIC {
         let version = u32::from_le_bytes(d[4..8].try_into().unwrap());
-        if version < CACHE_MIN_VERSION {
-            return format!(
-                "this file uses an older cache format (v{version}) that this version of Trace Viewer no longer reads (needs v{CACHE_MIN_VERSION}+) — re-export it, or reopen the original trace files instead"
-            );
-        }
         if version > CACHE_VERSION {
             return format!(
                 "this file uses a newer cache format (v{version}) than this version of Trace Viewer understands (up to v{CACHE_VERSION}) — update Trace Viewer to open it"
@@ -2044,7 +2076,7 @@ fn expand_gpu_export(d: &[u8]) -> Option<Vec<u8>> {
     if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
     let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
     let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
-    if r32(4) > CACHE_VERSION || r32(4) < CACHE_MIN_VERSION { return None; }
+    if r32(4) > CACHE_VERSION { return None; }
 
     let total_events = r64(40) as usize;
     let n_tracks = r32(48) as usize;
@@ -2685,17 +2717,7 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     all_flow_pairs.dedup_by(|a, b| a.src_track == b.src_track && a.src_ts == b.src_ts
         && a.dst_track == b.dst_track && a.dst_ts == b.dst_ts);
 
-    let mut stats: Vec<KernelStats> = dur_map.into_iter().map(|(name, mut durs)| {
-        let count = durs.len() as u32;
-        let total_dur: f64 = durs.iter().sum();
-        let max_dur = durs.iter().copied().fold(0.0f64, f64::max);
-        durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = durs.len();
-        let median_dur = if n % 2 == 1 { durs[n / 2] } else { (durs[n / 2 - 1] + durs[n / 2]) / 2.0 };
-        let min_dur = durs[0];
-        KernelStats { name, count, total_dur, median_dur, max_dur, min_dur }
-    }).collect();
-    stats.sort_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
+    let stats = kernel_stats_from_dur_map(dur_map);
 
     names.shrink_to_fit();
     cats.shrink_to_fit();

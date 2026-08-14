@@ -536,15 +536,32 @@ fn test_load_trace_no_events() {
 }
 
 #[test]
-fn test_load_cache_rejects_stale_version_with_incompatible_kernel_stats_layout() {
-    // v4 grew KernelStats (added min_dur) and is read via raw byte
-    // reinterpretation (n_stats * size_of::<KernelStats>()), not an optional
-    // trailing field — a v3 cache blob must be rejected outright rather than
-    // misread with the new (larger) struct size.
+fn test_load_cache_rejects_future_version() {
+    // Forward-compat: a cache format newer than this build understands must
+    // still be rejected (its layout may have diverged in ways this reader
+    // can't handle) — unaffected by making *older* versions (see
+    // test_compute_kernel_stats_min_dur) load via a fallback instead.
     let mut buf = vec![0u8; 80];
     buf[0..4].copy_from_slice(b"TRV2");
-    buf[4..8].copy_from_slice(&3u32.to_le_bytes());
-    assert!(crate::loader::load_cache_from_bytes(&buf).is_none(), "a pre-min_dur (v3) cache must not load");
+    buf[4..8].copy_from_slice(&999u32.to_le_bytes());
+    assert!(crate::loader::load_cache_from_bytes(&buf).is_none(), "a from-the-future cache version must not load");
+}
+
+#[test]
+fn test_compute_kernel_stats_min_dur() {
+    // v4 grew KernelStats (added min_dur); cache files written before that
+    // (any version < 4) have the old, smaller per-entry stats layout on
+    // disk. load_cache_from_bytes skips those bytes and recomputes stats
+    // from the raw events instead (see compute_kernel_stats) — this checks
+    // that recompute path actually produces the right min, not a guess.
+    let names = vec!["kernel_a"];
+    let events = vec![ev(0.0, 30.0, 0, 0), ev(50.0, 10.0, 0, 0), ev(100.0, 20.0, 0, 0)];
+    let trace = make_trace(names, vec![("GPU 0", true, events)]);
+    let stats = crate::loader::compute_kernel_stats(&trace.tracks);
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].min_dur, 10.0);
+    assert_eq!(stats[0].max_dur, 30.0);
+    assert_eq!(stats[0].count, 3);
 }
 
 #[test]
