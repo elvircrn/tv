@@ -1330,10 +1330,12 @@ impl App {
                             ui.set_cursor_pos([ui.cursor_start_pos()[0], row1_y]);
                         }
                         // Tracks whether the Export/Share controls below drew
-                        // anything, so the (cross-platform) Sync Clocks button
-                        // below knows whether it needs a leading same_line or
-                        // is the first thing on this row — e.g. always true on
-                        // wasm, since that whole block is native-only.
+                        // anything, so the Sync Clocks button below (native
+                        // only — on wasm it moves down to row 2, alongside
+                        // the other toolbar controls, since row 1 has nothing
+                        // else there) knows whether it needs a leading
+                        // same_line or is the first thing on this row.
+                        #[cfg(not(target_arch = "wasm32"))]
                         #[allow(unused_mut, unused_assignments)]
                         let mut row1_has_content = false;
                         // Only offered when there's a real source file to
@@ -1381,13 +1383,18 @@ impl App {
                                 None => {}
                             }
                         }
-                        // Cross-platform: sync_clocks sources rank/filename
-                        // pairs from either reload_paths (native directory
-                        // opens) or the trace's own persisted rank_paths
-                        // (works after loading an already-merged .tvcache,
-                        // native or web — see loader::sync_multi_rank_clocks).
+                        // sync_clocks sources rank/filename pairs from either
+                        // reload_paths (native directory opens) or the
+                        // trace's own persisted rank_paths (works after
+                        // loading an already-merged .tvcache, native or web
+                        // — see loader::sync_multi_rank_clocks).
                         let multi_rank = pane.reload_paths.len() >= 2
                             || pane.trace.as_ref().is_some_and(|t| t.rank_paths.len() >= 2);
+                        // Native: alongside Export/Share in row 1. On wasm
+                        // that whole row-1 block doesn't exist, so this moves
+                        // down to row 2 with the other toolbar controls
+                        // instead (see below, after the Watch checkbox).
+                        #[cfg(not(target_arch = "wasm32"))]
                         if multi_rank {
                             if row1_has_content {
                                 ui.same_line_with_spacing(0.0, 16.0);
@@ -1498,6 +1505,32 @@ impl App {
                         if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
                             ui.same_line_with_spacing(0.0, 10.0);
                             ui.checkbox("Watch", &mut pane.auto_reload);
+                        }
+                        // Wasm has no Export/Share row-1 controls (no
+                        // filesystem, no `gh` CLI), so Sync Clocks lives here
+                        // in row 2 with the other toolbar elements instead —
+                        // see the native version of this block, above.
+                        #[cfg(target_arch = "wasm32")]
+                        if multi_rank {
+                            ui.same_line_with_spacing(0.0, 16.0);
+                            if ui.button("Sync Clocks") {
+                                pane.sync_message = Some(match pane.sync_clocks() {
+                                    Ok(msg) => (true, msg),
+                                    Err(e) => (false, format!("Sync failed: {e}")),
+                                });
+                            }
+                            if ui.is_item_hovered() {
+                                ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) — aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
+                            }
+                            if let Some((ok, msg)) = &pane.sync_message {
+                                ui.same_line_with_spacing(0.0, 8.0);
+                                let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
+                                ui.align_text_to_frame_padding();
+                                ui.text_colored(color, msg.lines().next().unwrap_or(msg));
+                                if ui.is_item_hovered() && msg.contains('\n') {
+                                    ui.tooltip_text(msg);
+                                }
+                            }
                         }
                         if pi == 0 {
                             ui.same_line_with_spacing(0.0, 16.0);
