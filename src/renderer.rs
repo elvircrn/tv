@@ -161,7 +161,7 @@ impl MetalRenderer {
         );
         imgui.fonts().tex_id = imgui::TextureId::new(0);
         imgui.io_mut().font_global_scale = 1.0 / scale_factor as f32;
-        apply_style(imgui.style_mut());
+        crate::ui::apply_style(imgui.style_mut());
 
         let vtx_buf = device.new_buffer(INITIAL_BUF as u64, MTLResourceOptions::StorageModeShared);
         let idx_buf = device.new_buffer(INITIAL_BUF as u64, MTLResourceOptions::StorageModeShared);
@@ -298,80 +298,4 @@ impl MetalRenderer {
 
 fn layer_ref(raw: &raw_window_metal::Layer) -> &MetalLayerRef {
     unsafe { &*(raw.as_ptr().as_ptr() as *const MetalLayerRef) }
-}
-
-// Cohesive dark theme applied once at init. Replaces imgui's stock defaults so
-// the chrome (toolbar, buttons, dropdowns, scrollbars, popups, tables) reads as
-// one intentional surface: consistent rounding, quieter borders, and a single
-// accent (the logo blue) instead of imgui's default blue.
-fn apply_style(style: &mut imgui::Style) {
-    use imgui::StyleColor as C;
-
-    // Geometry: gentle, consistent rounding + calmer borders + a bit of air.
-    style.window_rounding = 6.0;
-    style.child_rounding = 4.0;
-    style.frame_rounding = 4.0;
-    style.popup_rounding = 4.0;
-    style.grab_rounding = 3.0;
-    style.scrollbar_rounding = 4.0;
-    style.tab_rounding = 4.0;
-    style.window_border_size = 1.0;
-    style.child_border_size = 1.0;
-    style.frame_border_size = 0.0;
-    style.popup_border_size = 1.0;
-    style.frame_padding = [8.0, 4.0];
-    // Leave item_spacing at imgui's default [8, 4]: the hand-rolled virtualized
-    // tables (draw_stats_table, labels table) assume a row pitch of
-    // font_size + ROW_PAD (4) == default item_spacing.y. Bumping it opens a gap
-    // after the header and desyncs the scroll virtualization.
-    style.item_spacing = [8.0, 4.0];
-    style.item_inner_spacing = [6.0, 4.0];
-    style.scrollbar_size = 12.0;
-    style.grab_min_size = 10.0;
-
-    // One accent, expressed at a few alphas.
-    let accent = [0.188, 0.635, 1.0, 1.0];
-    let accent_a = |a: f32| [accent[0], accent[1], accent[2], a];
-
-    let c = style.colors.as_mut_slice();
-    c[C::Text as usize] = [1.0, 1.0, 1.0, 1.0];
-    c[C::TextDisabled as usize] = [0.5, 0.5, 0.5, 1.0];
-    c[C::WindowBg as usize] = [0.086, 0.086, 0.086, 1.0];
-    c[C::ChildBg as usize] = [0.0, 0.0, 0.0, 0.0];
-    c[C::PopupBg as usize] = [0.08, 0.08, 0.08, 0.98];
-    c[C::Border as usize] = [0.24, 0.24, 0.24, 0.5];
-    c[C::BorderShadow as usize] = [0.0, 0.0, 0.0, 0.0];
-    c[C::FrameBg as usize] = [0.16, 0.16, 0.16, 1.0];
-    c[C::FrameBgHovered as usize] = [0.22, 0.22, 0.22, 1.0];
-    c[C::FrameBgActive as usize] = [0.26, 0.26, 0.26, 1.0];
-    c[C::TitleBg as usize] = [0.10, 0.10, 0.10, 1.0];
-    c[C::TitleBgActive as usize] = [0.12, 0.12, 0.12, 1.0];
-    c[C::TitleBgCollapsed as usize] = [0.08, 0.08, 0.08, 1.0];
-    c[C::MenuBarBg as usize] = [0.12, 0.12, 0.12, 1.0];
-    c[C::ScrollbarBg as usize] = [0.0, 0.0, 0.0, 0.0];
-    c[C::ScrollbarGrab as usize] = [0.30, 0.30, 0.30, 1.0];
-    c[C::ScrollbarGrabHovered as usize] = [0.38, 0.38, 0.38, 1.0];
-    c[C::ScrollbarGrabActive as usize] = [0.46, 0.46, 0.46, 1.0];
-    c[C::CheckMark as usize] = accent;
-    c[C::SliderGrab as usize] = accent_a(0.85);
-    c[C::SliderGrabActive as usize] = accent;
-    c[C::Button as usize] = [0.18, 0.18, 0.18, 1.0];
-    c[C::ButtonHovered as usize] = [0.26, 0.26, 0.26, 1.0];
-    c[C::ButtonActive as usize] = accent_a(0.55);
-    c[C::Header as usize] = [0.20, 0.20, 0.20, 1.0];
-    c[C::HeaderHovered as usize] = [0.26, 0.26, 0.26, 1.0];
-    c[C::HeaderActive as usize] = accent_a(0.45);
-    c[C::Separator as usize] = [0.24, 0.24, 0.24, 1.0];
-    c[C::SeparatorHovered as usize] = accent_a(0.55);
-    c[C::SeparatorActive as usize] = accent;
-    c[C::ResizeGrip as usize] = [0.26, 0.26, 0.26, 0.0];
-    c[C::ResizeGripHovered as usize] = accent_a(0.5);
-    c[C::ResizeGripActive as usize] = accent_a(0.85);
-    c[C::Tab as usize] = [0.14, 0.14, 0.14, 1.0];
-    c[C::TabHovered as usize] = accent_a(0.55);
-    c[C::TabActive as usize] = [0.22, 0.22, 0.22, 1.0];
-    c[C::TabUnfocused as usize] = [0.11, 0.11, 0.11, 1.0];
-    c[C::TabUnfocusedActive as usize] = [0.16, 0.16, 0.16, 1.0];
-    c[C::TextSelectedBg as usize] = accent_a(0.35);
-    c[C::NavHighlight as usize] = accent;
 }

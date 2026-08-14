@@ -111,6 +111,7 @@ impl WebGl2Renderer {
         }
         imgui.fonts().tex_id = imgui::TextureId::new(0);
         imgui.io_mut().font_global_scale = 1.0 / scale_factor as f32;
+        crate::ui::apply_style(imgui.style_mut());
 
         let font_tex = gl.create_texture().expect("create_texture failed");
         gl.bind_texture(Gl::TEXTURE_2D, Some(&font_tex));
