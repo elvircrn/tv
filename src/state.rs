@@ -949,6 +949,7 @@ impl Pane {
                 name: s.name, count: s.count, total_dur: s.total_dur,
                 median_dur: median,
                 max_dur: s.durations.iter().copied().fold(0.0f64, f64::max),
+                min_dur: s.durations.iter().copied().fold(f64::MAX, f64::min),
             }
         }).collect();
 
@@ -958,7 +959,7 @@ impl Pane {
         for se in &self.selection_stats {
             for (i, &d) in se.durations.iter().enumerate() {
                 let r = se.event_refs.get(i).copied().unwrap_or((u32::MAX, u32::MAX));
-                combined.push((KernelStats { name: se.name, count: 1, total_dur: d, median_dur: d, max_dur: d }, r));
+                combined.push((KernelStats { name: se.name, count: 1, total_dur: d, median_dur: d, max_dur: d, min_dur: d }, r));
             }
         }
         combined.sort_unstable_by(|a, b| b.0.total_dur.partial_cmp(&a.0.total_dur).unwrap());

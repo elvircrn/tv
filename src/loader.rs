@@ -760,7 +760,8 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
         durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let n = durs.len();
         let median_dur = if n % 2 == 1 { durs[n / 2] } else { (durs[n / 2 - 1] + durs[n / 2]) / 2.0 };
-        KernelStats { name, count, total_dur, median_dur, max_dur }
+        let min_dur = durs[0];
+        KernelStats { name, count, total_dur, median_dur, max_dur, min_dur }
     }).collect();
     stats.sort_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
 
@@ -777,7 +778,15 @@ const CACHE_MAGIC: &[u8; 4] = b"TRV2";
 // defaults it when missing, and loads accept any version <= this (older caches
 // simply lack the newer trailing fields). Only a newer-than-known cache is
 // rejected, since its layout may have diverged.
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
+// Below this, reject outright rather than "accept any version <=": v4 grew
+// `KernelStats` (added min_dur), which — unlike the optional trailing
+// fields the comment above describes — is a *fixed-size struct read via raw
+// byte reinterpretation* (`n_stats * size_of::<KernelStats>()`). A v3 cache
+// read with v4's larger struct size would misinterpret the stats bytes (and
+// everything after them) instead of just missing a field, so those caches
+// must be invalidated and re-parsed from source, not silently misread.
+const CACHE_MIN_VERSION: u32 = 4;
 
 fn cache_path(source: &str, cache_dir: Option<&str>) -> String {
     if let Some(dir) = cache_dir {
@@ -1812,7 +1821,7 @@ pub fn load_cache(source_path: &str, cache_dir: Option<&str>) -> Option<Trace> {
     if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
     let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
     let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
-    if r32(4) > CACHE_VERSION { return None; }
+    if r32(4) > CACHE_VERSION || r32(4) < CACHE_MIN_VERSION { return None; }
     if r64(8) != src_size || r64(16) != src_mtime { return None; }
     load_cache_from_bytes(&d)
 }
@@ -1838,7 +1847,7 @@ pub fn load_cache_from_bytes(d: &[u8]) -> Option<Trace> {
     let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
     let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
     let rf64 = |off: usize| f64::from_le_bytes(d[off..off + 8].try_into().unwrap());
-    if r32(4) > CACHE_VERSION { return None; }
+    if r32(4) > CACHE_VERSION || r32(4) < CACHE_MIN_VERSION { return None; }
 
     let max_ts = rf64(24);
     let min_ts = rf64(32);
@@ -1991,14 +2000,36 @@ pub fn load_cache_from_bytes(d: &[u8]) -> Option<Trace> {
     })
 }
 
+/// A clearer error than "invalid or corrupt" for a `.tvcache`-family file
+/// that failed to parse, when the reason is identifiable: a cache format
+/// version this build won't read (see CACHE_VERSION/CACHE_MIN_VERSION).
+/// That's fixable (re-export it, update Trace Viewer, or reopen the
+/// original trace files) — worth telling apart from genuine corruption.
+fn cache_load_error(d: &[u8]) -> String {
+    if d.len() >= 8 && d[0..4] == *CACHE_MAGIC {
+        let version = u32::from_le_bytes(d[4..8].try_into().unwrap());
+        if version < CACHE_MIN_VERSION {
+            return format!(
+                "this file uses an older cache format (v{version}) that this version of Trace Viewer no longer reads (needs v{CACHE_MIN_VERSION}+) — re-export it, or reopen the original trace files instead"
+            );
+        }
+        if version > CACHE_VERSION {
+            return format!(
+                "this file uses a newer cache format (v{version}) than this version of Trace Viewer understands (up to v{CACHE_VERSION}) — update Trace Viewer to open it"
+            );
+        }
+    }
+    "invalid or corrupt file".to_string()
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-fn load_cache_direct(cache_path: &str) -> Option<Trace> {
-    let d = read_and_decompress_cache(cache_path)?;
-    load_cache_from_bytes(&d)
+fn load_cache_direct(cache_path: &str) -> Result<Trace, String> {
+    let d = read_and_decompress_cache(cache_path).ok_or_else(|| "could not read file".to_string())?;
+    load_cache_from_bytes(&d).ok_or_else(|| cache_load_error(&d))
 }
 
 #[cfg(target_arch = "wasm32")]
-fn load_cache_direct(_cache_path: &str) -> Option<Trace> { None }
+fn load_cache_direct(_cache_path: &str) -> Result<Trace, String> { Err("not supported on web".to_string()) }
 
 /// Reverses `export_gpu_only`'s slim-SoA + per-track delta-encoded-timestamp
 /// event encoding back into the standard AoS `Event` layout that
@@ -2013,7 +2044,7 @@ fn expand_gpu_export(d: &[u8]) -> Option<Vec<u8>> {
     if d.len() < 80 || &d[0..4] != CACHE_MAGIC { return None; }
     let r32 = |off: usize| u32::from_le_bytes(d[off..off + 4].try_into().unwrap());
     let r64 = |off: usize| u64::from_le_bytes(d[off..off + 8].try_into().unwrap());
-    if r32(4) > CACHE_VERSION { return None; }
+    if r32(4) > CACHE_VERSION || r32(4) < CACHE_MIN_VERSION { return None; }
 
     let total_events = r64(40) as usize;
     let n_tracks = r32(48) as usize;
@@ -2124,25 +2155,25 @@ fn expand_gpu_export(d: &[u8]) -> Option<Vec<u8>> {
 /// decompress into memory first, unlike `load_cache_direct`'s mmap-based
 /// zero-copy path, since compressed bytes can't be randomly accessed.
 #[cfg(not(target_arch = "wasm32"))]
-fn load_cache_xz(cache_path: &str) -> Option<Trace> {
-    let file = std::fs::File::open(cache_path).ok()?;
+fn load_cache_xz(cache_path: &str) -> Result<Trace, String> {
+    let file = std::fs::File::open(cache_path).map_err(|e| e.to_string())?;
     let mut decoder = xz2::read::XzDecoder::new(BufReader::new(file));
     let mut buf = Vec::new();
-    decoder.read_to_end(&mut buf).ok()?;
-    let expanded = expand_gpu_export(&buf)?;
-    load_cache_from_bytes(&expanded)
+    decoder.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let expanded = expand_gpu_export(&buf).ok_or_else(|| cache_load_error(&buf))?;
+    load_cache_from_bytes(&expanded).ok_or_else(|| cache_load_error(&expanded))
 }
 
 /// Reads an `export_gpu_only_web` output (`.tvcache.gz`) — plain standard
 /// AoS layout under gzip, so unlike `load_cache_xz` this needs no inverse
 /// transform before `load_cache_from_bytes`.
 #[cfg(not(target_arch = "wasm32"))]
-fn load_cache_gz(cache_path: &str) -> Option<Trace> {
-    let file = std::fs::File::open(cache_path).ok()?;
+fn load_cache_gz(cache_path: &str) -> Result<Trace, String> {
+    let file = std::fs::File::open(cache_path).map_err(|e| e.to_string())?;
     let mut decoder = flate2::read::GzDecoder::new(BufReader::new(file));
     let mut buf = Vec::new();
-    decoder.read_to_end(&mut buf).ok()?;
-    load_cache_from_bytes(&buf)
+    decoder.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    load_cache_from_bytes(&buf).ok_or_else(|| cache_load_error(&buf))
 }
 
 fn merged_cache_hash(cache_dir: &str) -> u64 {
@@ -2307,18 +2338,15 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
     #[cfg(not(target_arch = "wasm32"))]
     if path.ends_with(".tvcache.xz") {
         return load_cache_xz(path)
-            .ok_or_else(|| "invalid or corrupt .tvcache.xz file".to_string())
             .inspect(|t| eprintln!("  cache (xz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events));
     }
     #[cfg(not(target_arch = "wasm32"))]
     if path.ends_with(".tvcache.gz") {
         return load_cache_gz(path)
-            .ok_or_else(|| "invalid or corrupt .tvcache.gz file".to_string())
             .inspect(|t| eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events));
     }
     if path.ends_with(".tvcache") {
         return load_cache_direct(path)
-            .ok_or_else(|| "invalid or corrupt .tvcache file".to_string())
             .inspect(|t| eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events));
     }
 
@@ -2384,32 +2412,32 @@ pub fn load_trace_progressive(
     #[cfg(not(target_arch = "wasm32"))]
     if path.ends_with(".tvcache.xz") {
         match load_cache_xz(path) {
-            Some(trace) => {
+            Ok(trace) => {
                 eprintln!("  cache (xz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
             }
-            None => { let _ = tx.send(Err("invalid or corrupt .tvcache.xz file".into())); }
+            Err(e) => { let _ = tx.send(Err(e)); }
         }
         return;
     }
     #[cfg(not(target_arch = "wasm32"))]
     if path.ends_with(".tvcache.gz") {
         match load_cache_gz(path) {
-            Some(trace) => {
+            Ok(trace) => {
                 eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
             }
-            None => { let _ = tx.send(Err("invalid or corrupt .tvcache.gz file".into())); }
+            Err(e) => { let _ = tx.send(Err(e)); }
         }
         return;
     }
     if path.ends_with(".tvcache") {
         match load_cache_direct(path) {
-            Some(trace) => {
+            Ok(trace) => {
                 eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
             }
-            None => { let _ = tx.send(Err("invalid or corrupt .tvcache file".into())); }
+            Err(e) => { let _ = tx.send(Err(e)); }
         }
         return;
     }
@@ -2664,7 +2692,8 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
         durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
         let n = durs.len();
         let median_dur = if n % 2 == 1 { durs[n / 2] } else { (durs[n / 2 - 1] + durs[n / 2]) / 2.0 };
-        KernelStats { name, count, total_dur, median_dur, max_dur }
+        let min_dur = durs[0];
+        KernelStats { name, count, total_dur, median_dur, max_dur, min_dur }
     }).collect();
     stats.sort_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());
 
@@ -3054,7 +3083,7 @@ pub fn load_trace_from_bytes_progressive(
                 eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
             }
-            None => { let _ = tx.send(Err(format!("{name}: invalid or corrupt .tvcache.gz file"))); }
+            None => { let _ = tx.send(Err(format!("{name}: {}", cache_load_error(&buf)))); }
         }
         return;
     }
@@ -3081,7 +3110,7 @@ pub fn load_trace_from_bytes_progressive(
                 eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
             }
-            None => { let _ = tx.send(Err(format!("{name}: invalid or corrupt .tvcache file"))); }
+            None => { let _ = tx.send(Err(format!("{name}: {}", cache_load_error(&decompressed)))); }
         }
         return;
     }

@@ -240,6 +240,7 @@ pub struct KernelStats {
     pub total_dur: f64,
     pub median_dur: f64,
     pub max_dur: f64,
+    pub min_dur: f64,
 }
 
 pub struct SelectionEntry {

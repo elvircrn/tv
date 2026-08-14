@@ -145,7 +145,7 @@ pub fn draw_selection_histogram(
 /// (so a persisted sort_col/column layout survives switching aggregate modes)
 /// but is only ever populated in individual-row mode, since an aggregate row
 /// can span kernel launches with different limiting factors.
-const STATS_HEADERS: [&str; 8] = ["Name", "Count", "Total", "%", "Mean", "Median", "Max", "Occ Limit"];
+const STATS_HEADERS: [&str; 9] = ["Name", "Count", "Total", "%", "Mean", "Median", "Max", "Min", "Occ Limit"];
 
 /// CUDA's default static shared-memory-per-block cap (48KB) on every
 /// architecture since Kepler. A kernel that opts into more via
@@ -265,7 +265,7 @@ pub fn draw_stats_table(
         .max(ui.calc_text_size("Median")[0] + 22.0);
     // "WARPS|BLOCKS" is the widest realistic limiting-factor combo.
     let occ_w = ui.calc_text_size("WARPS|BLOCKS")[0] + 12.0;
-    let cols: [TableColumnSetup<&str>; 8] = std::array::from_fn(|i| {
+    let cols: [TableColumnSetup<&str>; 9] = std::array::from_fn(|i| {
         let mut c = TableColumnSetup::new(STATS_HEADERS[i]);
         if i == 0 {
             // The name is textual and usually long, so let it stretch to absorb
@@ -274,7 +274,7 @@ pub fn draw_stats_table(
             c.flags |= TableColumnFlags::WIDTH_STRETCH | TableColumnFlags::NO_HIDE;
         } else {
             c.flags |= TableColumnFlags::WIDTH_FIXED;
-            c.init_width_or_weight = if i == 7 { occ_w } else { num_w };
+            c.init_width_or_weight = if i == 8 { occ_w } else { num_w };
         }
         if i == *sort_col {
             c.flags |= TableColumnFlags::DEFAULT_SORT;
@@ -335,7 +335,7 @@ pub fn draw_stats_table(
         // ~100k rows single-threaded. Each row is independent, so split the
         // parse across threads the same way loader.rs parallelizes per-track
         // work at load time.
-        let occ_limit_sort_cache: Option<Vec<(&str, bool)>> = (*sort_col == 7)
+        let occ_limit_sort_cache: Option<Vec<(&str, bool)>> = (*sort_col == 8)
             .then(|| parallel_occ_limit(stats.len(), &occ_limit_uncached));
         let occ_limit_for_sort = |si: usize| -> (&str, bool) {
             match &occ_limit_sort_cache {
@@ -356,6 +356,7 @@ pub fn draw_stats_table(
                 4 => avg(sa).partial_cmp(&avg(sb)).unwrap(),
                 5 => sa.median_dur.partial_cmp(&sb.median_dur).unwrap(),
                 6 => sa.max_dur.partial_cmp(&sb.max_dur).unwrap(),
+                7 => sa.min_dur.partial_cmp(&sb.min_dur).unwrap(),
                 _ => occ_limit_for_sort(a).0.cmp(occ_limit_for_sort(b).0),
             };
             if *sort_asc { ord } else { ord.reverse() }
@@ -438,6 +439,11 @@ pub fn draw_stats_table(
             ui.text(&buf.fmt);
         }
         if ui.table_set_column_index(7) {
+            buf.fmt.clear();
+            write_time(&mut buf.fmt, s.min_dur);
+            ui.text(&buf.fmt);
+        }
+        if ui.table_set_column_index(8) {
             let (limit, suspect) = occ_limit(si);
             if !limit.is_empty() {
                 if suspect {

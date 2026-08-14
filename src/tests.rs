@@ -536,6 +536,18 @@ fn test_load_trace_no_events() {
 }
 
 #[test]
+fn test_load_cache_rejects_stale_version_with_incompatible_kernel_stats_layout() {
+    // v4 grew KernelStats (added min_dur) and is read via raw byte
+    // reinterpretation (n_stats * size_of::<KernelStats>()), not an optional
+    // trailing field — a v3 cache blob must be rejected outright rather than
+    // misread with the new (larger) struct size.
+    let mut buf = vec![0u8; 80];
+    buf[0..4].copy_from_slice(b"TRV2");
+    buf[4..8].copy_from_slice(&3u32.to_le_bytes());
+    assert!(crate::loader::load_cache_from_bytes(&buf).is_none(), "a pre-min_dur (v3) cache must not load");
+}
+
+#[test]
 fn test_cache_roundtrip() {
     let json = r#"{"vllm_version": "0.26.1rc1.dev528+gf8d03e774", "distributedInfo": {"backend": "nccl", "rank": 3, "world_size": 8, "pg_config": [{"pg_name": "0", "ranks": [0, 1, 2, 3, 4, 5, 6, 7]}]}, "traceEvents": [
         {"ph":"X","ts":100,"dur":50,"pid":1,"tid":1,"name":"kern_a","cat":"kernel","args":{"op":"matmul"}},
@@ -1891,7 +1903,7 @@ fn bench_stats_sort_cost() {
     let mut all_refs: Vec<(u32, u32)> = Vec::new();
     for (ti, track) in trace.tracks.iter().enumerate() {
         for (ei, ev) in track.events.iter().enumerate() {
-            all_stats.push(KernelStats { name: ev.name, count: 1, total_dur: ev.dur, median_dur: ev.dur, max_dur: ev.dur });
+            all_stats.push(KernelStats { name: ev.name, count: 1, total_dur: ev.dur, median_dur: ev.dur, max_dur: ev.dur, min_dur: ev.dur });
             all_refs.push((ti as u32, ei as u32));
         }
     }
