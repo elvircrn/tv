@@ -1637,7 +1637,17 @@ impl App {
                                     }
                                 }
                                 let avail = ui.content_region_avail();
-                                ui.input_text_multiline("##detail_text", &mut state.buf.detail_buf, [avail[0], avail[1]])
+                                let mut text_h = avail[1];
+                                if track.gpu {
+                                    let drew = draw_duration_histogram(
+                                        &ui, trace, pane.show_cpu, ev.name, ev.dur, &mut state.buf, DETAIL_HIST_H,
+                                    );
+                                    if drew {
+                                        ui.spacing();
+                                        text_h = ui.content_region_avail()[1];
+                                    }
+                                }
+                                ui.input_text_multiline("##detail_text", &mut state.buf.detail_buf, [avail[0], text_h])
                                     .flags(imgui::InputTextFlags::READ_ONLY)
                                     .build();
                             } else {

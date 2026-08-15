@@ -58,6 +58,7 @@ pub const ZOOM_ANIM_DUR: f32 = 0.35;
 pub const SEARCH_ZOOM_FILL: f64 = 0.8; // matches fill this fraction of the width
 pub const ROW_PAD: f32 = 4.0;
 pub const HISTOGRAM_BAR_H: f32 = 18.0;
+pub const DETAIL_HIST_H: f32 = 70.0;
 
 pub fn track_height(max_depth: u16, collapsed: bool, scale: f32) -> f32 {
     let base = if collapsed { SUB_LANE_H } else { max_depth.max(1) as f32 * SUB_LANE_H };
@@ -338,4 +339,15 @@ pub struct DrawBuf {
     pub sel_bars: Vec<(f64, u32)>,
     pub detail_buf: String,
     pub merged_gpu_groups: Vec<MergedGpuGroup>,
+    /// (event name, show_cpu) the Detail tab's duration-distribution
+    /// histogram was last computed for — recomputing means an O(total
+    /// events) scan across every track, so this is skipped whenever the
+    /// selected event's name (and CPU visibility) hasn't changed since the
+    /// last redraw, the same guard `sort_cache_key` uses for the stats
+    /// table and for the same reason (redraws fire on every mouse-move).
+    pub detail_hist_key: Option<(u32, bool)>,
+    /// Per-bucket occurrence counts for the cached histogram above.
+    pub detail_hist_bins: Vec<u32>,
+    pub detail_hist_min: f64,
+    pub detail_hist_max: f64,
 }

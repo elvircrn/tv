@@ -62,6 +62,159 @@ fn draw_text_wrapped(col: ImColor32, text: &str, pos: [f32; 2], wrap_width: f32,
     }
 }
 
+/// Number of buckets in the Detail tab's duration-distribution histogram —
+/// a compromise between showing the shape (skew, outliers, bimodality) and
+/// staying readable at the tab's typical width.
+const DETAIL_HIST_BUCKETS: usize = 32;
+
+/// Bins `durs` into `n_buckets` equal-width buckets spanning [min, max].
+/// Values are clamped into the last bucket at the exact max boundary so
+/// every value lands somewhere. When every value is identical (`range ==
+/// 0`), everything goes in bucket 0 rather than dividing by zero. Returns
+/// `(bucket counts, min, max)`; `(min, max) == (f64::MAX, f64::MIN)` for an
+/// empty input, a deliberately invalid (min > max) sentinel the caller can
+/// check instead of a separate `is_empty`.
+pub(crate) fn bucket_durations(durs: &[f64], n_buckets: usize) -> (Vec<u32>, f64, f64) {
+    let (mut min, mut max) = (f64::MAX, f64::MIN);
+    for &d in durs {
+        min = min.min(d);
+        max = max.max(d);
+    }
+    let mut bins = vec![0u32; n_buckets];
+    let range = max - min;
+    for &d in durs {
+        let b = if range > 0.0 {
+            (((d - min) / range * n_buckets as f64) as usize).min(n_buckets - 1)
+        } else {
+            0
+        };
+        bins[b] += 1;
+    }
+    (bins, min, max)
+}
+
+/// Draws a real frequency histogram (duration on the x-axis, occurrence
+/// count as bar height) of every event named `name_id` across the trace —
+/// "how are all the calls to this kernel distributed", not just this one
+/// occurrence's number. The currently-selected event's own duration is
+/// marked with a vertical line so it's clear where it falls in the spread
+/// (e.g. "is this call typical, or a slow outlier"). Returns without
+/// drawing anything if fewer than 2 occurrences exist (nothing to show a
+/// distribution of) — the caller falls back to plain text in that case.
+///
+/// Recomputing the bucket counts is an O(total events) scan, so it's cached
+/// on `(name_id, show_cpu)` in `buf.detail_hist_*` and only redone when the
+/// selected event's name (or CPU visibility) actually changes — this runs
+/// on every redraw (every mouse-move), same reasoning as `sort_cache_key`.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_duration_histogram(
+    ui: &imgui::Ui,
+    trace: &Trace,
+    show_cpu: bool,
+    name_id: u32,
+    current_dur: f64,
+    buf: &mut DrawBuf,
+    height: f32,
+) -> bool {
+    let cache_key = (name_id, show_cpu);
+    if buf.detail_hist_key != Some(cache_key) {
+        let mut durs: Vec<f64> = Vec::new();
+        for t in &trace.tracks {
+            if !show_cpu && !t.gpu { continue; }
+            for e in &t.events {
+                if e.name == name_id { durs.push(e.dur); }
+            }
+        }
+        let (bins, min, max) = bucket_durations(&durs, DETAIL_HIST_BUCKETS);
+        buf.detail_hist_bins = bins;
+        buf.detail_hist_min = min;
+        buf.detail_hist_max = max;
+        buf.detail_hist_key = Some(cache_key);
+    }
+
+    let count: u32 = buf.detail_hist_bins.iter().sum();
+    if count < 2 { return false; }
+
+    let avail_w = ui.content_region_avail()[0];
+    let cursor = ui.cursor_screen_pos();
+    let dl = ui.get_window_draw_list();
+    let max_bin = buf.detail_hist_bins.iter().copied().max().unwrap_or(1).max(1);
+    let bar_w = avail_w / DETAIL_HIST_BUCKETS as f32;
+    let range = (buf.detail_hist_max - buf.detail_hist_min).max(1e-12);
+    let color = ACCENT_LINE;
+    let border_col = col32(15, 15, 15, 255);
+
+    // Plot background, so the histogram reads as its own panel rather than
+    // bars floating on the tab's base background.
+    dl.add_rect([cursor[0], cursor[1]], [cursor[0] + avail_w, cursor[1] + height], BG_TIMELINE)
+        .filled(true).build();
+
+    let mut hovered_bucket: Option<usize> = None;
+    for (i, &n) in buf.detail_hist_bins.iter().enumerate() {
+        let x0 = cursor[0] + i as f32 * bar_w;
+        let bar_h = (n as f32 / max_bin as f32) * height;
+        let y0 = cursor[1] + (height - bar_h);
+        if n > 0 {
+            let p0 = [x0 + 0.5, y0];
+            let p1 = [x0 + bar_w - 0.5, cursor[1] + height];
+            dl.add_rect(p0, p1, color).filled(true).build();
+            dl.add_rect(p0, p1, border_col).thickness(1.0).build();
+        }
+        let mx = ui.io().mouse_pos;
+        if mx[0] >= x0 && mx[0] < x0 + bar_w && mx[1] >= cursor[1] && mx[1] <= cursor[1] + height {
+            hovered_bucket = Some(i);
+        }
+    }
+
+    // Mark the selected occurrence's own duration against the distribution.
+    let marker_x = cursor[0] + (((current_dur - buf.detail_hist_min) / range) as f32).clamp(0.0, 1.0) * avail_w;
+    dl.add_line([marker_x, cursor[1] - 3.0], [marker_x, cursor[1] + height], col32(255, 210, 90, 255)).thickness(1.5).build();
+
+    // Y-axis: max count top-left (the scale the bar heights are relative
+    // to), 0 bottom-left (the baseline) — without these the bar heights
+    // have no indication of what count they actually represent.
+    let label_col = col32(160, 160, 160, 255);
+    buf.fmt.clear();
+    write!(buf.fmt, "{max_bin}").unwrap();
+    dl.add_text([cursor[0] + 3.0, cursor[1] + 2.0], label_col, &buf.fmt);
+    dl.add_text([cursor[0] + 3.0, cursor[1] + height - ui.current_font_size() - 2.0], label_col, "0");
+
+    // X-axis labels: min at the left edge, max at the right, midpoint
+    // centered — without these the bars have no indication of what
+    // duration range they actually span.
+    let label_y = cursor[1] + height + 4.0;
+    buf.fmt.clear();
+    write_time(&mut buf.fmt, buf.detail_hist_min);
+    dl.add_text([cursor[0], label_y], label_col, &buf.fmt);
+
+    let mid = (buf.detail_hist_min + buf.detail_hist_max) * 0.5;
+    buf.fmt.clear();
+    write_time(&mut buf.fmt, mid);
+    let mid_w = ui.calc_text_size(&buf.fmt)[0];
+    dl.add_text([cursor[0] + avail_w * 0.5 - mid_w * 0.5, label_y], label_col, &buf.fmt);
+
+    buf.fmt.clear();
+    write_time(&mut buf.fmt, buf.detail_hist_max);
+    let max_w = ui.calc_text_size(&buf.fmt)[0];
+    dl.add_text([cursor[0] + avail_w - max_w, label_y], label_col, &buf.fmt);
+
+    let label_h = ui.current_font_size() + 6.0;
+    drop(dl);
+    ui.dummy([avail_w, height + label_h]);
+
+    if let Some(b) = hovered_bucket {
+        let lo = buf.detail_hist_min + range as f64 * b as f64 / DETAIL_HIST_BUCKETS as f64;
+        let hi = buf.detail_hist_min + range as f64 * (b + 1) as f64 / DETAIL_HIST_BUCKETS as f64;
+        buf.fmt.clear();
+        write!(buf.fmt, "{} call{} in ", buf.detail_hist_bins[b], if buf.detail_hist_bins[b] == 1 { "" } else { "s" }).unwrap();
+        write_time(&mut buf.fmt, lo);
+        buf.fmt.push_str(" – ");
+        write_time(&mut buf.fmt, hi);
+        ui.tooltip_text(&buf.fmt);
+    }
+    true
+}
+
 pub fn draw_selection_histogram(
     ui: &imgui::Ui,
     trace: &Trace,

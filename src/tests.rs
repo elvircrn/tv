@@ -716,6 +716,37 @@ fn test_even_spacing_heights_empty_input() {
 }
 
 #[test]
+fn test_bucket_durations_spreads_across_range() {
+    let durs = vec![0.0, 25.0, 50.0, 75.0, 100.0];
+    let (bins, min, max) = crate::ui::bucket_durations(&durs, 4);
+    assert_eq!(min, 0.0);
+    assert_eq!(max, 100.0);
+    assert_eq!(bins.iter().sum::<u32>(), 5);
+    // 0.0->bucket0, 25.0->bucket1, 50.0->bucket2, 75.0->bucket3,
+    // 100.0 is exactly the max boundary and must clamp into the last
+    // bucket rather than overflow past the end of `bins`.
+    assert_eq!(bins, vec![1, 1, 1, 2]);
+}
+
+#[test]
+fn test_bucket_durations_identical_values_go_in_first_bucket() {
+    // range == 0 must not divide by zero.
+    let durs = vec![5.0, 5.0, 5.0];
+    let (bins, min, max) = crate::ui::bucket_durations(&durs, 8);
+    assert_eq!(min, 5.0);
+    assert_eq!(max, 5.0);
+    assert_eq!(bins[0], 3);
+    assert_eq!(bins.iter().sum::<u32>(), 3);
+}
+
+#[test]
+fn test_bucket_durations_empty_input() {
+    let (bins, min, max) = crate::ui::bucket_durations(&[], 8);
+    assert_eq!(bins.iter().sum::<u32>(), 0);
+    assert!(min > max, "empty input should produce the invalid min>max sentinel");
+}
+
+#[test]
 fn test_rank_summary() {
     use crate::rank_summary;
     let fname = "dp0_pp0_tp3_dcp0_ep3_rank3.1786304095590565996.pt.trace.json.gz";
