@@ -59,6 +59,13 @@ pub const SEARCH_ZOOM_FILL: f64 = 0.8; // matches fill this fraction of the widt
 pub const ROW_PAD: f32 = 4.0;
 pub const HISTOGRAM_BAR_H: f32 = 18.0;
 pub const DETAIL_HIST_H: f32 = 70.0;
+/// Floor for the dynamically shrunk font size used when a lane/row is
+/// squashed thinner than one line of text at the default size (deep call
+/// nesting, a scaled-down track, or an even-spacing collapse). Below this
+/// glyphs stop being legible either way, so the text is drawn at this size
+/// and allowed to overflow its row slightly rather than being hidden
+/// outright — a label peeking into its neighbor reads better than a blank row.
+pub const MIN_TEXT_PX: f32 = 6.0;
 
 pub fn track_height(max_depth: u16, collapsed: bool, scale: f32) -> f32 {
     let base = if collapsed { SUB_LANE_H } else { max_depth.max(1) as f32 * SUB_LANE_H };

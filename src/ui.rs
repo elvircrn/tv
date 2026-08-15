@@ -26,7 +26,7 @@ fn draw_text_clipped(col: ImColor32, text: &str, pos: [f32; 2], clip: [f32; 4]) 
     }
 }
 
-fn draw_text_wrapped(col: ImColor32, text: &str, pos: [f32; 2], wrap_width: f32, clip: [f32; 4]) {
+fn draw_text_wrapped(col: ImColor32, text: &str, pos: [f32; 2], wrap_width: f32, clip: [f32; 4], font_size: f32) {
     // imgui word-wrap only breaks on blanks (space/tab/ideographic) plus .,;!?".
     // A kernel signature like `void vllm::silu_and_mul_kernel<c10::BFloat16>(...)`
     // has no such break point except the space after "void", so imgui wraps there
@@ -45,7 +45,6 @@ fn draw_text_wrapped(col: ImColor32, text: &str, pos: [f32; 2], wrap_width: f32,
     unsafe {
         let raw_dl = imgui_sys::igGetWindowDrawList();
         let font = imgui_sys::igGetFont();
-        let font_size = imgui_sys::igGetFontSize();
         let start = text.as_ptr() as *const c_char;
         let end = (start as usize + text.len()) as *const c_char;
         imgui_sys::ImDrawList_AddText_FontPtr(
@@ -59,6 +58,23 @@ fn draw_text_wrapped(col: ImColor32, text: &str, pos: [f32; 2], wrap_width: f32,
             wrap_width,
             &imgui_sys::ImVec4 { x: clip[0], y: clip[1], z: clip[2], w: clip[3] },
         );
+    }
+}
+
+/// Reference lane height event/track-label text is tuned to read cleanly
+/// at: one un-scaled sub-lane (`SUB_LANE_H`) minus the gap drawn between
+/// adjacent lanes. Below this, `fit_font_size` shrinks the font
+/// proportionally instead of letting it clip mid-character.
+const REF_LINE_H: f32 = SUB_LANE_H - LANE_GAP;
+
+/// Scales `base_font_size` down to fit within `avail_h`, floored at
+/// `MIN_TEXT_PX` — never below-floor, and never above the normal size, so a
+/// roomy lane renders pixel-identical to before this existed.
+pub(crate) fn fit_font_size(base_font_size: f32, avail_h: f32) -> f32 {
+    if avail_h >= REF_LINE_H {
+        base_font_size
+    } else {
+        (base_font_size * (avail_h / REF_LINE_H).max(0.0)).max(MIN_TEXT_PX)
     }
 }
 
@@ -774,6 +790,7 @@ pub fn draw_timeline(
     focus: &mut Option<u32>,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let dl = ui.get_window_draw_list();
+    let base_font_size = ui.current_font_size();
     let tl_left = rect[0] + label_w;
     let tl_w = (rect[2] - tl_left).max(1.0);
 
@@ -1253,7 +1270,8 @@ pub fn draw_timeline(
                         let tx = ev_rect[0] + 3.0;
                         let ty = ev_rect[1] + 2.0;
                         let text_col = if matches { col32(240, 240, 240, 255) } else { col32(120, 120, 120, 255) };
-                        draw_text_wrapped(text_col, name, [tx, ty], w - 6.0, ev_rect);
+                        let text_size = fit_font_size(base_font_size, lane_h);
+                        draw_text_wrapped(text_col, name, [tx, ty], w - 6.0, ev_rect, text_size);
                     }
                 }
             } else {
@@ -1350,7 +1368,8 @@ pub fn draw_timeline(
                         let tx = ev_rect[0] + 3.0;
                         let ty = ev_rect[1] + 2.0;
                         let text_col = if matches { col32(240, 240, 240, 255) } else { col32(120, 120, 120, 255) };
-                        draw_text_wrapped(text_col, name, [tx, ty], w - 6.0, ev_rect);
+                        let text_size = fit_font_size(base_font_size, lane_h);
+                        draw_text_wrapped(text_col, name, [tx, ty], w - 6.0, ev_rect, text_size);
                     }
                 }
             }
@@ -1544,6 +1563,11 @@ pub fn draw_timeline(
             } else {
                 write!(buf.fmt, "{}", track.label).ok();
             }
+            // Set the window's font scale before measuring, so a squashed
+            // row's shrunk text is measured (and thus vertically centered)
+            // at the size it will actually render at, not the default size.
+            let scale = (fit_font_size(base_font_size, vis_h) / base_font_size).min(1.0);
+            unsafe { imgui_sys::igSetWindowFontScale(scale); }
             let text_h = ui.calc_text_size_with_opts(&buf.fmt, false, label_area_w - 4.0)[1];
             let pad_y = ((vis_h - text_h) * 0.5).max(0.0);
             ui.set_cursor_pos([ui.cursor_pos()[0], pad_y]);

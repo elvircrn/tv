@@ -747,6 +747,31 @@ fn test_bucket_durations_empty_input() {
 }
 
 #[test]
+fn test_fit_font_size_unshrunk_above_reference_height() {
+    // A lane at or above the tuned reference height renders pixel-identical
+    // to before this existed: no shrinking.
+    assert_eq!(crate::ui::fit_font_size(15.0, 16.0), 15.0);
+    assert_eq!(crate::ui::fit_font_size(15.0, 100.0), 15.0);
+}
+
+#[test]
+fn test_fit_font_size_shrinks_proportionally() {
+    // Half the reference height (16.0) should shrink to roughly half size.
+    let size = crate::ui::fit_font_size(16.0, 8.0);
+    assert!((size - 8.0).abs() < 0.01, "expected ~8.0, got {size}");
+}
+
+#[test]
+fn test_fit_font_size_floors_at_min_text_px() {
+    // An extremely squashed lane must still floor at MIN_TEXT_PX rather
+    // than shrinking to near-zero or negative.
+    let size = crate::ui::fit_font_size(15.0, 0.5);
+    assert_eq!(size, crate::types::MIN_TEXT_PX);
+    let size = crate::ui::fit_font_size(15.0, 0.0);
+    assert_eq!(size, crate::types::MIN_TEXT_PX);
+}
+
+#[test]
 fn test_rank_summary() {
     use crate::rank_summary;
     let fname = "dp0_pp0_tp3_dcp0_ep3_rank3.1786304095590565996.pt.trace.json.gz";
