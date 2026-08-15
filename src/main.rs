@@ -1286,269 +1286,119 @@ impl App {
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
                         | WindowFlags::NO_SAVED_SETTINGS
-                        | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS,
+                        | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
+                        | WindowFlags::MENU_BAR,
                 )
                 .build(|| {
                     let pane = &mut state.panes[pi];
                     if pane.trace.is_some() {
-                        // Native: two vertically-stacked rows — row 1 (top)
-                        // is the export/share/sync-clocks controls, row 2
-                        // (bottom) is everything else. Wasm has nothing in
-                        // row 1 (see TOOLBAR_H), so row1_y and row2_y both
-                        // collapse to the same single centered row there.
-                        // Frame widgets (input, buttons, checkboxes) are
-                        // `frame_height` tall; the square close button is
-                        // `TOOLBAR_ROW` tall and stays centered across the
-                        // whole toolbar regardless of row count.
-                        let frame_h = ui.frame_height();
-                        #[cfg(not(target_arch = "wasm32"))]
-                        let row_gap = 4.0;
-                        #[cfg(not(target_arch = "wasm32"))]
-                        let row1_y = ((TOOLBAR_H - 2.0 * frame_h - row_gap) * 0.5).max(0.0);
-                        #[cfg(not(target_arch = "wasm32"))]
-                        let row2_y = row1_y + frame_h + row_gap;
-                        #[cfg(target_arch = "wasm32")]
-                        let row1_y = ((TOOLBAR_H - frame_h) * 0.5).max(0.0);
-                        #[cfg(target_arch = "wasm32")]
-                        let row2_y = row1_y;
-                        {
-                            let win_size = ui.window_size();
-                            let btn = TOOLBAR_ROW; // square hit target
-                            let close_x = win_size[0] - btn - ui.clone_style().window_padding[0];
-                            let cur_y = ((TOOLBAR_H - btn) * 0.5).max(0.0);
-                            ui.set_cursor_pos([close_x, cur_y]);
-                            ui.invisible_button("##close", [btn, btn]);
-                            let hovered = ui.is_item_hovered();
-                            if ui.is_item_clicked() { close_pane = Some(pi); }
-                            if ui.is_item_hovered() { ui.tooltip_text("Close trace"); }
-                            let p_min = ui.item_rect_min();
-                            let p_max = ui.item_rect_max();
-                            let dl = ui.get_window_draw_list();
-                            if hovered {
-                                dl.add_rect(p_min, p_max, col32(200, 55, 55, 255))
-                                    .filled(true).rounding(4.0).build();
-                            }
-                            // Draw the glyph as two crossing strokes so it stays crisp
-                            // and legible at any size, instead of the tiny default "×".
-                            let inset = btn * 0.32;
-                            let a = [p_min[0] + inset, p_min[1] + inset];
-                            let b = [p_max[0] - inset, p_max[1] - inset];
-                            let stroke = if hovered { col32(255, 255, 255, 255) } else { col32(150, 150, 150, 255) };
-                            dl.add_line([a[0], a[1]], [b[0], b[1]], stroke).thickness(2.0).build();
-                            dl.add_line([a[0], b[1]], [b[0], a[1]], stroke).thickness(2.0).build();
-                            drop(dl);
-                            ui.set_cursor_pos([ui.cursor_start_pos()[0], row1_y]);
-                        }
-                        // Tracks whether the Export/Share controls below drew
-                        // anything, so the Sync Clocks button below (native
-                        // only — on wasm it moves down to row 2, alongside
-                        // the other toolbar controls, since row 1 has nothing
-                        // else there) knows whether it needs a leading
-                        // same_line or is the first thing on this row.
-                        #[cfg(not(target_arch = "wasm32"))]
-                        #[allow(unused_mut, unused_assignments)]
-                        let mut row1_has_content = false;
-                        // Only offered when there's a real source file to
-                        // derive the sibling export folder from, and the
-                        // trace actually has GPU tracks to export. Native
-                        // only — there's no filesystem to export to on wasm.
-                        #[cfg(not(target_arch = "wasm32"))]
-                        if !pane.reload_paths.is_empty()
-                            && pane.trace.as_ref().is_some_and(|t| t.tracks.iter().any(|tr| tr.gpu))
-                        {
-                            row1_has_content = true;
-                            let uploading = pane.share_link_job.is_some();
-                            let include_cpu = pane.share_include_cpu;
-                            ui.disabled(uploading, || {
-                                if ui.button("Share via Gist") {
-                                    pane.start_share_upload(include_cpu);
-                                }
-                            });
-                            if ui.is_item_hovered() {
-                                let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "GPU-only timings (no args)" };
-                                ui.tooltip_text(&format!("Export {what}, then upload it to a new secret GitHub gist via your locally logged-in `gh` CLI, and show a copyable ?gist= link — no browser login or pasted token, but it does need `gh auth login` already done on this machine"));
-                            }
-                            ui.same_line_with_spacing(0.0, 8.0);
-                            ui.checkbox("Include CPU data##sharecpu", &mut pane.share_include_cpu);
-                            if ui.is_item_hovered() {
-                                ui.tooltip_text("Upload the whole trace (all CPU and GPU tracks, args left intact, not stripped) instead of just GPU-only timings — much larger, but complete");
-                            }
-                            match &pane.share_link_result {
-                                Some((true, link)) if link.starts_with("https://") => {
-                                    ui.same_line_with_spacing(0.0, 8.0);
-                                    ui.align_text_to_frame_padding();
-                                    ui.text_colored([0.4, 0.85, 0.4, 1.0], link);
-                                    ui.same_line_with_spacing(0.0, 8.0);
-                                    if ui.small_button("Copy##sharelink") {
+                        if let Some(_mb) = ui.begin_menu_bar() {
+                            // ---- File menu: export/share/sync. Export/Share
+                            // are native-only (no filesystem, no `gh` CLI on
+                            // wasm); Sync Clocks works everywhere — sources
+                            // rank/filename pairs from either reload_paths
+                            // (native directory opens) or the trace's own
+                            // persisted rank_paths (works after loading an
+                            // already-merged .tvcache, native or web — see
+                            // loader::sync_multi_rank_clocks).
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let has_export_share = !pane.reload_paths.is_empty()
+                                && pane.trace.as_ref().is_some_and(|t| t.tracks.iter().any(|tr| tr.gpu));
+                            #[cfg(target_arch = "wasm32")]
+                            let has_export_share = false;
+                            let multi_rank = pane.reload_paths.len() >= 2
+                                || pane.trace.as_ref().is_some_and(|t| t.rank_paths.len() >= 2);
+                            if has_export_share || multi_rank {
+                                ui.menu("File", || {
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    if has_export_share {
+                                        let uploading = pane.share_link_job.is_some();
+                                        let include_cpu = pane.share_include_cpu;
+                                        if ui.menu_item_config("Share via Gist").enabled(!uploading).build() {
+                                            pane.start_share_upload(include_cpu);
+                                        }
+                                        if ui.is_item_hovered() {
+                                            let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "GPU-only timings (no args)" };
+                                            ui.tooltip_text(&format!("Export {what}, then upload it to a new secret GitHub gist via your locally logged-in `gh` CLI, and show a copyable ?gist= link — no browser login or pasted token, but it does need `gh auth login` already done on this machine"));
+                                        }
+                                        ui.menu_item_config("Include CPU data##sharecpu").build_with_ref(&mut pane.share_include_cpu);
+                                        if ui.is_item_hovered() {
+                                            ui.tooltip_text("Upload the whole trace (all CPU and GPU tracks, args left intact, not stripped) instead of just GPU-only timings — much larger, but complete");
+                                        }
+                                        match &pane.share_link_result {
+                                            Some((true, link)) if link.starts_with("https://") => {
+                                                ui.text_colored([0.4, 0.85, 0.4, 1.0], link);
+                                                ui.same_line();
+                                                if ui.small_button("Copy##sharelink") {
+                                                    #[cfg(not(target_arch = "wasm32"))]
+                                                    MacClipboard.set(link);
+                                                }
+                                            }
+                                            Some((ok, msg)) => {
+                                                let color = if *ok { [0.8, 0.8, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
+                                                ui.text_colored(color, msg);
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                    if multi_rank {
                                         #[cfg(not(target_arch = "wasm32"))]
-                                        MacClipboard.set(link);
+                                        if has_export_share {
+                                            ui.separator();
+                                        }
+                                        if ui.menu_item("Sync Clocks") {
+                                            pane.sync_message = Some(match pane.sync_clocks() {
+                                                Ok(msg) => (true, msg),
+                                                Err(e) => (false, format!("Sync failed: {e}")),
+                                            });
+                                        }
+                                        if ui.is_item_hovered() {
+                                            ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) — aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
+                                        }
+                                        if let Some((ok, msg)) = &pane.sync_message {
+                                            let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
+                                            ui.text_colored(color, msg.lines().next().unwrap_or(msg));
+                                            if ui.is_item_hovered() && msg.contains('\n') {
+                                                ui.tooltip_text(msg);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+
+                            // ---- View menu: display toggles + cross-pane actions.
+                            ui.menu("View", || {
+                                ui.menu_item_config("Show CPU trace").build_with_ref(&mut pane.show_cpu);
+                                ui.menu_item_config("Merge Streams").build_with_ref(&mut pane.merge_gpu);
+                                // vLLM traces emit a per-generation `execute_context_N(N)_generation_M(M)`
+                                // span on every stream — one toggle hides/shows them all. Only shown
+                                // when the trace actually contains such names (computed once at load,
+                                // in `poll_loading`, not recomputed every toolbar frame).
+                                if !pane.exec_context_names.is_empty() {
+                                    let all_hidden = pane.exec_context_names.iter()
+                                        .all(|&i| pane.hidden_names.get(i).copied().unwrap_or(false));
+                                    let label = if all_hidden { "Show Execute Context" } else { "Hide Execute Context" };
+                                    if ui.menu_item(label) {
+                                        for &i in &pane.exec_context_names {
+                                            if let Some(h) = pane.hidden_names.get_mut(i) { *h = !all_hidden; }
+                                        }
+                                        if !pane.search.is_empty() { pane.rebuild_search(); }
                                     }
                                 }
-                                Some((ok, msg)) => {
-                                    ui.same_line_with_spacing(0.0, 8.0);
-                                    let color = if *ok { [0.8, 0.8, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
-                                    ui.align_text_to_frame_padding();
-                                    ui.text_colored(color, msg);
+                                if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
+                                    ui.menu_item_config("Watch").build_with_ref(&mut pane.auto_reload);
                                 }
-                                None => {}
-                            }
-                        }
-                        // sync_clocks sources rank/filename pairs from either
-                        // reload_paths (native directory opens) or the
-                        // trace's own persisted rank_paths (works after
-                        // loading an already-merged .tvcache, native or web
-                        // — see loader::sync_multi_rank_clocks).
-                        let multi_rank = pane.reload_paths.len() >= 2
-                            || pane.trace.as_ref().is_some_and(|t| t.rank_paths.len() >= 2);
-                        // Native: alongside Export/Share in row 1. On wasm
-                        // that whole row-1 block doesn't exist, so this moves
-                        // down to row 2 with the other toolbar controls
-                        // instead (see below, after the Watch checkbox).
-                        #[cfg(not(target_arch = "wasm32"))]
-                        if multi_rank {
-                            if row1_has_content {
-                                ui.same_line_with_spacing(0.0, 16.0);
-                            }
-                            if ui.button("Sync Clocks") {
-                                pane.sync_message = Some(match pane.sync_clocks() {
-                                    Ok(msg) => (true, msg),
-                                    Err(e) => (false, format!("Sync failed: {e}")),
-                                });
-                            }
-                            if ui.is_item_hovered() {
-                                ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) — aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
-                            }
-                            if let Some((ok, msg)) = &pane.sync_message {
-                                ui.same_line_with_spacing(0.0, 8.0);
-                                let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
-                                ui.align_text_to_frame_padding();
-                                ui.text_colored(color, msg.lines().next().unwrap_or(msg));
-                                if ui.is_item_hovered() && msg.contains('\n') {
-                                    ui.tooltip_text(msg);
+                                if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
+                                    ui.separator();
+                                    if ui.menu_item("Diff") {
+                                        diff_clicked_against = Some(pi);
+                                    }
                                 }
-                            }
-                        }
-
-                        ui.set_cursor_pos([ui.cursor_start_pos()[0], row2_y]);
-                        // Search
-                        if pane.search_focus {
-                            ui.set_keyboard_focus_here();
-                            pane.search_focus = false;
-                        }
-                        ui.set_next_item_width(SEARCH_W);
-                        let prev_len = pane.prev_search.len();
-                        struct SelectAllCb<'a>(&'a mut bool);
-                        impl InputTextCallbackHandler for SelectAllCb<'_> {
-                            fn on_always(&mut self, mut data: TextCallbackData) {
-                                if *self.0 { data.select_all(); *self.0 = false; }
-                            }
-                        }
-                        let enter = ui.input_text("##search", &mut pane.search)
-                            .hint("Search (/) ")
-                            .flags(imgui::InputTextFlags::ENTER_RETURNS_TRUE
-                                | imgui::InputTextFlags::AUTO_SELECT_ALL)
-                            .callback(InputTextCallback::ALWAYS, SelectAllCb(&mut pane.select_all_pending))
-                            .build();
-                        if pane.search.len() != prev_len || pane.search != pane.prev_search {
-                            search_changed[pi] = true;
-                            pane.prev_search.clear();
-                            pane.prev_search.push_str(&pane.search);
-                        }
-                        if enter && !pane.search.trim().is_empty() {
-                            if search_changed[pi] {
-                                pane.rebuild_search();
-                                search_changed[pi] = false;
-                            }
-                            pane.select_from_search(&mut state.buf);
-                            pane.zoom_to_search();
-                            pane.pending_tab = Some(BottomTab::Selection);
-                        }
-                        let search_active = pane.search_mask.iter().any(|&m| m);
-                        if search_active {
-                            let has_matches = !pane.search_nav.is_empty();
-                            ui.same_line_with_spacing(0.0, 6.0);
-                            ui.enabled(has_matches, || {
-                                if ui.small_button("<##prevmatch") { pane.nav_search(false); }
                             });
-                            if ui.is_item_hovered() { ui.tooltip_text("Previous match (Shift+N)"); }
-                            ui.same_line_with_spacing(0.0, 2.0);
-                            ui.enabled(has_matches, || {
-                                if ui.small_button(">##nextmatch") { pane.nav_search(true); }
-                            });
-                            if ui.is_item_hovered() { ui.tooltip_text("Next match (N)"); }
-                            ui.same_line_with_spacing(0.0, 6.0);
-                            ui.align_text_to_frame_padding();
-                            state.buf.fmt.clear();
-                            write!(state.buf.fmt, "{} matches", pane.search_nav.len()).unwrap();
-                            ui.text_colored([0.6, 0.8, 1.0, 1.0], &state.buf.fmt);
-                        }
 
-                        // Controls: view actions first, then display toggles.
-                        if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
-                            ui.same_line_with_spacing(0.0, 16.0);
-                            if ui.button("Diff") {
-                                diff_clicked_against = Some(pi);
-                            }
-                        }
-                        ui.same_line_with_spacing(0.0, 16.0);
-                        ui.checkbox("Show CPU trace", &mut pane.show_cpu);
-                        ui.same_line_with_spacing(0.0, 10.0);
-                        ui.checkbox("Merge Streams", &mut pane.merge_gpu);
-
-                        // vLLM traces emit a per-generation `execute_context_N(N)_generation_M(M)`
-                        // span on every stream — one toggle hides/shows them all. Only shown
-                        // when the trace actually contains such names (computed once at load,
-                        // in `poll_loading`, not recomputed every toolbar frame).
-                        if !pane.exec_context_names.is_empty() {
-                            let all_hidden = pane.exec_context_names.iter()
-                                .all(|&i| pane.hidden_names.get(i).copied().unwrap_or(false));
-                            ui.same_line_with_spacing(0.0, 10.0);
-                            let label = if all_hidden { "Show Execute Context" } else { "Hide Execute Context" };
-                            if ui.button(label) {
-                                for &i in &pane.exec_context_names {
-                                    if let Some(h) = pane.hidden_names.get_mut(i) { *h = !all_hidden; }
-                                }
-                                if !pane.search.is_empty() { pane.rebuild_search(); }
-                            }
-                        }
-
-                        if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
-                            ui.same_line_with_spacing(0.0, 10.0);
-                            ui.checkbox("Watch", &mut pane.auto_reload);
-                        }
-                        // Wasm has no Export/Share row-1 controls (no
-                        // filesystem, no `gh` CLI), so Sync Clocks lives here
-                        // in row 2 with the other toolbar elements instead —
-                        // see the native version of this block, above.
-                        #[cfg(target_arch = "wasm32")]
-                        if multi_rank {
-                            ui.same_line_with_spacing(0.0, 16.0);
-                            if ui.button("Sync Clocks") {
-                                pane.sync_message = Some(match pane.sync_clocks() {
-                                    Ok(msg) => (true, msg),
-                                    Err(e) => (false, format!("Sync failed: {e}")),
-                                });
-                            }
-                            if ui.is_item_hovered() {
-                                ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) — aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
-                            }
-                            if let Some((ok, msg)) = &pane.sync_message {
-                                ui.same_line_with_spacing(0.0, 8.0);
-                                let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
-                                ui.align_text_to_frame_padding();
-                                ui.text_colored(color, msg.lines().next().unwrap_or(msg));
-                                if ui.is_item_hovered() && msg.contains('\n') {
-                                    ui.tooltip_text(msg);
-                                }
-                            }
-                        }
-                        if pi == 0 {
-                            ui.same_line_with_spacing(0.0, 16.0);
-                            ui.align_text_to_frame_padding();
-                            let _dim = ui.push_style_color(StyleColor::Text, [0.45, 0.45, 0.45, 1.0]);
-                            ui.text("?");
-                            if ui.is_item_hovered() {
-                                ui.tooltip(|| {
+                            // ---- Help menu: keyboard/mouse reference, once per window.
+                            if pi == 0 {
+                                ui.menu("Help", || {
                                     ui.text("Navigation");
                                     ui.separator();
                                     ui.text("W / Up            Zoom in (at view center)");
@@ -1589,8 +1439,70 @@ impl App {
                                     ui.text("Drop folder       Merge multi-rank traces");
                                 });
                             }
-                        }
 
+                            // ---- Search: stays inline in the menu bar itself
+                            // (not a dropdown) since it's used constantly.
+                            if pane.search_focus {
+                                ui.set_keyboard_focus_here();
+                                pane.search_focus = false;
+                            }
+                            ui.set_next_item_width(SEARCH_W);
+                            let prev_len = pane.prev_search.len();
+                            struct SelectAllCb<'a>(&'a mut bool);
+                            impl InputTextCallbackHandler for SelectAllCb<'_> {
+                                fn on_always(&mut self, mut data: TextCallbackData) {
+                                    if *self.0 { data.select_all(); *self.0 = false; }
+                                }
+                            }
+                            let enter = ui.input_text("##search", &mut pane.search)
+                                .hint("Search (/) ")
+                                .flags(imgui::InputTextFlags::ENTER_RETURNS_TRUE
+                                    | imgui::InputTextFlags::AUTO_SELECT_ALL)
+                                .callback(InputTextCallback::ALWAYS, SelectAllCb(&mut pane.select_all_pending))
+                                .build();
+                            if pane.search.len() != prev_len || pane.search != pane.prev_search {
+                                search_changed[pi] = true;
+                                pane.prev_search.clear();
+                                pane.prev_search.push_str(&pane.search);
+                            }
+                            if enter && !pane.search.trim().is_empty() {
+                                if search_changed[pi] {
+                                    pane.rebuild_search();
+                                    search_changed[pi] = false;
+                                }
+                                pane.select_from_search(&mut state.buf);
+                                pane.zoom_to_search();
+                                pane.pending_tab = Some(BottomTab::Selection);
+                            }
+                            let search_active = pane.search_mask.iter().any(|&m| m);
+                            if search_active {
+                                let has_matches = !pane.search_nav.is_empty();
+                                ui.same_line_with_spacing(0.0, 6.0);
+                                ui.enabled(has_matches, || {
+                                    if ui.small_button("<##prevmatch") { pane.nav_search(false); }
+                                });
+                                if ui.is_item_hovered() { ui.tooltip_text("Previous match (Shift+N)"); }
+                                ui.same_line_with_spacing(0.0, 2.0);
+                                ui.enabled(has_matches, || {
+                                    if ui.small_button(">##nextmatch") { pane.nav_search(true); }
+                                });
+                                if ui.is_item_hovered() { ui.tooltip_text("Next match (N)"); }
+                                ui.same_line_with_spacing(0.0, 6.0);
+                                ui.align_text_to_frame_padding();
+                                state.buf.fmt.clear();
+                                write!(state.buf.fmt, "{} matches", pane.search_nav.len()).unwrap();
+                                ui.text_colored([0.6, 0.8, 1.0, 1.0], &state.buf.fmt);
+                            }
+
+                            // ---- Close: right-aligned, last item in the bar.
+                            let win_w = ui.window_size()[0];
+                            let close_w = ui.calc_text_size("x")[0] + ui.clone_style().frame_padding[0] * 2.0;
+                            ui.same_line();
+                            let cur_y = ui.cursor_pos()[1];
+                            ui.set_cursor_pos([win_w - close_w - ui.clone_style().window_padding[0], cur_y]);
+                            if ui.small_button("x##close") { close_pane = Some(pi); }
+                            if ui.is_item_hovered() { ui.tooltip_text("Close trace"); }
+                        }
                     } else if pane.loading.is_some() {
                         ui.align_text_to_frame_padding();
                         ui.text(&pane.loading_progress_text());
