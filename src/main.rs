@@ -1131,11 +1131,11 @@ impl App {
             // Dear ImGui floors every non-child, non-auto-resize window at
             // style.WindowMinSize (32x32 by default) regardless of an
             // explicit `.size()` — without this override a 24px-tall strip
-            // gets silently grown to 32px and overlaps the toolbar row
-            // directly below it (see CalcWindowSizeAfterConstraint).
+            // gets silently grown to 32px and overlaps whatever's below it
+            // (see CalcWindowSizeAfterConstraint).
             let _min = ui.push_style_var(StyleVar::WindowMinSize([1.0, 1.0]));
             ui.window("##tracetabs")
-                .position([0.0, 0.0], Condition::Always)
+                .position([0.0, TOOLBAR_H], Condition::Always)
                 .size([display[0], TAB_BAR_H], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
@@ -1285,7 +1285,7 @@ impl App {
         {
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 6.0]));
             ui.window("##toolbar")
-                .position([0.0, TAB_BAR_H], Condition::Always)
+                .position([0.0, 0.0], Condition::Always)
                 .size([display[0], TOOLBAR_H], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
