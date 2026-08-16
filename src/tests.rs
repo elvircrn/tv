@@ -772,6 +772,36 @@ fn test_fit_font_size_floors_at_min_text_px() {
 }
 
 #[test]
+fn test_stretch_bounds_lone_event_fills_whole_row() {
+    // depth 0 has our event, depths 1 and 2 have nothing at all — it should
+    // claim the entire row.
+    let per_depth = vec![vec![(0.0, 10.0)], vec![], vec![]];
+    assert_eq!(crate::ui::stretch_bounds(&per_depth, 0, 0.0, 10.0), (0, 2));
+}
+
+#[test]
+fn test_stretch_bounds_blocked_by_real_overlap() {
+    // depth 1 has a sibling that overlaps our event's window, so it can't
+    // stretch past depth 0; depth 2 is free the whole time and still claimable.
+    let per_depth = vec![vec![(0.0, 10.0)], vec![(5.0, 6.0)], vec![]];
+    assert_eq!(crate::ui::stretch_bounds(&per_depth, 0, 0.0, 10.0), (0, 0));
+}
+
+#[test]
+fn test_stretch_bounds_not_blocked_by_non_overlapping_neighbor() {
+    // depth 1's occupant runs entirely before our event starts, so it
+    // doesn't block the stretch even though depth 1 isn't literally empty.
+    let per_depth = vec![vec![(10.0, 20.0)], vec![(0.0, 5.0)]];
+    assert_eq!(crate::ui::stretch_bounds(&per_depth, 0, 10.0, 20.0), (0, 1));
+}
+
+#[test]
+fn test_stretch_bounds_middle_depth_stretches_both_ways_when_free() {
+    let per_depth = vec![vec![], vec![(0.0, 10.0)], vec![]];
+    assert_eq!(crate::ui::stretch_bounds(&per_depth, 1, 0.0, 10.0), (0, 2));
+}
+
+#[test]
 fn test_rank_summary() {
     use crate::rank_summary;
     let fname = "dp0_pp0_tp3_dcp0_ep3_rank3.1786304095590565996.pt.trace.json.gz";

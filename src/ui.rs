@@ -78,6 +78,31 @@ pub(crate) fn fit_font_size(base_font_size: f32, avail_h: f32) -> f32 {
     }
 }
 
+/// For an event at `depth` spanning `[ts, end)` within a Tetris-packed
+/// merged row, finds the widest run of depths `[lo, hi]` (inclusive) around
+/// it that has nothing else — at any of those depths — overlapping `[ts,
+/// end)`. Packing only hands out as many depths as a row's single busiest
+/// moment needs, so most events, most of the time, have no sibling at the
+/// depths next to them; letting the event's own box span that empty run
+/// fills the row instead of leaving it visibly blank.
+///
+/// `per_depth[d]` must be sorted by start time and internally
+/// non-overlapping (guaranteed by the greedy depth-packing that produces
+/// it, since two overlapping events can never land on the same depth).
+pub(crate) fn stretch_bounds(per_depth: &[Vec<(f64, f64)>], depth: u16, ts: f64, end: f64) -> (u16, u16) {
+    let total_depth = per_depth.len() as u16;
+    let occupied = |d: u16| -> bool {
+        let slots = &per_depth[d as usize];
+        let idx = slots.partition_point(|&(s, _)| s <= ts);
+        (idx > 0 && slots[idx - 1].1 > ts) || (idx < slots.len() && slots[idx].0 < end)
+    };
+    let mut lo = depth;
+    while lo > 0 && !occupied(lo - 1) { lo -= 1; }
+    let mut hi = depth;
+    while hi + 1 < total_depth && !occupied(hi + 1) { hi += 1; }
+    (lo, hi)
+}
+
 /// Number of buckets in the Detail tab's duration-distribution histogram —
 /// a compromise between showing the shape (skew, outliers, bimodality) and
 /// staying readable at the tab's typical width.
@@ -1184,17 +1209,33 @@ pub fn draw_timeline(
             if let Some(group) = merged_group {
                 let total_depth = group.max_depth;
                 let sub_h = track_h / total_depth as f32;
-                let lane_h = sub_h - LANE_GAP;
                 buf.last_px.clear();
                 buf.last_px.resize(total_depth as usize, -1i32);
+
+                // Packing only gives a row as many depths as its single
+                // busiest moment needs, so most events, most of the time,
+                // have no sibling at the depths above/below them — those
+                // slots then sit visibly empty for the event's whole span.
+                // Let each event claim any run of adjacent depths that
+                // truly has nothing else overlapping its own time range,
+                // so a lone kernel fills the row instead of a thin slice
+                // of it.
+                let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); total_depth as usize];
+                for &(ti32, ei32, eff_depth) in &group.events {
+                    let ev = &trace.tracks[ti32 as usize].events[ei32 as usize];
+                    per_depth[eff_depth as usize].push((ev.ts, ev.ts + ev.dur));
+                }
 
                 for &(ti32, ei32, eff_depth) in &group.events {
                     let orig_ti = ti32 as usize;
                     let ei = ei32 as usize;
                     let ev = &trace.tracks[orig_ti].events[ei];
+                    let ev_end = ev.ts + ev.dur;
                     let x0 = t2x(ev.ts, view.t0, px_per_us, tl_left).max(tl_left);
-                    let x1 = t2x(ev.ts + ev.dur, view.t0, px_per_us, tl_left).min(rect[2]);
+                    let x1 = t2x(ev_end, view.t0, px_per_us, tl_left).min(rect[2]);
                     let w = x1 - x0;
+                    let (lo, hi) = stretch_bounds(&per_depth, eff_depth, ev.ts, ev_end);
+                    let stretched_h = (hi - lo + 1) as f32 * sub_h - LANE_GAP;
 
                     let matches = !filtering
                         || (searching && (ev.name as usize) < search_mask.len() && search_mask[ev.name as usize])
@@ -1204,24 +1245,24 @@ pub fn draw_timeline(
                         let px = x0 as i32;
                         if px == buf.last_px[eff_depth as usize] { continue; }
                         buf.last_px[eff_depth as usize] = px;
-                        let ev_y = y + eff_depth as f32 * sub_h + EV_INSET;
+                        let ev_y = y + lo as f32 * sub_h + EV_INSET;
                         let color = if matches {
                             name_color(&trace.names[ev.name as usize])
                         } else {
                             dim_color(&trace.names[ev.name as usize])
                         };
-                        dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + lane_h], color).filled(true).build();
+                        dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + stretched_h], color).filled(true).build();
                         continue;
                     }
 
-                    let ev_y = y + eff_depth as f32 * sub_h + EV_INSET;
+                    let ev_y = y + lo as f32 * sub_h + EV_INSET;
                     let name = &trace.names[ev.name as usize];
                     let color = if matches {
                         name_color(name)
                     } else {
                         dim_color(name)
                     };
-                    let ev_rect = [x0, ev_y, x1, ev_y + lane_h];
+                    let ev_rect = [x0, ev_y, x1, ev_y + stretched_h];
 
                     let is_hovered = hover_in_timeline
                         && mouse_pos[0] >= ev_rect[0] && mouse_pos[0] <= ev_rect[2]
@@ -1229,8 +1270,8 @@ pub fn draw_timeline(
 
                     let is_primary = selected.map_or(false, |s| s.track_idx == ti32 && s.event_idx == ei32);
                     let is_multi = multi_select_name.map_or(false, |n| ev.name == n);
-                    let ev_track_y = buf.y_offsets[vi] + eff_depth as f32 * sub_h;
-                    let is_selected = is_selected(ti32, ei32, ev_track_y, sub_h, ev.ts, ev.dur);
+                    let ev_track_y = buf.y_offsets[vi] + lo as f32 * sub_h;
+                    let is_selected = is_selected(ti32, ei32, ev_track_y, stretched_h, ev.ts, ev.dur);
                     let is_sel_mask = !sel_mask.is_empty() && sel_mask.get(ev.name as usize).copied().unwrap_or(false);
 
                     let fill = if is_hovered { brighten(color, 30) } else if is_selected || is_sel_mask { brighten(color, 20) } else { color };
@@ -1270,7 +1311,7 @@ pub fn draw_timeline(
                         let tx = ev_rect[0] + 3.0;
                         let ty = ev_rect[1] + 2.0;
                         let text_col = if matches { col32(240, 240, 240, 255) } else { col32(120, 120, 120, 255) };
-                        let text_size = fit_font_size(base_font_size, lane_h);
+                        let text_size = fit_font_size(base_font_size, stretched_h);
                         draw_text_wrapped(text_col, name, [tx, ty], w - 6.0, ev_rect, text_size);
                     }
                 }
