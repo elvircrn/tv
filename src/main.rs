@@ -98,6 +98,13 @@ struct App {
     renderer: Option<PlatformRenderer>,
     state: AppState,
     last_frame: Instant,
+    // Actual measured height of the toolbar window from the last frame it
+    // rendered — the toolbar's own box height is content-fit (see
+    // render_frame), so the tab strip below it needs the *real* number, not
+    // the old fixed TOOLBAR_H, or a few px of leftover box height between
+    // the menu bar and the tab row reads as a visible gap. Falls back to
+    // TOOLBAR_H before the first frame renders it.
+    toolbar_h: f32,
     scale_factor: f64,
     scroll_accum: [f32; 2],
     pinch_accum: f32,
@@ -190,6 +197,7 @@ impl App {
                 diff_pane_indices: None,
             },
             last_frame: Instant::now(),
+            toolbar_h: TOOLBAR_H,
             scale_factor: 1.0,
             scroll_accum: [0.0; 2],
             pinch_accum: 0.0,
@@ -1122,6 +1130,11 @@ impl App {
         let mouse_pos = ui.io().mouse_pos;
         let mouse_delta = ui.io().mouse_delta;
 
+        // Measured at the end of last frame's toolbar window (see below) —
+        // its box is now content-fit, not the old fixed TOOLBAR_H, so
+        // anything positioned relative to "below the toolbar" needs the
+        // real number or a few px of leftover box height shows up as a gap.
+        let toolbar_h = self.toolbar_h;
         let state = &mut self.state;
 
         // ---- Tab strip: one tab per open trace ----
@@ -1135,7 +1148,7 @@ impl App {
             // (see CalcWindowSizeAfterConstraint).
             let _min = ui.push_style_var(StyleVar::WindowMinSize([1.0, 1.0]));
             ui.window("##tracetabs")
-                .position([0.0, TOOLBAR_H], Condition::Always)
+                .position([0.0, toolbar_h], Condition::Always)
                 .size([display[0], TAB_BAR_H], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
@@ -1175,7 +1188,7 @@ impl App {
         let has_trace = state.panes[ai].has_trace();
         let bottom_h = if has_trace { state.bottom_h } else { 0.0 };
         let status_h = if has_trace { STATUS_H } else { 0.0 };
-        let content_top = TAB_BAR_H + TOOLBAR_H;
+        let content_top = toolbar_h + TAB_BAR_H;
 
         let mut t_section = Instant::now();
         macro_rules! mark {
@@ -1284,9 +1297,16 @@ impl App {
         };
         {
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 6.0]));
+            // Auto-fit height (0.0) instead of the old fixed TOOLBAR_H: the
+            // tab strip sits directly below this window now, so its box must
+            // match its actual content height exactly or the leftover slack
+            // between the menu bar and the window's bottom edge reads as a
+            // gap above the tabs. WindowMinSize override for the same reason
+            // as ##tracetabs — a content-fit menu bar can be under 32px.
+            let _min = ui.push_style_var(StyleVar::WindowMinSize([1.0, 1.0]));
             ui.window("##toolbar")
                 .position([0.0, 0.0], Condition::Always)
-                .size([display[0], TOOLBAR_H], Condition::Always)
+                .size([display[0], 0.0], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
@@ -1295,6 +1315,7 @@ impl App {
                         | WindowFlags::MENU_BAR,
                 )
                 .build(|| {
+                    self.toolbar_h = ui.window_size()[1];
                     let pane = &mut state.panes[ai];
                     if pane.trace.is_some() {
                         if let Some(_mb) = ui.begin_menu_bar() {
