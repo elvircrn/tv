@@ -325,71 +325,12 @@ pub struct MergedGeom {
     pub events: Vec<(u32, u32, u16)>,
 }
 
-/// Duration-weighted running average color for events that collapse onto the
-/// same sub-pixel timeline column (below `MIN_EV_PX` wide), so a far
-/// zoomed-out view blends them together instead of only ever showing
-/// whichever one happened to draw first. One slot per depth/lane, reset at
-/// the start of each row's event loop; `px == i32::MIN` means "nothing
-/// accumulated yet / already flushed".
-#[derive(Clone, Copy)]
-pub struct ColumnBlend {
-    px: i32,
-    y0: f32,
-    y1: f32,
-    r: f64,
-    g: f64,
-    b: f64,
-    weight: f64,
-}
-
-impl Default for ColumnBlend {
-    fn default() -> Self {
-        ColumnBlend { px: i32::MIN, y0: 0.0, y1: 0.0, r: 0.0, g: 0.0, b: 0.0, weight: 0.0 }
-    }
-}
-
-impl ColumnBlend {
-    /// True if `px` belongs to a different column than whatever's currently
-    /// accumulating — the caller should `finish()` (and draw) the old one
-    /// before starting a new one with `start()`.
-    pub fn is_new_column(&self, px: i32) -> bool {
-        self.px != px
-    }
-
-    pub fn start(px: i32, y0: f32, y1: f32) -> Self {
-        ColumnBlend { px, y0, y1, r: 0.0, g: 0.0, b: 0.0, weight: 0.0 }
-    }
-
-    pub fn add(&mut self, color: ImColor32, weight: f64) {
-        let w = weight.max(1e-9);
-        self.r += color.r as f64 * w;
-        self.g += color.g as f64 * w;
-        self.b += color.b as f64 * w;
-        self.weight += w;
-    }
-
-    /// The blended color and rect (x, y0, y1) to draw, or `None` if nothing
-    /// was ever accumulated (an empty/already-flushed slot).
-    pub fn finish(&self) -> Option<(ImColor32, f32, f32, f32)> {
-        if self.weight <= 0.0 {
-            return None;
-        }
-        let color = ImColor32::from_rgba(
-            (self.r / self.weight).round() as u8,
-            (self.g / self.weight).round() as u8,
-            (self.b / self.weight).round() as u8,
-            255,
-        );
-        Some((color, self.px as f32, self.y0, self.y1))
-    }
-}
-
 #[derive(Default)]
 pub struct DrawBuf {
     pub visible: Vec<usize>,
     pub heights: Vec<f32>,
     pub y_offsets: Vec<f32>,
-    pub col_blend: Vec<ColumnBlend>,
+    pub last_px: Vec<i32>,
     /// (generation, sort_col, sort_asc, row count, is_individual_mode) from
     /// the last time `sort_idx` was actually recomputed. `draw_stats_table`
     /// reuses `sort_idx` as-is when this key is unchanged, since the table
