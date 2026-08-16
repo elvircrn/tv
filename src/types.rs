@@ -21,13 +21,10 @@ pub const LABEL_W: f32 = 200.0;
 pub const MIN_EV_PX: f32 = 1.0;
 pub const TEXT_MIN_PX: f32 = 60.0;
 pub const TOOLBAR_ROW: f32 = 24.0;
-/// Height of the tab strip (open traces, one per tab) at the very top of the
-/// window, above the menu-bar/search toolbar row.
+/// Height of the tab strip (open traces, one per tab), directly below the
+/// menu-bar/search toolbar row (whose height is computed from real font/style
+/// metrics in `render_frame`, not a fixed constant — see `toolbar_h` there).
 pub const TAB_BAR_H: f32 = TOOLBAR_ROW;
-// A single real imgui menu bar row (File/View/Help dropdowns + the search
-// box), same height on every platform now that there's no separate
-// "export/share" row of inline buttons to make room for.
-pub const TOOLBAR_H: f32 = TOOLBAR_ROW + 8.0;
 pub const STATUS_H: f32 = TOOLBAR_ROW + 4.0;
 pub const DETAIL_H: f32 = 200.0;
 pub const INITIAL_BUF: usize = 256 * 1024;
