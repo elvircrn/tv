@@ -802,6 +802,48 @@ fn test_stretch_bounds_middle_depth_stretches_both_ways_when_free() {
 }
 
 #[test]
+fn test_column_blend_empty_has_no_finish() {
+    let acc = ColumnBlend::default();
+    assert!(acc.finish().is_none());
+}
+
+#[test]
+fn test_column_blend_single_sample_is_unchanged() {
+    let mut acc = ColumnBlend::start(5, 10.0, 20.0);
+    let color = ImColor32::from_rgba(200, 100, 50, 255);
+    acc.add(color, 1.0);
+    let (c, x, y0, y1) = acc.finish().unwrap();
+    assert_eq!((c.r, c.g, c.b), (200, 100, 50));
+    assert_eq!((x, y0, y1), (5.0, 10.0, 20.0));
+}
+
+#[test]
+fn test_column_blend_equal_weight_averages_channels() {
+    let mut acc = ColumnBlend::start(0, 0.0, 1.0);
+    acc.add(ImColor32::from_rgba(0, 0, 0, 255), 1.0);
+    acc.add(ImColor32::from_rgba(100, 200, 40, 255), 1.0);
+    let (c, ..) = acc.finish().unwrap();
+    assert_eq!((c.r, c.g, c.b), (50, 100, 20));
+}
+
+#[test]
+fn test_column_blend_skews_toward_larger_weight() {
+    let mut acc = ColumnBlend::start(0, 0.0, 1.0);
+    acc.add(ImColor32::from_rgba(0, 0, 0, 255), 1.0);
+    acc.add(ImColor32::from_rgba(100, 100, 100, 255), 9.0);
+    let (c, ..) = acc.finish().unwrap();
+    // 90% weight on the brighter sample should land close to it, not the midpoint (50).
+    assert_eq!((c.r, c.g, c.b), (90, 90, 90));
+}
+
+#[test]
+fn test_column_blend_is_new_column() {
+    let acc = ColumnBlend::start(7, 0.0, 1.0);
+    assert!(!acc.is_new_column(7));
+    assert!(acc.is_new_column(8));
+}
+
+#[test]
 fn test_rank_summary() {
     use crate::rank_summary;
     let fname = "dp0_pp0_tp3_dcp0_ep3_rank3.1786304095590565996.pt.trace.json.gz";

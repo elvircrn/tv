@@ -1209,8 +1209,8 @@ pub fn draw_timeline(
             if let Some(group) = merged_group {
                 let total_depth = group.max_depth;
                 let sub_h = track_h / total_depth as f32;
-                buf.last_px.clear();
-                buf.last_px.resize(total_depth as usize, -1i32);
+                buf.col_blend.clear();
+                buf.col_blend.resize(total_depth as usize, ColumnBlend::default());
 
                 // Packing only gives a row as many depths as its single
                 // busiest moment needs, so most events, most of the time,
@@ -1243,15 +1243,20 @@ pub fn draw_timeline(
 
                     if w < MIN_EV_PX {
                         let px = x0 as i32;
-                        if px == buf.last_px[eff_depth as usize] { continue; }
-                        buf.last_px[eff_depth as usize] = px;
                         let ev_y = y + lo as f32 * sub_h + EV_INSET;
                         let color = if matches {
                             name_color(&trace.names[ev.name as usize])
                         } else {
                             dim_color(&trace.names[ev.name as usize])
                         };
-                        dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + stretched_h], color).filled(true).build();
+                        let acc = &mut buf.col_blend[eff_depth as usize];
+                        if acc.is_new_column(px) {
+                            if let Some((c, fx, fy0, fy1)) = acc.finish() {
+                                dl.add_rect([fx, fy0], [fx + 1.0, fy1], c).filled(true).build();
+                            }
+                            *acc = ColumnBlend::start(px, ev_y, ev_y + stretched_h);
+                        }
+                        acc.add(color, ev.dur.max(f64::EPSILON));
                         continue;
                     }
 
@@ -1315,6 +1320,14 @@ pub fn draw_timeline(
                         draw_text_wrapped(text_col, name, [tx, ty], w - 6.0, ev_rect, text_size);
                     }
                 }
+                // Flush whichever column is still pending per depth — the
+                // last sub-pixel column touched has no "next different
+                // pixel" event to trigger its own flush above.
+                for acc in &buf.col_blend {
+                    if let Some((c, fx, fy0, fy1)) = acc.finish() {
+                        dl.add_rect([fx, fy0], [fx + 1.0, fy1], c).filled(true).build();
+                    }
+                }
             } else {
                 let orig_ti = buf.visible[vi];
                 let track = &trace.tracks[orig_ti];
@@ -1324,8 +1337,8 @@ pub fn draw_timeline(
                 let start = bisect_overlap(&track.events, &track.prefix_max_dur, view.t0);
                 let end = track.events.partition_point(|e| e.ts <= view.t1);
 
-                buf.last_px.clear();
-                buf.last_px.resize(track.max_depth as usize, -1i32);
+                buf.col_blend.clear();
+                buf.col_blend.resize(track.max_depth as usize, ColumnBlend::default());
 
                 for ei in start..end {
                     let ev = &track.events[ei];
@@ -1341,15 +1354,20 @@ pub fn draw_timeline(
 
                     if w < MIN_EV_PX {
                         let px = x0 as i32;
-                        if px == buf.last_px[ev.depth as usize] { continue; }
-                        buf.last_px[ev.depth as usize] = px;
                         let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
                         let color = if matches {
                             name_color(&trace.names[ev.name as usize])
                         } else {
                             dim_color(&trace.names[ev.name as usize])
                         };
-                        dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + lane_h], color).filled(true).build();
+                        let acc = &mut buf.col_blend[ev.depth as usize];
+                        if acc.is_new_column(px) {
+                            if let Some((c, fx, fy0, fy1)) = acc.finish() {
+                                dl.add_rect([fx, fy0], [fx + 1.0, fy1], c).filled(true).build();
+                            }
+                            *acc = ColumnBlend::start(px, ev_y, ev_y + lane_h);
+                        }
+                        acc.add(color, ev.dur.max(f64::EPSILON));
                         continue;
                     }
 
@@ -1411,6 +1429,13 @@ pub fn draw_timeline(
                         let text_col = if matches { col32(240, 240, 240, 255) } else { col32(120, 120, 120, 255) };
                         let text_size = fit_font_size(base_font_size, lane_h);
                         draw_text_wrapped(text_col, name, [tx, ty], w - 6.0, ev_rect, text_size);
+                    }
+                }
+                // Flush whichever column is still pending per depth — see
+                // the identical comment in the merged-row branch above.
+                for acc in &buf.col_blend {
+                    if let Some((c, fx, fy0, fy1)) = acc.finish() {
+                        dl.add_rect([fx, fy0], [fx + 1.0, fy1], c).filled(true).build();
                     }
                 }
             }
