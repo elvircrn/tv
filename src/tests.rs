@@ -70,7 +70,7 @@ fn make_state(trace: Trace) -> AppState {
     AppState {
         panes: vec![pane],
         active: 0,
-        divider_xs: Vec::new(),
+        pending_active_tab: None,
         buf,
         bottom_h: DETAIL_H,
         drag: DragKind::None,

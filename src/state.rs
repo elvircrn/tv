@@ -972,7 +972,10 @@ impl Pane {
 pub struct AppState {
     pub panes: Vec<Pane>,
     pub active: usize,
-    pub divider_xs: Vec<f32>,
+    /// One-shot "force this tab selected next frame" signal, set right after
+    /// opening a new trace so the tab strip visually catches up with
+    /// `active`. Mirrors `Pane.pending_tab`.
+    pub pending_active_tab: Option<usize>,
     pub buf: DrawBuf,
     pub bottom_h: f32,
     pub drag: DragKind,
@@ -985,30 +988,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn recompute_dividers(&mut self, width: f32) {
-        let n = self.panes.len();
-        self.divider_xs.clear();
-        for i in 1..n {
-            self.divider_xs.push(width * i as f32 / n as f32);
-        }
-    }
-
-    pub fn pane_x(&self, pi: usize, _width: f32) -> f32 {
-        if pi == 0 { 0.0 } else { self.divider_xs[pi - 1] }
-    }
-
-    pub fn pane_w(&self, pi: usize, width: f32) -> f32 {
-        let x0 = if pi == 0 { 0.0 } else { self.divider_xs[pi - 1] };
-        let x1 = if pi < self.divider_xs.len() { self.divider_xs[pi] } else { width };
-        x1 - x0
-    }
-
-    pub fn add_pane(&mut self, width: f32) {
+    pub fn add_pane(&mut self) -> usize {
         self.panes.push(Pane::new());
-        self.recompute_dividers(width);
+        self.panes.len() - 1
     }
 
-    pub fn remove_pane(&mut self, pi: usize, width: f32) {
+    pub fn remove_pane(&mut self, pi: usize) {
         self.panes.remove(pi);
         if self.active > pi {
             self.active -= 1;
@@ -1016,13 +1001,5 @@ impl AppState {
             self.active = self.panes.len().saturating_sub(1);
         }
         self.drag = DragKind::None;
-        self.recompute_dividers(width);
-    }
-
-    pub fn pane_at_x(&self, x: f32) -> usize {
-        for (i, &dx) in self.divider_xs.iter().enumerate() {
-            if x < dx { return i; }
-        }
-        self.panes.len() - 1
     }
 }

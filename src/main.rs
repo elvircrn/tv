@@ -74,6 +74,24 @@ fn rank_summary(fname: &str, dist_rank: i32, dist_world: i32) -> String {
     out
 }
 
+/// Short label for a pane's tab / "Diff against" entry: the dropped folder's
+/// name, the trace file's basename, or "Untitled" for a pane with nothing
+/// loaded yet. Multi-rank panes store `trace_path` as "N ranks: prefix" (see
+/// `Pane::open_multi`) — this shows just the prefix, not the rank count,
+/// since the count belongs in the status bar, not a short tab label.
+fn tab_label(pane: &Pane) -> &str {
+    if let Some(dir) = &pane.reload_dir {
+        if let Some(name) = std::path::Path::new(dir).file_name().and_then(|f| f.to_str()) {
+            return name;
+        }
+    }
+    if pane.trace_path.is_empty() {
+        return "Untitled";
+    }
+    let shown = pane.trace_path.split_once("ranks: ").map(|(_, p)| p).unwrap_or(&pane.trace_path);
+    shown.rsplit('/').next().unwrap_or(shown)
+}
+
 struct App {
     window: Option<Window>,
     imgui: Option<imgui::Context>,
@@ -160,7 +178,7 @@ impl App {
             state: AppState {
                 panes: vec![Pane::new()],
                 active: 0,
-                divider_xs: Vec::new(),
+                pending_active_tab: None,
                 buf: DrawBuf::default(),
                 bottom_h: DETAIL_H,
                 drag: DragKind::None,
@@ -708,10 +726,6 @@ impl ApplicationHandler for App {
             pi += 1;
         }
         self.pending_files.clear();
-        if self.state.panes.len() > 1 {
-            let size = self.window.as_ref().unwrap().inner_size();
-            self.state.recompute_dividers(size.width as f32 / self.scale_factor as f32);
-        }
     }
 
     // Fired when the browser-side `resize` listener installed in `resumed()`
@@ -731,9 +745,6 @@ impl ApplicationHandler for App {
 
         let files = std::mem::take(&mut *self.pending_web_files.borrow_mut());
         if !files.is_empty() {
-            let display_w = self.window.as_ref()
-                .map(|w| w.inner_size().width as f32 / self.scale_factor as f32)
-                .unwrap_or(INITIAL_WIN_W);
             // A dropped folder's files land here as one flat batch (see
             // walk_dropped_entry) — group same-run rank files (e.g.
             // "...-rank-0.json.gz", "...-rank-1.json.gz") into a single
@@ -742,20 +753,16 @@ impl ApplicationHandler for App {
             let (rank_groups, standalone) = crate::loader::group_by_rank_bytes(files);
             for group in rank_groups {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
-                let target = if let Some(i) = empty { i } else {
-                    self.state.add_pane(display_w);
-                    self.state.panes.len() - 1
-                };
+                let target = empty.unwrap_or_else(|| self.state.add_pane());
                 self.state.active = target;
+                self.state.pending_active_tab = Some(target);
                 self.state.panes[target].open_multi_from_bytes(group);
             }
             for (name, bytes) in standalone {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
-                let target = if let Some(i) = empty { i } else {
-                    self.state.add_pane(display_w);
-                    self.state.panes.len() - 1
-                };
+                let target = empty.unwrap_or_else(|| self.state.add_pane());
                 self.state.active = target;
+                self.state.pending_active_tab = Some(target);
                 self.state.panes[target].open_from_bytes(name, bytes);
             }
             if let Some(w) = &self.window { w.request_redraw(); }
@@ -1065,7 +1072,6 @@ impl App {
 
         if !self.pending_drops.is_empty() {
             let drops = std::mem::take(&mut self.pending_drops);
-            let display_w = phys.width as f32 / s;
             let dropped_dirs: Vec<String> = drops.iter()
                 .filter(|p| std::path::Path::new(p).is_dir())
                 .cloned().collect();
@@ -1075,11 +1081,9 @@ impl App {
             let (rank_groups, standalone) = crate::loader::detect_rank_groups(&drops);
             for group in rank_groups {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
-                let target = if let Some(i) = empty { i } else {
-                    self.state.add_pane(display_w);
-                    self.state.panes.len() - 1
-                };
+                let target = empty.unwrap_or_else(|| self.state.add_pane());
                 self.state.active = target;
+                self.state.pending_active_tab = Some(target);
                 if dropped_dirs.len() == 1 {
                     self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
                     self.state.panes[target].cache_dir = drop_cache_dir.clone();
@@ -1088,11 +1092,9 @@ impl App {
             }
             for path in standalone {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
-                let target = if let Some(i) = empty { i } else {
-                    self.state.add_pane(display_w);
-                    self.state.panes.len() - 1
-                };
+                let target = empty.unwrap_or_else(|| self.state.add_pane());
                 self.state.active = target;
+                self.state.pending_active_tab = Some(target);
                 if dropped_dirs.len() == 1 {
                     self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
                     self.state.panes[target].cache_dir = drop_cache_dir.clone();
@@ -1122,17 +1124,58 @@ impl App {
 
         let state = &mut self.state;
 
-        if state.divider_xs.is_empty() && state.panes.len() > 1 {
-            state.recompute_dividers(display[0]);
+        // ---- Tab strip: one tab per open trace ----
+        let mut close_pane: Option<usize> = None;
+        {
+            let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 4.0]));
+            // Dear ImGui floors every non-child, non-auto-resize window at
+            // style.WindowMinSize (32x32 by default) regardless of an
+            // explicit `.size()` — without this override a 24px-tall strip
+            // gets silently grown to 32px and overlaps the toolbar row
+            // directly below it (see CalcWindowSizeAfterConstraint).
+            let _min = ui.push_style_var(StyleVar::WindowMinSize([1.0, 1.0]));
+            ui.window("##tracetabs")
+                .position([0.0, 0.0], Condition::Always)
+                .size([display[0], TAB_BAR_H], Condition::Always)
+                .flags(
+                    WindowFlags::NO_DECORATION
+                        | WindowFlags::NO_MOVE
+                        | WindowFlags::NO_SAVED_SETTINGS
+                        | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS,
+                )
+                .build(|| {
+                    if let Some(_bar) = ui.tab_bar("##tracetabbar") {
+                        let pending = state.pending_active_tab.take();
+                        for pi in 0..state.panes.len() {
+                            let tab_id = format!("{}##tab{}", tab_label(&state.panes[pi]), pi);
+                            let mut open = true;
+                            let flags = if pending == Some(pi) {
+                                imgui::TabItemFlags::SET_SELECTED
+                            } else { imgui::TabItemFlags::empty() };
+                            if let Some(_t) = imgui::TabItem::new(&tab_id).opened(&mut open).flags(flags).begin(&ui) {
+                                state.active = pi;
+                            }
+                            if !open {
+                                close_pane = Some(pi);
+                            }
+                        }
+                    }
+                });
+        }
+        if let Some(pi) = close_pane {
+            if state.panes.len() > 1 {
+                state.remove_pane(pi);
+            } else {
+                state.panes[0] = Pane::new();
+            }
+            window.request_redraw();
         }
 
-        let mut n_panes = state.panes.len();
-        let mut pane_xs: Vec<f32> = (0..n_panes).map(|pi| state.pane_x(pi, display[0])).collect();
-        let mut pane_ws: Vec<f32> = (0..n_panes).map(|pi| state.pane_w(pi, display[0])).collect();
-
-        let any_has_trace = (0..n_panes).any(|pi| state.panes[pi].has_trace());
-        let bottom_h = if any_has_trace { state.bottom_h } else { 0.0 };
-        let status_h = if any_has_trace { STATUS_H } else { 0.0 };
+        let ai = state.active;
+        let has_trace = state.panes[ai].has_trace();
+        let bottom_h = if has_trace { state.bottom_h } else { 0.0 };
+        let status_h = if has_trace { STATUS_H } else { 0.0 };
+        let content_top = TAB_BAR_H + TOOLBAR_H;
 
         let mut t_section = Instant::now();
         macro_rules! mark {
@@ -1143,10 +1186,9 @@ impl App {
             }
         }
 
-        // ---- Drag handling (bottom divider, label divider, split divider) ----
-        let selecting = (shift && ui.io().mouse_down[0])
-            || (0..n_panes).any(|pi| state.panes[pi].selection_dirty);
-        if any_has_trace && !state.diff_popup_open {
+        // ---- Drag handling (bottom divider, label divider) ----
+        let selecting = (shift && ui.io().mouse_down[0]) || state.panes[ai].selection_dirty;
+        if has_trace && !state.diff_popup_open {
             let divider_y = display[1] - bottom_h - status_h;
             // Small area around the lock icon itself: a plain single click
             // there also toggles pin, on top of double-clicking anywhere
@@ -1156,7 +1198,7 @@ impl App {
             let near_icon = (mouse_pos[0] - display[0] * 0.5).abs() < LOCK_ICON_RADIUS * 2.2
                 && (mouse_pos[1] - divider_y).abs() < DIVIDER_GRAB_PX;
             let near_h = !selecting && !near_icon
-                && (mouse_pos[1] - divider_y).abs() < DIVIDER_GRAB_PX && mouse_pos[1] > TOOLBAR_H;
+                && (mouse_pos[1] - divider_y).abs() < DIVIDER_GRAB_PX && mouse_pos[1] > content_top;
 
             // Double-clicking the divider (or a single click right on the
             // icon) toggles "even spacing" for the active pane — every
@@ -1171,12 +1213,12 @@ impl App {
             let toggle_fit = (near_h && ui.is_mouse_double_clicked(imgui::MouseButton::Left))
                 || (near_icon && ui.is_mouse_clicked(imgui::MouseButton::Left));
             if toggle_fit {
-                let pane = &mut state.panes[state.active];
+                let pane = &mut state.panes[ai];
                 pane.even_spacing = !pane.even_spacing;
             }
             if near_icon {
                 ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
-                let tip = if state.panes[state.active].even_spacing {
+                let tip = if state.panes[ai].even_spacing {
                     "Tracks are fit to the visible height — click to go back to their normal (scrollable) sizes."
                 } else {
                     "Fit all tracks to evenly fill the space down to this divider — handy for the merged view, where a few rank rows otherwise leave a lot of dead space. Double-clicking the divider does the same thing."
@@ -1194,41 +1236,32 @@ impl App {
 
             if ui.io().mouse_down[0] && state.drag == DragKind::BottomDivider {
                 state.bottom_h -= mouse_delta[1];
-                state.bottom_h = state.bottom_h.clamp(MIN_BOTTOM_H, display[1] - TOOLBAR_H - status_h - MIN_BOTTOM_H);
+                state.bottom_h = state.bottom_h.clamp(MIN_BOTTOM_H, display[1] - content_top - status_h - MIN_BOTTOM_H);
             } else if state.drag == DragKind::BottomDivider && !ui.io().mouse_down[0] {
                 state.drag = DragKind::None;
             }
         }
 
-        // Label divider (check each pane)
-        if !state.diff_popup_open {
+        // Label divider (active pane only)
+        if !state.diff_popup_open && has_trace {
             let divider_y = display[1] - bottom_h - status_h;
-            let mut near_v_pane: Option<usize> = None;
+            let mut near_v = false;
             if !selecting {
-                for pi in 0..n_panes {
-                    if !state.panes[pi].has_trace() { continue; }
-                    let label_x = pane_xs[pi] + state.panes[pi].label_w;
-                    let in_pane = mouse_pos[0] >= pane_xs[pi] && mouse_pos[0] < pane_xs[pi] + pane_ws[pi];
-                    if in_pane && (mouse_pos[0] - label_x).abs() < DIVIDER_GRAB_PX
-                        && mouse_pos[1] > TOOLBAR_H && mouse_pos[1] < divider_y
-                    {
-                        near_v_pane = Some(pi);
-                    }
-                }
+                let label_x = state.panes[ai].label_w;
+                near_v = (mouse_pos[0] - label_x).abs() < DIVIDER_GRAB_PX
+                    && mouse_pos[1] > content_top && mouse_pos[1] < divider_y;
             }
 
-            if (near_v_pane.is_some() && !state.drag.is_active()) || matches!(state.drag, DragKind::LabelDivider(_)) {
+            if (near_v && !state.drag.is_active()) || matches!(state.drag, DragKind::LabelDivider(_)) {
                 ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeEW));
             }
-            if ui.io().mouse_down[0] && !state.drag.is_active() {
-                if let Some(pi) = near_v_pane {
-                    state.drag = DragKind::LabelDivider(pi);
-                }
+            if ui.io().mouse_down[0] && !state.drag.is_active() && near_v {
+                state.drag = DragKind::LabelDivider(ai);
             }
             if let DragKind::LabelDivider(pi) = state.drag {
                 if ui.io().mouse_down[0] {
                     state.panes[pi].label_w += mouse_delta[0];
-                    let max_w = pane_ws[pi] * 0.5;
+                    let max_w = display[0] * 0.5;
                     state.panes[pi].label_w = state.panes[pi].label_w.clamp(MIN_LABEL_W, max_w);
                 } else {
                     state.drag = DragKind::None;
@@ -1236,52 +1269,24 @@ impl App {
             }
         }
 
-        // Split dividers
-        if n_panes > 1 && !state.diff_popup_open {
-            let mut near_div: Option<usize> = None;
-            if !selecting {
-                for (i, &dx) in state.divider_xs.iter().enumerate() {
-                    if (mouse_pos[0] - dx).abs() < DIVIDER_GRAB_PX && mouse_pos[1] > TOOLBAR_H {
-                        near_div = Some(i);
-                        break;
-                    }
-                }
-            }
-
-            if (near_div.is_some() && !state.drag.is_active()) || matches!(state.drag, DragKind::SplitDivider(_)) {
-                ui.set_mouse_cursor(Some(imgui::MouseCursor::ResizeEW));
-            }
-            if ui.io().mouse_down[0] && !state.drag.is_active() {
-                if let Some(i) = near_div {
-                    state.drag = DragKind::SplitDivider(i);
-                }
-            }
-            if let DragKind::SplitDivider(i) = state.drag {
-                if ui.io().mouse_down[0] {
-                    state.divider_xs[i] += mouse_delta[0];
-                    let lo = if i == 0 { MIN_SPLIT_W } else { state.divider_xs[i - 1] + MIN_SPLIT_W };
-                    let hi = if i + 1 < state.divider_xs.len() { state.divider_xs[i + 1] - MIN_SPLIT_W } else { display[0] - MIN_SPLIT_W };
-                    state.divider_xs[i] = state.divider_xs[i].clamp(lo, hi);
-                } else {
-                    state.drag = DragKind::None;
-                }
-            }
-        }
-
         mark!("drag", t_section);
-        // ---- Per-pane toolbars ----
-        let mut search_changed = vec![false; n_panes];
-        let mut close_pane: Option<usize> = None;
+        // ---- Toolbar (active pane) ----
+        let mut search_changed = false;
         let mut diff_clicked_against: Option<usize> = None;
-        let active_has_sel = !state.panes[state.active].selection_stats.is_empty();
-        for pi in 0..n_panes {
-            state.buf.fmt.clear();
-            write!(state.buf.fmt, "##toolbar{}", pi).unwrap();
-            let toolbar_name = state.buf.fmt.clone();
+        let active_has_sel = !state.panes[ai].selection_stats.is_empty();
+        let diff_targets: Vec<(usize, String)> = if active_has_sel {
+            (0..state.panes.len())
+                .filter(|&pi| pi != ai && !state.panes[pi].selection_stats.is_empty())
+                .map(|pi| (pi, tab_label(&state.panes[pi]).to_string()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        {
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 6.0]));
-            ui.window(&toolbar_name)
-                .position([pane_xs[pi], 0.0], Condition::Always)
-                .size([pane_ws[pi], TOOLBAR_H], Condition::Always)
+            ui.window("##toolbar")
+                .position([0.0, TAB_BAR_H], Condition::Always)
+                .size([display[0], TOOLBAR_H], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
@@ -1290,7 +1295,7 @@ impl App {
                         | WindowFlags::MENU_BAR,
                 )
                 .build(|| {
-                    let pane = &mut state.panes[pi];
+                    let pane = &mut state.panes[ai];
                     if pane.trace.is_some() {
                         if let Some(_mb) = ui.begin_menu_bar() {
                             // ---- File menu: export/share/sync. Export/Share
@@ -1304,8 +1309,6 @@ impl App {
                             #[cfg(not(target_arch = "wasm32"))]
                             let has_export_share = !pane.reload_paths.is_empty()
                                 && pane.trace.as_ref().is_some_and(|t| t.tracks.iter().any(|tr| tr.gpu));
-                            #[cfg(target_arch = "wasm32")]
-                            let has_export_share = false;
                             let multi_rank = pane.reload_paths.len() >= 2
                                 || pane.trace.as_ref().is_some_and(|t| t.rank_paths.len() >= 2);
                             #[cfg(not(target_arch = "wasm32"))]
@@ -1383,16 +1386,20 @@ impl App {
                                         }
                                     }
                                 }
-                                if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
+                                if !diff_targets.is_empty() {
                                     ui.separator();
-                                    if ui.menu_item("Diff") {
-                                        diff_clicked_against = Some(pi);
-                                    }
+                                    ui.menu("Diff against", || {
+                                        for (other, label) in &diff_targets {
+                                            if ui.menu_item(label) {
+                                                diff_clicked_against = Some(*other);
+                                            }
+                                        }
+                                    });
                                 }
                             });
 
-                            // ---- Help menu: keyboard/mouse reference, once per window.
-                            if pi == 0 {
+                            // ---- Help menu: keyboard/mouse reference.
+                            {
                                 ui.menu("Help", || {
                                     ui.text("Navigation");
                                     ui.separator();
@@ -1427,10 +1434,16 @@ impl App {
                                     ui.text("Drag border       Resize track height");
                                     ui.text("Dbl-click below   Even-fill lane heights (toggle)");
                                     ui.separator();
+                                    ui.text("Tabs");
+                                    ui.separator();
+                                    ui.text("Drop file         Open in a new tab");
+                                    ui.text("Click tab         Switch trace");
+                                    ui.text("Click tab's x     Close trace");
+                                    ui.text("View > Diff against   Compare two tabs' selections");
+                                    ui.separator();
                                     ui.text("Files");
                                     ui.separator();
                                     ui.text("Drop file         Open trace");
-                                    ui.text("Drop 2nd file     Split-pane view");
                                     ui.text("Drop folder       Merge multi-rank traces");
                                 });
                             }
@@ -1456,14 +1469,14 @@ impl App {
                                 .callback(InputTextCallback::ALWAYS, SelectAllCb(&mut pane.select_all_pending))
                                 .build();
                             if pane.search.len() != prev_len || pane.search != pane.prev_search {
-                                search_changed[pi] = true;
+                                search_changed = true;
                                 pane.prev_search.clear();
                                 pane.prev_search.push_str(&pane.search);
                             }
                             if enter && !pane.search.trim().is_empty() {
-                                if search_changed[pi] {
+                                if search_changed {
                                     pane.rebuild_search();
-                                    search_changed[pi] = false;
+                                    search_changed = false;
                                 }
                                 pane.select_from_search(&mut state.buf);
                                 pane.zoom_to_search();
@@ -1488,15 +1501,6 @@ impl App {
                                 write!(state.buf.fmt, "{} matches", pane.search_nav.len()).unwrap();
                                 ui.text_colored([0.6, 0.8, 1.0, 1.0], &state.buf.fmt);
                             }
-
-                            // ---- Close: right-aligned, last item in the bar.
-                            let win_w = ui.window_size()[0];
-                            let close_w = ui.calc_text_size("x")[0] + ui.clone_style().frame_padding[0] * 2.0;
-                            ui.same_line();
-                            let cur_y = ui.cursor_pos()[1];
-                            ui.set_cursor_pos([win_w - close_w - ui.clone_style().window_padding[0], cur_y]);
-                            if ui.small_button("x##close") { close_pane = Some(pi); }
-                            if ui.is_item_hovered() { ui.tooltip_text("Close trace"); }
                         }
                     } else if pane.loading.is_some() {
                         ui.align_text_to_frame_padding();
@@ -1518,57 +1522,35 @@ impl App {
                 });
         }
 
-        if let Some(pi) = close_pane {
-            if n_panes > 1 {
-                state.remove_pane(pi, display[0]);
-            } else {
-                state.panes[0] = Pane::new();
-            }
-            n_panes = state.panes.len();
-            pane_xs = (0..n_panes).map(|pi| state.pane_x(pi, display[0])).collect();
-            pane_ws = (0..n_panes).map(|pi| state.pane_w(pi, display[0])).collect();
-            window.request_redraw();
-        }
-
         mark!("toolbar", t_section);
         // ---- Diff trigger ----
         if let Some(other) = diff_clicked_against {
-            let seq_a = state.panes[state.active].extract_selection_events();
+            let seq_a = state.panes[ai].extract_selection_events();
             let seq_b = state.panes[other].extract_selection_events();
             state.diff_result = Some(diff::compute_diff(&seq_a, &seq_b));
             state.diff_bar_scroll = 0.0;
             state.diff_bar_zoom = 1.0;
             state.show_diff = true;
-            state.diff_pane_indices = Some([state.active, other]);
+            state.diff_pane_indices = Some([ai, other]);
         }
 
-        // ---- Divider lines (skip when diff popup covers everything) ----
-        if !state.diff_popup_open {
-            if any_has_trace {
-                let divider_y = display[1] - bottom_h - status_h;
-                let dl = ui.get_foreground_draw_list();
-                let near = !selecting && ((mouse_pos[1] - divider_y).abs() < DIVIDER_GRAB_PX || state.drag == DragKind::BottomDivider);
-                let col = if near { col32(120, 120, 120, 255) } else { col32(60, 60, 60, 255) };
-                dl.add_line([0.0, divider_y], [display[0], divider_y], col).build();
-                draw_lock_icon(&dl, display[0] * 0.5, divider_y - 1.0, state.panes[state.active].even_spacing);
-            }
-            for (i, &dx) in state.divider_xs.iter().enumerate() {
-                let dl = ui.get_foreground_draw_list();
-                let near = !selecting && ((mouse_pos[0] - dx).abs() < DIVIDER_GRAB_PX || state.drag == DragKind::SplitDivider(i));
-                let col = if near { col32(120, 120, 120, 255) } else { col32(60, 60, 60, 255) };
-                dl.add_line([dx, 0.0], [dx, display[1]], col).build();
-            }
+        // ---- Divider line (skip when diff popup covers everything) ----
+        if !state.diff_popup_open && has_trace {
+            let divider_y = display[1] - bottom_h - status_h;
+            let dl = ui.get_foreground_draw_list();
+            let near = !selecting && ((mouse_pos[1] - divider_y).abs() < DIVIDER_GRAB_PX || state.drag == DragKind::BottomDivider);
+            let col = if near { col32(120, 120, 120, 255) } else { col32(60, 60, 60, 255) };
+            dl.add_line([0.0, divider_y], [display[0], divider_y], col).build();
+            draw_lock_icon(&dl, display[0] * 0.5, divider_y - 1.0, state.panes[ai].even_spacing);
         }
 
         mark!("dividers", t_section);
-        // ---- Per-pane bottom panels ----
-        for pi in 0..n_panes {
-            if !state.panes[pi].has_trace() { continue; }
-            let bottom_name = format!("##bottom{}", pi);
+        // ---- Bottom panel (active pane) ----
+        if state.panes[ai].has_trace() {
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 6.0]));
-            ui.window(&bottom_name)
-                .position([pane_xs[pi], display[1] - bottom_h - status_h], Condition::Always)
-                .size([pane_ws[pi], bottom_h], Condition::Always)
+            ui.window("##bottom")
+                .position([0.0, display[1] - bottom_h - status_h], Condition::Always)
+                .size([display[0], bottom_h], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
@@ -1576,10 +1558,9 @@ impl App {
                         | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS,
                 )
                 .build(|| {
-                    let pane = &mut state.panes[pi];
+                    let pane = &mut state.panes[ai];
                     let trace = pane.trace.as_ref().unwrap();
-                    let tab_bar_name = format!("##bottomtabs{}", pi);
-                    if let Some(_tab_bar) = ui.tab_bar(&tab_bar_name) {
+                    if let Some(_tab_bar) = ui.tab_bar("##bottomtabs") {
                         let pending = pane.pending_tab.take();
                         let detail_flags = if pending == Some(BottomTab::Detail) {
                             imgui::TabItemFlags::SET_SELECTED
@@ -1683,9 +1664,9 @@ impl App {
                                 ui.separator();
                                 let t_tbl = Instant::now();
                                 if pane.sel_aggregate {
-                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, None, pane.sel_generation, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
+                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, None, pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
                                 } else {
-                                    draw_stats_table(&ui, trace, &pane.sel_individual, Some(&pane.sel_individual_refs), pane.sel_generation, &mut pane.search, &mut search_changed[pi], &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
+                                    draw_stats_table(&ui, trace, &pane.sel_individual, Some(&pane.sel_individual_refs), pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
                                 }
                                 let tbl_ms = t_tbl.elapsed().as_secs_f64() * 1000.0;
                                 let tbl_rows = if pane.sel_aggregate { pane.sel_agg_stats.len() } else { pane.sel_individual.len() };
@@ -1700,16 +1681,14 @@ impl App {
         }
 
         mark!("bottom", t_section);
-        // ---- Per-pane status bars ----
-        for pi in 0..n_panes {
-            if !state.panes[pi].has_trace() { continue; }
-            let pane = &state.panes[pi];
+        // ---- Status bar (active pane) ----
+        if state.panes[ai].has_trace() {
+            let pane = &state.panes[ai];
             let t = pane.trace.as_ref().unwrap();
-            let status_name = format!("##status{}", pi);
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 2.0]));
-            ui.window(&status_name)
-                .position([pane_xs[pi], display[1] - status_h], Condition::Always)
-                .size([pane_ws[pi], status_h], Condition::Always)
+            ui.window("##status")
+                .position([0.0, display[1] - status_h], Condition::Always)
+                .size([display[0], status_h], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
@@ -1760,20 +1739,20 @@ impl App {
         }
 
         mark!("status", t_section);
-        // ---- Per-pane timelines ----
-        let mut hover_results: Vec<Option<EventRef>> = vec![None; n_panes];
-        let mut click_results: Vec<Option<EventRef>> = vec![None; n_panes];
-        let mut new_selections: Vec<Option<Option<[f64; 4]>>> = vec![None; n_panes];
-        let mut double_clicks: Vec<bool> = vec![false; n_panes];
+        // ---- Timeline (active pane) ----
+        let mut hover_result: Option<EventRef> = None;
+        let mut click_result: Option<EventRef> = None;
+        let mut new_selection: Option<Option<[f64; 4]>> = None;
+        let mut double_click = false;
 
-        for pi in 0..n_panes {
-            if !state.panes[pi].has_trace() {
-                let tl_top = TOOLBAR_H;
-                let tl_h = display[1] - TOOLBAR_H;
+        {
+            if !state.panes[ai].has_trace() {
+                let tl_top = content_top;
+                let tl_h = display[1] - content_top;
                 let _pad = ui.push_style_var(StyleVar::WindowPadding([0.0, 0.0]));
-                ui.window(&format!("##splash{pi}"))
-                    .position([pane_xs[pi], tl_top], Condition::Always)
-                    .size([pane_ws[pi], tl_h], Condition::Always)
+                ui.window("##splash")
+                    .position([0.0, tl_top], Condition::Always)
+                    .size([display[0], tl_h], Condition::Always)
                     .flags(
                         WindowFlags::NO_DECORATION
                             | WindowFlags::NO_MOVE
@@ -1791,12 +1770,12 @@ impl App {
                         let logo_h = VLLM_LOGO_GRID * logo_scale;
                         let cx = win_pos[0] + (avail[0] - logo_w) * 0.5;
                         let mut cy = win_pos[1] + (avail[1] - logo_h) * 0.5;
-                        if state.panes[pi].error.is_some() {
+                        if state.panes[ai].error.is_some() {
                             cy -= 30.0;
                         }
                         draw_vllm_logo(&dl, cx, cy, logo_scale);
                         drop(dl);
-                        if let Some(e) = &state.panes[pi].error {
+                        if let Some(e) = &state.panes[ai].error {
                             let wrap_w = (avail[0] * 0.8).min(600.0);
                             let text_size = ui.calc_text_size_with_opts(e, false, wrap_w);
                             let tx = (avail[0] - text_size[0].min(wrap_w)) * 0.5;
@@ -1807,16 +1786,14 @@ impl App {
                             ui.text_wrapped(e);
                         }
                     });
-                continue;
-            }
-            let tl_top = TOOLBAR_H;
-            let tl_h = display[1] - TOOLBAR_H - bottom_h - status_h;
+            } else {
+            let tl_top = content_top;
+            let tl_h = display[1] - content_top - bottom_h - status_h;
 
-            let timeline_name = format!("##timeline{}", pi);
             let _pad = ui.push_style_var(StyleVar::WindowPadding([0.0, 0.0]));
-            ui.window(&timeline_name)
-                .position([pane_xs[pi], tl_top], Condition::Always)
-                .size([pane_ws[pi], tl_h], Condition::Always)
+            ui.window("##timeline")
+                .position([0.0, tl_top], Condition::Always)
+                .size([display[0], tl_h], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
@@ -1827,18 +1804,13 @@ impl App {
                 .build(|| {
                     let pos = ui.cursor_screen_pos();
                     let avail = ui.content_region_avail();
-                    let canvas_name = format!("##canvas{}", pi);
-                    ui.invisible_button(&canvas_name, avail);
+                    ui.invisible_button("##canvas", avail);
                     let hovered = ui.is_item_hovered();
                     let clicked = ui.is_item_clicked();
                     let double_clicked = ui.is_mouse_double_clicked(imgui::MouseButton::Left) && hovered;
                     let active = ui.is_item_active();
 
-                    if clicked {
-                        state.active = pi;
-                    }
-
-                    let pane = &mut state.panes[pi];
+                    let pane = &mut state.panes[ai];
                     let trace = pane.trace.as_ref().unwrap();
                     let rect = [pos[0], pos[1], pos[0] + avail[0], pos[1] + avail[1]];
                     let (h, c, sel) = draw_timeline(
@@ -1848,7 +1820,7 @@ impl App {
                         pane.show_cpu,
                         &mut state.buf,
                         rect,
-                        pi,
+                        ai,
                         hovered,
                         clicked,
                         active,
@@ -1876,22 +1848,23 @@ impl App {
                         dt,
                         &mut pane.pending_focus,
                     );
-                    hover_results[pi] = h;
-                    click_results[pi] = c;
-                    new_selections[pi] = sel;
-                    double_clicks[pi] = double_clicked;
+                    hover_result = h;
+                    click_result = c;
+                    new_selection = sel;
+                    double_click = double_clicked;
                 });
+            }
         }
 
         mark!("timeline", t_section);
 
-        // ---- Process click/selection results per pane ----
-        for pi in 0..n_panes {
-            if let Some(c) = click_results[pi] {
-                let pane = &mut state.panes[pi];
+        // ---- Process click/selection results (active pane) ----
+        {
+            if let Some(c) = click_result {
+                let pane = &mut state.panes[ai];
                 let trace = pane.trace.as_ref().unwrap();
                 let ev = &trace.tracks[c.track_idx as usize].events[c.event_idx as usize];
-                let double = double_clicks[pi];
+                let double = double_click;
                 pane.multi_select_name = if double { Some(ev.name) } else { None };
                 pane.selected = Some(c);
                 // Clicking a single event to inspect it (Detail tab) must not
@@ -1900,7 +1873,6 @@ impl App {
                 // to Selection after clicking any event elsewhere showed
                 // nothing. A double-click still replaces the Selection tab's
                 // contents via rebuild_multi_select_stats below.
-                state.active = pi;
                 if double {
                     // Double-click replaces any drag-region selection with a
                     // by-name multi-select, so clear the region's visual
@@ -1918,8 +1890,8 @@ impl App {
                 }
             }
 
-            if let Some(sel) = new_selections[pi] {
-                let pane = &mut state.panes[pi];
+            if let Some(sel) = new_selection {
+                let pane = &mut state.panes[ai];
                 pane.selection = sel;
                 if sel.is_some() {
                     pane.selected = None;
@@ -1935,26 +1907,23 @@ impl App {
                 }
             }
 
-            if state.panes[pi].selection_dirty && !ui.io().mouse_down[0] {
-                state.panes[pi].finish_selection(&mut state.buf);
-                state.panes[pi].pending_tab = Some(BottomTab::Selection);
-                state.panes[pi].selection_dirty = false;
-                state.active = pi;
+            if state.panes[ai].selection_dirty && !ui.io().mouse_down[0] {
+                state.panes[ai].finish_selection(&mut state.buf);
+                state.panes[ai].pending_tab = Some(BottomTab::Selection);
+                state.panes[ai].selection_dirty = false;
             }
         }
 
-        let needs_extra_frame = click_results.iter().any(|c| c.is_some())
-            || new_selections.iter().any(|s| s.is_some());
+        let needs_extra_frame = click_result.is_some() || new_selection.is_some();
         if needs_extra_frame {
             window.request_redraw();
         }
 
         mark!("clicks", t_section);
-        // ---- Hover tooltip ----
-        for pi in 0..n_panes {
-            if state.diff_popup_open { break; }
-            if let Some(r) = &hover_results[pi] {
-                if let Some(trace) = &state.panes[pi].trace {
+        // ---- Hover tooltip (active pane) ----
+        if !state.diff_popup_open {
+            if let Some(r) = &hover_result {
+                if let Some(trace) = &state.panes[ai].trace {
                     let track = &trace.tracks[r.track_idx as usize];
                     let ev = &track.events[r.event_idx as usize];
                     ui.tooltip(|| {
@@ -2017,7 +1986,6 @@ impl App {
         mark!("diff", t_section);
         // ---- Keybinds (active pane) ----
         let any_text_focused = ui.is_any_item_active();
-        let ai = state.active;
 
         if ui.is_key_pressed(imgui::Key::Home) {
             if let Some(max_ts) = state.panes[ai].trace.as_ref().map(|t| t.max_ts) {
@@ -2031,7 +1999,7 @@ impl App {
         if ui.is_key_pressed(imgui::Key::Escape) {
             state.panes[ai].search.clear();
             state.panes[ai].clear_selection();
-            search_changed[ai] = true;
+            search_changed = true;
         }
         if !any_text_focused && ctrl && ui.is_key_pressed(imgui::Key::C) {
             let pane = &state.panes[ai];
@@ -2103,10 +2071,8 @@ impl App {
             }
         }
 
-        for pi in 0..n_panes {
-            if search_changed[pi] {
-                state.panes[pi].rebuild_search();
-            }
+        if search_changed {
+            state.panes[ai].rebuild_search();
         }
 
         mark!("keybinds", t_section);

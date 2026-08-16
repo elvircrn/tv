@@ -21,6 +21,9 @@ pub const LABEL_W: f32 = 200.0;
 pub const MIN_EV_PX: f32 = 1.0;
 pub const TEXT_MIN_PX: f32 = 60.0;
 pub const TOOLBAR_ROW: f32 = 24.0;
+/// Height of the tab strip (open traces, one per tab) at the very top of the
+/// window, above the menu-bar/search toolbar row.
+pub const TAB_BAR_H: f32 = TOOLBAR_ROW;
 // A single real imgui menu bar row (File/View/Help dropdowns + the search
 // box), same height on every platform now that there's no separate
 // "export/share" row of inline buttons to make room for.
@@ -39,7 +42,6 @@ pub const FIT_PAD_FRAC: f64 = 0.02;
 pub const DIVIDER_GRAB_PX: f32 = 7.0;
 pub const MIN_BOTTOM_H: f32 = 60.0;
 pub const MIN_LABEL_W: f32 = 60.0;
-pub const MIN_SPLIT_W: f32 = 200.0;
 pub const LANE_GAP: f32 = 4.0;
 pub const EV_INSET: f32 = 2.0;
 pub const EV_ROUNDING: f32 = 2.0;
@@ -287,7 +289,6 @@ pub enum DragKind {
     LabelDivider(usize),
     TrackResize(usize, usize),
     TrackDrag(usize, usize, f32),
-    SplitDivider(usize),
 }
 
 impl DragKind {
