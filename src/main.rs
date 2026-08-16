@@ -1308,60 +1308,36 @@ impl App {
                             let has_export_share = false;
                             let multi_rank = pane.reload_paths.len() >= 2
                                 || pane.trace.as_ref().is_some_and(|t| t.rank_paths.len() >= 2);
-                            if has_export_share || multi_rank {
+                            #[cfg(not(target_arch = "wasm32"))]
+                            if has_export_share {
                                 ui.menu("File", || {
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    if has_export_share {
-                                        let uploading = pane.share_link_job.is_some();
-                                        let include_cpu = pane.share_include_cpu;
-                                        if ui.menu_item_config("Share via Gist").enabled(!uploading).build() {
-                                            pane.start_share_upload(include_cpu);
-                                        }
-                                        if ui.is_item_hovered() {
-                                            let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "GPU-only timings (no args)" };
-                                            ui.tooltip_text(&format!("Export {what}, then upload it to a new secret GitHub gist via your locally logged-in `gh` CLI, and show a copyable ?gist= link — no browser login or pasted token, but it does need `gh auth login` already done on this machine"));
-                                        }
-                                        ui.menu_item_config("Include CPU data##sharecpu").build_with_ref(&mut pane.share_include_cpu);
-                                        if ui.is_item_hovered() {
-                                            ui.tooltip_text("Upload the whole trace (all CPU and GPU tracks, args left intact, not stripped) instead of just GPU-only timings — much larger, but complete");
-                                        }
-                                        match &pane.share_link_result {
-                                            Some((true, link)) if link.starts_with("https://") => {
-                                                ui.text_colored([0.4, 0.85, 0.4, 1.0], link);
-                                                ui.same_line();
-                                                if ui.small_button("Copy##sharelink") {
-                                                    #[cfg(not(target_arch = "wasm32"))]
-                                                    MacClipboard.set(link);
-                                                }
-                                            }
-                                            Some((ok, msg)) => {
-                                                let color = if *ok { [0.8, 0.8, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
-                                                ui.text_colored(color, msg);
-                                            }
-                                            None => {}
-                                        }
+                                    let uploading = pane.share_link_job.is_some();
+                                    let include_cpu = pane.share_include_cpu;
+                                    if ui.menu_item_config("Share via Gist").enabled(!uploading).build() {
+                                        pane.start_share_upload(include_cpu);
                                     }
-                                    if multi_rank {
-                                        #[cfg(not(target_arch = "wasm32"))]
-                                        if has_export_share {
-                                            ui.separator();
-                                        }
-                                        if ui.menu_item("Sync Clocks") {
-                                            pane.sync_message = Some(match pane.sync_clocks() {
-                                                Ok(msg) => (true, msg),
-                                                Err(e) => (false, format!("Sync failed: {e}")),
-                                            });
-                                        }
-                                        if ui.is_item_hovered() {
-                                            ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) — aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
-                                        }
-                                        if let Some((ok, msg)) = &pane.sync_message {
-                                            let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
-                                            ui.text_colored(color, msg.lines().next().unwrap_or(msg));
-                                            if ui.is_item_hovered() && msg.contains('\n') {
-                                                ui.tooltip_text(msg);
+                                    if ui.is_item_hovered() {
+                                        let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "GPU-only timings (no args)" };
+                                        ui.tooltip_text(&format!("Export {what}, then upload it to a new secret GitHub gist via your locally logged-in `gh` CLI, and show a copyable ?gist= link — no browser login or pasted token, but it does need `gh auth login` already done on this machine"));
+                                    }
+                                    ui.menu_item_config("Include CPU data##sharecpu").build_with_ref(&mut pane.share_include_cpu);
+                                    if ui.is_item_hovered() {
+                                        ui.tooltip_text("Upload the whole trace (all CPU and GPU tracks, args left intact, not stripped) instead of just GPU-only timings — much larger, but complete");
+                                    }
+                                    match &pane.share_link_result {
+                                        Some((true, link)) if link.starts_with("https://") => {
+                                            ui.text_colored([0.4, 0.85, 0.4, 1.0], link);
+                                            ui.same_line();
+                                            if ui.small_button("Copy##sharelink") {
+                                                #[cfg(not(target_arch = "wasm32"))]
+                                                MacClipboard.set(link);
                                             }
                                         }
+                                        Some((ok, msg)) => {
+                                            let color = if *ok { [0.8, 0.8, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
+                                            ui.text_colored(color, msg);
+                                        }
+                                        None => {}
                                     }
                                 });
                             }
@@ -1387,6 +1363,25 @@ impl App {
                                 }
                                 if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
                                     ui.menu_item_config("Watch").build_with_ref(&mut pane.auto_reload);
+                                }
+                                if multi_rank {
+                                    ui.separator();
+                                    if ui.menu_item("Sync Clocks") {
+                                        pane.sync_message = Some(match pane.sync_clocks() {
+                                            Ok(msg) => (true, msg),
+                                            Err(e) => (false, format!("Sync failed: {e}")),
+                                        });
+                                    }
+                                    if ui.is_item_hovered() {
+                                        ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) — aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
+                                    }
+                                    if let Some((ok, msg)) = &pane.sync_message {
+                                        let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
+                                        ui.text_colored(color, msg.lines().next().unwrap_or(msg));
+                                        if ui.is_item_hovered() && msg.contains('\n') {
+                                            ui.tooltip_text(msg);
+                                        }
+                                    }
                                 }
                                 if active_has_sel && pi != state.active && !pane.selection_stats.is_empty() {
                                     ui.separator();
