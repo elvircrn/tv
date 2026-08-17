@@ -92,6 +92,18 @@ fn tab_label(pane: &Pane) -> &str {
     shown.rsplit('/').next().unwrap_or(shown)
 }
 
+/// Wires up a freshly-opened pane's `reload_dir`/`cache_dir` when its files
+/// came from a directory argument (CLI or drop) — `dir` is `None` for bare
+/// file arguments, which have nothing to watch/cache against.
+fn set_reload_dir(pane: &mut Pane, dir: Option<&str>) {
+    if let Some(dir) = dir {
+        if !dir.ends_with(".tvcache") {
+            pane.reload_dir = Some(dir.to_string());
+            pane.cache_dir = Some(crate::loader::cache_dir_for_folder(dir));
+        }
+    }
+}
+
 struct App {
     window: Option<Window>,
     imgui: Option<imgui::Context>,
@@ -695,33 +707,21 @@ impl ApplicationHandler for App {
         self.imgui = Some(imgui);
         self.renderer = Some(renderer);
 
-        let cli_dirs: Vec<String> = self.pending_files.iter()
-            .filter(|p| std::path::Path::new(p).is_dir())
-            .cloned().collect();
-        let cli_cache_dir = if cli_dirs.len() == 1 && !cli_dirs[0].ends_with(".tvcache") {
-            Some(crate::loader::cache_dir_for_folder(&cli_dirs[0]))
-        } else { None };
         let (rank_groups, standalone) = crate::loader::detect_rank_groups(&self.pending_files);
         let mut pi = 0;
-        for group in rank_groups {
+        for (group, source_dir) in rank_groups {
             if pi >= self.state.panes.len() {
                 self.state.panes.push(Pane::new());
             }
-            if cli_dirs.len() == 1 {
-                self.state.panes[pi].reload_dir = Some(cli_dirs[0].clone());
-                self.state.panes[pi].cache_dir = cli_cache_dir.clone();
-            }
+            set_reload_dir(&mut self.state.panes[pi], source_dir.as_deref());
             self.state.panes[pi].open_multi(group);
             pi += 1;
         }
-        for path in standalone {
+        for (path, source_dir) in standalone {
             if pi >= self.state.panes.len() {
                 self.state.panes.push(Pane::new());
             }
-            if cli_dirs.len() == 1 {
-                self.state.panes[pi].reload_dir = Some(cli_dirs[0].clone());
-                self.state.panes[pi].cache_dir = cli_cache_dir.clone();
-            }
+            set_reload_dir(&mut self.state.panes[pi], source_dir.as_deref());
             self.state.panes[pi].open(path);
             pi += 1;
         }
@@ -1072,33 +1072,21 @@ impl App {
 
         if !self.pending_drops.is_empty() {
             let drops = std::mem::take(&mut self.pending_drops);
-            let dropped_dirs: Vec<String> = drops.iter()
-                .filter(|p| std::path::Path::new(p).is_dir())
-                .cloned().collect();
-            let drop_cache_dir = if dropped_dirs.len() == 1 && !dropped_dirs[0].ends_with(".tvcache") {
-                Some(crate::loader::cache_dir_for_folder(&dropped_dirs[0]))
-            } else { None };
             let (rank_groups, standalone) = crate::loader::detect_rank_groups(&drops);
-            for group in rank_groups {
+            for (group, source_dir) in rank_groups {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
                 let target = empty.unwrap_or_else(|| self.state.add_pane());
                 self.state.active = target;
                 self.state.pending_active_tab = Some(target);
-                if dropped_dirs.len() == 1 {
-                    self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
-                    self.state.panes[target].cache_dir = drop_cache_dir.clone();
-                }
+                set_reload_dir(&mut self.state.panes[target], source_dir.as_deref());
                 self.state.panes[target].open_multi(group);
             }
-            for path in standalone {
+            for (path, source_dir) in standalone {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
                 let target = empty.unwrap_or_else(|| self.state.add_pane());
                 self.state.active = target;
                 self.state.pending_active_tab = Some(target);
-                if dropped_dirs.len() == 1 {
-                    self.state.panes[target].reload_dir = Some(dropped_dirs[0].clone());
-                    self.state.panes[target].cache_dir = drop_cache_dir.clone();
-                }
+                set_reload_dir(&mut self.state.panes[target], source_dir.as_deref());
                 self.state.panes[target].open(path);
             }
         }
@@ -2113,15 +2101,15 @@ fn main() {
         let t0 = Instant::now();
         let (rank_groups, standalone) = loader::detect_rank_groups(&bench_args);
         let all_files: Vec<&str> = rank_groups.iter()
-            .flat_map(|g| g.iter().map(|(_, p)| p.as_str()))
-            .chain(standalone.iter().map(|p| p.as_str()))
+            .flat_map(|(g, _)| g.iter().map(|(_, p)| p.as_str()))
+            .chain(standalone.iter().map(|(p, _)| p.as_str()))
             .collect();
         eprintln!("bench: {} files found in {:.3}s", all_files.len(), t0.elapsed().as_secs_f64());
         for f in &all_files { eprintln!("  {f}"); }
 
         if rank_groups.is_empty() && standalone.len() <= 1 {
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let path = standalone.first().map(|s| s.as_str()).unwrap_or(&bench_args[0]);
+            let path = standalone.first().map(|(s, _)| s.as_str()).unwrap_or(&bench_args[0]);
             match loader::load_trace(path, &counter, 0, None) {
                 Ok(t) => eprintln!("  ok: {} events, {} tracks, {:.2}s", t.total_events, t.tracks.len(), t0.elapsed().as_secs_f64()),
                 Err(e) => eprintln!("  err: {e}"),
@@ -2129,8 +2117,8 @@ fn main() {
         } else {
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut all_paths: Vec<(usize, String)> = Vec::new();
-            for group in &rank_groups { all_paths.extend(group.clone()); }
-            for (i, p) in standalone.iter().enumerate() { all_paths.push((all_paths.len() + i, p.clone())); }
+            for (group, _) in &rank_groups { all_paths.extend(group.clone()); }
+            for (i, (p, _)) in standalone.iter().enumerate() { all_paths.push((all_paths.len() + i, p.clone())); }
 
             let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len()).max(2);
             eprintln!("bench: {} threads per file", tpf);

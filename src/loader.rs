@@ -2546,16 +2546,21 @@ fn extract_rank(fname: &str) -> Option<(String, usize)> {
     None
 }
 
-pub fn detect_rank_groups(paths: &[String]) -> (Vec<Vec<(usize, String)>>, Vec<String>) {
-    let expanded = expand_dirs(paths);
+/// Groups an already-expanded (no directories left) flat file list by
+/// `extract_rank`'s key, splitting singleton "groups" back out to
+/// `standalone`. Shared by `detect_rank_groups`, which calls this once per
+/// top-level directory argument (see there for why: `extract_rank`'s keys —
+/// especially the `"ep-group"` fallback — aren't globally unique across
+/// unrelated runs, only within one directory's own files).
+fn group_paths(expanded: &[String]) -> (Vec<Vec<(usize, String)>>, Vec<String>) {
     let mut groups: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut standalone = Vec::new();
 
-    for path in &expanded {
+    for path in expanded {
         let fname = std::path::Path::new(path)
             .file_name()
             .and_then(|f| f.to_str())
-            .unwrap_or(path);
+            .unwrap_or(path.as_str());
         if let Some((key, rank)) = extract_rank(fname) {
             groups.entry(key).or_default().push((rank, path.clone()));
         } else {
@@ -2571,6 +2576,48 @@ pub fn detect_rank_groups(paths: &[String]) -> (Vec<Vec<(usize, String)>>, Vec<S
         } else {
             standalone.push(group.remove(0).1);
         }
+    }
+
+    (rank_groups, standalone)
+}
+
+/// Detects multi-rank groups among the given top-level paths (files and/or
+/// directories — e.g. CLI args, or everything dropped onto the window at
+/// once). Each *directory* argument is expanded and grouped in total
+/// isolation from every other argument (own `expand_dirs` + `group_paths`
+/// call), so opening N sibling sweep-result folders together always yields N
+/// separate opens instead of silently merging them — `extract_rank`'s keys
+/// (filename prefix before `-rank-N`, or the literal `"ep-group"` fallback)
+/// routinely collide across different runs that happen to share a naming
+/// convention, so pooling every directory's files into one grouping pass
+/// would misattribute one folder's ranks to another's.
+///
+/// Bare file arguments (not directories) are still pooled together and
+/// grouped as one batch, same as before — that's the "select several rank
+/// files and drop them all at once" case, where they're *meant* to merge.
+///
+/// The `Option<String>` alongside each result is the directory argument it
+/// was expanded from (`None` for bare file arguments), so the caller can set
+/// up per-pane `reload_dir`/watch support for each directory independently.
+pub fn detect_rank_groups(paths: &[String]) -> (Vec<(Vec<(usize, String)>, Option<String>)>, Vec<(String, Option<String>)>) {
+    let mut rank_groups = Vec::new();
+    let mut standalone = Vec::new();
+    let mut loose_files = Vec::new();
+
+    for path in paths {
+        if std::path::Path::new(path).is_dir() {
+            let (dir_groups, dir_standalone) = group_paths(&expand_dirs(std::slice::from_ref(path)));
+            rank_groups.extend(dir_groups.into_iter().map(|g| (g, Some(path.clone()))));
+            standalone.extend(dir_standalone.into_iter().map(|p| (p, Some(path.clone()))));
+        } else {
+            loose_files.push(path.clone());
+        }
+    }
+
+    if !loose_files.is_empty() {
+        let (loose_groups, loose_standalone) = group_paths(&expand_dirs(&loose_files));
+        rank_groups.extend(loose_groups.into_iter().map(|g| (g, None)));
+        standalone.extend(loose_standalone.into_iter().map(|p| (p, None)));
     }
 
     (rank_groups, standalone)

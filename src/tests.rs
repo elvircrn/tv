@@ -288,6 +288,28 @@ fn test_selection_stats_basic() {
 }
 
 #[test]
+fn test_reselecting_same_region_twice_reproduces_stats() {
+    let names = vec!["", "A", "B"];
+    let events = vec![ev(0.0, 10.0, 1, 0), ev(10.0, 20.0, 2, 0), ev(30.0, 10.0, 1, 0)];
+    let trace = make_trace(names, vec![("GPU 0", true, events)]);
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+
+    p.selection = Some([0.0, 40.0, 0.0, 1e9]);
+    p.finish_selection(&mut state.buf);
+    assert_eq!(p.selection_stats.len(), 2, "first selection");
+
+    // Redo the exact same drag.
+    p.selection = Some([0.0, 40.0, 0.0, 1e9]);
+    p.finish_selection(&mut state.buf);
+    assert_eq!(p.selection_stats.len(), 2, "second identical selection");
+
+    p.selection = Some([0.0, 40.0, 0.0, 1e9]);
+    p.finish_selection(&mut state.buf);
+    assert_eq!(p.selection_stats.len(), 2, "third identical selection");
+}
+
+#[test]
 fn test_selection_stats_respects_hidden() {
     let names = vec!["", "A", "B"];
     let events = vec![ev(0.0, 10.0, 1, 0), ev(10.0, 20.0, 2, 0)];
@@ -1444,11 +1466,12 @@ fn test_detect_rank_groups_basic() {
     ];
     let (groups, standalone) = detect_rank_groups(&paths);
     assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].len(), 3);
-    assert_eq!(groups[0][0].0, 0);
-    assert_eq!(groups[0][1].0, 1);
-    assert_eq!(groups[0][2].0, 2);
-    assert_eq!(standalone, vec!["standalone.json"]);
+    assert_eq!(groups[0].0.len(), 3);
+    assert_eq!(groups[0].0[0].0, 0);
+    assert_eq!(groups[0].0[1].0, 1);
+    assert_eq!(groups[0].0[2].0, 2);
+    assert_eq!(groups[0].1, None);
+    assert_eq!(standalone, vec![("standalone.json".to_string(), None)]);
 }
 
 #[test]
@@ -1460,10 +1483,10 @@ fn test_detect_rank_groups_ep_format() {
     ];
     let (groups, standalone) = detect_rank_groups(&paths);
     assert_eq!(groups.len(), 1, "should group all ep files together");
-    assert_eq!(groups[0].len(), 3);
-    assert_eq!(groups[0][0].0, 0);
-    assert_eq!(groups[0][1].0, 1);
-    assert_eq!(groups[0][2].0, 2);
+    assert_eq!(groups[0].0.len(), 3);
+    assert_eq!(groups[0].0[0].0, 0);
+    assert_eq!(groups[0].0[1].0, 1);
+    assert_eq!(groups[0].0[2].0, 2);
     assert!(standalone.is_empty());
 }
 
@@ -1486,6 +1509,39 @@ fn test_detect_rank_groups_no_ranks() {
     let (groups, standalone) = detect_rank_groups(&paths);
     assert!(groups.is_empty());
     assert_eq!(standalone.len(), 2);
+}
+
+#[test]
+fn test_detect_rank_groups_isolates_directories() {
+    // Two different runs that happen to use identically-named rank files
+    // (the common case: the same trace tool dumps "trace-rank-N.json" every
+    // time) must never merge into one group just because they share a
+    // directory-relative filename — each directory argument is its own
+    // isolated grouping universe.
+    let base = std::env::temp_dir().join("tv_test_dir_isolation");
+    let dir_a = base.join("run_a");
+    let dir_b = base.join("run_b");
+    std::fs::create_dir_all(&dir_a).unwrap();
+    std::fs::create_dir_all(&dir_b).unwrap();
+    for dir in [&dir_a, &dir_b] {
+        std::fs::write(dir.join("trace-rank-0.json"), "{}").unwrap();
+        std::fs::write(dir.join("trace-rank-1.json"), "{}").unwrap();
+    }
+
+    let paths = vec![dir_a.to_str().unwrap().to_string(), dir_b.to_str().unwrap().to_string()];
+    let (groups, standalone) = detect_rank_groups(&paths);
+
+    assert_eq!(groups.len(), 2, "each directory's rank files must form their own group");
+    assert!(standalone.is_empty());
+    for (group, _) in &groups {
+        assert_eq!(group.len(), 2);
+    }
+    let dirs_seen: std::collections::HashSet<_> = groups.iter().map(|(_, d)| d.clone()).collect();
+    assert_eq!(dirs_seen.len(), 2, "each group must be tagged with its own source directory");
+    assert!(dirs_seen.contains(&Some(dir_a.to_str().unwrap().to_string())));
+    assert!(dirs_seen.contains(&Some(dir_b.to_str().unwrap().to_string())));
+
+    std::fs::remove_dir_all(&base).ok();
 }
 
 #[test]

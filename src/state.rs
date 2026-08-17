@@ -585,10 +585,10 @@ impl Pane {
         if let Some(dir) = &self.reload_dir {
             let (groups, standalone) = crate::loader::detect_rank_groups(&[dir.clone()]);
             let mut all_paths: Vec<(usize, String)> = Vec::new();
-            for group in groups {
+            for (group, _dir) in groups {
                 all_paths.extend(group);
             }
-            for (i, path) in standalone.into_iter().enumerate() {
+            for (i, (path, _dir)) in standalone.into_iter().enumerate() {
                 let rank = all_paths.len() + i;
                 all_paths.push((rank, path));
             }
