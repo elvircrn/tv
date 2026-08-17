@@ -104,6 +104,18 @@ pub struct Pane {
     pub even_spacing: bool,
     pub geom: PaneGeom,
     pub hidden_names: Vec<bool>,
+    /// (view.t0 bits, view.t1 bits, hidden_names snapshot, track_order
+    /// snapshot) from the last time the merged multi-rank view's per-group
+    /// Tetris packing (`build_merged_group_events`) actually ran for this
+    /// pane. Rebuilding it is O(events in view) per rank group — measured at
+    /// ~11ms for a 28-rank, 468K-event trace fully zoomed out — and it reran
+    /// unconditionally on every redraw (i.e. every mouse-move) even when
+    /// nothing about the view had changed. Owned per-pane, not on the shared
+    /// `DrawBuf`, for the same reason `sort_cache_key`/`detail_hist_key`
+    /// moved there: only one pane renders per frame (see the tab strip in
+    /// main.rs), so a shared cache would compare against whichever *other*
+    /// pane last rendered.
+    pub merge_cache_key: Option<(u64, u64, Vec<bool>, Vec<usize>)>,
     /// Interned name indices matching "execute_context" — vLLM's per-generation
     /// wrapper span. Computed once per trace load (see `poll_loading`), not
     /// per toolbar frame, since it only depends on `trace.names`.
@@ -205,6 +217,7 @@ impl Pane {
             even_spacing: false,
             geom: PaneGeom::default(),
             hidden_names: Vec::new(),
+            merge_cache_key: None,
             exec_context_names: Vec::new(),
             pending_tab: Some(BottomTab::Detail),
             pending_focus: None,

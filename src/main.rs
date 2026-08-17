@@ -1852,6 +1852,7 @@ impl App {
                         pane.merge_gpu,
                         dt,
                         &mut pane.pending_focus,
+                        &mut pane.merge_cache_key,
                     );
                     hover_result = h;
                     click_result = c;

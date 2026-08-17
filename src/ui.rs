@@ -765,6 +765,43 @@ pub(crate) fn collect_merged_track_events(
     }
 }
 
+/// Depth-packs one merged rank-group's events for the current view window:
+/// gathers every event across the group's tracks (`collect_merged_track_events`),
+/// sorts by start time, then greedily assigns each event the lowest depth
+/// slot not already occupied at that instant (Tetris packing). Returns the
+/// resulting max depth (at least 1); packed `(track_idx, event_idx, depth)`
+/// triples are appended to `out` (cleared first, capacity reused frame to
+/// frame). Pure and imgui-free so it can be measured/tested directly against
+/// real trace data — this runs once per rank group, every redraw, in the
+/// merged multi-rank view, so it's the hot path when "Merge Streams" is slow.
+pub(crate) fn build_merged_group_events(
+    trace: &Trace,
+    group_tracks: &[usize],
+    view_t0: f64,
+    view_t1: f64,
+    hidden_names: &[bool],
+    out: &mut Vec<(u32, u32, u16)>,
+) -> u16 {
+    out.clear();
+    let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
+    for &ti in group_tracks {
+        let gt = &trace.tracks[ti];
+        collect_merged_track_events(gt, ti, view_t0, view_t1, hidden_names, &mut ev_list);
+    }
+    ev_list.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let mut depth_ends: Vec<f64> = Vec::new();
+    let mut max_depth: u16 = 0;
+    for (ts, dur, ti, ei) in ev_list {
+        let d = depth_ends.iter().position(|&end| end <= ts)
+            .unwrap_or_else(|| { depth_ends.push(0.0); depth_ends.len() - 1 });
+        depth_ends[d] = ts + dur;
+        let d16 = d as u16;
+        if d16 >= max_depth { max_depth = d16 + 1; }
+        out.push((ti, ei, d16));
+    }
+    max_depth.max(1)
+}
+
 /// Row heights for "even spacing" mode: `has_content[vi]` says whether row
 /// `vi` has any event in the current view window. Rows without one collapse
 /// to a thin fixed strip (`EMPTY_ROW_H`, clamped so it can't itself exceed
@@ -831,6 +868,7 @@ pub fn draw_timeline(
     merge_gpu: bool,
     dt: f32,
     focus: &mut Option<u32>,
+    merge_cache_key: &mut Option<(u64, u64, Vec<bool>, Vec<usize>)>,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let dl = ui.get_window_draw_list();
     let base_font_size = ui.current_font_size();
@@ -879,8 +917,10 @@ pub fn draw_timeline(
                     let g = &mut buf.merged_gpu_groups[gi];
                     g.tracks.clear();
                     g.tracks.push(i);
-                    g.events.clear();
-                    g.max_depth = 0;
+                    // events/max_depth are NOT reset here — `build_merged_group_events`
+                    // clears/overwrites them itself when it actually runs, and
+                    // leaving them alone otherwise is what lets the merge-cache
+                    // check below skip recomputation and reuse last frame's values.
                     g.vi = 0;
                     g.label.clear();
                     match rank {
@@ -902,6 +942,26 @@ pub fn draw_timeline(
     }
     buf.merged_gpu_groups.truncate(group_slot);
 
+    // Skip re-deriving the merged view's per-rank-group Tetris packing
+    // (`build_merged_group_events`, below) when nothing that could change it
+    // moved since last frame — view range, hidden names, or track order.
+    // Every redraw (i.e. every mouse-move, not just an actual pan/zoom)
+    // otherwise re-sorted and re-packed every visible event in every rank
+    // group from scratch: measured at ~11ms for a 28-rank, 468K-event trace
+    // fully zoomed out (`bench_merge_filter` in tests.rs). Owned per-pane
+    // (`Pane::merge_cache_key`), not on the shared DrawBuf, since only one
+    // pane renders per frame — a shared cache would compare against
+    // whichever *other* pane last rendered.
+    let merge_cache_valid = if merge_gpu {
+        let key = (view.t0.to_bits(), view.t1.to_bits(), hidden_names.to_vec(), track_order.clone());
+        let valid = merge_cache_key.as_ref() == Some(&key);
+        if !valid { *merge_cache_key = Some(key); }
+        valid
+    } else {
+        *merge_cache_key = None;
+        false
+    };
+
     // Parallel to buf.visible/heights: whether each row has any event
     // actually overlapping the current view window. Feeds the even-spacing
     // pass below so rows with nothing to show at this zoom collapse instead
@@ -922,25 +982,16 @@ pub fn draw_timeline(
                 let gi = rank_group_idxs[ri].1;
                 let g = &buf.merged_gpu_groups[gi];
                 let group_tracks: Vec<usize> = g.tracks.clone();
-                let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
-                for &ti in &group_tracks {
-                    let gt = &trace.tracks[ti];
-                    collect_merged_track_events(gt, ti, view.t0, view.t1, hidden_names, &mut ev_list);
-                }
-                ev_list.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                let mut depth_ends: Vec<f64> = Vec::new();
-                let mut max_depth: u16 = 0;
+                let (md, is_empty) = if merge_cache_valid {
+                    (g.max_depth, g.events.is_empty())
+                } else {
+                    let mut events = std::mem::take(&mut buf.merged_gpu_groups[gi].events);
+                    let md = build_merged_group_events(trace, &group_tracks, view.t0, view.t1, hidden_names, &mut events);
+                    let is_empty = events.is_empty();
+                    buf.merged_gpu_groups[gi].events = events;
+                    (md, is_empty)
+                };
                 let g = &mut buf.merged_gpu_groups[gi];
-                g.events.clear();
-                for &(ts, dur, ti, ei) in &ev_list {
-                    let d = depth_ends.iter().position(|&end| end <= ts)
-                        .unwrap_or_else(|| { depth_ends.push(0.0); depth_ends.len() - 1 });
-                    depth_ends[d] = ts + dur;
-                    let d16 = d as u16;
-                    if d16 >= max_depth { max_depth = d16 + 1; }
-                    g.events.push((ti, ei, d16));
-                }
-                let md = max_depth.max(1);
                 let first = group_tracks[0];
                 let scale = track_scales.get(first).copied().unwrap_or(1.0);
                 let h = md as f32 * SUB_LANE_H * scale;
@@ -950,7 +1001,7 @@ pub fn draw_timeline(
                 buf.visible.push(first);
                 buf.heights.push(h);
                 buf.y_offsets.push(cumulative);
-                has_content.push(!ev_list.is_empty());
+                has_content.push(!is_empty);
                 cumulative += h;
             }
             continue;
