@@ -114,6 +114,23 @@ pub struct Pane {
     pub pending_focus: Option<u32>,
     pub sort_col: usize,
     pub sort_asc: bool,
+    /// (generation, sort_col, sort_asc, row count, is_individual_mode) from
+    /// the last time `sort_idx` was actually recomputed for THIS pane. Owned
+    /// per-pane, not on the shared `DrawBuf` — only one pane renders per
+    /// frame (see the tab strip in main.rs), so a shared cache would compare
+    /// against whichever *other* pane last rendered and could spuriously
+    /// "match" and show that pane's stale rows instead of recomputing.
+    pub sort_cache_key: Option<(u64, usize, bool, usize, bool)>,
+    pub sort_idx: Vec<usize>,
+    /// (event name, show_cpu) the Detail tab's duration-distribution
+    /// histogram was last computed for, and the cached bucket counts —
+    /// same per-pane-ownership reasoning as `sort_cache_key` (a name id is
+    /// only unique within this pane's own trace, so two different open
+    /// traces routinely reuse the same low ids).
+    pub detail_hist_key: Option<(u32, bool)>,
+    pub detail_hist_bins: Vec<u32>,
+    pub detail_hist_min: f64,
+    pub detail_hist_max: f64,
     pub sel_aggregate: bool,
     pub label_w: f32,
     pub sel_median: f64,
@@ -193,6 +210,12 @@ impl Pane {
             pending_focus: None,
             sort_col: 2,
             sort_asc: false,
+            sort_cache_key: None,
+            sort_idx: Vec::new(),
+            detail_hist_key: None,
+            detail_hist_bins: Vec::new(),
+            detail_hist_min: 0.0,
+            detail_hist_max: 0.0,
             sel_aggregate: true,
             label_w: LABEL_W,
             sel_median: 0.0,

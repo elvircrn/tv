@@ -144,9 +144,16 @@ pub(crate) fn bucket_durations(durs: &[f64], n_buckets: usize) -> (Vec<u32>, f64
 /// distribution of) — the caller falls back to plain text in that case.
 ///
 /// Recomputing the bucket counts is an O(total events) scan, so it's cached
-/// on `(name_id, show_cpu)` in `buf.detail_hist_*` and only redone when the
-/// selected event's name (or CPU visibility) actually changes — this runs
-/// on every redraw (every mouse-move), same reasoning as `sort_cache_key`.
+/// on `(name_id, show_cpu)` and only redone when the selected event's name
+/// (or CPU visibility) actually changes — this runs on every redraw (every
+/// mouse-move), same reasoning as `sort_cache_key` in `draw_stats_table`.
+///
+/// The cache is pane-owned (passed in), not `DrawBuf`-shared: `DrawBuf` now
+/// carries whichever pane is currently active across frames (only one pane
+/// renders per frame, see the tab strip in main.rs), so a cache keyed on
+/// `name_id` alone could spuriously "match" a *different* pane's leftover
+/// cache — `name_id` is only unique within one trace's own intern table, so
+/// two different open traces routinely reuse the same low ids.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_duration_histogram(
     ui: &imgui::Ui,
@@ -154,11 +161,15 @@ pub fn draw_duration_histogram(
     show_cpu: bool,
     name_id: u32,
     current_dur: f64,
+    hist_key: &mut Option<(u32, bool)>,
+    hist_bins: &mut Vec<u32>,
+    hist_min: &mut f64,
+    hist_max: &mut f64,
     buf: &mut DrawBuf,
     height: f32,
 ) -> bool {
     let cache_key = (name_id, show_cpu);
-    if buf.detail_hist_key != Some(cache_key) {
+    if *hist_key != Some(cache_key) {
         let mut durs: Vec<f64> = Vec::new();
         for t in &trace.tracks {
             if !show_cpu && !t.gpu { continue; }
@@ -167,21 +178,21 @@ pub fn draw_duration_histogram(
             }
         }
         let (bins, min, max) = bucket_durations(&durs, DETAIL_HIST_BUCKETS);
-        buf.detail_hist_bins = bins;
-        buf.detail_hist_min = min;
-        buf.detail_hist_max = max;
-        buf.detail_hist_key = Some(cache_key);
+        *hist_bins = bins;
+        *hist_min = min;
+        *hist_max = max;
+        *hist_key = Some(cache_key);
     }
 
-    let count: u32 = buf.detail_hist_bins.iter().sum();
+    let count: u32 = hist_bins.iter().sum();
     if count < 2 { return false; }
 
     let avail_w = ui.content_region_avail()[0];
     let cursor = ui.cursor_screen_pos();
     let dl = ui.get_window_draw_list();
-    let max_bin = buf.detail_hist_bins.iter().copied().max().unwrap_or(1).max(1);
+    let max_bin = hist_bins.iter().copied().max().unwrap_or(1).max(1);
     let bar_w = avail_w / DETAIL_HIST_BUCKETS as f32;
-    let range = (buf.detail_hist_max - buf.detail_hist_min).max(1e-12);
+    let range = ((*hist_max) - (*hist_min)).max(1e-12);
     let color = ACCENT_LINE;
     let border_col = col32(15, 15, 15, 255);
 
@@ -191,7 +202,7 @@ pub fn draw_duration_histogram(
         .filled(true).build();
 
     let mut hovered_bucket: Option<usize> = None;
-    for (i, &n) in buf.detail_hist_bins.iter().enumerate() {
+    for (i, &n) in hist_bins.iter().enumerate() {
         let x0 = cursor[0] + i as f32 * bar_w;
         let bar_h = (n as f32 / max_bin as f32) * height;
         let y0 = cursor[1] + (height - bar_h);
@@ -208,7 +219,7 @@ pub fn draw_duration_histogram(
     }
 
     // Mark the selected occurrence's own duration against the distribution.
-    let marker_x = cursor[0] + (((current_dur - buf.detail_hist_min) / range) as f32).clamp(0.0, 1.0) * avail_w;
+    let marker_x = cursor[0] + (((current_dur - (*hist_min)) / range) as f32).clamp(0.0, 1.0) * avail_w;
     dl.add_line([marker_x, cursor[1] - 3.0], [marker_x, cursor[1] + height], col32(255, 210, 90, 255)).thickness(1.5).build();
 
     // Y-axis: max count top-left (the scale the bar heights are relative
@@ -225,17 +236,17 @@ pub fn draw_duration_histogram(
     // duration range they actually span.
     let label_y = cursor[1] + height + 4.0;
     buf.fmt.clear();
-    write_time(&mut buf.fmt, buf.detail_hist_min);
+    write_time(&mut buf.fmt, *hist_min);
     dl.add_text([cursor[0], label_y], label_col, &buf.fmt);
 
-    let mid = (buf.detail_hist_min + buf.detail_hist_max) * 0.5;
+    let mid = ((*hist_min) + (*hist_max)) * 0.5;
     buf.fmt.clear();
     write_time(&mut buf.fmt, mid);
     let mid_w = ui.calc_text_size(&buf.fmt)[0];
     dl.add_text([cursor[0] + avail_w * 0.5 - mid_w * 0.5, label_y], label_col, &buf.fmt);
 
     buf.fmt.clear();
-    write_time(&mut buf.fmt, buf.detail_hist_max);
+    write_time(&mut buf.fmt, *hist_max);
     let max_w = ui.calc_text_size(&buf.fmt)[0];
     dl.add_text([cursor[0] + avail_w - max_w, label_y], label_col, &buf.fmt);
 
@@ -244,10 +255,10 @@ pub fn draw_duration_histogram(
     ui.dummy([avail_w, height + label_h]);
 
     if let Some(b) = hovered_bucket {
-        let lo = buf.detail_hist_min + range as f64 * b as f64 / DETAIL_HIST_BUCKETS as f64;
-        let hi = buf.detail_hist_min + range as f64 * (b + 1) as f64 / DETAIL_HIST_BUCKETS as f64;
+        let lo = (*hist_min) + range as f64 * b as f64 / DETAIL_HIST_BUCKETS as f64;
+        let hi = (*hist_min) + range as f64 * (b + 1) as f64 / DETAIL_HIST_BUCKETS as f64;
         buf.fmt.clear();
-        write!(buf.fmt, "{} call{} in ", buf.detail_hist_bins[b], if buf.detail_hist_bins[b] == 1 { "" } else { "s" }).unwrap();
+        write!(buf.fmt, "{} call{} in ", hist_bins[b], if hist_bins[b] == 1 { "" } else { "s" }).unwrap();
         write_time(&mut buf.fmt, lo);
         buf.fmt.push_str(" – ");
         write_time(&mut buf.fmt, hi);
@@ -421,13 +432,20 @@ pub fn draw_stats_table(
     // single limiting factor applies.
     event_refs: Option<&[(u32, u32)]>,
     // Bumped by `compute_aggregates` whenever the selection is rebuilt; part
-    // of the sort cache key (see `DrawBuf::sort_cache_key`) so an unchanged
+    // of the sort cache key (see `sort_cache_key` below) so an unchanged
     // selection doesn't get re-sorted every redraw.
     generation: u64,
     search: &mut String,
     search_changed: &mut bool,
     sort_col: &mut usize,
     sort_asc: &mut bool,
+    // Pane-owned (not DrawBuf-shared): DrawBuf now carries whichever pane is
+    // currently active across frames (only one pane renders per frame, see
+    // the tab strip in main.rs), so a cache keyed on generation/params alone
+    // could spuriously "match" a *different* pane's leftover cache from the
+    // last time it was active and show its stale rows instead of recomputing.
+    sort_cache_key: &mut Option<(u64, usize, bool, usize, bool)>,
+    sort_idx: &mut Vec<usize>,
     buf: &mut DrawBuf,
     table_id: &str,
 ) {
@@ -517,7 +535,7 @@ pub fn draw_stats_table(
     // on a 1M-row selection even for a plain numeric column).
     let stats_is_individual = event_refs.is_some();
     let cache_key = (generation, *sort_col, *sort_asc, stats.len(), stats_is_individual);
-    if buf.sort_cache_key != Some(cache_key) {
+    if *sort_cache_key != Some(cache_key) {
         // Sorting by Occ Limit naively (parsing each row's raw JSON args
         // inside the comparator) measured at 140ms for just 15k rows on its
         // own. Parse each row exactly once up front instead, only when it's
@@ -538,9 +556,9 @@ pub fn draw_stats_table(
             }
         };
 
-        buf.sort_idx.clear();
-        buf.sort_idx.extend(0..stats.len());
-        buf.sort_idx.sort_by(|&a, &b| {
+        sort_idx.clear();
+        sort_idx.extend(0..stats.len());
+        sort_idx.sort_by(|&a, &b| {
             let (sa, sb) = (&stats[a], &stats[b]);
             let ord = match *sort_col {
                 0 => trace.names[sa.name as usize].cmp(&trace.names[sb.name as usize]),
@@ -555,7 +573,7 @@ pub fn draw_stats_table(
             };
             if *sort_asc { ord } else { ord.reverse() }
         });
-        buf.sort_cache_key = Some(cache_key);
+        *sort_cache_key = Some(cache_key);
     }
     let occ_limit = occ_limit_uncached;
 
@@ -568,11 +586,11 @@ pub fn draw_stats_table(
     // real cost behind "sorting is slow": it ran unconditionally on every
     // call, independent of the sort cache above, so it stayed slow even on a
     // cache hit. Measured at 112k rows: this alone was ~160ms.
-    let clipper = imgui::ListClipper::new(buf.sort_idx.len() as i32)
+    let clipper = imgui::ListClipper::new(sort_idx.len() as i32)
         .items_height(row_h)
         .begin(ui);
     for row in clipper.iter() {
-        let si = buf.sort_idx[row as usize];
+        let si = sort_idx[row as usize];
         let s = &stats[si];
         let name = &trace.names[s.name as usize];
         ui.table_next_row();

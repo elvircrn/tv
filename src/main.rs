@@ -1630,7 +1630,10 @@ impl App {
                                 let mut text_h = avail[1];
                                 if track.gpu {
                                     let drew = draw_duration_histogram(
-                                        &ui, trace, pane.show_cpu, ev.name, ev.dur, &mut state.buf, DETAIL_HIST_H,
+                                        &ui, trace, pane.show_cpu, ev.name, ev.dur,
+                                        &mut pane.detail_hist_key, &mut pane.detail_hist_bins,
+                                        &mut pane.detail_hist_min, &mut pane.detail_hist_max,
+                                        &mut state.buf, DETAIL_HIST_H,
                                     );
                                     if drew {
                                         ui.spacing();
@@ -1678,9 +1681,9 @@ impl App {
                                 ui.separator();
                                 let t_tbl = Instant::now();
                                 if pane.sel_aggregate {
-                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, None, pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
+                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, None, pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut pane.sort_cache_key, &mut pane.sort_idx, &mut state.buf, "##selstats");
                                 } else {
-                                    draw_stats_table(&ui, trace, &pane.sel_individual, Some(&pane.sel_individual_refs), pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut state.buf, "##selstats");
+                                    draw_stats_table(&ui, trace, &pane.sel_individual, Some(&pane.sel_individual_refs), pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut pane.sort_cache_key, &mut pane.sort_idx, &mut state.buf, "##selstats");
                                 }
                                 let tbl_ms = t_tbl.elapsed().as_secs_f64() * 1000.0;
                                 let tbl_rows = if pane.sel_aggregate { pane.sel_agg_stats.len() } else { pane.sel_individual.len() };
