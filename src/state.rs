@@ -369,7 +369,13 @@ impl Pane {
             trace.rank_paths.clone()
         };
         let trace = self.trace.as_mut().ok_or_else(|| "no trace loaded".to_string())?;
-        crate::loader::sync_multi_rank_clocks(trace, &rank_paths, crate::loader::DEFAULT_SYNC_MARKER)
+        let result = crate::loader::sync_multi_rank_clocks(trace, &rank_paths, crate::loader::DEFAULT_SYNC_MARKER);
+        // Shifts event timestamps in place (same events/indices, so this
+        // isn't the out-of-bounds risk a reload is) but the merged view's
+        // cached Tetris packing is order-dependent on those timestamps, and
+        // the cache key doesn't otherwise change just because clocks synced.
+        if result.is_ok() { self.merge_cache_key = None; }
+        result
     }
 
     /// Exports (via `export_gpu_only_web`, or `export_full_web` when
@@ -652,6 +658,13 @@ impl Pane {
                     // EventRef would index out of bounds in the Detail panel.
                     self.selected = None;
                     self.selection_stats.clear();
+                    // Same reasoning: the merged-view Tetris-packing cache
+                    // stores raw (track_idx, event_idx) pairs keyed on
+                    // (view range, hidden names, track order) — none of
+                    // which necessarily change on a reload, so a stale cache
+                    // hit would keep pointing at indices that no longer
+                    // exist in the new trace's (possibly smaller) tracks.
+                    self.merge_cache_key = None;
                     let old_stats = std::mem::take(&mut self.trace.as_mut().unwrap().stats);
                     self.trace = Some(trace);
                     self.trace.as_mut().unwrap().stats = old_stats;

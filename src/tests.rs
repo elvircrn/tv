@@ -269,6 +269,31 @@ fn test_brighten_saturates() {
     assert_eq!(b & 0xFF, 255);
 }
 
+// --- Merge-view cache invalidation ---
+
+#[test]
+fn test_reload_resets_merge_cache_key() {
+    // Regression test: the merged multi-rank view's Tetris-packing cache
+    // (Pane::merge_cache_key) is keyed on (view range, hidden names, track
+    // order) — none of which necessarily change across a reload, even
+    // though the reloaded trace's events (and their indices) can be
+    // completely different. A stale cache hit after a reload panics with an
+    // out-of-bounds index once the render loop looks up a cached
+    // (track_idx, event_idx) pair against the new, smaller trace.
+    let trace1 = make_trace(vec!["", "k"], vec![("GPU 0", true, vec![ev(0.0, 1.0, 1, 0)])]);
+    let mut pane = Pane::new();
+    pane.trace = Some(trace1);
+    pane.merge_cache_key = Some((0, 0, vec![false], vec![0]));
+
+    let trace2 = make_trace(vec!["", "k"], vec![("GPU 0", true, vec![ev(0.0, 1.0, 1, 0)])]);
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Ok(trace2)).unwrap();
+    pane.loading = Some(rx);
+    pane.poll_loading();
+
+    assert!(pane.merge_cache_key.is_none(), "reload must invalidate the merge cache");
+}
+
 // --- Selection stats ---
 
 #[test]
