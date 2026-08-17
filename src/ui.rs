@@ -869,6 +869,7 @@ pub fn draw_timeline(
     dt: f32,
     focus: &mut Option<u32>,
     merge_cache_key: &mut Option<(u64, u64, Vec<bool>, Vec<usize>)>,
+    merged_gpu_groups: &mut Vec<MergedGpuGroup>,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let dl = ui.get_window_draw_list();
     let base_font_size = ui.current_font_size();
@@ -894,7 +895,7 @@ pub fn draw_timeline(
     buf.visible.clear();
     buf.heights.clear();
     buf.y_offsets.clear();
-    let n_old_groups = buf.merged_gpu_groups.len();
+    let n_old_groups = merged_gpu_groups.len();
     let mut cumulative = 0.0f32;
 
     // Pre-group GPU tracks by rank when merging (simple Vec, no BTreeMap)
@@ -906,15 +907,15 @@ pub fn draw_timeline(
             let rank = crate::state::parse_rank(&trace.tracks[i].label);
             if let Some(&(_, gi)) = rank_group_idxs.iter().find(|(r, _)| *r == rank) {
                 if gi < n_old_groups {
-                    buf.merged_gpu_groups[gi].tracks.push(i);
+                    merged_gpu_groups[gi].tracks.push(i);
                 } else {
-                    buf.merged_gpu_groups[gi - n_old_groups].tracks.push(i);
+                    merged_gpu_groups[gi - n_old_groups].tracks.push(i);
                 }
             } else {
                 let gi = group_slot;
                 group_slot += 1;
                 if gi < n_old_groups {
-                    let g = &mut buf.merged_gpu_groups[gi];
+                    let g = &mut merged_gpu_groups[gi];
                     g.tracks.clear();
                     g.tracks.push(i);
                     // events/max_depth are NOT reset here — `build_merged_group_events`
@@ -932,7 +933,7 @@ pub fn draw_timeline(
                         Some(r) => format!("  Rank {}", r),
                         None => "GPU".to_string(),
                     };
-                    buf.merged_gpu_groups.push(MergedGpuGroup {
+                    merged_gpu_groups.push(MergedGpuGroup {
                         tracks: vec![i], events: Vec::new(), max_depth: 0, vi: 0, label,
                     });
                 }
@@ -940,7 +941,7 @@ pub fn draw_timeline(
             }
         }
     }
-    buf.merged_gpu_groups.truncate(group_slot);
+    merged_gpu_groups.truncate(group_slot);
 
     // Skip re-deriving the merged view's per-rank-group Tetris packing
     // (`build_merged_group_events`, below) when nothing that could change it
@@ -980,18 +981,18 @@ pub fn draw_timeline(
                 if emitted_ranks[ri] { continue; }
                 emitted_ranks[ri] = true;
                 let gi = rank_group_idxs[ri].1;
-                let g = &buf.merged_gpu_groups[gi];
+                let g = &merged_gpu_groups[gi];
                 let group_tracks: Vec<usize> = g.tracks.clone();
                 let (md, is_empty) = if merge_cache_valid {
                     (g.max_depth, g.events.is_empty())
                 } else {
-                    let mut events = std::mem::take(&mut buf.merged_gpu_groups[gi].events);
+                    let mut events = std::mem::take(&mut merged_gpu_groups[gi].events);
                     let md = build_merged_group_events(trace, &group_tracks, view.t0, view.t1, hidden_names, &mut events);
                     let is_empty = events.is_empty();
-                    buf.merged_gpu_groups[gi].events = events;
+                    merged_gpu_groups[gi].events = events;
                     (md, is_empty)
                 };
-                let g = &mut buf.merged_gpu_groups[gi];
+                let g = &mut merged_gpu_groups[gi];
                 let first = group_tracks[0];
                 let scale = track_scales.get(first).copied().unwrap_or(1.0);
                 let h = md as f32 * SUB_LANE_H * scale;
@@ -1060,7 +1061,7 @@ pub fn draw_timeline(
     geom.y_offsets.clear();
     geom.y_offsets.extend_from_slice(&buf.y_offsets);
     geom.merged.clear();
-    for g in &buf.merged_gpu_groups {
+    for g in merged_gpu_groups.iter() {
         geom.merged.push(MergedGeom {
             vi: g.vi,
             events: g.events.clone(),
@@ -1120,7 +1121,7 @@ pub fn draw_timeline(
     // even while t0/t1 are still animating.
     if let Some(ti) = focus.take() {
         if let Some(a) = view.anim.as_mut() {
-            let row_vi = buf.merged_gpu_groups.iter()
+            let row_vi = merged_gpu_groups.iter()
                 .find(|g| g.tracks.contains(&(ti as usize)))
                 .map(|g| g.vi)
                 .or_else(|| buf.visible.iter().position(|&v| v == ti as usize));
@@ -1273,7 +1274,7 @@ pub fn draw_timeline(
             let bg = if vi % 2 == 0 { ROW_BG_A } else { ROW_BG_B };
             dl.add_rect([rect[0], y], [rect[2], y + track_h], bg).filled(true).build();
 
-            let merged_group = buf.merged_gpu_groups.iter().find(|g| g.vi == vi);
+            let merged_group = merged_gpu_groups.iter().find(|g| g.vi == vi);
 
             if let Some(group) = merged_group {
                 let total_depth = group.max_depth;
@@ -1528,7 +1529,7 @@ pub fn draw_timeline(
                         if let Some(vi) = buf.visible.iter().position(|&v| v == ti) {
                             return Some((vi, depth));
                         }
-                        for g in &buf.merged_gpu_groups {
+                        for g in merged_gpu_groups.iter() {
                             if g.tracks.contains(&ti) {
                                 let md = g.events.iter()
                                     .find(|&&(t, e, _)| t == ti as u32 && e == ei as u32)
@@ -1542,7 +1543,7 @@ pub fn draw_timeline(
                     let sel_loc = find_vi_and_depth(sel_ti, sel.event_idx as usize, sel_ev.depth);
                     if let Some((sel_vi, sel_eff_depth)) = sel_loc {
                         let sel_gpu = sel_track.gpu;
-                        let total_depth: u16 = buf.merged_gpu_groups.iter()
+                        let total_depth: u16 = merged_gpu_groups.iter()
                             .find(|g| g.vi == sel_vi)
                             .map_or(sel_track.max_depth.max(1), |g| g.max_depth);
                         let src_sub_h = buf.heights[sel_vi] / total_depth as f32;
@@ -1570,7 +1571,7 @@ pub fn draw_timeline(
                             let dst_ev = dst_evs[dst_ei];
 
                             let (dst_x, dst_y) = if let Some((dst_vi, dst_eff_depth)) = find_vi_and_depth(dst_ti, dst_ei, dst_ev.depth) {
-                                let dst_total: u16 = buf.merged_gpu_groups.iter()
+                                let dst_total: u16 = merged_gpu_groups.iter()
                                     .find(|g| g.vi == dst_vi)
                                     .map_or(trace.tracks[dst_ti].max_depth.max(1), |g| g.max_depth);
                                 let dst_sub_h = buf.heights[dst_vi] / dst_total as f32;
@@ -1668,7 +1669,7 @@ pub fn draw_timeline(
             .begin()
         {
             buf.fmt.clear();
-            if let Some(g) = buf.merged_gpu_groups.iter().find(|g| g.vi == vi) {
+            if let Some(g) = merged_gpu_groups.iter().find(|g| g.vi == vi) {
                 write!(buf.fmt, "{}", g.label).ok();
             } else {
                 write!(buf.fmt, "{}", track.label).ok();

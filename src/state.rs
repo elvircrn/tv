@@ -116,6 +116,17 @@ pub struct Pane {
     /// main.rs), so a shared cache would compare against whichever *other*
     /// pane last rendered.
     pub merge_cache_key: Option<(u64, u64, Vec<bool>, Vec<usize>)>,
+    /// The merged multi-rank view's per-rank-group row data (packed events +
+    /// max depth), validated against `merge_cache_key` above. This must live
+    /// here, not on the shared `DrawBuf` (where it lived before it was
+    /// cached) — once frame-to-frame reuse was introduced, a pane whose own
+    /// `merge_cache_key` still matched could otherwise silently read back
+    /// whatever a *different* pane's render had just overwritten this with,
+    /// panicking on (track_idx, event_idx) pairs that don't exist in this
+    /// pane's own trace. Harmless before caching, since it was always fully
+    /// rebuilt within the same frame it was read, regardless of which pane's
+    /// turn it was.
+    pub merged_gpu_groups: Vec<MergedGpuGroup>,
     /// Interned name indices matching "execute_context" — vLLM's per-generation
     /// wrapper span. Computed once per trace load (see `poll_loading`), not
     /// per toolbar frame, since it only depends on `trace.names`.
@@ -218,6 +229,7 @@ impl Pane {
             geom: PaneGeom::default(),
             hidden_names: Vec::new(),
             merge_cache_key: None,
+            merged_gpu_groups: Vec::new(),
             exec_context_names: Vec::new(),
             pending_tab: Some(BottomTab::Detail),
             pending_focus: None,
