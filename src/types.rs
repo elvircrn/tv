@@ -295,14 +295,6 @@ impl DragKind {
 pub struct MergedGpuGroup {
     pub tracks: Vec<usize>,
     pub events: Vec<(u32, u32, u16)>,
-    /// `(ts, ts+dur)` for every event in `events`, bucketed by its assigned
-    /// depth — the same data `stretch_bounds` needs to know whether a
-    /// neighboring depth is free to stretch into. Built as a byproduct of
-    /// `build_merged_group_events`'s depth-assignment loop (it already has
-    /// `ts`/`dur`/depth in hand there) instead of a separate O(events) pass
-    /// in the render loop, which used to rebuild this from scratch every
-    /// single frame regardless of whether `events` had even changed.
-    pub per_depth: Vec<Vec<(f64, f64)>>,
     pub max_depth: u16,
     pub vi: usize,
     pub label: String,

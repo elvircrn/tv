@@ -819,33 +819,6 @@ fn test_fit_font_size_floors_at_min_text_px() {
 }
 
 #[test]
-fn test_build_merged_group_events_per_depth_matches_assigned_depths() {
-    // per_depth is now built as a byproduct of the same loop that assigns
-    // depths (instead of a separate pass in the render loop) — this pins
-    // down that every event's (ts, ts+dur) actually lands in per_depth at
-    // the depth it was assigned, and per_depth's length matches max_depth.
-    let names = vec!["", "a", "b", "c"];
-    let trace = make_trace(names, vec![
-        ("GPU 0", true, vec![ev(0.0, 5.0, 1, 0)]),
-        ("GPU 1", true, vec![ev(2.0, 5.0, 2, 0)]),  // overlaps GPU 0 -> new depth
-        ("GPU 2", true, vec![ev(20.0, 3.0, 3, 0)]), // non-overlapping -> depth 0 reused
-    ]);
-    let group_tracks = vec![0usize, 1, 2];
-    let hidden_names = vec![false; trace.names.len()];
-    let mut out = Vec::new();
-    let mut per_depth = Vec::new();
-    let max_depth = crate::ui::build_merged_group_events(&trace, &group_tracks, 0.0, 100.0, &hidden_names, &mut out, &mut per_depth);
-
-    assert_eq!(out.len(), 3);
-    assert_eq!(per_depth.len(), max_depth as usize);
-    for &(ti, ei, d) in &out {
-        let e = &trace.tracks[ti as usize].events[ei as usize];
-        let want = (e.ts, e.ts + e.dur);
-        assert!(per_depth[d as usize].contains(&want), "expected {:?} in per_depth[{}] = {:?}", want, d, per_depth[d as usize]);
-    }
-}
-
-#[test]
 fn test_stretch_bounds_lone_event_fills_whole_row() {
     // depth 0 has our event, depths 1 and 2 have nothing at all — it should
     // claim the entire row.
