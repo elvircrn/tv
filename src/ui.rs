@@ -1292,14 +1292,22 @@ pub fn draw_timeline(
                 // of it.
                 let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); total_depth as usize];
                 for &(ti32, ei32, eff_depth) in &group.events {
-                    let ev = &trace.tracks[ti32 as usize].events[ei32 as usize];
-                    per_depth[eff_depth as usize].push((ev.ts, ev.ts + ev.dur));
+                    // Defensive: `group.events` is a cache (see merge_cache_key)
+                    // of (track_idx, event_idx, depth) triples snapshotted
+                    // against a possibly-earlier version of this trace. If it's
+                    // ever stale despite the cache-key check (e.g. a reload the
+                    // key didn't catch), skip rather than index out of bounds —
+                    // a briefly-wrong merged row beats a hard crash.
+                    let Some(ev) = trace.tracks.get(ti32 as usize).and_then(|t| t.events.get(ei32 as usize)) else { continue };
+                    if let Some(slot) = per_depth.get_mut(eff_depth as usize) {
+                        slot.push((ev.ts, ev.ts + ev.dur));
+                    }
                 }
 
                 for &(ti32, ei32, eff_depth) in &group.events {
                     let orig_ti = ti32 as usize;
                     let ei = ei32 as usize;
-                    let ev = &trace.tracks[orig_ti].events[ei];
+                    let Some(ev) = trace.tracks.get(orig_ti).and_then(|t| t.events.get(ei)) else { continue };
                     let ev_end = ev.ts + ev.dur;
                     let x0 = t2x(ev.ts, view.t0, px_per_us, tl_left).max(tl_left);
                     let x1 = t2x(ev_end, view.t0, px_per_us, tl_left).min(rect[2]);
@@ -1313,8 +1321,9 @@ pub fn draw_timeline(
 
                     if w < MIN_EV_PX {
                         let px = x0 as i32;
-                        if px == buf.last_px[eff_depth as usize] { continue; }
-                        buf.last_px[eff_depth as usize] = px;
+                        let Some(slot) = buf.last_px.get_mut(eff_depth as usize) else { continue };
+                        if px == *slot { continue; }
+                        *slot = px;
                         let ev_y = y + lo as f32 * sub_h + EV_INSET;
                         let color = if matches {
                             name_color(&trace.names[ev.name as usize])
