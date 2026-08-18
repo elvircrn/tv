@@ -1754,6 +1754,106 @@ fn bench_merge_filter() {
     }
 }
 
+// Measures a *full* draw_timeline call (real imgui context, no renderer
+// backend needed — draw lists are plain in-memory data) at several zoom
+// levels, to see where the frame budget actually goes beyond the
+// merge-group build that bench_merge_filter isolates. Run with:
+//   cargo test --release bench_draw_timeline -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_draw_timeline() {
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache> to run this bench"); return; }
+    };
+    let counter = test_counter();
+    let trace = load_trace(&path, &counter, 8, None).expect("load trace");
+    eprintln!("loaded: {} tracks, {} events, span 0..{:.0} us", trace.tracks.len(), trace.total_events, trace.max_ts);
+
+    let mut imgui = imgui::Context::create();
+    imgui.io_mut().display_size = [1600.0, 900.0];
+    imgui.fonts().build_rgba32_texture();
+
+    let mut pane = Pane::new();
+    pane.merge_gpu = true;
+    pane.track_order = default_track_order(&trace.tracks);
+    pane.hidden_names = vec![false; trace.names.len()];
+    pane.collapsed = vec![false; trace.tracks.len()];
+    pane.track_scales = vec![1.0; trace.tracks.len()];
+    let max_ts = trace.max_ts;
+    pane.trace = Some(trace);
+
+    let mut buf = DrawBuf::default();
+    let mut drag = DragKind::None;
+
+    let mut run = |t0: f64, t1: f64, label: &str, iters: u32| {
+        pane.view.t0 = t0;
+        pane.view.t1 = t1;
+        pane.merge_cache_key = None; // force a cache miss every call, like an active zoom does
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let ui = imgui.new_frame();
+            ui.window("bench")
+                .position([0.0, 0.0], imgui::Condition::Always)
+                .size([1600.0, 900.0], imgui::Condition::Always)
+                .build(|| {
+                    let trace_ref = pane.trace.as_ref().unwrap();
+                    draw_timeline(
+                        ui, trace_ref, &mut pane.view, pane.show_cpu, &mut buf,
+                        [0.0, 0.0, 1600.0, 900.0], 0, false, false, false,
+                        [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0, false, false,
+                        &pane.search_mask, pane.selection, &pane.finished_sel_events,
+                        &mut pane.collapsed, &pane.hidden_names, pane.selected, pane.multi_select_name,
+                        &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
+                        &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
+                        &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
+                    );
+                });
+            imgui.render();
+            pane.merge_cache_key = None; // simulate "view changes every frame" (active zoom/pan)
+        }
+        let per = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        eprintln!("{label:<22} {per:>7.3} ms/frame (cache miss every frame)");
+    };
+
+    run(0.0, max_ts, "zoom=100% (full trace)", 10);
+    run(0.0, max_ts * 0.25, "zoom=25%", 10);
+    run(0.0, max_ts * 0.05, "zoom=5%", 10);
+
+    // And the idle-hover case: same view every frame, cache should hit
+    // after the first call. Reset to full-trace zoom — `run()` above left
+    // `pane.view` at the last (5%) call's range otherwise.
+    pane.view.t0 = 0.0;
+    pane.view.t1 = max_ts;
+    pane.merge_cache_key = None;
+    let start = std::time::Instant::now();
+    let iters = 30;
+    for i in 0..iters {
+        let ui = imgui.new_frame();
+        ui.window("bench")
+            .position([0.0, 0.0], imgui::Condition::Always)
+            .size([1600.0, 900.0], imgui::Condition::Always)
+            .build(|| {
+                let trace_ref = pane.trace.as_ref().unwrap();
+                draw_timeline(
+                    ui, trace_ref, &mut pane.view, pane.show_cpu, &mut buf,
+                    [0.0, 0.0, 1600.0, 900.0], 0, false, false, false,
+                    [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0, false, false,
+                    &pane.search_mask, pane.selection, &pane.finished_sel_events,
+                    &mut pane.collapsed, &pane.hidden_names, pane.selected, pane.multi_select_name,
+                    &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
+                    &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
+                    &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
+                );
+            });
+        imgui.render();
+        if i == 0 {
+            eprintln!("(first call after cache reset primes the cache)");
+        }
+    }
+    let per = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    eprintln!("{:<22} {:>7.3} ms/frame (idle, view unchanged, cache hit)", "zoom=100% idle", per);
+}
 
 #[test]
 fn test_zoom_to_search_frames_first_match_80pct_fill() {

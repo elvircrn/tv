@@ -1,4 +1,5 @@
 use crate::parse::fnv1a;
+use crate::time::Instant;
 use crate::types::*;
 use imgui::{ImColor32, StyleColor, StyleVar, WindowFlags};
 use std::fmt::Write;
@@ -871,6 +872,7 @@ pub fn draw_timeline(
     merge_cache_key: &mut Option<(u64, u64, Vec<bool>, Vec<usize>)>,
     merged_gpu_groups: &mut Vec<MergedGpuGroup>,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
+    let t_dt_start = Instant::now();
     let dl = ui.get_window_draw_list();
     let base_font_size = ui.current_font_size();
     let tl_left = rect[0] + label_w;
@@ -1250,6 +1252,8 @@ pub fn draw_timeline(
         finished_sel_events.contains(&(ti, ei))
     };
 
+    let layout_ms = t_dt_start.elapsed().as_secs_f64() * 1000.0;
+    let t_draw_start = Instant::now();
     dl.with_clip_rect([tl_left, tracks_top], [rect[2], rect[3]], || {
         let interval = nice_interval(view.t1 - view.t0);
         if interval > 0.0 {
@@ -1651,6 +1655,7 @@ pub fn draw_timeline(
             }
         }
     });
+    let draw_ms = t_draw_start.elapsed().as_secs_f64() * 1000.0;
 
     drop(dl);
 
@@ -1798,6 +1803,14 @@ pub fn draw_timeline(
                 *even_spacing = !*even_spacing;
             }
         }
+    }
+
+    let total_ms = t_dt_start.elapsed().as_secs_f64() * 1000.0;
+    if total_ms > 20.0 {
+        eprintln!(
+            "  draw_timeline: {total_ms:.1}ms total (layout {layout_ms:.1}ms incl. merge-group build, draw-loop {draw_ms:.1}ms, post {:.1}ms)",
+            total_ms - layout_ms - draw_ms,
+        );
     }
 
     (hover_result, click_result, sel_change)
