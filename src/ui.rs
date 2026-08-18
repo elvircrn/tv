@@ -775,6 +775,13 @@ pub(crate) fn collect_merged_track_events(
 /// frame). Pure and imgui-free so it can be measured/tested directly against
 /// real trace data — this runs once per rank group, every redraw, in the
 /// merged multi-rank view, so it's the hot path when "Merge Streams" is slow.
+///
+/// Also fills `per_depth_out` with `(ts, ts+dur)` bucketed by each event's
+/// assigned depth — `stretch_bounds` needs exactly this to decide whether a
+/// neighboring depth is free to stretch into. Building it here, as a
+/// byproduct of the loop that already computes `ts`/`dur`/depth for the
+/// packing itself, replaces what used to be a second, separate O(events)
+/// pass over the same data in the render loop.
 pub(crate) fn build_merged_group_events(
     trace: &Trace,
     group_tracks: &[usize],
@@ -782,8 +789,10 @@ pub(crate) fn build_merged_group_events(
     view_t1: f64,
     hidden_names: &[bool],
     out: &mut Vec<(u32, u32, u16)>,
+    per_depth_out: &mut Vec<Vec<(f64, f64)>>,
 ) -> u16 {
     out.clear();
+    for slot in per_depth_out.iter_mut() { slot.clear(); }
     let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
     for &ti in group_tracks {
         let gt = &trace.tracks[ti];
@@ -799,6 +808,8 @@ pub(crate) fn build_merged_group_events(
         let d16 = d as u16;
         if d16 >= max_depth { max_depth = d16 + 1; }
         out.push((ti, ei, d16));
+        if per_depth_out.len() <= d { per_depth_out.resize_with(d + 1, Vec::new); }
+        per_depth_out[d].push((ts, ts + dur));
     }
     max_depth.max(1)
 }
@@ -936,7 +947,7 @@ pub fn draw_timeline(
                         None => "GPU".to_string(),
                     };
                     merged_gpu_groups.push(MergedGpuGroup {
-                        tracks: vec![i], events: Vec::new(), max_depth: 0, vi: 0, label,
+                        tracks: vec![i], events: Vec::new(), per_depth: Vec::new(), max_depth: 0, vi: 0, label,
                     });
                 }
                 rank_group_idxs.push((rank, gi));
@@ -989,9 +1000,11 @@ pub fn draw_timeline(
                     (g.max_depth, g.events.is_empty())
                 } else {
                     let mut events = std::mem::take(&mut merged_gpu_groups[gi].events);
-                    let md = build_merged_group_events(trace, &group_tracks, view.t0, view.t1, hidden_names, &mut events);
+                    let mut per_depth = std::mem::take(&mut merged_gpu_groups[gi].per_depth);
+                    let md = build_merged_group_events(trace, &group_tracks, view.t0, view.t1, hidden_names, &mut events, &mut per_depth);
                     let is_empty = events.is_empty();
                     merged_gpu_groups[gi].events = events;
+                    merged_gpu_groups[gi].per_depth = per_depth;
                     (md, is_empty)
                 };
                 let g = &mut merged_gpu_groups[gi];
@@ -1293,20 +1306,11 @@ pub fn draw_timeline(
                 // Let each event claim any run of adjacent depths that
                 // truly has nothing else overlapping its own time range,
                 // so a lone kernel fills the row instead of a thin slice
-                // of it.
-                let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); total_depth as usize];
-                for &(ti32, ei32, eff_depth) in &group.events {
-                    // Defensive: `group.events` is a cache (see merge_cache_key)
-                    // of (track_idx, event_idx, depth) triples snapshotted
-                    // against a possibly-earlier version of this trace. If it's
-                    // ever stale despite the cache-key check (e.g. a reload the
-                    // key didn't catch), skip rather than index out of bounds —
-                    // a briefly-wrong merged row beats a hard crash.
-                    let Some(ev) = trace.tracks.get(ti32 as usize).and_then(|t| t.events.get(ei32 as usize)) else { continue };
-                    if let Some(slot) = per_depth.get_mut(eff_depth as usize) {
-                        slot.push((ev.ts, ev.ts + ev.dur));
-                    }
-                }
+                // of it. `per_depth` is built once, alongside `events`, in
+                // `build_merged_group_events` — not re-derived here every
+                // frame (that used to be a second full pass over every
+                // surviving event, on top of the draw pass below).
+                let per_depth = &group.per_depth;
 
                 for &(ti32, ei32, eff_depth) in &group.events {
                     let orig_ti = ti32 as usize;
@@ -1316,8 +1320,6 @@ pub fn draw_timeline(
                     let x0 = t2x(ev.ts, view.t0, px_per_us, tl_left).max(tl_left);
                     let x1 = t2x(ev_end, view.t0, px_per_us, tl_left).min(rect[2]);
                     let w = x1 - x0;
-                    let (lo, hi) = stretch_bounds(&per_depth, eff_depth, ev.ts, ev_end);
-                    let stretched_h = (hi - lo + 1) as f32 * sub_h - LANE_GAP;
 
                     let matches = !filtering
                         || (searching && (ev.name as usize) < search_mask.len() && search_mask[ev.name as usize])
@@ -1328,16 +1330,25 @@ pub fn draw_timeline(
                         let Some(slot) = buf.last_px.get_mut(eff_depth as usize) else { continue };
                         if px == *slot { continue; }
                         *slot = px;
-                        let ev_y = y + lo as f32 * sub_h + EV_INSET;
+                        // No stretch_bounds here: it's a binary search per
+                        // neighboring depth, and this branch is by far the
+                        // most common one once thousands of events collapse
+                        // into a handful of screen pixels at low zoom — a
+                        // 1px-wide tick stretching into an empty neighbor
+                        // depth is a minor visual nicety not worth its cost
+                        // at that scale (unlike for a fully-rendered block).
+                        let ev_y = y + eff_depth as f32 * sub_h + EV_INSET;
                         let color = if matches {
                             name_color(&trace.names[ev.name as usize])
                         } else {
                             dim_color(&trace.names[ev.name as usize])
                         };
-                        dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + stretched_h], color).filled(true).build();
+                        dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + (sub_h - LANE_GAP)], color).filled(true).build();
                         continue;
                     }
 
+                    let (lo, hi) = stretch_bounds(per_depth, eff_depth, ev.ts, ev_end);
+                    let stretched_h = (hi - lo + 1) as f32 * sub_h - LANE_GAP;
                     let ev_y = y + lo as f32 * sub_h + EV_INSET;
                     let name = &trace.names[ev.name as usize];
                     let color = if matches {
