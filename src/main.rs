@@ -92,6 +92,16 @@ fn tab_label(pane: &Pane) -> &str {
     shown.rsplit('/').next().unwrap_or(shown)
 }
 
+/// Whether the tab strip is worth a row at all — hidden for the single
+/// default empty pane (nothing opened yet, or everything was closed back
+/// down to it), since a lone "Untitled" tab over the splash screen is just
+/// clutter. Shown as soon as there's more than one pane, or the one pane
+/// has ever had something opened into it (`trace_path` is set immediately
+/// in `Pane::open`/`open_multi`, before loading even finishes).
+pub(crate) fn should_show_tab_strip(panes: &[Pane]) -> bool {
+    panes.len() > 1 || !panes[0].trace_path.is_empty()
+}
+
 /// Wires up a freshly-opened pane's `reload_dir`/`cache_dir` when its files
 /// came from a directory argument (CLI or drop) — `dir` is `None` for bare
 /// file arguments, which have nothing to watch/cache against.
@@ -1122,8 +1132,14 @@ impl App {
         let state = &mut self.state;
 
         // ---- Tab strip: one tab per open trace ----
+        // Hidden entirely when there's nothing open yet (or everything was
+        // closed back to the single default pane) — a lone "Untitled" tab
+        // for a pane with no trace just reads as clutter over the splash;
+        // once has_trace() is possible for any pane the strip is worth its
+        // row again, even at one real tab.
+        let show_tabs = should_show_tab_strip(&state.panes);
         let mut close_pane: Option<usize> = None;
-        {
+        if show_tabs {
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 4.0]));
             // Dear ImGui floors every non-child, non-auto-resize window at
             // style.WindowMinSize (32x32 by default) regardless of an
@@ -1172,7 +1188,7 @@ impl App {
         let has_trace = state.panes[ai].has_trace();
         let bottom_h = if has_trace { state.bottom_h } else { 0.0 };
         let status_h = if has_trace { STATUS_H } else { 0.0 };
-        let content_top = toolbar_h + TAB_BAR_H;
+        let content_top = toolbar_h + if show_tabs { TAB_BAR_H } else { 0.0 };
 
         let mut t_section = Instant::now();
         macro_rules! mark {

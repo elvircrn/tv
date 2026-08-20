@@ -269,6 +269,25 @@ fn test_brighten_saturates() {
     assert_eq!(b & 0xFF, 255);
 }
 
+// --- Tab strip visibility ---
+
+#[test]
+fn test_should_show_tab_strip() {
+    // Single default pane, nothing ever opened -> no tab row.
+    let panes = vec![Pane::new()];
+    assert!(!should_show_tab_strip(&panes));
+
+    // Same single pane, but something has been opened into it (trace_path
+    // gets set immediately by Pane::open, before loading even finishes).
+    let mut opened = Pane::new();
+    opened.trace_path = "foo.json".to_string();
+    assert!(should_show_tab_strip(&[opened]));
+
+    // More than one pane, even if both are still empty (e.g. right after
+    // add_pane before a drop's open() call lands) -> show the row.
+    assert!(should_show_tab_strip(&[Pane::new(), Pane::new()]));
+}
+
 // --- Merge-view cache invalidation ---
 
 #[test]
@@ -374,6 +393,35 @@ fn test_selection_stats_cpu_hidden() {
 // user doing anything to their selection. capture_sel_events resolves a
 // finished selection to a frozen (track_idx, event_idx) set at drag-finish
 // time instead, so it must survive layout changes unchanged.
+#[test]
+fn test_capture_sel_events_direction_independent() {
+    // A shift-drag from bottom-right to top-left stores the same rectangle
+    // as top-left to bottom-right, just with start/end (and therefore corner
+    // order) swapped — capture_sel_events must resolve both to the exact
+    // same set of events.
+    let trace = make_trace(
+        vec!["", "a", "b", "c"],
+        vec![
+            ("GPU 0", true, vec![ev(0.0, 10.0, 1, 0), ev(20.0, 10.0, 2, 0)]),
+            ("GPU 1", true, vec![ev(5.0, 10.0, 3, 0)]),
+        ],
+    );
+    let state = make_state(trace);
+    let p = &state.panes[0];
+    let y_bottom = p.geom.y_offsets[1] as f64 + p.geom.heights[1] as f64;
+
+    // Rect spans both tracks and t in [0, 30] however you'd naturally drag it.
+    let top_left_to_bottom_right = [0.0, 30.0, 0.0, y_bottom];
+    let bottom_right_to_top_left = [30.0, 0.0, y_bottom, 0.0];
+
+    let a = p.capture_sel_events(top_left_to_bottom_right);
+    let b = p.capture_sel_events(bottom_right_to_top_left);
+    assert_eq!(a.len(), 3, "sanity: all 3 events should be within this rect");
+    let a_set: std::collections::HashSet<_> = a.into_iter().collect();
+    let b_set: std::collections::HashSet<_> = b.into_iter().collect();
+    assert_eq!(a_set, b_set, "drag direction must not change which events get selected");
+}
+
 #[test]
 fn test_selection_survives_layout_change() {
     let trace = make_trace(
