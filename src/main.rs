@@ -1132,24 +1132,39 @@ impl App {
         let state = &mut self.state;
 
         // ---- Tab strip: one tab per open trace ----
+        // Inline with the toolbar row (same y, to its right) instead of a
+        // separate row below it — saves a whole row of vertical space.
         // Hidden entirely when there's nothing open yet (or everything was
         // closed back to the single default pane) — a lone "Untitled" tab
         // for a pane with no trace just reads as clutter over the splash;
         // once has_trace() is possible for any pane the strip is worth its
-        // row again, even at one real tab.
+        // space again, even at one real tab.
         let show_tabs = should_show_tab_strip(&state.panes);
+        // Wide enough for every tab's actual label (so short names don't
+        // waste space and long ones aren't clipped unnecessarily), but never
+        // so wide it starves the toolbar — File/View/Help + the search box
+        // and its match-nav buttons need roughly this much room themselves.
+        let min_toolbar_w = 420.0f32;
+        let tabs_width = if show_tabs {
+            let natural: f32 = state.panes.iter()
+                .map(|p| ui.calc_text_size(tab_label(p))[0] + 32.0)
+                .sum();
+            natural.clamp(120.0, (display[0] - min_toolbar_w).max(120.0))
+        } else {
+            0.0
+        };
         let mut close_pane: Option<usize> = None;
         if show_tabs {
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 4.0]));
             // Dear ImGui floors every non-child, non-auto-resize window at
             // style.WindowMinSize (32x32 by default) regardless of an
-            // explicit `.size()` — without this override a 24px-tall strip
+            // explicit `.size()` — without this override a short strip
             // gets silently grown to 32px and overlaps whatever's below it
             // (see CalcWindowSizeAfterConstraint).
             let _min = ui.push_style_var(StyleVar::WindowMinSize([1.0, 1.0]));
             ui.window("##tracetabs")
-                .position([0.0, toolbar_h], Condition::Always)
-                .size([display[0], TAB_BAR_H], Condition::Always)
+                .position([display[0] - tabs_width, 0.0], Condition::Always)
+                .size([tabs_width, toolbar_h], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
@@ -1188,7 +1203,7 @@ impl App {
         let has_trace = state.panes[ai].has_trace();
         let bottom_h = if has_trace { state.bottom_h } else { 0.0 };
         let status_h = if has_trace { STATUS_H } else { 0.0 };
-        let content_top = toolbar_h + if show_tabs { TAB_BAR_H } else { 0.0 };
+        let content_top = toolbar_h;
 
         let mut t_section = Instant::now();
         macro_rules! mark {
@@ -1304,7 +1319,7 @@ impl App {
             let _min = ui.push_style_var(StyleVar::WindowMinSize([1.0, 1.0]));
             ui.window("##toolbar")
                 .position([0.0, 0.0], Condition::Always)
-                .size([display[0], toolbar_h], Condition::Always)
+                .size([display[0] - tabs_width, toolbar_h], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
