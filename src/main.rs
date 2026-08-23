@@ -210,6 +210,7 @@ impl App {
                 diff_bar_scroll: 0.0,
                 diff_bar_zoom: 1.0,
                 diff_pane_indices: None,
+                kernel_ctx_menu: None,
             },
             last_frame: Instant::now(),
             scale_factor: 1.0,
@@ -1890,6 +1891,43 @@ impl App {
                     click_result = c;
                     new_selection = sel;
                     double_click = double_clicked;
+
+                    // Right-click a kernel instance to sync every rank's clock so
+                    // that rank's own first occurrence of the SAME kernel name
+                    // ends at the same time as this one — a generalized, ad-hoc
+                    // version of "Sync Clocks" (which hardcodes the DeepEP combine
+                    // marker) driven by whatever the user actually clicked.
+                    let right_clicked = ui.is_mouse_clicked(imgui::MouseButton::Right) && hovered;
+                    if right_clicked {
+                        if let Some(r) = h {
+                            state.kernel_ctx_menu = Some((ai, r));
+                            ui.open_popup("##kernel_ctx_menu");
+                        }
+                    }
+                    if let Some((pi, r)) = state.kernel_ctx_menu {
+                        if pi == ai {
+                            let name_opt: Option<String> = state.panes[ai].trace.as_ref().and_then(|t| {
+                                t.tracks.get(r.track_idx as usize)
+                                    .and_then(|tr| tr.events.get(r.event_idx as usize))
+                                    .map(|ev| t.names[ev.name as usize].clone())
+                            });
+                            ui.popup("##kernel_ctx_menu", || {
+                                let Some(name) = &name_opt else {
+                                    ui.close_current_popup();
+                                    return;
+                                };
+                                ui.text_disabled(name);
+                                ui.separator();
+                                if ui.menu_item("Sync Ranks to End of This Event") {
+                                    let pane = &mut state.panes[ai];
+                                    pane.sync_message = Some(match pane.sync_clocks_on(name) {
+                                        Ok(msg) => (true, msg),
+                                        Err(e) => (false, format!("Sync failed: {e}")),
+                                    });
+                                }
+                            });
+                        }
+                    }
                 });
             }
         }

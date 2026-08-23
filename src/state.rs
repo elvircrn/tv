@@ -371,6 +371,14 @@ impl Pane {
     /// empty there), but it's enough: any `.tvcache` merged natively and
     /// then opened in the browser carries its `rank_paths` with it.
     pub fn sync_clocks(&mut self) -> Result<String, String> {
+        self.sync_clocks_on(crate::loader::DEFAULT_SYNC_MARKER)
+    }
+
+    /// Same alignment as `sync_clocks`, but on an arbitrary marker instead of
+    /// the hardcoded DeepEP combine kernel — used by the timeline's
+    /// right-click "sync ranks to this event" context menu, where `marker`
+    /// is the exact name of whichever kernel instance the user clicked.
+    pub fn sync_clocks_on(&mut self, marker: &str) -> Result<String, String> {
         let rank_paths: Vec<(usize, String)> = if self.reload_paths.len() >= 2 {
             self.reload_paths.clone()
         } else {
@@ -381,7 +389,7 @@ impl Pane {
             trace.rank_paths.clone()
         };
         let trace = self.trace.as_mut().ok_or_else(|| "no trace loaded".to_string())?;
-        let result = crate::loader::sync_multi_rank_clocks(trace, &rank_paths, crate::loader::DEFAULT_SYNC_MARKER);
+        let result = crate::loader::sync_multi_rank_clocks(trace, &rank_paths, marker);
         // Shifts event timestamps in place (same events/indices, so this
         // isn't the out-of-bounds risk a reload is) but the merged view's
         // cached Tetris packing is order-dependent on those timestamps, and
@@ -1046,6 +1054,11 @@ pub struct AppState {
     pub diff_bar_scroll: f64,
     pub diff_bar_zoom: f64,
     pub diff_pane_indices: Option<[usize; 2]>,
+    /// Target of the "right-click a kernel -> sync ranks to it" context menu,
+    /// set at right-click time and read when the menu's item is clicked.
+    /// `(pane_idx, event)` — pane index guards against the popup surviving a
+    /// tab switch and firing against the wrong pane's trace.
+    pub kernel_ctx_menu: Option<(usize, EventRef)>,
 }
 
 impl AppState {

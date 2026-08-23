@@ -80,6 +80,7 @@ fn make_state(trace: Trace) -> AppState {
         diff_bar_scroll: 0.0,
         diff_bar_zoom: 1.0,
         diff_pane_indices: None,
+        kernel_ctx_menu: None,
     }
 }
 
