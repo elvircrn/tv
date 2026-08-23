@@ -1666,18 +1666,21 @@ pub fn draw_timeline(
         let track_h = buf.heights[vi];
         let y = tracks_top + buf.y_offsets[vi] - view.scroll_y;
         if y + track_h < tracks_top || y > rect[3] { continue; }
-        let vis_top = y.max(tracks_top);
-        let vis_h = (y + track_h).min(rect[3]) - vis_top;
-        if vis_h <= 0.0 { continue; }
 
+        // Position/size the label child window on the row's TRUE bounds (y,
+        // track_h), not the viewport-clipped slice — a child window is
+        // clipped against its parent automatically, so a row scrolled
+        // halfway off the top/bottom still renders (the visible part of)
+        // its label centered on the row's real center instead of the
+        // center of whatever sliver is currently on screen.
         let label_area_w = tl_left - 4.0 - rect[0];
-        ui.set_cursor_pos([rect[0] - win_pos[0], vis_top - win_pos[1]]);
+        ui.set_cursor_pos([rect[0] - win_pos[0], y - win_pos[1]]);
 
         buf.fmt.clear();
         write!(buf.fmt, "##tl{vi}").ok();
         let _pad = ui.push_style_var(StyleVar::WindowPadding([2.0, 2.0]));
         if let Some(_child) = ui.child_window(&buf.fmt)
-            .size([label_area_w, vis_h])
+            .size([label_area_w, track_h])
             .border(false)
             .flags(WindowFlags::NO_SCROLLBAR | WindowFlags::NO_SCROLL_WITH_MOUSE | WindowFlags::NO_BACKGROUND | WindowFlags::NO_INPUTS)
             .begin()
@@ -1694,7 +1697,7 @@ pub fn draw_timeline(
             // "let it overflow rather than disappear" floor as the height
             // case. Set the window's font scale before each measurement so
             // what's measured (and centered) matches what actually renders.
-            let mut font_size = fit_font_size(base_font_size, vis_h);
+            let mut font_size = fit_font_size(base_font_size, track_h);
             unsafe { imgui_sys::igSetWindowFontScale(font_size / base_font_size); }
             let natural_w = ui.calc_text_size_with_opts(&buf.fmt, false, f32::MAX)[0];
             if natural_w > label_area_w && natural_w > 0.0 {
@@ -1702,7 +1705,7 @@ pub fn draw_timeline(
                 unsafe { imgui_sys::igSetWindowFontScale(font_size / base_font_size); }
             }
             let text_size = ui.calc_text_size_with_opts(&buf.fmt, false, f32::MAX);
-            let pad_y = ((vis_h - text_size[1]) * 0.5).max(0.0);
+            let pad_y = ((track_h - text_size[1]) * 0.5).max(0.0);
             let pad_x = ((label_area_w - text_size[0]) * 0.5).max(0.0);
             ui.set_cursor_pos([pad_x, pad_y]);
             let _col = ui.push_style_color(StyleColor::Text, [0.82, 0.82, 0.82, 1.0]);
