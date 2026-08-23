@@ -15,7 +15,7 @@ impl std::ops::Deref for ArgsBuf {
     }
 }
 
-pub const RULER_H: f32 = 28.0;
+pub const RULER_H: f32 = 20.0;
 pub const SUB_LANE_H: f32 = 20.0;
 pub const LABEL_W: f32 = 200.0;
 pub const MIN_EV_PX: f32 = 1.0;

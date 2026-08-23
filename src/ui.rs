@@ -1688,16 +1688,25 @@ pub fn draw_timeline(
             } else {
                 write!(buf.fmt, "{}", track.label).ok();
             }
-            // Set the window's font scale before measuring, so a squashed
-            // row's shrunk text is measured (and thus vertically centered)
-            // at the size it will actually render at, not the default size.
-            let scale = (fit_font_size(base_font_size, vis_h) / base_font_size).min(1.0);
-            unsafe { imgui_sys::igSetWindowFontScale(scale); }
-            let text_h = ui.calc_text_size_with_opts(&buf.fmt, false, label_area_w - 4.0)[1];
-            let pad_y = ((vis_h - text_h) * 0.5).max(0.0);
-            ui.set_cursor_pos([ui.cursor_pos()[0], pad_y]);
+            // Shrink to fit the row's height first (as before), then shrink
+            // further if it's still too wide to fit on one line — labels
+            // never wrap, they just get smaller, down to MIN_TEXT_PX, same
+            // "let it overflow rather than disappear" floor as the height
+            // case. Set the window's font scale before each measurement so
+            // what's measured (and centered) matches what actually renders.
+            let mut font_size = fit_font_size(base_font_size, vis_h);
+            unsafe { imgui_sys::igSetWindowFontScale(font_size / base_font_size); }
+            let natural_w = ui.calc_text_size_with_opts(&buf.fmt, false, f32::MAX)[0];
+            if natural_w > label_area_w && natural_w > 0.0 {
+                font_size = (font_size * (label_area_w / natural_w)).max(MIN_TEXT_PX);
+                unsafe { imgui_sys::igSetWindowFontScale(font_size / base_font_size); }
+            }
+            let text_size = ui.calc_text_size_with_opts(&buf.fmt, false, f32::MAX);
+            let pad_y = ((vis_h - text_size[1]) * 0.5).max(0.0);
+            let pad_x = ((label_area_w - text_size[0]) * 0.5).max(0.0);
+            ui.set_cursor_pos([pad_x, pad_y]);
             let _col = ui.push_style_color(StyleColor::Text, [0.82, 0.82, 0.82, 1.0]);
-            ui.text_wrapped(&buf.fmt);
+            ui.text(&buf.fmt);
         }
         drop(_pad);
     }
@@ -1832,7 +1841,7 @@ fn draw_ruler(dl: &imgui::DrawListMut, rect: [f32; 4], view: &View, fmt: &mut St
             dl.add_line([x, rect[1]], [x, rect[3]], RULER_TICK).build();
             fmt.clear();
             write_time(fmt, tick);
-            dl.add_text([x + 3.0, rect[1] + 4.0], RULER_TEXT, &*fmt);
+            dl.add_text([x + 3.0, rect[1] + 1.0], RULER_TEXT, &*fmt);
         }
         tick += interval;
         count += 1;
