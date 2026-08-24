@@ -2,6 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <!-- See index.html: pins the layout viewport and disables the browser's
+       own pinch/double-tap zoom so it doesn't fight the canvas's own
+       app-level pinch-to-zoom. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Trace Viewer (multi-threaded)</title>
   <style>
     html, body { margin: 0; padding: 0; overflow: hidden; background: #161616; }

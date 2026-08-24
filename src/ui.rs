@@ -1112,7 +1112,7 @@ pub fn draw_timeline(
     // A live search zoom drives the view unless the user grabs it back with a
     // mouse zoom/pan; cancel then so the two don't fight for t0/t1.
     let user_zoomed = hovered && (pinch != 0.0 || (ctrl && scroll[1] != 0.0) || scroll[0] != 0.0);
-    let user_panned = active && !drag.is_active() && !shift && mouse_delta[0] != 0.0;
+    let user_panned = active && !drag.is_active() && !shift && (mouse_delta[0] != 0.0 || mouse_delta[1] != 0.0);
     if user_zoomed || user_panned {
         view.anim = None;
         *focus = None;
@@ -1183,6 +1183,15 @@ pub fn draw_timeline(
             let dt = -dx / px_per_us;
             view.t0 += dt;
             view.t1 += dt;
+            // Vertical component of the same drag scrolls rows too — on
+            // desktop this rides along with the existing horizontal pan
+            // (harmless, since a plain click-drag rarely moves only
+            // vertically), but it's what makes a touchscreen usable at all:
+            // a single-finger drag is the ONLY way to scroll on mobile,
+            // there's no separate wheel/trackpad gesture to fall back on.
+            view.scroll_y -= mouse_delta[1];
+            let max_scroll = (total_h - (rect[3] - rect[1] - RULER_H)).max(0.0);
+            view.scroll_y = view.scroll_y.clamp(0.0, max_scroll);
         }
     }
 
