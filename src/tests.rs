@@ -1826,15 +1826,36 @@ fn bench_merge_filter() {
 // levels, to see where the frame budget actually goes beyond the
 // merge-group build that bench_merge_filter isolates. Run with:
 //   cargo test --release bench_draw_timeline -- --ignored --nocapture
+//
+// TV_BENCH_TRACE accepts either a single pre-merged .tvcache file, or a
+// directory of per-rank files (the same thing a `tv <dir>` CLI open takes) —
+// the latter is loaded and merged in parallel here, mirroring the `--bench`
+// CLI path in main.rs, so this bench works straight off a fresh sweep-result
+// folder without needing an already-exported merged cache first.
 #[test]
 #[ignore]
 fn bench_draw_timeline() {
     let path = match std::env::var("TV_BENCH_TRACE") {
         Ok(p) => p,
-        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache> to run this bench"); return; }
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache or a directory> to run this bench"); return; }
     };
-    let counter = test_counter();
-    let trace = load_trace(&path, &counter, 8, None).expect("load trace");
+    let trace = if std::path::Path::new(&path).is_dir() {
+        let (rank_groups, standalone) = detect_rank_groups(&[path.clone()]);
+        let mut all_paths: Vec<(usize, String)> = Vec::new();
+        for (group, _) in &rank_groups { all_paths.extend(group.clone()); }
+        for (i, (p, _)) in standalone.iter().enumerate() { all_paths.push((all_paths.len() + i, p.clone())); }
+        let counter = test_counter();
+        use rayon::prelude::*;
+        let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len().max(1)).max(2);
+        let traces: Vec<(usize, Trace)> = all_paths.par_iter().filter_map(|(rank, p)| {
+            load_trace(p, &counter, tpf, None).ok().map(|t| (*rank, t))
+        }).collect();
+        eprintln!("loaded {} rank files from {path}", traces.len());
+        merge_traces(traces)
+    } else {
+        let counter = test_counter();
+        load_trace(&path, &counter, 8, None).expect("load trace")
+    };
     eprintln!("loaded: {} tracks, {} events, span 0..{:.0} us", trace.tracks.len(), trace.total_events, trace.max_ts);
 
     let mut imgui = imgui::Context::create();

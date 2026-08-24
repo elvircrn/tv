@@ -1334,6 +1334,15 @@ pub fn draw_timeline(
 
     let layout_ms = t_dt_start.elapsed().as_secs_f64() * 1000.0;
     let t_draw_start = Instant::now();
+    // Every drawn event looks its color up by name, but `palette_color`
+    // hashes the name string and redoes an HSL saturation-boost calculation
+    // to get there — identical work for every one of the (often 100K+)
+    // occurrences of the same kernel name in a frame. Precompute both
+    // brightness variants once per unique name (there are typically a few
+    // hundred, vs. hundreds of thousands of events) and index by name id in
+    // the hot loop below instead.
+    let name_colors: Vec<ImColor32> = trace.names.iter().map(|n| name_color(n)).collect();
+    let name_dim_colors: Vec<ImColor32> = trace.names.iter().map(|n| dim_color(n)).collect();
     dl.with_clip_rect([tl_left, tracks_top], [rect[2], rect[3]], || {
         let interval = nice_interval(view.t1 - view.t0);
         if interval > 0.0 {
@@ -1410,9 +1419,9 @@ pub fn draw_timeline(
                         *slot = px;
                         let ev_y = y + lo as f32 * sub_h + EV_INSET;
                         let color = if matches {
-                            name_color(&trace.names[ev.name as usize])
+                            name_colors[ev.name as usize]
                         } else {
-                            dim_color(&trace.names[ev.name as usize])
+                            name_dim_colors[ev.name as usize]
                         };
                         dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + stretched_h], color).filled(true).build();
                         continue;
@@ -1421,9 +1430,9 @@ pub fn draw_timeline(
                     let ev_y = y + lo as f32 * sub_h + EV_INSET;
                     let name = &trace.names[ev.name as usize];
                     let color = if matches {
-                        name_color(name)
+                        name_colors[ev.name as usize]
                     } else {
-                        dim_color(name)
+                        name_dim_colors[ev.name as usize]
                     };
                     let ev_rect = [x0, ev_y, x1, ev_y + stretched_h];
 
@@ -1508,9 +1517,9 @@ pub fn draw_timeline(
                         buf.last_px[ev.depth as usize] = px;
                         let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
                         let color = if matches {
-                            name_color(&trace.names[ev.name as usize])
+                            name_colors[ev.name as usize]
                         } else {
-                            dim_color(&trace.names[ev.name as usize])
+                            name_dim_colors[ev.name as usize]
                         };
                         dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + lane_h], color).filled(true).build();
                         continue;
@@ -1519,9 +1528,9 @@ pub fn draw_timeline(
                     let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
                     let name = &trace.names[ev.name as usize];
                     let color = if matches {
-                        name_color(name)
+                        name_colors[ev.name as usize]
                     } else {
-                        dim_color(name)
+                        name_dim_colors[ev.name as usize]
                     };
                     let ev_rect = [x0, ev_y, x1, ev_y + lane_h];
 
