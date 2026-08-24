@@ -145,15 +145,20 @@ pub struct Pane {
     /// "match" and show that pane's stale rows instead of recomputing.
     pub sort_cache_key: Option<(u64, usize, bool, usize, bool)>,
     pub sort_idx: Vec<usize>,
-    /// (event name, show_cpu) the Detail tab's duration-distribution
-    /// histogram was last computed for, and the cached bucket counts —
-    /// same per-pane-ownership reasoning as `sort_cache_key` (a name id is
-    /// only unique within this pane's own trace, so two different open
-    /// traces routinely reuse the same low ids).
-    pub detail_hist_key: Option<(u32, bool)>,
+    /// (event name, show_cpu, bucket count) the Detail tab's
+    /// duration-distribution histogram was last computed for, and the
+    /// cached bucket counts — same per-pane-ownership reasoning as
+    /// `sort_cache_key` (a name id is only unique within this pane's own
+    /// trace, so two different open traces routinely reuse the same low
+    /// ids). Bucket count is part of the key because it now scales with the
+    /// panel's width (see `DETAIL_HIST_TARGET_BAR_W`), so a resize needs a
+    /// rebucket too, not just a name/visibility change.
+    pub detail_hist_key: Option<(u32, bool, usize)>,
     pub detail_hist_bins: Vec<u32>,
     pub detail_hist_min: f64,
     pub detail_hist_max: f64,
+    pub detail_hist_mean: f64,
+    pub detail_hist_median: f64,
     pub sel_aggregate: bool,
     pub label_w: f32,
     pub sel_median: f64,
@@ -241,6 +246,8 @@ impl Pane {
             detail_hist_bins: Vec::new(),
             detail_hist_min: 0.0,
             detail_hist_max: 0.0,
+            detail_hist_mean: 0.0,
+            detail_hist_median: 0.0,
             sel_aggregate: true,
             label_w: LABEL_W,
             sel_median: 0.0,

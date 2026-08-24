@@ -104,10 +104,28 @@ pub(crate) fn stretch_bounds(per_depth: &[Vec<(f64, f64)>], depth: u16, ts: f64,
     (lo, hi)
 }
 
-/// Number of buckets in the Detail tab's duration-distribution histogram —
-/// a compromise between showing the shape (skew, outliers, bimodality) and
-/// staying readable at the tab's typical width.
-const DETAIL_HIST_BUCKETS: usize = 32;
+/// Target on-screen width of one bucket bar in the Detail tab's
+/// duration-distribution histogram — bucket count derives from the panel's
+/// actual width (`avail_w / DETAIL_HIST_TARGET_BAR_W`, clamped) instead of a
+/// fixed count, so a wide Detail panel gets finer-grained buckets instead of
+/// the same 32 stretched-out bars.
+const DETAIL_HIST_TARGET_BAR_W: f32 = 4.0;
+const DETAIL_HIST_MIN_BUCKETS: usize = 24;
+const DETAIL_HIST_MAX_BUCKETS: usize = 200;
+
+/// Draws a short vertical dashed line — used for the histogram's mean
+/// marker, where a solid line would be visually confused with the "this
+/// call" marker.
+fn add_dashed_vline(dl: &imgui::DrawListMut, x: f32, y0: f32, y1: f32, color: ImColor32) {
+    const DASH: f32 = 4.0;
+    const GAP: f32 = 3.0;
+    let mut y = y0;
+    while y < y1 {
+        let y_end = (y + DASH).min(y1);
+        dl.add_line([x, y], [x, y_end], color).thickness(1.5).build();
+        y += DASH + GAP;
+    }
+}
 
 /// Bins `durs` into `n_buckets` equal-width buckets spanning [min, max].
 /// Values are clamped into the last bucket at the exact max boundary so
@@ -162,14 +180,20 @@ pub fn draw_duration_histogram(
     show_cpu: bool,
     name_id: u32,
     current_dur: f64,
-    hist_key: &mut Option<(u32, bool)>,
+    hist_key: &mut Option<(u32, bool, usize)>,
     hist_bins: &mut Vec<u32>,
     hist_min: &mut f64,
     hist_max: &mut f64,
+    hist_mean: &mut f64,
+    hist_median: &mut f64,
     buf: &mut DrawBuf,
     height: f32,
 ) -> bool {
-    let cache_key = (name_id, show_cpu);
+    let avail_w = ui.content_region_avail()[0];
+    let n_buckets = ((avail_w / DETAIL_HIST_TARGET_BAR_W) as usize)
+        .clamp(DETAIL_HIST_MIN_BUCKETS, DETAIL_HIST_MAX_BUCKETS);
+
+    let cache_key = (name_id, show_cpu, n_buckets);
     if *hist_key != Some(cache_key) {
         let mut durs: Vec<f64> = Vec::new();
         for t in &trace.tracks {
@@ -178,7 +202,10 @@ pub fn draw_duration_histogram(
                 if e.name == name_id { durs.push(e.dur); }
             }
         }
-        let (bins, min, max) = bucket_durations(&durs, DETAIL_HIST_BUCKETS);
+        let (bins, min, max) = bucket_durations(&durs, n_buckets);
+        *hist_mean = if durs.is_empty() { 0.0 } else { durs.iter().sum::<f64>() / durs.len() as f64 };
+        durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+        *hist_median = durs.get(durs.len() / 2).copied().unwrap_or(0.0);
         *hist_bins = bins;
         *hist_min = min;
         *hist_max = max;
@@ -187,39 +214,83 @@ pub fn draw_duration_histogram(
 
     let count: u32 = hist_bins.iter().sum();
     if count < 2 { return false; }
+    let n_buckets = hist_bins.len();
+    let range = ((*hist_max) - (*hist_min)).max(1e-12);
 
-    let avail_w = ui.content_region_avail()[0];
+    // ---- Header: count/mean/median/this-call summary line — the numeric
+    // detail the bars alone can't give an exact read on. This call's
+    // percentile is approximated from the cached bucket counts (every
+    // fully-below bucket, plus a linear fraction of whichever bucket it
+    // falls in) rather than keeping the whole sorted duration list around
+    // just for one exact lookup.
+    let cur_b = (((current_dur - *hist_min) / range * n_buckets as f64) as isize)
+        .clamp(0, n_buckets as isize - 1) as usize;
+    let below: u32 = hist_bins[..cur_b].iter().sum();
+    let bucket_lo = *hist_min + range * cur_b as f64 / n_buckets as f64;
+    let bucket_frac = ((current_dur - bucket_lo) / (range / n_buckets as f64)).clamp(0.0, 1.0);
+    let pct = (below as f64 + bucket_frac * hist_bins[cur_b] as f64) / count as f64 * 100.0;
+    buf.fmt.clear();
+    write!(buf.fmt, "{count} calls  ·  mean ").unwrap();
+    write_time(&mut buf.fmt, *hist_mean);
+    buf.fmt.push_str("  ·  median ");
+    write_time(&mut buf.fmt, *hist_median);
+    buf.fmt.push_str("  ·  this call ");
+    write_time(&mut buf.fmt, current_dur);
+    write!(buf.fmt, " ({pct:.0}th pct)").unwrap();
+    ui.text_colored([0.65, 0.65, 0.65, 1.0], &buf.fmt);
+
     let cursor = ui.cursor_screen_pos();
     let dl = ui.get_window_draw_list();
     let max_bin = hist_bins.iter().copied().max().unwrap_or(1).max(1);
-    let bar_w = avail_w / DETAIL_HIST_BUCKETS as f32;
-    let range = ((*hist_max) - (*hist_min)).max(1e-12);
-    let color = ACCENT_LINE;
+    let bar_w = avail_w / n_buckets as f32;
+    let top_color = brighten(ACCENT_LINE, 40);
     let border_col = col32(15, 15, 15, 255);
 
-    // Plot background, so the histogram reads as its own panel rather than
-    // bars floating on the tab's base background.
+    // Plot background + outline, so the histogram reads as its own card
+    // rather than bars floating on the tab's base background.
     dl.add_rect([cursor[0], cursor[1]], [cursor[0] + avail_w, cursor[1] + height], BG_TIMELINE)
         .filled(true).build();
+    dl.add_rect([cursor[0], cursor[1]], [cursor[0] + avail_w, cursor[1] + height], GRID)
+        .thickness(1.0).build();
 
+    // Horizontal gridlines at quarter heights — without them a bar's exact
+    // height relative to the max is a guess; these give a ruler to read it
+    // against without cluttering the plot with numbers at every line.
+    for frac in [0.25, 0.5, 0.75] {
+        let y = cursor[1] + height * (1.0 - frac);
+        dl.add_line([cursor[0], y], [cursor[0] + avail_w, y], GRID).build();
+    }
+
+    let mx = ui.io().mouse_pos;
     let mut hovered_bucket: Option<usize> = None;
     for (i, &n) in hist_bins.iter().enumerate() {
         let x0 = cursor[0] + i as f32 * bar_w;
+        let is_hovered = mx[0] >= x0 && mx[0] < x0 + bar_w && mx[1] >= cursor[1] && mx[1] <= cursor[1] + height;
+        if is_hovered { hovered_bucket = Some(i); }
+        if n == 0 { continue; }
         let bar_h = (n as f32 / max_bin as f32) * height;
         let y0 = cursor[1] + (height - bar_h);
-        if n > 0 {
-            let p0 = [x0 + 0.5, y0];
-            let p1 = [x0 + bar_w - 0.5, cursor[1] + height];
-            dl.add_rect(p0, p1, color).filled(true).build();
-            dl.add_rect(p0, p1, border_col).thickness(1.0).build();
-        }
-        let mx = ui.io().mouse_pos;
-        if mx[0] >= x0 && mx[0] < x0 + bar_w && mx[1] >= cursor[1] && mx[1] <= cursor[1] + height {
-            hovered_bucket = Some(i);
-        }
+        let p0 = [x0 + 0.5, y0];
+        let p1 = [x0 + bar_w - 0.5, cursor[1] + height];
+        // A light-to-base vertical gradient gives each bar some depth
+        // instead of a flat color fill, and the hovered bar brightens
+        // further on top of that so it's obvious which one the tooltip
+        // below belongs to.
+        let (top, bot) = if is_hovered {
+            (brighten(top_color, 30), brighten(ACCENT_LINE, 30))
+        } else {
+            (top_color, ACCENT_LINE)
+        };
+        dl.add_rect_filled_multicolor(p0, p1, top, top, bot, bot);
+        dl.add_rect(p0, p1, border_col).thickness(1.0).build();
     }
 
-    // Mark the selected occurrence's own duration against the distribution.
+    // Mean marker (dashed, so it doesn't get confused with the solid "this
+    // call" marker below) and the selected occurrence's own duration
+    // (solid) — together they place this one call within the distribution
+    // instead of leaving the bars to speak for themselves.
+    let mean_x = cursor[0] + (((*hist_mean - (*hist_min)) / range) as f32).clamp(0.0, 1.0) * avail_w;
+    add_dashed_vline(&dl, mean_x, cursor[1], cursor[1] + height, col32(120, 220, 190, 220));
     let marker_x = cursor[0] + (((current_dur - (*hist_min)) / range) as f32).clamp(0.0, 1.0) * avail_w;
     dl.add_line([marker_x, cursor[1] - 3.0], [marker_x, cursor[1] + height], col32(255, 210, 90, 255)).thickness(1.5).build();
 
@@ -256,8 +327,8 @@ pub fn draw_duration_histogram(
     ui.dummy([avail_w, height + label_h]);
 
     if let Some(b) = hovered_bucket {
-        let lo = (*hist_min) + range as f64 * b as f64 / DETAIL_HIST_BUCKETS as f64;
-        let hi = (*hist_min) + range as f64 * (b + 1) as f64 / DETAIL_HIST_BUCKETS as f64;
+        let lo = (*hist_min) + range * b as f64 / n_buckets as f64;
+        let hi = (*hist_min) + range * (b + 1) as f64 / n_buckets as f64;
         buf.fmt.clear();
         write!(buf.fmt, "{} call{} in ", hist_bins[b], if hist_bins[b] == 1 { "" } else { "s" }).unwrap();
         write_time(&mut buf.fmt, lo);

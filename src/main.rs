@@ -1653,6 +1653,7 @@ impl App {
                                         &ui, trace, pane.show_cpu, ev.name, ev.dur,
                                         &mut pane.detail_hist_key, &mut pane.detail_hist_bins,
                                         &mut pane.detail_hist_min, &mut pane.detail_hist_max,
+                                        &mut pane.detail_hist_mean, &mut pane.detail_hist_median,
                                         &mut state.buf, DETAIL_HIST_H,
                                     );
                                     if drew {

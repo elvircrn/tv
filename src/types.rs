@@ -53,7 +53,7 @@ pub const ZOOM_ANIM_DUR: f32 = 0.35;
 pub const SEARCH_ZOOM_FILL: f64 = 0.8; // matches fill this fraction of the width
 pub const ROW_PAD: f32 = 4.0;
 pub const HISTOGRAM_BAR_H: f32 = 18.0;
-pub const DETAIL_HIST_H: f32 = 70.0;
+pub const DETAIL_HIST_H: f32 = 90.0;
 /// Floor for the dynamically shrunk font size used when a lane/row is
 /// squashed thinner than one line of text at the default size (deep call
 /// nesting, a scaled-down track, or an even-spacing collapse). Below this
