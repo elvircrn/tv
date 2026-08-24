@@ -2367,6 +2367,43 @@ fn test_collect_merged_track_events_excludes_events_before_view_t0() {
 }
 
 #[test]
+fn test_build_merged_group_events_stretch_matches_naive_recompute() {
+    // Track 0/1 each have an event at [0,10) -- they overlap, so one lands
+    // at depth 0 and the other at depth 1. Track 0's second event at
+    // [100,10) doesn't overlap anything and gets depth 0 (first available),
+    // but depth 1 is genuinely empty across its own [100,110) window, so it
+    // should stretch to claim both depths.
+    let trace = make_trace(vec!["a"], vec![
+        ("GPU 0", true, vec![ev(0.0, 10.0, 0, 0), ev(100.0, 10.0, 0, 0)]),
+        ("GPU 1", true, vec![ev(0.0, 10.0, 0, 0)]),
+    ]);
+    let hidden = vec![false; trace.names.len()];
+    let mut events = Vec::new();
+    let mut stretch = Vec::new();
+    let max_depth = crate::ui::build_merged_group_events(&trace, &[0, 1], 0.0, 200.0, &hidden, &mut events, &mut stretch);
+    assert_eq!(max_depth, 2);
+    assert_eq!(events.len(), 3);
+    assert_eq!(stretch.len(), 3);
+
+    // The render loop now trusts this cached `stretch` instead of rebuilding
+    // per_depth and calling stretch_bounds fresh every frame -- confirm it's
+    // identical to what that naive per-frame recompute would have produced.
+    let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); max_depth as usize];
+    for &(ti, ei, depth) in &events {
+        let e = &trace.tracks[ti as usize].events[ei as usize];
+        per_depth[depth as usize].push((e.ts, e.ts + e.dur));
+    }
+    for (i, &(ti, ei, depth)) in events.iter().enumerate() {
+        let e = &trace.tracks[ti as usize].events[ei as usize];
+        let expected = crate::ui::stretch_bounds(&per_depth, depth, e.ts, e.ts + e.dur);
+        assert_eq!(stretch[i], expected, "event {i} (track {ti} idx {ei})");
+    }
+
+    let lone_idx = events.iter().position(|&(ti, ei, _)| ti == 0 && ei == 1).unwrap();
+    assert_eq!(stretch[lone_idx], (0, 1), "lone event should stretch across both depths");
+}
+
+#[test]
 #[ignore]
 fn bench_merge_gpu_collect_cost() {
     // Profiling harness: measures collect_merged_track_events (the merged/

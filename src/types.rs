@@ -291,6 +291,12 @@ impl DragKind {
 pub struct MergedGpuGroup {
     pub tracks: Vec<usize>,
     pub events: Vec<(u32, u32, u16)>,
+    /// Parallel to `events`: each entry's (lo, hi) depth range after
+    /// stretching into empty neighboring slots (see `stretch_bounds`).
+    /// Cached alongside `events` under the same merge-cache lifecycle
+    /// (rebuilt together, always the same length) so the render loop never
+    /// has to recompute this per event on every redrawn frame.
+    pub stretch: Vec<(u16, u16)>,
     pub max_depth: u16,
     pub vi: usize,
     pub label: String,

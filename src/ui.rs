@@ -853,8 +853,10 @@ pub(crate) fn build_merged_group_events(
     view_t1: f64,
     hidden_names: &[bool],
     out: &mut Vec<(u32, u32, u16)>,
+    stretch_out: &mut Vec<(u16, u16)>,
 ) -> u16 {
     out.clear();
+    stretch_out.clear();
     let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
     for &ti in group_tracks {
         let gt = &trace.tracks[ti];
@@ -863,7 +865,7 @@ pub(crate) fn build_merged_group_events(
     ev_list.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     let mut depth_ends: Vec<f64> = Vec::new();
     let mut max_depth: u16 = 0;
-    for (ts, dur, ti, ei) in ev_list {
+    for &(ts, dur, ti, ei) in &ev_list {
         let d = depth_ends.iter().position(|&end| end <= ts)
             .unwrap_or_else(|| { depth_ends.push(0.0); depth_ends.len() - 1 });
         depth_ends[d] = ts + dur;
@@ -871,7 +873,25 @@ pub(crate) fn build_merged_group_events(
         if d16 >= max_depth { max_depth = d16 + 1; }
         out.push((ti, ei, d16));
     }
-    max_depth.max(1)
+    max_depth = max_depth.max(1);
+
+    // stretch_bounds needs the COMPLETE per-depth interval lists (an event
+    // earlier in time can stretch into a slot that only frees up later in
+    // the window), so this is a second pass over the now-finished depth
+    // assignment above, not something foldable into that single forward
+    // pass. Doing it once here, cached alongside `out` under the same
+    // merge_cache_key lifecycle, instead of once per redrawn frame in
+    // draw_timeline's render loop, is the actual point of computing it in
+    // this cache-rebuild-only function at all.
+    let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); max_depth as usize];
+    for (i, &(ts, dur, _, _)) in ev_list.iter().enumerate() {
+        per_depth[out[i].2 as usize].push((ts, ts + dur));
+    }
+    for (i, &(ts, dur, _, _)) in ev_list.iter().enumerate() {
+        stretch_out.push(stretch_bounds(&per_depth, out[i].2, ts, ts + dur));
+    }
+
+    max_depth
 }
 
 /// Row heights for "even spacing" mode: `has_content[vi]` says whether row
@@ -1007,7 +1027,7 @@ pub fn draw_timeline(
                         None => "GPU".to_string(),
                     };
                     merged_gpu_groups.push(MergedGpuGroup {
-                        tracks: vec![i], events: Vec::new(), max_depth: 0, vi: 0, label,
+                        tracks: vec![i], events: Vec::new(), stretch: Vec::new(), max_depth: 0, vi: 0, label,
                     });
                 }
                 rank_group_idxs.push((rank, gi));
@@ -1060,9 +1080,11 @@ pub fn draw_timeline(
                     (g.max_depth, g.events.is_empty())
                 } else {
                     let mut events = std::mem::take(&mut merged_gpu_groups[gi].events);
-                    let md = build_merged_group_events(trace, &group_tracks, view.t0, view.t1, hidden_names, &mut events);
+                    let mut stretch = std::mem::take(&mut merged_gpu_groups[gi].stretch);
+                    let md = build_merged_group_events(trace, &group_tracks, view.t0, view.t1, hidden_names, &mut events, &mut stretch);
                     let is_empty = events.is_empty();
                     merged_gpu_groups[gi].events = events;
+                    merged_gpu_groups[gi].stretch = stretch;
                     (md, is_empty)
                 };
                 let g = &mut merged_gpu_groups[gi];
@@ -1379,25 +1401,17 @@ pub fn draw_timeline(
                 // busiest moment needs, so most events, most of the time,
                 // have no sibling at the depths above/below them — those
                 // slots then sit visibly empty for the event's whole span.
-                // Let each event claim any run of adjacent depths that
-                // truly has nothing else overlapping its own time range,
-                // so a lone kernel fills the row instead of a thin slice
-                // of it.
-                let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); total_depth as usize];
-                for &(ti32, ei32, eff_depth) in &group.events {
-                    // Defensive: `group.events` is a cache (see merge_cache_key)
-                    // of (track_idx, event_idx, depth) triples snapshotted
-                    // against a possibly-earlier version of this trace. If it's
-                    // ever stale despite the cache-key check (e.g. a reload the
-                    // key didn't catch), skip rather than index out of bounds —
-                    // a briefly-wrong merged row beats a hard crash.
-                    let Some(ev) = trace.tracks.get(ti32 as usize).and_then(|t| t.events.get(ei32 as usize)) else { continue };
-                    if let Some(slot) = per_depth.get_mut(eff_depth as usize) {
-                        slot.push((ev.ts, ev.ts + ev.dur));
-                    }
-                }
-
-                for &(ti32, ei32, eff_depth) in &group.events {
+                // Each event's stretch bounds (how far it can claim a run of
+                // adjacent empty depths, computed against ALL events in the
+                // group, including ones later in time) are precomputed once
+                // per merge-cache rebuild in `build_merged_group_events`
+                // rather than rebuilt from scratch here on every redrawn
+                // frame — `group.stretch` is parallel to `group.events`, so
+                // indexing it by position is always correct as long as the
+                // two are the same length (defensive fallback below covers
+                // the same "stale cache despite the key check" case
+                // `group.events` itself is guarded against).
+                for (gi, &(ti32, ei32, eff_depth)) in group.events.iter().enumerate() {
                     let orig_ti = ti32 as usize;
                     let ei = ei32 as usize;
                     let Some(ev) = trace.tracks.get(orig_ti).and_then(|t| t.events.get(ei)) else { continue };
@@ -1405,7 +1419,7 @@ pub fn draw_timeline(
                     let x0 = t2x(ev.ts, view.t0, px_per_us, tl_left).max(tl_left);
                     let x1 = t2x(ev_end, view.t0, px_per_us, tl_left).min(rect[2]);
                     let w = x1 - x0;
-                    let (lo, hi) = stretch_bounds(&per_depth, eff_depth, ev.ts, ev_end);
+                    let (lo, hi) = group.stretch.get(gi).copied().unwrap_or((eff_depth, eff_depth));
                     let stretched_h = (hi - lo + 1) as f32 * sub_h - LANE_GAP;
 
                     let matches = !filtering
