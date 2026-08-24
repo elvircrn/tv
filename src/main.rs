@@ -114,6 +114,35 @@ fn set_reload_dir(pane: &mut Pane, dir: Option<&str>) {
     }
 }
 
+/// Formats one arg's value for the Detail tab's free-text panel. A nested
+/// JSON object (CUPTI's `occupancy` dict is the common one — limitingFactors,
+/// blockLimitRegs, etc.) is expanded one key per indented line instead of
+/// being dumped as a single compact-JSON line, which otherwise runs off the
+/// edge of the panel: Dear ImGui's `InputTextMultiline` has no word-wrap
+/// option (it's a text editor widget, not a label), so a line that's too
+/// wide is just invisible past the right edge rather than wrapping.
+/// Anything that isn't a `{...}` object (numbers, strings, arrays) is
+/// written through unchanged. Recursion is capped at a few levels as a
+/// defensive bound, not because args actually nest that deep in practice.
+fn format_arg_value(buf: &mut String, val: &str, depth: usize) {
+    if depth < 4 && val.starts_with('{') && val.ends_with('}') {
+        let mut strs = Vec::new();
+        let mut idx = FnvMap::default();
+        let mut pairs = Vec::new();
+        parse_args_flat(val.as_bytes(), &mut strs, &mut idx, &mut pairs);
+        if !pairs.is_empty() {
+            for &[k, v] in &pairs {
+                buf.push('\n');
+                for _ in 0..=depth { buf.push_str("  "); }
+                write!(buf, "{}: ", strs[k as usize]).unwrap();
+                format_arg_value(buf, &strs[v as usize], depth + 1);
+            }
+            return;
+        }
+    }
+    buf.push_str(val);
+}
+
 struct App {
     window: Option<Window>,
     imgui: Option<imgui::Context>,
@@ -1641,7 +1670,8 @@ impl App {
                                         if !pairs.is_empty() {
                                             state.buf.detail_buf.push('\n');
                                             for &[k, v] in &pairs {
-                                                write!(state.buf.detail_buf, "\n{}: {}", strs[k as usize], strs[v as usize]).unwrap();
+                                                write!(state.buf.detail_buf, "\n{}: ", strs[k as usize]).unwrap();
+                                                format_arg_value(&mut state.buf.detail_buf, &strs[v as usize], 0);
                                             }
                                         }
                                     }

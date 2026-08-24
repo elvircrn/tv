@@ -1018,6 +1018,24 @@ fn test_parse_args_flat_empty() {
 }
 
 #[test]
+fn test_format_arg_value_expands_nested_object() {
+    let mut out = String::new();
+    format_arg_value(&mut out, r#"{"limitingFactors": "REGS", "blockLimitRegs": 1}"#, 0);
+    assert_eq!(out, "\n  limitingFactors: REGS\n  blockLimitRegs: 1");
+}
+
+#[test]
+fn test_format_arg_value_passes_through_scalars() {
+    let mut out = String::new();
+    format_arg_value(&mut out, "REGS", 0);
+    assert_eq!(out, "REGS");
+
+    let mut out = String::new();
+    format_arg_value(&mut out, "{}", 0);
+    assert_eq!(out, "{}");
+}
+
+#[test]
 fn test_select_from_search() {
     let trace = make_trace(
         vec!["alpha_kernel", "beta_kernel", "gamma_kernel"],
