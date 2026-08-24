@@ -2,6 +2,12 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <!-- Pin the layout viewport to the device width and disable the browser's
+       own pinch-to-zoom/double-tap-zoom: the canvas already handles pinch
+       as an app-level timeline zoom (see WindowEvent::Touch/PinchGesture in
+       main.rs), and page-level zoom fighting it on top makes the whole
+       thing feel broken on a touchscreen. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Trace Viewer</title>
   <style>
     html, body { margin: 0; padding: 0; overflow: hidden; background: #161616; }
@@ -20,8 +26,8 @@
   -->
   
 <script type="module">
-import init, * as bindings from '/tv/tv-742a5804f4a91723.js';
-const wasm = await init({ module_or_path: '/tv/tv-742a5804f4a91723_bg.wasm' });
+import init, * as bindings from '/tv/tv-c7c322316e791e42.js';
+const wasm = await init({ module_or_path: '/tv/tv-c7c322316e791e42_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -30,6 +36,6 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-<link rel="modulepreload" href="/tv/tv-742a5804f4a91723.js" crossorigin="anonymous" integrity="sha384-VrGUT4zDRko36jL7m6Kx1Yb73r108KFrOVX7FLnIuIFVufe7Vr5/mKqd3+yLA4PT"><link rel="preload" href="/tv/tv-742a5804f4a91723_bg.wasm" crossorigin="anonymous" integrity="sha384-a3dfhYhOkWfYz3YxJXzY9Foc2ZzKzCfSDSr3rYongc31Pcd9qYwZ58TFCBZWCh83" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/tv/tv-c7c322316e791e42.js" crossorigin="anonymous" integrity="sha384-StVH76qo9ahsZOTOYk1LKx0/pdWcN4X42zOVTpHHHYAxTSGulD2YWUUvQXWSbhCe"><link rel="preload" href="/tv/tv-c7c322316e791e42_bg.wasm" crossorigin="anonymous" integrity="sha384-oIC0ybbdwrhclnxucQ84WhC+JiCfp68Ice3cOqfN7Fit/I3H2UXcjbigmTptseRe" as="fetch" type="application/wasm"></head>
 <body></body>
 </html>
