@@ -560,10 +560,8 @@ fn kernel_stats_from_dur_map(dur_map: HashMap<u32, Vec<f64>>) -> Vec<KernelStats
         let count = durs.len() as u32;
         let total_dur: f64 = durs.iter().sum();
         let max_dur = durs.iter().copied().fold(0.0f64, f64::max);
-        durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = durs.len();
-        let median_dur = if n % 2 == 1 { durs[n / 2] } else { (durs[n / 2 - 1] + durs[n / 2]) / 2.0 };
-        let min_dur = durs[0];
+        let min_dur = durs.iter().copied().fold(f64::MAX, f64::min);
+        let median_dur = crate::types::median_inplace(&mut durs);
         KernelStats { name, count, total_dur, median_dur, max_dur, min_dur }
     }).collect();
     stats.sort_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap());

@@ -80,6 +80,27 @@ pub fn bisect_overlap(events: &[Event], prefix_max_dur: &[f64], t: f64) -> usize
     lo
 }
 
+/// Median of `durs` via partial reordering (`select_nth_unstable`) instead
+/// of a full sort — callers only ever need the middle value(s), so this is
+/// an O(n) average instead of O(n log n), which matters at the scale a
+/// selection or a whole-trace kernel-name group can reach (hundreds of
+/// thousands of durations sharing one float comparator). Leaves `durs`
+/// reordered but NOT fully sorted as a side effect; only call this with a
+/// buffer the caller doesn't need sorted afterward.
+pub fn median_inplace(durs: &mut [f64]) -> f64 {
+    let n = durs.len();
+    if n == 0 { return 0.0; }
+    let mid = n / 2;
+    durs.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap());
+    if n % 2 == 1 {
+        durs[mid]
+    } else {
+        let hi = durs[mid];
+        let lo = durs[..mid].iter().copied().fold(f64::MIN, f64::max);
+        (lo + hi) / 2.0
+    }
+}
+
 pub const PALETTE: &[u32] = &[
     0x4E79A7, 0xF28E2B, 0xE15759, 0x76B7B2, 0x59A14F, 0xEDC948, 0xB07AA1, 0xFF9DA7, 0x9C755F,
     0x86BCB6, 0x8CD17D, 0xB6992D, 0xF1CE63, 0xA0CBE8, 0xFFBE7D, 0xD4A6C8,

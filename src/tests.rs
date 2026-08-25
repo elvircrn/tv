@@ -843,6 +843,19 @@ fn test_bucket_durations_empty_input() {
 }
 
 #[test]
+fn test_median_inplace() {
+    use crate::types::median_inplace;
+    assert_eq!(median_inplace(&mut []), 0.0);
+    assert_eq!(median_inplace(&mut [5.0]), 5.0);
+    // Odd length: exact middle element, regardless of input order.
+    assert_eq!(median_inplace(&mut [3.0, 1.0, 2.0]), 2.0);
+    // Even length: average of the two middle elements.
+    assert_eq!(median_inplace(&mut [4.0, 1.0, 3.0, 2.0]), 2.5);
+    // Duplicates and negatives, still unsorted going in.
+    assert_eq!(median_inplace(&mut [-1.0, -1.0, 5.0, 5.0]), 2.0);
+}
+
+#[test]
 fn test_fit_font_size_unshrunk_above_reference_height() {
     // A lane at or above the tuned reference height renders pixel-identical
     // to before this existed: no shrinking.
@@ -1941,6 +1954,55 @@ fn bench_draw_timeline() {
     }
     let per = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
     eprintln!("{:<22} {:>7.3} ms/frame (idle, view unchanged, cache hit)", "zoom=100% idle", per);
+}
+
+// Selecting a large region calls Pane::rebuild_selection_stats, which was
+// spending most of its time in an eager sort of the individual-event rows
+// that draw_stats_table immediately re-sorts anyway (see its own sort_idx
+// cache). Accepts the same TV_BENCH_TRACE (file or directory) as
+// bench_draw_timeline. Run with:
+//   cargo test --release bench_selection_stats -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_selection_stats() {
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache or a directory> to run this bench"); return; }
+    };
+    let trace = if std::path::Path::new(&path).is_dir() {
+        let (rank_groups, standalone) = detect_rank_groups(&[path.clone()]);
+        let mut all_paths: Vec<(usize, String)> = Vec::new();
+        for (group, _) in &rank_groups { all_paths.extend(group.clone()); }
+        for (i, (p, _)) in standalone.iter().enumerate() { all_paths.push((all_paths.len() + i, p.clone())); }
+        let counter = test_counter();
+        use rayon::prelude::*;
+        let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len().max(1)).max(2);
+        let traces: Vec<(usize, Trace)> = all_paths.par_iter().filter_map(|(rank, p)| {
+            load_trace(p, &counter, tpf, None).ok().map(|t| (*rank, t))
+        }).collect();
+        merge_traces(traces)
+    } else {
+        let counter = test_counter();
+        load_trace(&path, &counter, 8, None).expect("load trace")
+    };
+
+    let mut sel: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    for (ti, t) in trace.tracks.iter().enumerate() {
+        if !t.gpu { continue; }
+        for ei in 0..t.events.len() {
+            sel.insert((ti as u32, ei as u32));
+        }
+    }
+    eprintln!("selecting {} events across {} names", sel.len(), trace.names.len());
+
+    let mut pane = Pane::new();
+    pane.finished_sel = Some([0.0, 0.0, 0.0, 0.0]);
+    pane.finished_sel_events = sel;
+    pane.trace = Some(trace);
+    let mut buf = DrawBuf::default();
+    let t0 = std::time::Instant::now();
+    pane.rebuild_selection_stats(&mut buf);
+    eprintln!("total rebuild_selection_stats: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
 }
 
 #[test]

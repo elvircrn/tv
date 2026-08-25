@@ -1012,15 +1012,11 @@ impl Pane {
     fn compute_aggregates(&mut self) {
         self.sel_generation = self.sel_generation.wrapping_add(1);
         let mut all_durs: Vec<f64> = self.selection_stats.iter().flat_map(|s| s.durations.iter().copied()).collect();
-        all_durs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-        let n = all_durs.len();
-        self.sel_median = if n == 0 { 0.0 } else if n % 2 == 1 { all_durs[n / 2] } else { (all_durs[n / 2 - 1] + all_durs[n / 2]) / 2.0 };
+        self.sel_median = median_inplace(&mut all_durs);
 
         self.sel_agg_stats = self.selection_stats.iter().map(|s| {
             let mut sorted = s.durations.clone();
-            sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
-            let n = sorted.len();
-            let median = if n == 0 { 0.0 } else if n % 2 == 1 { sorted[n / 2] } else { (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0 };
+            let median = median_inplace(&mut sorted);
             KernelStats {
                 name: s.name, count: s.count, total_dur: s.total_dur,
                 median_dur: median,
@@ -1029,18 +1025,22 @@ impl Pane {
             }
         }).collect();
 
-        // Keep each row's (track_idx, event_idx) attached through the sort so
-        // the individual-mode table can look its raw args back up afterward.
-        let mut combined: Vec<(KernelStats, (u32, u32))> = Vec::new();
+        // One row per event, in whatever order selection_stats yields them —
+        // NOT pre-sorted by duration. draw_stats_table maintains its own
+        // sort_idx keyed on whichever column the user actually sorted by
+        // (see ui.rs) and never assumes its input arrives sorted, so an
+        // eager sort here was pure wasted work: for a 380k-event selection
+        // it cost as much as the rest of this function combined, just to be
+        // immediately thrown away and re-derived by sort_idx anyway.
+        self.sel_individual.clear();
+        self.sel_individual_refs.clear();
         for se in &self.selection_stats {
             for (i, &d) in se.durations.iter().enumerate() {
                 let r = se.event_refs.get(i).copied().unwrap_or((u32::MAX, u32::MAX));
-                combined.push((KernelStats { name: se.name, count: 1, total_dur: d, median_dur: d, max_dur: d, min_dur: d }, r));
+                self.sel_individual.push(KernelStats { name: se.name, count: 1, total_dur: d, median_dur: d, max_dur: d, min_dur: d });
+                self.sel_individual_refs.push(r);
             }
         }
-        combined.sort_unstable_by(|a, b| b.0.total_dur.partial_cmp(&a.0.total_dur).unwrap());
-        self.sel_individual = combined.iter().map(|(s, _)| s.clone()).collect();
-        self.sel_individual_refs = combined.iter().map(|(_, r)| *r).collect();
     }
 
 }
