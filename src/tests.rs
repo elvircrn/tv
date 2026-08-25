@@ -1908,6 +1908,7 @@ fn bench_draw_timeline() {
                         &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                         &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                         &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
+                        &mut pane.merge_throttle_elapsed,
                     );
                 });
             imgui.render();
@@ -1945,6 +1946,7 @@ fn bench_draw_timeline() {
                     &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
+                    &mut pane.merge_throttle_elapsed,
                 );
             });
         imgui.render();
@@ -1954,6 +1956,89 @@ fn bench_draw_timeline() {
     }
     let per = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
     eprintln!("{:<22} {:>7.3} ms/frame (idle, view unchanged, cache hit)", "zoom=100% idle", per);
+}
+
+#[test]
+fn test_merge_cache_throttles_during_continuous_zoom_and_settles() {
+    // A small synthetic trace (no TV_BENCH_TRACE needed) exercising the same
+    // draw_timeline call as bench_draw_timeline, just to observe the
+    // merge_cache_key/merge_throttle_elapsed bookkeeping directly rather
+    // than timing it.
+    let trace = make_trace(vec!["a"], vec![
+        ("GPU 0", true, vec![ev(0.0, 10.0, 0, 0), ev(1000.0, 10.0, 0, 0)]),
+        ("GPU 1", true, vec![ev(0.0, 10.0, 0, 0), ev(1000.0, 10.0, 0, 0)]),
+    ]);
+
+    let mut imgui = imgui::Context::create();
+    imgui.io_mut().display_size = [800.0, 400.0];
+    imgui.fonts().build_rgba32_texture();
+
+    let mut pane = Pane::new();
+    pane.merge_gpu = true;
+    pane.track_order = default_track_order(&trace.tracks);
+    pane.hidden_names = vec![false; trace.names.len()];
+    pane.collapsed = vec![false; trace.tracks.len()];
+    pane.track_scales = vec![1.0; trace.tracks.len()];
+    pane.view.t0 = 0.0;
+    pane.view.t1 = 100.0;
+    pane.trace = Some(trace);
+
+    let mut buf = DrawBuf::default();
+    let mut drag = DragKind::None;
+
+    // dt well under MERGE_REBUILD_THROTTLE_S (0.05s): a real continuous zoom
+    // fires many frames per throttle window at any normal frame rate.
+    let dt = 0.01f32;
+    let mut rebuild_frames = 0;
+    let mut frame = |pane: &mut Pane, buf: &mut DrawBuf, drag: &mut DragKind| -> bool {
+        let mut rebuilt = false;
+        let ui = imgui.new_frame();
+        ui.window("bench")
+            .position([0.0, 0.0], imgui::Condition::Always)
+            .size([800.0, 400.0], imgui::Condition::Always)
+            .build(|| {
+                let key_before = pane.merge_cache_key.clone();
+                let trace_ref = pane.trace.as_ref().unwrap();
+                draw_timeline(
+                    ui, trace_ref, &mut pane.view, pane.show_cpu, buf,
+                    [0.0, 0.0, 800.0, 400.0], 0, false, false, false,
+                    [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0, false, false,
+                    &pane.search_mask, pane.selection, &pane.finished_sel_events,
+                    &mut pane.collapsed, &pane.hidden_names, pane.selected, pane.multi_select_name,
+                    &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
+                    &mut pane.geom, &mut pane.track_order, drag, pane.merge_gpu, dt,
+                    &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
+                    &mut pane.merge_throttle_elapsed,
+                );
+                let current_key = Some((pane.view.t0.to_bits(), pane.view.t1.to_bits(), pane.hidden_names.clone(), pane.track_order.clone()));
+                // A rebuild happened iff merge_cache_key now matches the
+                // CURRENT view exactly and either it started empty or the
+                // view actually moved since last frame.
+                rebuilt = pane.merge_cache_key == current_key && key_before != current_key;
+            });
+        imgui.render();
+        rebuilt
+    };
+
+    // Simulate a continuous zoom-out: t1 grows a little every frame.
+    for _ in 0..20 {
+        pane.view.t1 += 5.0;
+        if frame(&mut pane, &mut buf, &mut drag) { rebuild_frames += 1; }
+    }
+    assert!(rebuild_frames < 20, "throttle should have skipped at least some of 20 rapid view changes, got {rebuild_frames} rebuilds");
+    assert!(rebuild_frames >= 1, "the very first changed frame must still rebuild immediately");
+
+    // Now the view holds still. Keep calling for long enough to cross the
+    // throttle window, and confirm the cache eventually becomes exactly
+    // accurate again instead of staying stuck on a stale mid-zoom layout.
+    let mut settled = false;
+    for _ in 0..10 {
+        if frame(&mut pane, &mut buf, &mut drag) { settled = true; }
+    }
+    let final_key = pane.merge_cache_key.clone();
+    let current_key = Some((pane.view.t0.to_bits(), pane.view.t1.to_bits(), pane.hidden_names.clone(), pane.track_order.clone()));
+    assert_eq!(final_key, current_key, "cache must catch up to the final view once it stops changing");
+    assert!(settled, "at least one of the settle-period frames should have done the correcting rebuild");
 }
 
 // Selecting a large region calls Pane::rebuild_selection_stats, which was

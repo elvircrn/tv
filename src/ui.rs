@@ -919,6 +919,16 @@ pub(crate) fn even_spacing_heights(has_content: &[bool], avail: f32) -> Vec<f32>
     has_content.iter().map(|&c| if n_content > 0 && !c { empty_h } else { content_h }).collect()
 }
 
+/// Minimum time between merged-view Tetris-packing rebuilds while the view
+/// range is changing continuously (an active pan/zoom) — see the
+/// `merge_cache_valid` computation in `draw_timeline` for the full
+/// reasoning. Chosen as a small fraction of a frame budget at a reasonable
+/// interactive frame rate: frequent enough that the layout still visibly
+/// keeps up with a fast zoom, but bounded so a sustained zoom-out (where the
+/// event count in view keeps growing every frame) can't cost a full rebuild
+/// on literally every one of those frames.
+const MERGE_REBUILD_THROTTLE_S: f32 = 0.05;
+
 #[allow(clippy::too_many_arguments)]
 pub fn draw_timeline(
     ui: &imgui::Ui,
@@ -962,6 +972,7 @@ pub fn draw_timeline(
     focus: &mut Option<u32>,
     merge_cache_key: &mut Option<(u64, u64, Vec<bool>, Vec<usize>)>,
     merged_gpu_groups: &mut Vec<MergedGpuGroup>,
+    merge_throttle_elapsed: &mut f32,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let t_dt_start = Instant::now();
     let dl = ui.get_window_draw_list();
@@ -1046,13 +1057,41 @@ pub fn draw_timeline(
     // (`Pane::merge_cache_key`), not on the shared DrawBuf, since only one
     // pane renders per frame — a shared cache would compare against
     // whichever *other* pane last rendered.
+    //
+    // A CONTINUOUS zoom (especially zooming out, where the number of events
+    // entering the view keeps growing every single frame) invalidates this
+    // key on every frame by construction — there's nothing to cache, the
+    // view genuinely is different each time. Throttle just the view-range
+    // case (not hidden_names/track_order, which are discrete one-shot user
+    // actions, not a per-frame stream): once rebuilt, keep reusing that
+    // layout for `MERGE_REBUILD_THROTTLE_S` even as t0/t1 keeps drifting,
+    // instead of paying a full rebuild on every one of the many frames a
+    // fast zoom fires. `merge_cache_key` is deliberately left pointing at
+    // the last REBUILT key (not this frame's) while throttled, so once the
+    // view stops changing the mismatch is still detected and one final
+    // correcting rebuild brings the layout fully up to date again.
     let merge_cache_valid = if merge_gpu {
         let key = (view.t0.to_bits(), view.t1.to_bits(), hidden_names.to_vec(), track_order.clone());
-        let valid = merge_cache_key.as_ref() == Some(&key);
-        if !valid { *merge_cache_key = Some(key); }
-        valid
+        match merge_cache_key.as_ref() {
+            Some(old) if old == &key => {
+                *merge_throttle_elapsed = 0.0;
+                true
+            }
+            Some(old) if old.2 == key.2 && old.3 == key.3
+                && *merge_throttle_elapsed < MERGE_REBUILD_THROTTLE_S =>
+            {
+                *merge_throttle_elapsed += dt;
+                true
+            }
+            _ => {
+                *merge_cache_key = Some(key);
+                *merge_throttle_elapsed = 0.0;
+                false
+            }
+        }
     } else {
         *merge_cache_key = None;
+        *merge_throttle_elapsed = 0.0;
         false
     };
 
