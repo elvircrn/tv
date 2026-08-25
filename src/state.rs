@@ -127,15 +127,6 @@ pub struct Pane {
     /// rebuilt within the same frame it was read, regardless of which pane's
     /// turn it was.
     pub merged_gpu_groups: Vec<MergedGpuGroup>,
-    /// Seconds since the merged view's Tetris packing was last actually
-    /// rebuilt for a view-range-only change (an active pan/zoom, which can
-    /// invalidate `merge_cache_key` every single frame). A continuous zoom
-    /// still costs a full rebuild each time this crosses `MERGE_REBUILD_THROTTLE_S`
-    /// in `draw_timeline`, but not on every frame in between — see the
-    /// merge_cache_valid computation there for the full reasoning. Reset to
-    /// 0 whenever a rebuild actually happens (throttled or not), so it only
-    /// ever measures "time since we were last accurate".
-    pub merge_throttle_elapsed: f32,
     /// Interned name indices matching "execute_context" — vLLM's per-generation
     /// wrapper span. Computed once per trace load (see `poll_loading`), not
     /// per toolbar frame, since it only depends on `trace.names`.
@@ -244,7 +235,6 @@ impl Pane {
             hidden_names: Vec::new(),
             merge_cache_key: None,
             merged_gpu_groups: Vec::new(),
-            merge_throttle_elapsed: 0.0,
             exec_context_names: Vec::new(),
             pending_tab: Some(BottomTab::Detail),
             pending_focus: None,

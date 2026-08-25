@@ -1917,7 +1917,6 @@ impl App {
                         &mut pane.pending_focus,
                         &mut pane.merge_cache_key,
                         &mut pane.merged_gpu_groups,
-                        &mut pane.merge_throttle_elapsed,
                     );
                     hover_result = h;
                     click_result = c;
