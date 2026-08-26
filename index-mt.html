@@ -10,6 +10,47 @@
   <style>
     html, body { margin: 0; padding: 0; overflow: hidden; background: #161616; }
     canvas { display: block; outline: none; touch-action: none; }
+
+    /* See index.html: shown by web/initializer.mjs while the wasm binary
+       downloads, styled to match so there's no visible seam handing off to
+       the real canvas. */
+    #tv-loading {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      background: #161616;
+      font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #ccc;
+    }
+    .tv-loading-bar-track {
+      width: 220px;
+      height: 6px;
+      background: #2a2a2a;
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .tv-loading-bar-fill {
+      height: 100%;
+      width: 0%;
+      background: rgb(48, 162, 255);
+      border-radius: 3px;
+      transition: width 0.15s ease-out;
+    }
+    .tv-loading-bar-fill.indeterminate {
+      width: 40% !important;
+      animation: tv-loading-indeterminate 1.1s ease-in-out infinite;
+    }
+    .tv-loading-bar-fill.failed {
+      background: #e5484d;
+    }
+    @keyframes tv-loading-indeterminate {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(280%); }
+    }
   </style>
   <!--
     Separate entry point from index.html, built only by
@@ -43,7 +84,8 @@
   -->
   <link data-trunk rel="rust" data-bin="tv" data-type="main"
         data-cargo-features="mt" data-bindgen-target="web"
-        data-wasm-opt-params="--enable-threads --enable-nontrapping-float-to-int --enable-bulk-memory --enable-sign-ext --enable-mutable-globals" />
+        data-wasm-opt-params="--enable-threads --enable-nontrapping-float-to-int --enable-bulk-memory --enable-sign-ext --enable-mutable-globals"
+        data-initializer="web/initializer.mjs" />
 </head>
 <body></body>
 </html>
