@@ -17,6 +17,25 @@ source scripts/wasm-env.sh
 rm -rf target/wasm32-unknown-unknown target/wasm-bindgen target/wasm-opt dist
 trunk build --release --public-url /tv/
 
+# Trunk unconditionally emits a `<link rel="preload" ... as="fetch">` for the
+# wasm binary regardless of whether a data-initializer is configured (see
+# web/initializer.mjs). That preload races the browser's own fetcher ahead
+# of — and gets coalesced with — the initializer's progress-tracked fetch()
+# for the same URL, so by the time our script runs the file is often already
+# served from cache with no visible download left to show progress for
+# (trunk-rs/trunk has no attribute to opt a single link out of this). Strip
+# just that one tag; the JS/initializer modulepreloads are untouched and
+# still load eagerly.
+python3 -c "
+import re
+path = 'dist/index.html'
+html = open(path).read()
+new_html = re.sub(r'<link rel=\"preload\"[^>]*type=\"application/wasm\"[^>]*>', '', html)
+if new_html == html:
+    raise SystemExit('expected to strip a wasm preload link but found none — did trunk change its output format?')
+open(path, 'w').write(new_html)
+"
+
 commit=$(git rev-parse --short HEAD)
 worktree_dir=$(mktemp -d)
 trap 'git worktree remove --force "$worktree_dir" 2>/dev/null || true' EXIT
