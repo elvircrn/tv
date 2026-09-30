@@ -2216,13 +2216,34 @@ pub fn draw_steps_table(
             match s.batch {
                 Some(b) => {
                     ui.table_set_column_index(colmap[5]);
-                    ui.text(format!("{}", b.total_tokens));
+                    // When every DP group ran the same local batch, show the
+                    // split alongside the total ("4 (4x1)" = 4 groups of 1
+                    // token) — the uniform-TP case at a glance; hover shows
+                    // the full per-group breakdown either way.
+                    buf.fmt.clear();
+                    write!(buf.fmt, "{}", b.total_tokens).unwrap();
+                    if s.group_batches.len() > 1 {
+                        let local: Vec<u64> = s.group_batches.iter().map(|(_, g)| g.total_tokens).collect();
+                        if local.iter().all(|&t| t == local[0]) {
+                            write!(buf.fmt, " ({}x{})", local.len(), local[0]).unwrap();
+                        }
+                    }
+                    ui.text(&buf.fmt);
+                    hover_group_breakdown(ui, buf, s, |g| {
+                        format!("{} tok", g.total_tokens)
+                    });
                     ui.table_set_column_index(colmap[6]);
                     // Request count with the phase's token count — the
                     // interesting part for chunked-prefill sizing.
                     ui.text(format!("{} ({})", b.n_ctx, b.ctx_tokens));
+                    hover_group_breakdown(ui, buf, s, |g| {
+                        format!("{} reqs ({} tok)", g.n_ctx, g.ctx_tokens)
+                    });
                     ui.table_set_column_index(colmap[7]);
                     ui.text(format!("{} ({})", b.n_gen, b.gen_tokens));
+                    hover_group_breakdown(ui, buf, s, |g| {
+                        format!("{} reqs ({} tok)", g.n_gen, g.gen_tokens)
+                    });
                 }
                 None => {
                     ui.table_set_column_index(colmap[5]);
@@ -2239,6 +2260,30 @@ pub fn draw_steps_table(
         ui.table_set_column_index(colmap[9]);
         ui.text(format!("{}", s.kernel_count));
     }
+}
+
+/// If the mouse hovers the just-drawn cell and the step carries per-DP-group
+/// batches, show a tooltip with one line per group (the `fmt` of each
+/// group's local batch via `f`). The interned annotation per group is the
+/// ground truth for what that group's scheduler ran — the summed columns
+/// can hide a straggler group behind identical-looking totals.
+fn hover_group_breakdown(
+    ui: &imgui::Ui,
+    buf: &mut DrawBuf,
+    s: &StepInfo,
+    f: impl Fn(&StepBatch) -> String,
+) {
+    if s.group_batches.len() < 2 { return; }
+    if !ui.is_item_hovered() { return; }
+    ui.tooltip(|| {
+        ui.text("Per DP group:");
+        for (dp, g) in &s.group_batches {
+            buf.fmt.clear();
+            write!(buf.fmt, "  dp{dp}: ").unwrap();
+            buf.fmt.push_str(&f(g));
+            ui.text(&buf.fmt);
+        }
+    });
 }
 
 pub fn nice_interval(range: f64) -> f64 {

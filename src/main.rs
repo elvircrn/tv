@@ -1760,7 +1760,11 @@ impl App {
                                 imgui::TabItemFlags::SET_SELECTED
                             } else { imgui::TabItemFlags::empty() };
                             if let Some(_t) = imgui::TabItem::new("Steps").flags(steps_flags).begin(&ui) {
-                                // Summary line first: totals over all steps.
+                                // Summary line first: totals over all steps,
+                                // plus the DP-group count when the trace's
+                                // batches are per-group (each DP group runs
+                                // its own scheduler, so group-local batches
+                                // are summed into the totals).
                                 let n = pane.steps.len();
                                 let total_idle: f64 = pane.steps.iter().map(|s| s.idle_before).sum();
                                 let span = pane.steps.last().map(|s| s.t1).unwrap_or(0.0)
@@ -1771,6 +1775,11 @@ impl App {
                                 write!(state.buf.fmt, " span, ").unwrap();
                                 write_time(&mut state.buf.fmt, total_idle);
                                 write!(state.buf.fmt, " idle ({:.0}%)", total_idle / span.max(1e-9) * 100.0).unwrap();
+                                let n_groups = pane.steps.iter()
+                                    .map(|s| s.group_batches.len()).max().unwrap_or(0);
+                                if n_groups > 1 {
+                                    write!(state.buf.fmt, ", {n_groups} DP groups (batch summed per group; hover cells for breakdown)").unwrap();
+                                }
                                 ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
                                 draw_steps_table(&ui, &pane.steps, pane.step_cursor, &mut state.buf, &mut step_clicked);
                             }

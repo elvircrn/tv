@@ -156,7 +156,15 @@ pub(crate) fn compute_steps(trace: &Trace, exec_context_names: &[usize]) -> Vec<
     let n = ref_spans.len();
     let mut bounds = vec![(f64::MAX, f64::MIN, 0f64); n]; // (min t0, max t1, sum dur)
     let mut rank_sets: Vec<std::collections::HashSet<usize>> = (0..n).map(|_| Default::default()).collect();
-    for &(s0, s1, ti, _) in &spans {
+    // Rank -> DP-group id (from `rank_paths` filenames, when the trace is a
+    // multi-rank merge). Ranks in the same DP group share one scheduler and
+    // annotate identical batch info, so each group's parsed batch counts
+    // once per step; different groups run independent schedulers whose local
+    // batches are summed. See `step_dp_groups`.
+    let rank_dp = step_dp_groups(trace);
+    // One parsed batch per distinct DP group per step, for aggregation.
+    let mut group_batches: Vec<Vec<(u32, Option<StepBatch>)>> = (0..n).map(|_| Vec::new()).collect();
+    for &(s0, s1, ti, name) in &spans {
         let track = &trace.tracks[ti];
         let rank = parse_rank(&track.label);
         // Best-overlap reference interval. Reference spans are disjoint, so
@@ -182,6 +190,17 @@ pub(crate) fn compute_steps(trace: &Trace, exec_context_names: &[usize]) -> Vec<
             best.0 = nearest;
         }
         let i = best.0;
+        // Batch bookkeeping: ranks in the same DP group share one scheduler
+        // and annotate identical batch info, so each group contributes its
+        // parsed batch once per step (first span wins); different groups run
+        // independent schedulers whose local batches are summed at the end.
+        let dp = rank.and_then(|r| rank_dp.get(&r).copied()).flatten();
+        if let Some(dp) = dp {
+            let gb = &mut group_batches[i];
+            if !gb.iter().any(|&(d, _)| d == dp) {
+                gb.push((dp, parse_exec_context_name(&trace.names[name as usize])));
+            }
+        }
         bounds[i].0 = bounds[i].0.min(s0);
         bounds[i].1 = bounds[i].1.max(s1);
         bounds[i].2 += s1 - s0;
@@ -217,18 +236,64 @@ pub(crate) fn compute_steps(trace: &Trace, exec_context_names: &[usize]) -> Vec<
         }
         let idle_before = if steps.is_empty() { 0.0 } else { (t0 - prev_t1).max(0.0) };
         prev_t1 = t1;
-        // Batch composition from the reference span's name — all spans of a
-        // step share one interned name (the annotation is identical across
-        // ranks and streams by construction).
-        let batch = parse_exec_context_name(&trace.names[ref_spans[i].2 as usize]);
+        // Batch composition. With DP info, the total is the sum over the
+        // per-group local batches (kept for display); without it
+        // (single-rank trace, or a merge without parseable filenames) the
+        // reference span's own parsed batch is already the whole batch.
+        let gbs = &group_batches[i];
+        let (batch, group_batches) = if gbs.is_empty() {
+            (parse_exec_context_name(&trace.names[ref_spans[i].2 as usize]), Vec::new())
+        } else {
+            let mut acc: Option<StepBatch> = None;
+            let mut kept: Vec<(u32, StepBatch)> = Vec::new();
+            for &(dp, b) in gbs {
+                if let Some(b) = b {
+                    acc = Some(match acc { Some(a) => a.sum(&b), None => b });
+                    kept.push((dp, b));
+                }
+            }
+            (acc, kept)
+        };
         steps.push(StepInfo {
             t0, t1, gpu_dur, idle_before,
             n_ranks: rank_sets[i].len() as u32,
             kernel_count,
             batch,
+            group_batches,
         });
     }
     steps
+}
+
+/// Maps rank id -> DP-group id for a merged multi-rank trace, from the
+/// per-rank source filenames persisted in `Trace::rank_paths`
+/// (`dp{N}_pp{P}_tp{T}_dcp{D}_ep{E}_rank{R}...`, built by vLLM's
+/// `get_custom_suffix` in distributed/utils.py).
+///
+/// Why grouping by DP matters: with external data parallelism, every DP
+/// group runs its own scheduler and its workers' execute-annotations
+/// (`gpu_worker.py:annotate_profile`) describe only that group's local
+/// batch. Ranks in the same group (all TP/EP/DCP/PP members — they share
+/// the group's scheduler output) annotate identically, so per-group batches
+/// must be deduplicated, and different groups' local batches summed. This
+/// is topology-agnostic: whatever dp/tp/ep/pp/dcp shape the job ran, the
+/// filename's `dp` index is the scheduler boundary, and we never assume a
+/// group size.
+///
+/// Ranks with no parseable `dp` index map to `None` (each such rank gets a
+/// singleton group, matching `sync_multi_rank_clocks`' solo fallback), and
+/// empty `rank_paths` (single-rank trace, or a merge whose sources didn't
+/// carry the suffix) yields an empty map — the caller then just uses the
+/// reference span's batch, which is already the whole batch for a
+/// single-scheduler trace.
+fn step_dp_groups(trace: &Trace) -> std::collections::HashMap<usize, Option<u32>> {
+    let mut map = std::collections::HashMap::new();
+    for (rank, path) in &trace.rank_paths {
+        let fname = std::path::Path::new(path)
+            .file_name().and_then(|s| s.to_str()).unwrap_or(path.as_str());
+        map.insert(*rank, crate::loader::parse_dp_tp(fname).0);
+    }
+    map
 }
 
 /// All spans on any track whose name matches `name_set` and whose category

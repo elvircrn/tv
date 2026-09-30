@@ -2792,7 +2792,7 @@ pub const DEFAULT_SYNC_MARKER: &str = "deep_ep::elastic::combine_impl";
 /// (native directory opens) or the merged trace's own persisted
 /// `rank_paths` (works after loading an already-merged `.tvcache`, native
 /// or web).
-fn parse_dp_tp(fname: &str) -> (Option<u32>, Option<u32>) {
+pub(crate) fn parse_dp_tp(fname: &str) -> (Option<u32>, Option<u32>) {
     fn find(fname: &str, pfx: &str) -> Option<u32> {
         let bytes = fname.as_bytes();
         let pb = pfx.as_bytes();

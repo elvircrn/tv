@@ -2830,6 +2830,20 @@ fn make_stepped_trace(
     }
 }
 
+/// `make_stepped_trace` + the `rank_paths` a `merge_traces` of the given
+/// per-rank source filenames would carry — needed by tests that exercise
+/// DP-group batch aggregation (`compute_steps` reads DP indices from these).
+fn make_stepped_trace_dp(
+    cats: Vec<&str>,
+    names: Vec<&str>,
+    tracks: Vec<(&str, bool, Vec<(f64, f64, usize, usize)>)>,
+    rank_paths: Vec<(usize, String)>,
+) -> Trace {
+    let mut t = make_stepped_trace(cats, names, tracks);
+    t.rank_paths = rank_paths;
+    t
+}
+
 #[test]
 fn test_compute_steps_multi_rank() {
     // 3 steps on the reference rank (Rank 0 stream), skewed +5us on Rank 1,
@@ -2901,6 +2915,61 @@ fn test_compute_steps_empty_for_non_vllm() {
 }
 
 #[test]
+fn test_compute_steps_sums_batches_across_dp_groups() {
+    // tp2 x dp2: 4 ranks, two DP groups of two TP ranks each. Every rank in
+    // a group annotates the same local batch (1 gen token); the two groups
+    // have different local batches for step 0 (1 vs 3 tokens) so the sum is
+    // checkable. The token counts must NOT be summed per-rank (which would
+    // double each group's contribution to 8).
+    let ec0 = 0usize; // name idx: dp0 group's annotation (1 token)
+    let ec1 = 1usize; // name idx: dp1 group's annotation (3 tokens)
+    let c_gua = 0usize; // cat idx: gpu_user_annotation
+    // Group-local annotation: every rank of a DP group carries the same
+    // interned name; the two groups differ (their schedulers ran different
+    // local batches).
+    let step = |t0: f64, name: usize| vec![
+        (t0, 10.0, name, c_gua),
+        (t0 + 1.0, 2.0, 2usize, 1usize), // kernel
+    ];
+    let trace = make_stepped_trace_dp(
+        vec!["gpu_user_annotation", "kernel"],
+        vec![
+            "execute_1_context_0(sq0sk0sqsq0sqsk0)_generation_1(sq1sk12sqsq1sqsk12)",
+            "execute_3_context_0(sq0sk0sqsq0sqsk0)_generation_1(sq3sk30sqsq9sqsk30)",
+            "some_kernel",
+        ],
+        vec![
+            ("Rank 0 stream 1", true, step(0.0, ec0)), // dp0 tp0
+            ("Rank 1 stream 1", true, step(0.5, ec0)), // dp0 tp1 (same scheduler)
+            ("Rank 2 stream 1", true, step(1.0, ec1)), // dp1 tp0
+            ("Rank 3 stream 1", true, step(1.5, ec1)), // dp1 tp1 (same scheduler)
+        ],
+        vec![
+            (0, "dp0_pp0_tp0_dcp0_ep0_rank0.x.json.gz".to_string()),
+            (1, "dp0_pp0_tp1_dcp0_ep1_rank1.x.json.gz".to_string()),
+            (2, "dp1_pp0_tp0_dcp2_ep2_rank2.x.json.gz".to_string()),
+            (3, "dp1_pp0_tp1_dcp0_ep3_rank3.x.json.gz".to_string()),
+        ],
+    );
+    let ec_names = find_exec_context_names(&trace.names);
+    let steps = compute_steps(&trace, &ec_names);
+    assert_eq!(steps.len(), 1);
+    let b = steps[0].batch.expect("batch must parse");
+    // 1 token (dp0) + 3 tokens (dp1) = 4 — not 8 (per-rank double count).
+    assert_eq!(b.total_tokens, 4);
+    assert_eq!(b.n_gen, 2); // 1 + 1 requests
+    assert_eq!(b.gen_tokens, 4);
+    // KV sums are per-group local sums: 12 (dp0) + 30 (dp1).
+    assert_eq!(b.gen_kv, Some(42));
+    // Per-group breakdown is kept alongside the sum.
+    assert_eq!(steps[0].group_batches.len(), 2);
+    assert_eq!(steps[0].group_batches[0], (0, parse_exec_context_name(&trace.names[ec0]).unwrap()));
+    assert_eq!(steps[0].group_batches[1], (1, parse_exec_context_name(&trace.names[ec1]).unwrap()));
+    assert_eq!(steps[0].n_ranks, 4);
+    assert_eq!(steps[0].kernel_count, 4);
+}
+
+#[test]
 fn test_nav_step_and_frame_step() {
     let ec = 0usize;
     let r = vec![(0.0, 10.0, ec, 0usize), (20.0, 10.0, ec, 0usize), (40.0, 10.0, ec, 0usize)];
@@ -2960,8 +3029,13 @@ fn test_steps_on_real_merged_trace() {
     eprintln!("computed {} steps in {ms:.1} ms", steps.len());
     assert!(!steps.is_empty(), "real merged trace must have steps");
     for (i, s) in steps.iter().enumerate() {
-        eprintln!("step {i:>2}: [{:>12.1}, {:>12.1}] wall={:>7.1} gpu={:>7.1} idle={:>7.1} ranks={} kernels={}",
-            s.t0, s.t1, s.t1 - s.t0, s.gpu_dur, s.idle_before, s.n_ranks, s.kernel_count);
+        let batch = match s.batch {
+            Some(b) => format!(" tokens={} ctx={}({}) gen={}({})",
+                b.total_tokens, b.n_ctx, b.ctx_tokens, b.n_gen, b.gen_tokens),
+            None => String::new(),
+        };
+        eprintln!("step {i:>2}: [{:>12.1}, {:>12.1}] wall={:>7.1} gpu={:>7.1} idle={:>7.1} ranks={} kernels={}{}",
+            s.t0, s.t1, s.t1 - s.t0, s.gpu_dur, s.idle_before, s.n_ranks, s.kernel_count, batch);
     }
 }
 

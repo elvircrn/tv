@@ -310,6 +310,31 @@ pub struct StepBatch {
     pub gen_kv: Option<u64>,
 }
 
+impl StepBatch {
+    /// Sum with another batch — used to aggregate the per-DP-group local
+    /// batches of one scheduler step into the job-wide batch. With external
+    /// data parallelism each DP group's workers annotate only their own
+    /// group's slice, so the displayed batch is the sum over groups. KV sums
+    /// stay None if either side lacks them (legacy format).
+    pub fn sum(&self, other: &StepBatch) -> StepBatch {
+        StepBatch {
+            total_tokens: self.total_tokens + other.total_tokens,
+            n_ctx: self.n_ctx + other.n_ctx,
+            ctx_tokens: self.ctx_tokens + other.ctx_tokens,
+            ctx_kv: match (self.ctx_kv, other.ctx_kv) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            },
+            n_gen: self.n_gen + other.n_gen,
+            gen_tokens: self.gen_tokens + other.gen_tokens,
+            gen_kv: match (self.gen_kv, other.gen_kv) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            },
+        }
+    }
+}
+
 /// One vLLM scheduler step, derived from the `execute_context_*`
 /// `gpu_user_annotation` spans (CPU-side `user_annotation` as fallback).
 /// All spans share the same interned name — steps are distinguishable only
@@ -334,11 +359,20 @@ pub struct StepInfo {
     pub n_ranks: u32,
     /// `cat == "kernel"` events inside [t0, t1) across GPU tracks.
     pub kernel_count: u32,
-    /// Batch composition parsed from the span name (token/req counts).
-    /// All spans of a step share one interned name, so this is the whole
-    /// step's composition. None when the name matches neither annotation
-    /// format (shouldn't happen for spans that got this far).
+    /// Batch composition parsed from the span name (token/req counts). With
+    /// external data parallelism, each DP group's spans carry only that
+    /// group's local batch, so this is the sum over DP groups (all groups'
+    /// members share one scheduler output within a group, hence one parsed
+    /// batch per group). None when no assigned span's name matched either
+    /// annotation format.
     pub batch: Option<StepBatch>,
+    /// The per-DP-group local batches that `batch` aggregates:
+    /// `(dp index, local batch)`, one entry per distinct DP group with a
+    /// span assigned to this step. Empty for single-scheduler traces (no
+    /// DP split) — `batch` is then the whole batch already. Displayed as a
+    /// per-group breakdown so a straggler group is visible rather than
+    /// averaged away.
+    pub group_batches: Vec<(u32, StepBatch)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
