@@ -845,26 +845,19 @@ pub(crate) fn collect_merged_track_events(
     }
 }
 
-/// Depth-packs one merged rank-group's events for the current view window:
-/// gathers every event across the group's tracks (`collect_merged_track_events`),
-/// sorts by start time, then greedily assigns each event the lowest depth
-/// slot not already occupied at that instant (Tetris packing). Returns the
-/// resulting max depth (at least 1); packed `(track_idx, event_idx, depth)`
-/// triples are appended to `out` (cleared first, capacity reused frame to
-/// frame). Pure and imgui-free so it can be measured/tested directly against
-/// real trace data — this runs once per rank group, every redraw, in the
-/// merged multi-rank view, so it's the hot path when "Merge Streams" is slow.
+/// Depth-packs one merged rank-group's events over the group's ENTIRE time
+/// span into a `MergedPack` (see its docs for why view-independent):
+/// gathers every event across the group's tracks
+/// (`collect_merged_track_events` over ±inf, so no window edge influences
+/// the packing), k-way-merges the per-track sorted runs, greedily assigns
+/// each event the lowest depth slot not already occupied at that instant
+/// (Tetris packing), and computes stretch bounds. Pure and imgui-free so it
+/// can be measured/tested directly against real trace data.
 pub(crate) fn build_merged_group_events(
     trace: &Trace,
     group_tracks: &[usize],
-    view_t0: f64,
-    view_t1: f64,
     hidden_names: &[bool],
-    out: &mut Vec<(u32, u32, u16)>,
-    stretch_out: &mut Vec<(u16, u16)>,
-) -> u16 {
-    out.clear();
-    stretch_out.clear();
+) -> MergedPack {
     let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
     // Each track contributes one contiguous ts-sorted run to ev_list (tracks
     // are ts-sorted at load, and the collect filters are order-independent),
@@ -881,7 +874,7 @@ pub(crate) fn build_merged_group_events(
     for &ti in group_tracks {
         let gt = &trace.tracks[ti];
         let run_start = ev_list.len();
-        collect_merged_track_events(gt, ti, view_t0, view_t1, hidden_names, &mut ev_list);
+        collect_merged_track_events(gt, ti, f64::NEG_INFINITY, f64::INFINITY, hidden_names, &mut ev_list);
         if ev_list.len() > run_start { run_bounds.push((run_start, ev_list.len())); }
     }
     let ev_list = if run_bounds.len() <= 1 {
@@ -905,13 +898,14 @@ pub(crate) fn build_merged_group_events(
     };
     let mut depth_ends: Vec<f64> = Vec::new();
     let mut max_depth: u16 = 0;
-    for &(ts, dur, ti, ei) in &ev_list {
+    let mut depths: Vec<u16> = Vec::with_capacity(ev_list.len());
+    for &(ts, dur, _, _) in &ev_list {
         let d = depth_ends.iter().position(|&end| end <= ts)
             .unwrap_or_else(|| { depth_ends.push(0.0); depth_ends.len() - 1 });
         depth_ends[d] = ts + dur;
         let d16 = d as u16;
         if d16 >= max_depth { max_depth = d16 + 1; }
-        out.push((ti, ei, d16));
+        depths.push(d16);
     }
     max_depth = max_depth.max(1);
 
@@ -919,10 +913,7 @@ pub(crate) fn build_merged_group_events(
     // earlier in time can stretch into a slot that only frees up later in
     // the window), so this is a second pass over the now-finished depth
     // assignment above, not something foldable into that single forward
-    // pass. Doing it once here, cached alongside `out` under the same
-    // merge_cache_key lifecycle, instead of once per redrawn frame in
-    // draw_timeline's render loop, is the actual point of computing it in
-    // this cache-rebuild-only function at all.
+    // pass.
     //
     // The naive per-event form (`stretch_bounds`, still the reference
     // implementation the parity test checks against) binary-searches each
@@ -942,7 +933,7 @@ pub(crate) fn build_merged_group_events(
     let d_total = max_depth as usize;
     let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); d_total];
     for (i, &(ts, dur, _, _)) in ev_list.iter().enumerate() {
-        per_depth[out[i].2 as usize].push((ts, ts + dur));
+        per_depth[depths[i] as usize].push((ts, ts + dur));
     }
     let mut free_at: Vec<Vec<bool>> = vec![Vec::new(); d_total];
     for d_prime in 0..d_total {
@@ -955,16 +946,35 @@ pub(crate) fn build_merged_group_events(
             mask.push(cur == slots.len() || slots[cur].0 >= end);
         }
     }
+    let mut stretch: Vec<(u16, u16)> = Vec::with_capacity(ev_list.len());
     for (i, _) in ev_list.iter().enumerate() {
-        let d = out[i].2 as usize;
+        let d = depths[i] as usize;
         let mut lo = d;
         while lo > 0 && free_at[lo - 1][i] { lo -= 1; }
         let mut hi = d;
         while hi + 1 < d_total && free_at[hi + 1][i] { hi += 1; }
-        stretch_out.push((lo as u16, hi as u16));
+        stretch.push((lo as u16, hi as u16));
     }
 
-    max_depth
+    // Parallel-array layout: the render loop and selection read ts/ends/
+    // refs/depth in tight per-column slices, which the old tuple-of-4
+    // layout (24 bytes/event, interleaved fields) walked wastefully.
+    let mut prefix_max_dur = Vec::with_capacity(ev_list.len());
+    let mut running_max = 0.0f64;
+    for &(_, dur, _, _) in ev_list.iter() {
+        if dur > running_max { running_max = dur; }
+        prefix_max_dur.push(running_max);
+    }
+    MergedPack {
+        ts: ev_list.iter().map(|e| e.0).collect(),
+        ends: ev_list.iter().map(|e| e.0 + e.1).collect(),
+        prefix_max_dur,
+        refs: ev_list.iter().map(|e| (e.2, e.3)).collect(),
+        name: ev_list.iter().map(|e| trace.tracks[e.2 as usize].events[e.3 as usize].name).collect(),
+        depth: depths,
+        stretch,
+        max_depth,
+    }
 }
 
 /// Row heights for "even spacing" mode: `has_content[vi]` says whether row
@@ -1033,7 +1043,7 @@ pub fn draw_timeline(
     merge_gpu: bool,
     dt: f32,
     focus: &mut Option<u32>,
-    merge_cache_key: &mut Option<(u64, u64, Vec<bool>, Vec<usize>)>,
+    merge_cache_key: &mut Option<(Vec<bool>, Vec<usize>)>,
     merged_gpu_groups: &mut Vec<MergedGpuGroup>,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let t_dt_start = Instant::now();
@@ -1084,9 +1094,9 @@ pub fn draw_timeline(
                     let g = &mut merged_gpu_groups[gi];
                     g.tracks.clear();
                     g.tracks.push(i);
-                    // events/max_depth are NOT reset here — `build_merged_group_events`
-                    // clears/overwrites them itself when it actually runs, and
-                    // leaving them alone otherwise is what lets the merge-cache
+                    // pack is NOT reset here — `build_merged_group_events`
+                    // replaces it wholesale when it actually runs, and
+                    // leaving it alone otherwise is what lets the merge-cache
                     // check below skip recomputation and reuse last frame's values.
                     g.vi = 0;
                     g.label.clear();
@@ -1100,7 +1110,7 @@ pub fn draw_timeline(
                         None => "GPU".to_string(),
                     };
                     merged_gpu_groups.push(MergedGpuGroup {
-                        tracks: vec![i], events: std::sync::Arc::new(Vec::new()), stretch: std::sync::Arc::new(Vec::new()), max_depth: 0, vi: 0, label,
+                        tracks: vec![i], pack: std::sync::Arc::new(MergedPack::default()), vi: 0, label,
                     });
                 }
                 rank_group_idxs.push((rank, gi));
@@ -1111,16 +1121,15 @@ pub fn draw_timeline(
 
     // Skip re-deriving the merged view's per-rank-group Tetris packing
     // (`build_merged_group_events`, below) when nothing that could change it
-    // moved since last frame — view range, hidden names, or track order.
-    // Every redraw (i.e. every mouse-move, not just an actual pan/zoom)
-    // otherwise re-sorted and re-packed every visible event in every rank
-    // group from scratch: measured at ~11ms for a 28-rank, 468K-event trace
-    // fully zoomed out (`bench_merge_filter` in tests.rs). Owned per-pane
-    // (`Pane::merge_cache_key`), not on the shared DrawBuf, since only one
-    // pane renders per frame — a shared cache would compare against
-    // whichever *other* pane last rendered.
+    // moved since last frame — hidden names or track order. The view range
+    // is deliberately NOT in the key: the pack covers the group's whole
+    // time span and is windowed per frame (see `MergedPack`), so panning
+    // and zooming reuse it as-is. Owned per-pane (`Pane::merge_cache_key`),
+    // not on the shared DrawBuf, since only one pane renders per frame — a
+    // shared cache would compare against whichever *other* pane last
+    // rendered.
     let merge_cache_valid = if merge_gpu {
-        let key = (view.t0.to_bits(), view.t1.to_bits(), hidden_names.to_vec(), track_order.clone());
+        let key = (hidden_names.to_vec(), track_order.clone());
         let valid = merge_cache_key.as_ref() == Some(&key);
         if !valid { *merge_cache_key = Some(key); }
         valid
@@ -1131,26 +1140,21 @@ pub fn draw_timeline(
 
     // The actual rebuild, hoisted out of the layout loop below so the rank
     // groups can be packed in parallel: each group's Tetris packing is fully
-    // independent (disjoint track sets, own events/stretch buffers), and on
-    // a 32-rank trace fully zoomed out the sequential rebuild cost was the
-    // whole frame (~230ms of a ~235ms frame, `bench_draw_timeline` +
-    // `bench_merge_phases` in tests.rs). Layout then only READS each group's
-    // max_depth/events. Rayon runs on its regular thread pool natively and
-    // degrades to sequential on wasm32 (same as loader's
-    // `parse_chunks_parallel`), so this needs no target gating. `tracks` is
-    // taken and restored rather than borrowed because `par_iter_mut` needs
-    // exclusive access to the whole group struct anyway.
+    // independent (disjoint track sets, own pack), and on a 32-rank trace
+    // the sequential rebuild cost was the whole frame (~230ms of a ~235ms
+    // frame, `bench_draw_timeline` + `bench_merge_phases` in tests.rs).
+    // Layout then only READS each group's pack.max_depth / visible slice.
+    // Rayon runs on its regular thread pool natively and degrades to
+    // sequential on wasm32 (same as loader's `parse_chunks_parallel`), so
+    // this needs no target gating. `tracks` is taken and restored rather
+    // than borrowed because `par_iter_mut` needs exclusive access to the
+    // whole group struct anyway.
     if merge_gpu && !merge_cache_valid {
         use rayon::prelude::*;
         merged_gpu_groups[..group_slot].par_iter_mut().for_each(|g| {
             let group_tracks = std::mem::take(&mut g.tracks);
-            let mut events: Vec<(u32, u32, u16)> = std::mem::take(std::sync::Arc::get_mut(&mut g.events).unwrap_or(&mut Vec::new()));
-            let mut stretch: Vec<(u16, u16)> = std::mem::take(std::sync::Arc::get_mut(&mut g.stretch).unwrap_or(&mut Vec::new()));
-            let md = build_merged_group_events(trace, &group_tracks, view.t0, view.t1, hidden_names, &mut events, &mut stretch);
+            g.pack = std::sync::Arc::new(build_merged_group_events(trace, &group_tracks, hidden_names));
             g.tracks = group_tracks;
-            g.events = std::sync::Arc::new(events);
-            g.stretch = std::sync::Arc::new(stretch);
-            g.max_depth = md;
         });
     }
 
@@ -1174,8 +1178,15 @@ pub fn draw_timeline(
                 let gi = rank_group_idxs[ri].1;
                 let g = &mut merged_gpu_groups[gi];
                 let first = g.tracks[0];
-                let md = g.max_depth;
-                let is_empty = g.events.is_empty();
+                let md = g.pack.max_depth;
+                // Whole-span pack: "has content in view" is a windowed slice
+                // query, not an is_empty on the pack.
+                let has_ev_in_view = {
+                    let p = &g.pack;
+                    let start = p.overlap_start(view.t0);
+                    let end = p.ts_end(view.t1);
+                    p.ends[start..end].iter().any(|&e| e >= view.t0)
+                };
                 let scale = track_scales.get(first).copied().unwrap_or(1.0);
                 let h = md as f32 * SUB_LANE_H * scale;
                 let vi = buf.visible.len();
@@ -1183,7 +1194,7 @@ pub fn draw_timeline(
                 buf.visible.push(first);
                 buf.heights.push(h);
                 buf.y_offsets.push(cumulative);
-                has_content.push(!is_empty);
+                has_content.push(has_ev_in_view);
                 cumulative += h;
             }
             continue;
@@ -1245,7 +1256,7 @@ pub fn draw_timeline(
     for g in merged_gpu_groups.iter() {
         geom.merged.push(MergedGeom {
             vi: g.vi,
-            events: std::sync::Arc::clone(&g.events),
+            pack: std::sync::Arc::clone(&g.pack),
         });
     }
 
@@ -1478,7 +1489,7 @@ pub fn draw_timeline(
             let merged_group = merged_gpu_groups.iter().find(|g| g.vi == vi);
 
             if let Some(group) = merged_group {
-                let total_depth = group.max_depth;
+                let total_depth = group.pack.max_depth;
                 let sub_h = track_h / total_depth as f32;
                 buf.last_px.clear();
                 buf.last_px.resize(total_depth as usize, -1i32);
@@ -1497,15 +1508,22 @@ pub fn draw_timeline(
                 // two are the same length (defensive fallback below covers
                 // the same "stale cache despite the key check" case
                 // `group.events` itself is guarded against).
-                for (gi, &(ti32, ei32, eff_depth)) in group.events.iter().enumerate() {
+                let p = &group.pack;
+                let start = p.overlap_start(view.t0);
+                let end = p.ts_end(view.t1);
+                for gi in start..end {
+                    let ti32 = p.refs[gi].0;
+                    let ei = p.refs[gi].1 as usize;
+                    let eff_depth = p.depth[gi];
+                    let ev_ts = p.ts[gi];
+                    let ev_end = p.ends[gi];
+                    if ev_end < view.t0 { continue; }
                     let orig_ti = ti32 as usize;
-                    let ei = ei32 as usize;
                     let Some(ev) = trace.tracks.get(orig_ti).and_then(|t| t.events.get(ei)) else { continue };
-                    let ev_end = ev.ts + ev.dur;
-                    let x0 = t2x(ev.ts, view.t0, px_per_us, tl_left).max(tl_left);
+                    let x0 = t2x(ev_ts, view.t0, px_per_us, tl_left).max(tl_left);
                     let x1 = t2x(ev_end, view.t0, px_per_us, tl_left).min(rect[2]);
                     let w = x1 - x0;
-                    let (lo, hi) = group.stretch.get(gi).copied().unwrap_or((eff_depth, eff_depth));
+                    let (lo, hi) = p.stretch[gi];
                     let stretched_h = (hi - lo + 1) as f32 * sub_h - LANE_GAP;
 
                     let matches = !filtering
@@ -1513,17 +1531,36 @@ pub fn draw_timeline(
                         || (has_sel_mask && sel_mask.get(ev.name as usize).copied().unwrap_or(false));
 
                     if w < MIN_EV_PX {
-                        let px = x0 as i32;
+                        // Pixel quantization: at wide zoom millions of events
+                        // are narrower than a pixel, so the exact position of
+                        // a sub-pixel event is a sub-pixel detail. Snap each
+                        // to the pixel column its CENTER falls in — a dot's
+                        // column then only changes when the center actually
+                        // crosses a pixel boundary, instead of flickering
+                        // whenever the fractional part of the left edge
+                        // re-rounds (the old left-edge snap). x0 is monotonic
+                        // in ts over the slice and a sub-pixel event's center
+                        // is within half a pixel of its x0, so once a center
+                        // is more than half a pixel past the right edge every
+                        // later event in the slice is fully off-screen too —
+                        // break, don't scan the rest.
+                        let px = (x0 + w * 0.5) as i32;
+                        if px as f32 > rect[2] + 0.5 { break; }
+                        if px < tl_left as i32 { continue; }
                         let Some(slot) = buf.last_px.get_mut(eff_depth as usize) else { continue };
                         if px == *slot { continue; }
                         *slot = px;
                         let ev_y = y + lo as f32 * sub_h + EV_INSET;
                         let color = if matches {
-                            name_colors[ev.name as usize]
+                            name_colors[p.name[gi] as usize]
                         } else {
-                            name_dim_colors[ev.name as usize]
+                            name_dim_colors[p.name[gi] as usize]
                         };
-                        dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + stretched_h], color).filled(true).build();
+                        // Draw AT the snapped column (not the raw x0), so the
+                        // dot's on-screen position and its dedupe key agree and
+                        // both stay put under small pans.
+                        let px_f = px as f32;
+                        dl.add_rect([px_f, ev_y], [px_f + 1.0, ev_y + stretched_h], color).filled(true).build();
                         continue;
                     }
 
@@ -1540,10 +1577,10 @@ pub fn draw_timeline(
                         && mouse_pos[0] >= ev_rect[0] && mouse_pos[0] <= ev_rect[2]
                         && mouse_pos[1] >= ev_rect[1] && mouse_pos[1] <= ev_rect[3];
 
-                    let is_primary = selected.map_or(false, |s| s.track_idx == ti32 && s.event_idx == ei32);
+                    let is_primary = selected.map_or(false, |s| s.track_idx == ti32 && s.event_idx as usize == ei);
                     let is_multi = multi_select_name.map_or(false, |n| ev.name == n);
                     let ev_track_y = buf.y_offsets[vi] + lo as f32 * sub_h;
-                    let is_selected = is_selected(ti32, ei32, ev_track_y, stretched_h, ev.ts, ev.dur);
+                    let is_selected = is_selected(ti32, ei as u32, ev_track_y, stretched_h, ev.ts, ev.dur);
                     let is_sel_mask = !sel_mask.is_empty() && sel_mask.get(ev.name as usize).copied().unwrap_or(false);
 
                     let fill = if is_hovered { brighten(color, 30) } else if is_selected || is_sel_mask { brighten(color, 20) } else { color };
@@ -1568,7 +1605,7 @@ pub fn draw_timeline(
                     }
 
                     if is_hovered {
-                        let r = EventRef { track_idx: ti32, event_idx: ei32 };
+                        let r = EventRef { track_idx: ti32, event_idx: ei as u32 };
                         let prefer = hover_result.map_or(true, |prev| {
                             let prev_ev = &trace.tracks[prev.track_idx as usize].events[prev.event_idx as usize];
                             ev.depth > prev_ev.depth || (ev.depth == prev_ev.depth && ev.dur < prev_ev.dur)
@@ -1733,10 +1770,13 @@ pub fn draw_timeline(
                         }
                         for g in merged_gpu_groups.iter() {
                             if g.tracks.contains(&ti) {
-                                let md = g.events.iter()
-                                    .find(|&&(t, e, _)| t == ti as u32 && e == ei as u32)
-                                    .map(|&(_, _, d)| d)
-                                    .unwrap_or(0);
+                                // Pack is ts-sorted; binary-search the
+                                // referenced event's packed depth.
+                                let p = &g.pack;
+                                let idx = p.refs.partition_point(|r| r.0 < ti as u32 || (r.0 == ti as u32 && r.1 < ei as u32));
+                                let md = if idx < p.depth.len() && p.refs[idx] == (ti as u32, ei as u32) {
+                                    p.depth[idx]
+                                } else { 0 };
                                 return Some((g.vi, md));
                             }
                         }
@@ -1747,7 +1787,7 @@ pub fn draw_timeline(
                         let sel_gpu = sel_track.gpu;
                         let total_depth: u16 = merged_gpu_groups.iter()
                             .find(|g| g.vi == sel_vi)
-                            .map_or(sel_track.max_depth.max(1), |g| g.max_depth);
+                            .map_or(sel_track.max_depth.max(1), |g| g.pack.max_depth);
                         let src_sub_h = buf.heights[sel_vi] / total_depth as f32;
                         let src_lane_h = src_sub_h - LANE_GAP;
                         let src_y = tracks_top + buf.y_offsets[sel_vi] - view.scroll_y
@@ -1775,7 +1815,7 @@ pub fn draw_timeline(
                             let (dst_x, dst_y) = if let Some((dst_vi, dst_eff_depth)) = find_vi_and_depth(dst_ti, dst_ei, dst_ev.depth) {
                                 let dst_total: u16 = merged_gpu_groups.iter()
                                     .find(|g| g.vi == dst_vi)
-                                    .map_or(trace.tracks[dst_ti].max_depth.max(1), |g| g.max_depth);
+                                    .map_or(trace.tracks[dst_ti].max_depth.max(1), |g| g.pack.max_depth);
                                 let dst_sub_h = buf.heights[dst_vi] / dst_total as f32;
                                 let dst_lane_h = dst_sub_h - LANE_GAP;
                                 let dy = tracks_top + buf.y_offsets[dst_vi] - view.scroll_y

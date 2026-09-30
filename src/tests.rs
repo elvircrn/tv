@@ -15,8 +15,7 @@ fn ev(ts: f64, dur: f64, name: u32, depth: u16) -> Event {
     Event { ts, dur, name, cat: 0, args_off: 0, args_len: 0, depth }
 }
 
-fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace {
-    let name_strs: Vec<String> = names.into_iter().map(String::from).collect();
+fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace {    let name_strs: Vec<String> = names.into_iter().map(String::from).collect();
     let mut trs = Vec::new();
     let mut max_ts: f64 = 0.0;
     let mut total_events = 0;
@@ -43,6 +42,40 @@ fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace 
         dist_rank: -1, dist_world: 0,
         flow_pairs: Vec::new(),
         rank_paths: Vec::new(),
+    }
+}
+
+/// Hand-builds a `MergedPack` from (ts, dur, track_idx, event_idx, depth,
+/// lo, hi) tuples for tests that need to pin the pane's merged geometry
+/// directly (selection tests etc.) without running the real packing.
+/// prefix_max_dur/name/ends are derived to match the pack invariants.
+fn make_merged_pack(entries: &[(f64, f64, u32, u32, u16, u16, u16)]) -> MergedPack {
+    let mut ts = Vec::with_capacity(entries.len());
+    let mut prefix_max_dur = Vec::with_capacity(entries.len());
+    let mut running_max = 0.0f64;
+    for &(t, d, _, _, _, _, _) in entries {
+        ts.push(t);
+        if d > running_max { running_max = d; }
+        prefix_max_dur.push(running_max);
+    }
+    MergedPack {
+        ts,
+        ends: entries.iter().map(|&(t, d, _, _, _, _, _)| t + d).collect(),
+        prefix_max_dur,
+        refs: entries.iter().map(|&(_, _, ti, ei, _, _, _)| (ti, ei)).collect(),
+        name: entries.iter().map(|&(_, _, ti, ei, _, _, _)| {
+            // Caller's tuples reference real trace events; name comes from
+            // the trace at pack time — fill it in after, via override below,
+            // since the helper doesn't see the trace. Use 0; tests that need
+            // real names set them through capture/extract paths that read
+            // `refs`, not `name` (name is only read on the sub-pixel render
+            // path).
+            let _ = (ti, ei);
+            0
+        }).collect(),
+        depth: entries.iter().map(|&(_, _, _, _, d, _, _)| d).collect(),
+        stretch: entries.iter().map(|&(_, _, _, _, _, lo, hi)| (lo, hi)).collect(),
+        max_depth: entries.iter().map(|&(_, _, _, _, d, _, _)| d + 1).max().unwrap_or(1),
     }
 }
 
@@ -303,7 +336,7 @@ fn test_reload_resets_merge_cache_key() {
     let trace1 = make_trace(vec!["", "k"], vec![("GPU 0", true, vec![ev(0.0, 1.0, 1, 0)])]);
     let mut pane = Pane::new();
     pane.trace = Some(trace1);
-    pane.merge_cache_key = Some((0, 0, vec![false], vec![0]));
+    pane.merge_cache_key = Some((vec![false], vec![0]));
 
     let trace2 = make_trace(vec!["", "k"], vec![("GPU 0", true, vec![ev(0.0, 1.0, 1, 0)])]);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -312,6 +345,52 @@ fn test_reload_resets_merge_cache_key() {
     pane.poll_loading();
 
     assert!(pane.merge_cache_key.is_none(), "reload must invalidate the merge cache");
+}
+
+// Regression test for the left-edge popping bug: while panning right (holding
+// D), events straddling the left edge visibly re-laned and re-stretched frame
+// after frame. Cause: the Tetris packing was window-relative — an off-screen
+// event overlapping a left-edge-straddling event influenced its depth, and
+// dropped out of the collect window as the pan progressed, re-packing
+// everything near the edge. Fix: the pack is whole-span/view-independent and
+// only (hidden_names, track_order) key it. This test pins the structural
+// property: a left-edge event's packed depth and stretch must be IDENTICAL
+// whether the window is the whole trace or a tight pan that cuts off its
+// off-screen influencers.
+#[test]
+fn test_merged_pack_is_view_independent_at_left_edge() {
+    // Track 0: event B [0,50) — the off-screen influencer once panned past.
+    // Track 1: event A [10,20) — overlaps B, so packs at depth 1 while B is
+    // in the window; A's stretch can't claim depth 0 while B spans it.
+    // Event C [30,40) overlaps only B (depth 1).
+    let trace = make_trace(vec!["a"], vec![
+        ("GPU 0", true, vec![ev(0.0, 50.0, 0, 0)]),
+        ("GPU 1", true, vec![ev(10.0, 10.0, 0, 0), ev(30.0, 10.0, 0, 0)]),
+    ]);
+    let hidden = vec![false; trace.names.len()];
+
+    let pack = crate::ui::build_merged_group_events(&trace, &[0, 1], &hidden);
+
+    // Find A (track 1, idx 0) and C (track 1, idx 1) in the packed refs.
+    let a = pack.refs.iter().position(|&(ti, ei)| ti == 1 && ei == 0).unwrap();
+    let c = pack.refs.iter().position(|&(ti, ei)| ti == 1 && ei == 1).unwrap();
+
+    // Whole-trace expectations: B takes depth 0, both track-1 events sit at
+    // depth 1 with no stretch (depth 0 is occupied across their spans).
+    assert_eq!(pack.depth[a], 1, "A packs above B while both are packed");
+    assert_eq!(pack.depth[c], 1);
+    assert_eq!(pack.stretch[a], (1, 1), "A cannot stretch into B's occupied depth 0");
+    assert_eq!(pack.stretch[c], (1, 1));
+
+    // The pack has no window — the SAME arrays serve every view. Simulate
+    // the render loop's windowed read for a pan that has scrolled B's start
+    // out of view (B still overlaps [10,45) so it's still in the slice via
+    // overlap_start): A's depth/stretch read from the pack are unchanged.
+    let start = pack.overlap_start(10.0);
+    let end = pack.ts_end(45.0);
+    let a_slice = pack.refs[start..end].iter().position(|&(ti, ei)| ti == 1 && ei == 0).unwrap() + start;
+    assert_eq!(pack.depth[a_slice], pack.depth[a], "A's depth must not depend on the window");
+    assert_eq!(pack.stretch[a_slice], pack.stretch[a], "A's stretch must not depend on the window");
 }
 
 // --- Selection stats ---
@@ -1394,7 +1473,10 @@ fn test_merged_selection_excludes_unrendered_wrapper() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     // Packed row: kA at depth 0, kB at depth 1; wrapper (idx 0) intentionally omitted.
-    p.geom.merged = vec![MergedGeom { vi: 0, events: vec![(0, 1, 0), (0, 2, 1)].into() }];
+    p.geom.merged = vec![MergedGeom { vi: 0, pack: make_merged_pack(&[
+        (0.0, 10.0, 0, 1, 0, 0, 0),
+        (20.0, 10.0, 0, 2, 1, 1, 1),
+    ]).into() }];
     p.geom.heights[0] = 40.0; // max_depth 2 * SUB_LANE_H(20)
     p.geom.y_offsets[0] = 0.0;
 
@@ -1426,7 +1508,10 @@ fn test_merged_selection_respects_depth_yrange() {
     );
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
-    p.geom.merged = vec![MergedGeom { vi: 0, events: vec![(0, 1, 0), (0, 2, 1)].into() }];
+    p.geom.merged = vec![MergedGeom { vi: 0, pack: make_merged_pack(&[
+        (0.0, 10.0, 0, 1, 0, 0, 0),
+        (20.0, 10.0, 0, 2, 1, 1, 1),
+    ]).into() }];
     p.geom.heights[0] = 40.0;
     p.geom.y_offsets[0] = 0.0;
 
@@ -1887,46 +1972,71 @@ fn bench_draw_timeline() {
     let mut buf = DrawBuf::default();
     let mut drag = DragKind::None;
 
-    let mut run = |t0: f64, t1: f64, label: &str, iters: u32| {
-        pane.view.t0 = t0;
-        pane.view.t1 = t1;
-        pane.merge_cache_key = None; // force a cache miss every call, like an active zoom does
-        let start = std::time::Instant::now();
-        for _ in 0..iters {
-            let ui = imgui.new_frame();
-            ui.window("bench")
-                .position([0.0, 0.0], imgui::Condition::Always)
-                .size([1600.0, 900.0], imgui::Condition::Always)
-                .build(|| {
-                    let trace_ref = pane.trace.as_ref().unwrap();
-                    draw_timeline(
-                        ui, trace_ref, &mut pane.view, pane.show_cpu, &mut buf,
-                        [0.0, 0.0, 1600.0, 900.0], 0, false, false, false,
-                        [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0, false, false,
-                        &pane.search_mask, pane.selection, &pane.finished_sel_events,
-                        &mut pane.collapsed, &pane.hidden_names, pane.selected, pane.multi_select_name,
-                        &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
-                        &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
-                        &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
-                    );
-                });
-            imgui.render();
-            pane.merge_cache_key = None; // simulate "view changes every frame" (active zoom/pan)
-        }
-        let per = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-        eprintln!("{label:<22} {per:>7.3} ms/frame (cache miss every frame)");
-    };
-
-    run(0.0, max_ts, "zoom=100% (full trace)", 10);
-    run(0.0, max_ts * 0.25, "zoom=25%", 10);
-    run(0.0, max_ts * 0.05, "zoom=5%", 10);
-
-    // And the idle-hover case: same view every frame, cache should hit
-    // after the first call. Reset to full-trace zoom — `run()` above left
-    // `pane.view` at the last (5%) call's range otherwise.
+    // One forced whole-span pack build (what a hidden-names/track-order
+    // change, or the first merged frame after opening, costs), then the
+    // per-frame cost with the view CHANGING every frame — a continuous
+    // pan/zoom. The pack is view-independent now (see MergedPack), so pan
+    // frames are pure windowed rendering; the "cache miss every frame"
+    // reset the old bench did would force a full repack per frame, which
+    // real interaction never triggers.
     pane.view.t0 = 0.0;
     pane.view.t1 = max_ts;
     pane.merge_cache_key = None;
+    let t_pack = std::time::Instant::now();
+    {
+        let ui = imgui.new_frame();
+        ui.window("bench")
+            .position([0.0, 0.0], imgui::Condition::Always)
+            .size([1600.0, 900.0], imgui::Condition::Always)
+            .build(|| {
+                let trace_ref = pane.trace.as_ref().unwrap();
+                draw_timeline(
+                    ui, trace_ref, &mut pane.view, pane.show_cpu, &mut buf,
+                    [0.0, 0.0, 1600.0, 900.0], 0, false, false, false,
+                    [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0, false, false,
+                    &pane.search_mask, pane.selection, &pane.finished_sel_events,
+                    &mut pane.collapsed, &pane.hidden_names, pane.selected, pane.multi_select_name,
+                    &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
+                    &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
+                    &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
+                );
+            });
+        imgui.render();
+    }
+    eprintln!("one-time whole-span pack build: {:.1} ms", t_pack.elapsed().as_secs_f64() * 1000.0);
+
+    // Continuous pan at full zoom-out: view.t0/t1 slide every frame, pack
+    // cache stays valid.
+    let start = std::time::Instant::now();
+    let iters = 30;
+    for i in 0..iters {
+        pane.view.t0 = (i as f64) * 100.0;
+        pane.view.t1 = pane.view.t0 + max_ts;
+        let ui = imgui.new_frame();
+        ui.window("bench")
+            .position([0.0, 0.0], imgui::Condition::Always)
+            .size([1600.0, 900.0], imgui::Condition::Always)
+            .build(|| {
+                let trace_ref = pane.trace.as_ref().unwrap();
+                draw_timeline(
+                    ui, trace_ref, &mut pane.view, pane.show_cpu, &mut buf,
+                    [0.0, 0.0, 1600.0, 900.0], 0, false, false, false,
+                    [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0, false, false,
+                    &pane.search_mask, pane.selection, &pane.finished_sel_events,
+                    &mut pane.collapsed, &pane.hidden_names, pane.selected, pane.multi_select_name,
+                    &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
+                    &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
+                    &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
+                );
+            });
+        imgui.render();
+    }
+    let per = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+    eprintln!("{:<22} {:>7.3} ms/frame (pan at full zoom, view moves every frame)", "zoom=100% pan", per);
+
+    // And the idle-hover case: same view every frame, cache hits throughout.
+    pane.view.t0 = 0.0;
+    pane.view.t1 = max_ts;
     let start = std::time::Instant::now();
     let iters = 30;
     for i in 0..iters {
@@ -1948,9 +2058,7 @@ fn bench_draw_timeline() {
                 );
             });
         imgui.render();
-        if i == 0 {
-            eprintln!("(first call after cache reset primes the cache)");
-        }
+        let _ = i;
     }
     let per = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
     eprintln!("{:<22} {:>7.3} ms/frame (idle, view unchanged, cache hit)", "zoom=100% idle", per);
@@ -2440,29 +2548,27 @@ fn test_build_merged_group_events_stretch_matches_naive_recompute() {
         ("GPU 1", true, vec![ev(0.0, 10.0, 0, 0)]),
     ]);
     let hidden = vec![false; trace.names.len()];
-    let mut events = Vec::new();
-    let mut stretch = Vec::new();
-    let max_depth = crate::ui::build_merged_group_events(&trace, &[0, 1], 0.0, 200.0, &hidden, &mut events, &mut stretch);
-    assert_eq!(max_depth, 2);
-    assert_eq!(events.len(), 3);
-    assert_eq!(stretch.len(), 3);
+    let pack = crate::ui::build_merged_group_events(&trace, &[0, 1], &hidden);
+    assert_eq!(pack.max_depth, 2);
+    assert_eq!(pack.depth.len(), 3);
+    assert_eq!(pack.stretch.len(), 3);
 
     // The render loop now trusts this cached `stretch` instead of rebuilding
     // per_depth and calling stretch_bounds fresh every frame -- confirm it's
     // identical to what that naive per-frame recompute would have produced.
-    let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); max_depth as usize];
-    for &(ti, ei, depth) in &events {
+    let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); pack.max_depth as usize];
+    for (i, &(ti, ei)) in pack.refs.iter().enumerate() {
         let e = &trace.tracks[ti as usize].events[ei as usize];
-        per_depth[depth as usize].push((e.ts, e.ts + e.dur));
+        per_depth[pack.depth[i] as usize].push((e.ts, e.ts + e.dur));
     }
-    for (i, &(ti, ei, depth)) in events.iter().enumerate() {
+    for (i, &(ti, ei)) in pack.refs.iter().enumerate() {
         let e = &trace.tracks[ti as usize].events[ei as usize];
-        let expected = crate::ui::stretch_bounds(&per_depth, depth, e.ts, e.ts + e.dur);
-        assert_eq!(stretch[i], expected, "event {i} (track {ti} idx {ei})");
+        let expected = crate::ui::stretch_bounds(&per_depth, pack.depth[i], e.ts, e.ts + e.dur);
+        assert_eq!(pack.stretch[i], expected, "event {i} (track {ti} idx {ei})");
     }
 
-    let lone_idx = events.iter().position(|&(ti, ei, _)| ti == 0 && ei == 1).unwrap();
-    assert_eq!(stretch[lone_idx], (0, 1), "lone event should stretch across both depths");
+    let lone_idx = pack.refs.iter().position(|&(ti, ei)| ti == 0 && ei == 1).unwrap();
+    assert_eq!(pack.stretch[lone_idx], (0, 1), "lone event should stretch across both depths");
 }
 
 #[test]
@@ -2584,12 +2690,13 @@ fn bench_parallel_occ_limit_parse() {
     assert_eq!(cache, cache2, "parallel result must match sequential");
 }
 
-// Phase breakdown of the merged-view rebuild (`build_merged_group_events`)
-// on a real trace — the hot path when "Merge Streams" is on during a pan/zoom
-// (cache miss every frame). Times the production builder end-to-end per rank
-// group, plus its collect and sort phases in isolation (the same calls the
-// builder makes) for attribution; the remainder is pack+stretch. Accepts a
-// single pre-merged .tvcache (same as bench_merge_filter). Run with:
+// Phase breakdown of the merged-view pack build (`build_merged_group_events`)
+// on a real trace. The pack is view-independent (built once per
+// hidden_names/track_order change, see MergedPack), so this measures the
+// one-time build cost per rank group — collect phase in isolation for
+// attribution, production builder end-to-end — plus, for reference, the
+// per-frame windowed-render cost the old per-frame rebuild used to dominate.
+// Accepts a single pre-merged .tvcache (same as bench_merge_filter). Run with:
 //   TV_BENCH_TRACE=<merged.tvcache> cargo test --release bench_merge_phases -- --ignored --nocapture
 #[test]
 #[ignore]
@@ -2615,48 +2722,64 @@ fn bench_merge_phases() {
     }
     eprintln!("{} rank groups", groups.len());
 
+    let hidden: Vec<bool> = Vec::new();
+    let iters = 10;
+
+    // One-time pack build per group (view-independent — no zoom loop).
+    let mut t_collect = std::time::Duration::ZERO;
+    let mut t_full = std::time::Duration::ZERO;
+    let mut total_packed = 0usize;
+    for _ in 0..iters {
+        for (_r, tracks) in &groups {
+            // Collect exactly as the builder does, timed in isolation
+            // for attribution.
+            let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
+            let s = std::time::Instant::now();
+            for &ti in tracks {
+                let gt = &trace.tracks[ti];
+                crate::ui::collect_merged_track_events(gt, ti, f64::NEG_INFINITY, f64::INFINITY, &hidden, &mut ev_list);
+            }
+            t_collect += s.elapsed();
+            drop(ev_list);
+
+            // The production builder end-to-end (it re-collects
+            // internally, so merge+pack+stretch is t_full minus the
+            // collect phase above).
+            let s = std::time::Instant::now();
+            let pack = crate::ui::build_merged_group_events(&trace, tracks, &hidden);
+            t_full += s.elapsed();
+            total_packed += pack.depth.len();
+        }
+    }
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / iters as f64;
+    let full_ms = ms(t_full);
+    let other_ms = (full_ms - ms(t_collect)).max(0.0);
+    eprintln!(
+        "pack build (whole span)   packed={:>9}  full build {full_ms:>7.2} ms  (collect {:.2} + merge/pack/stretch {other_ms:.2})  [sequential]",
+        total_packed / iters, ms(t_collect),
+    );
+
+    // Per-frame windowed slice cost (what every pan/zoom frame now pays
+    // instead of a rebuild): binary search + iterate the visible slice.
     let max_ts = trace.max_ts;
+    let packs: Vec<crate::types::MergedPack> = groups.iter()
+        .map(|(_r, tracks)| crate::ui::build_merged_group_events(&trace, tracks, &hidden))
+        .collect();
     for &(label, frac) in &[("100%", 1.0), ("25%", 0.25), ("5%", 0.05)] {
         let t0 = 0.0;
         let t1 = max_ts * frac;
-        let mut t_collect = std::time::Duration::ZERO;
-        let mut t_full = std::time::Duration::ZERO;
-        let mut total_packed = 0usize;
-
-        let iters = 10;
-        let hidden: Vec<bool> = Vec::new();
+        let s = std::time::Instant::now();
+        let mut visited = 0usize;
         for _ in 0..iters {
-            for (_r, tracks) in &groups {
-                // Collect exactly as the builder does, timed in isolation
-                // for attribution.
-                let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
-                let s = std::time::Instant::now();
-                for &ti in tracks {
-                    let gt = &trace.tracks[ti];
-                    crate::ui::collect_merged_track_events(gt, ti, t0, t1, &hidden, &mut ev_list);
+            for p in &packs {
+                let start = p.overlap_start(t0);
+                let end = p.ts_end(t1);
+                for gi in start..end {
+                    if p.ends[gi] >= t0 { visited += 1; }
                 }
-                t_collect += s.elapsed();
-                drop(ev_list);
-
-                // The production builder end-to-end (it re-collects
-                // internally, so merge+pack+stretch is t_full minus the
-                // collect phase above).
-                let mut events: Vec<(u32, u32, u16)> = Vec::new();
-                let mut stretch: Vec<(u16, u16)> = Vec::new();
-                let s = std::time::Instant::now();
-                let _md = crate::ui::build_merged_group_events(
-                    &trace, tracks, t0, t1, &hidden, &mut events, &mut stretch,
-                );
-                t_full += s.elapsed();
-                total_packed += events.len();
             }
         }
-        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / iters as f64;
-        let full_ms = ms(t_full);
-        let other_ms = (full_ms - ms(t_collect)).max(0.0);
-        eprintln!(
-            "zoom={label:>4}  packed={:>9}  full build {full_ms:>7.2} ms  (collect {:.2} + merge/pack/stretch {other_ms:.2})  [sequential]",
-            total_packed / iters, ms(t_collect),
-        );
+        let per = s.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        eprintln!("windowed slice zoom={label:>4}  visited={:>9}  {:>7.2} ms/frame [sequential]", visited / iters, per);
     }
 }

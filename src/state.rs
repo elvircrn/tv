@@ -104,18 +104,14 @@ pub struct Pane {
     pub even_spacing: bool,
     pub geom: PaneGeom,
     pub hidden_names: Vec<bool>,
-    /// (view.t0 bits, view.t1 bits, hidden_names snapshot, track_order
-    /// snapshot) from the last time the merged multi-rank view's per-group
-    /// Tetris packing (`build_merged_group_events`) actually ran for this
-    /// pane. Rebuilding it is O(events in view) per rank group — measured at
-    /// ~11ms for a 28-rank, 468K-event trace fully zoomed out — and it reran
-    /// unconditionally on every redraw (i.e. every mouse-move) even when
-    /// nothing about the view had changed. Owned per-pane, not on the shared
-    /// `DrawBuf`, for the same reason `sort_cache_key`/`detail_hist_key`
-    /// moved there: only one pane renders per frame (see the tab strip in
-    /// main.rs), so a shared cache would compare against whichever *other*
-    /// pane last rendered.
-    pub merge_cache_key: Option<(u64, u64, Vec<bool>, Vec<usize>)>,
+    /// Cache key for `merged_gpu_groups` below. The pack is VIEW-INDEPENDENT
+    /// (whole-span packing, see `MergedPack`), so the key is only
+    /// (hidden_names, track_order) — panning and zooming must NOT rebuild
+    /// it: a window-relative pack is what made events straddling the left
+    /// edge visibly re-lane frame after frame during a pan (off-screen
+    /// influencers dropping out of the collect window) and cost a full
+    /// repack on every view-change frame.
+    pub merge_cache_key: Option<(Vec<bool>, Vec<usize>)>,
     /// The merged multi-rank view's per-rank-group row data (packed events +
     /// max depth), validated against `merge_cache_key` above. This must live
     /// here, not on the shared `DrawBuf` (where it lived before it was
@@ -514,11 +510,19 @@ impl Pane {
             if let Some(group) = self.geom.merged.iter().find(|g| g.vi == vi) {
                 // Match the rendered merged row: iterate the packed events
                 // (wrappers stripped) and apply the renderer's depth/y test.
-                let max_depth = group.events.iter().map(|&(_, _, d)| d).max().map(|d| d + 1).unwrap_or(1);
-                let sub_h = track_h / max_depth.max(1) as f32;
-                for &(ti32, ei32, depth) in group.events.iter() {
-                    let ev = &trace.tracks[ti32 as usize].events[ei32 as usize];
-                    if !(ev.ts + ev.dur >= s0 && ev.ts <= s1) { continue; }
+                // Same windowing the render loop uses (pack is whole-span,
+                // view-independent — see MergedPack).
+                let p = &group.pack;
+                let max_depth = p.max_depth.max(1);
+                let sub_h = track_h / max_depth as f32;
+                let start = p.overlap_start(s0);
+                let end = p.ts_end(s1);
+                for gi in start..end {
+                    let (ti32, ei32) = p.refs[gi];
+                    let depth = p.depth[gi];
+                    let ts = p.ts[gi];
+                    let end_t = p.ends[gi];
+                    if !(end_t >= s0 && ts <= s1) { continue; }
                     let ev_top = track_top + depth as f32 * sub_h;
                     let ev_bot = ev_top + sub_h;
                     if ev_bot < y0 || ev_top > y1 { continue; }

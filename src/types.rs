@@ -309,19 +309,73 @@ impl DragKind {
     pub fn is_active(self) -> bool { self != DragKind::None }
 }
 
+/// One merged rank-group's Tetris packing over its events, in ts-sorted
+/// parallel arrays. View-INDEPENDENT: packed once over the group's whole
+/// time span (keyed only on hidden_names/track_order, see
+/// `Pane::merge_cache_key`), so panning and zooming never re-pack — the
+/// render loop binary-searches `ts`/`prefix_max_dur` for the visible slice
+/// instead. That view-independence is also what fixes left-edge popping
+/// during a pan: a window-relative pack re-depthed every event straddling
+/// the left edge as its off-screen influencers (events overlapping it but
+/// ending before view.t0) dropped out of the collect window, visibly
+/// re-laning and re-stretching them frame after frame.
+#[derive(Default)]
+pub struct MergedPack {
+    /// Event start times, ascending (the sort key of every other array).
+    pub ts: Vec<f64>,
+    /// ts + dur, parallel to `ts` (render x1 and overlap checks).
+    pub ends: Vec<f64>,
+    /// Running max of durations over `ts[..=i]` — same shape as
+    /// `Track::prefix_max_dur`, feeds the bisect_overlap-style lower bound
+    /// when windowing the visible slice.
+    pub prefix_max_dur: Vec<f64>,
+    /// (track_idx, event_idx) back-references into the trace. Only needed
+    /// for the wide-event render path (hover/selection/full event data) —
+    /// the sub-pixel path reads `name` below instead of chasing these into
+    /// track memory.
+    pub refs: Vec<(u32, u32)>,
+    /// Interned event-name index per event, parallel to `ts`. Duplicated
+    /// from the referenced events so the sub-pixel render pass (the common
+    /// case at wide zoom, millions of events) touches this compact array
+    /// sequentially instead of pointer-chasing `refs` into scattered track
+    /// storage just to pick a color.
+    pub name: Vec<u32>,
+    /// Packed Tetris depth per event, parallel to `ts`.
+    pub depth: Vec<u16>,
+    /// (lo, hi) stretched depth range per event (see `stretch_bounds`),
+    /// parallel to `ts`.
+    pub stretch: Vec<(u16, u16)>,
+    /// Max packed depth over the whole group (>= 1) — drives row height.
+    pub max_depth: u16,
+}
+
+impl MergedPack {
+    /// First index whose event could overlap `t` (conservative lower bound:
+    /// `prefix_max_dur` accounts for the longest event seen up to each
+    /// index, not that event's own duration — same caveat as
+    /// `types::bisect_overlap`, callers skip non-overlapping entries).
+    pub fn overlap_start(&self, t: f64) -> usize {
+        let (mut lo, mut hi) = (0, self.ts.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.ts[mid] + self.prefix_max_dur[mid] < t { lo = mid + 1; } else { hi = mid; }
+        }
+        lo
+    }
+
+    /// One-past-last index whose event starts at or before `t`.
+    pub fn ts_end(&self, t: f64) -> usize {
+        self.ts.partition_point(|&ts| ts <= t)
+    }
+}
+
 pub struct MergedGpuGroup {
     pub tracks: Vec<usize>,
-    /// (lo, hi) depth-range pairs, parallel to `events` (see the render loop
-    /// in draw_timeline). Shared behind an Arc with the per-pane `PaneGeom`
-    /// snapshot (`MergedGeom::events`) — draw_timeline used to deep-clone
-    /// these multi-million-entry buffers every frame into the snapshot;
-    /// the snapshot just bumps a refcount now, while the merge rebuild
-    /// (the only writer) swaps in a fresh Arc.
-    pub stretch: Arc<Vec<(u16, u16)>>,
-    /// Packed `(track_idx, event_idx, packed_depth)` triples. Shared behind
-    /// an Arc for the same reason as `stretch`.
-    pub events: Arc<Vec<(u32, u32, u16)>>,
-    pub max_depth: u16,
+    /// The view-independent packed representation (see `MergedPack`).
+    /// Shared behind an Arc with the per-pane `PaneGeom` snapshot — the
+    /// snapshot is a refcount bump, and the (rare) rebuild swaps in a fresh
+    /// Arc rather than mutating under live readers.
+    pub pack: Arc<MergedPack>,
     pub vi: usize,
     pub label: String,
 }
@@ -343,14 +397,14 @@ pub struct PaneGeom {
 
 pub struct MergedGeom {
     pub vi: usize,
-    /// Packed `(track_idx, event_idx, packed_depth)` triples — exactly the events
-    /// drawn in the merged row. The Tetris packing in `draw_timeline` already
-    /// stripped grandparent wrappers (whole-stream spans) and hidden names, so a
-    /// selection that iterates these matches the rendered row precisely instead of
-    /// sweeping in ghost events that were never drawn. Shares the same Arc as
-    /// `MergedGpuGroup::events` — the snapshot below is a refcount bump, not
-    /// a multi-million-entry clone.
-    pub events: Arc<Vec<(u32, u32, u16)>>,
+    /// The view-independent packed events exactly as drawn in the merged
+    /// row (Tetris packing already stripped grandparent wrappers and hidden
+    /// names, so a selection iterating these matches the rendered row
+    /// instead of sweeping in ghost events). Shares the same Arc as
+    /// `MergedGpuGroup::pack` — snapshotting is a refcount bump, and the
+    /// selection read (windowed just like the render loop) sees exactly
+    /// what the render loop drew.
+    pub pack: Arc<MergedPack>,
 }
 
 #[derive(Default)]
