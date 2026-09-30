@@ -90,6 +90,14 @@ pub(crate) fn fit_font_size(base_font_size: f32, avail_h: f32) -> f32 {
 /// `per_depth[d]` must be sorted by start time and internally
 /// non-overlapping (guaranteed by the greedy depth-packing that produces
 /// it, since two overlapping events can never land on the same depth).
+/// [test/parity-reference only] `build_merged_group_events` now computes
+/// stretch via the linear sweep documented at its call site, so this naive
+/// form is no longer on the hot path — but it stays as the executable
+/// specification the parity test
+/// (`test_build_merged_group_events_stretch_matches_naive_recompute`)
+/// validates the sweep against: same inputs, provably same outputs, ~10x
+/// slower per event (binary searches instead of tandem cursors).
+#[cfg(test)]
 pub(crate) fn stretch_bounds(per_depth: &[Vec<(f64, f64)>], depth: u16, ts: f64, end: f64) -> (u16, u16) {
     let total_depth = per_depth.len() as u16;
     let occupied = |d: u16| -> bool {
@@ -858,11 +866,43 @@ pub(crate) fn build_merged_group_events(
     out.clear();
     stretch_out.clear();
     let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
+    // Each track contributes one contiguous ts-sorted run to ev_list (tracks
+    // are ts-sorted at load, and the collect filters are order-independent),
+    // so instead of paying a full O(n log n) sort on the concatenated runs —
+    // measured at ~70ms of a ~112ms sequential rebuild for a 32-rank,
+    // 3.6M-event trace fully zoomed out — merge the k pre-sorted runs in a
+    // single linear pass. k is the group's track count (single digits for
+    // real rank groups), so a plain scan of the k heads beats a heap and
+    // stays cache-friendly. Ties prefer the lower run index, matching the
+    // stable concatenate-then-sort result closely enough that packing (the
+    // only consumer of the order) is unaffected: equal-ts events overlap and
+    // land on different depths either way.
+    let mut run_bounds: Vec<(usize, usize)> = Vec::with_capacity(group_tracks.len());
     for &ti in group_tracks {
         let gt = &trace.tracks[ti];
+        let run_start = ev_list.len();
         collect_merged_track_events(gt, ti, view_t0, view_t1, hidden_names, &mut ev_list);
+        if ev_list.len() > run_start { run_bounds.push((run_start, ev_list.len())); }
     }
-    ev_list.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let ev_list = if run_bounds.len() <= 1 {
+        ev_list
+    } else {
+        let mut merged: Vec<(f64, f64, u32, u32)> = Vec::with_capacity(ev_list.len());
+        let mut heads: Vec<usize> = run_bounds.iter().map(|&(s, _)| s).collect();
+        loop {
+            let mut best: Option<usize> = None;
+            for (ri, &h) in heads.iter().enumerate() {
+                if h >= run_bounds[ri].1 { continue; }
+                if best.is_none() || ev_list[h].0 < ev_list[heads[best.unwrap()]].0 {
+                    best = Some(ri);
+                }
+            }
+            let Some(ri) = best else { break };
+            merged.push(ev_list[heads[ri]]);
+            heads[ri] += 1;
+        }
+        merged
+    };
     let mut depth_ends: Vec<f64> = Vec::new();
     let mut max_depth: u16 = 0;
     for &(ts, dur, ti, ei) in &ev_list {
@@ -883,12 +923,45 @@ pub(crate) fn build_merged_group_events(
     // merge_cache_key lifecycle, instead of once per redrawn frame in
     // draw_timeline's render loop, is the actual point of computing it in
     // this cache-rebuild-only function at all.
-    let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); max_depth as usize];
+    //
+    // The naive per-event form (`stretch_bounds`, still the reference
+    // implementation the parity test checks against) binary-searches each
+    // neighbor depth's interval list for every event — measured at ~123ms
+    // for a 32-rank, 3.6M-event trace fully zoomed out, nearly all of it
+    // cache misses jumping around those multi-million-entry lists. But both
+    // sides are sorted by ts, so the same per-event answers fall out of one
+    // linear sweep per depth: walk all events in ts order holding a single
+    // cursor into that depth's disjoint intervals — an interval ending at
+    // or before the current event's start can never overlap a later event
+    // either, so the cursor only ever moves forward — and the event's
+    // interval is free at that depth iff the cursor is exhausted or points
+    // at an interval starting at/after the event's end. The resulting
+    // free_at masks then answer the lo/hi walks stretch_bounds does, at
+    // O(events × depths) sequential steps instead of O(events × depths ×
+    // log events) random ones.
+    let d_total = max_depth as usize;
+    let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); d_total];
     for (i, &(ts, dur, _, _)) in ev_list.iter().enumerate() {
         per_depth[out[i].2 as usize].push((ts, ts + dur));
     }
-    for (i, &(ts, dur, _, _)) in ev_list.iter().enumerate() {
-        stretch_out.push(stretch_bounds(&per_depth, out[i].2, ts, ts + dur));
+    let mut free_at: Vec<Vec<bool>> = vec![Vec::new(); d_total];
+    for d_prime in 0..d_total {
+        let slots = &per_depth[d_prime];
+        let mask = &mut free_at[d_prime];
+        let mut cur = 0usize;
+        for &(ts, dur, _, _) in ev_list.iter() {
+            let end = ts + dur;
+            while cur < slots.len() && slots[cur].1 <= ts { cur += 1; }
+            mask.push(cur == slots.len() || slots[cur].0 >= end);
+        }
+    }
+    for (i, _) in ev_list.iter().enumerate() {
+        let d = out[i].2 as usize;
+        let mut lo = d;
+        while lo > 0 && free_at[lo - 1][i] { lo -= 1; }
+        let mut hi = d;
+        while hi + 1 < d_total && free_at[hi + 1][i] { hi += 1; }
+        stretch_out.push((lo as u16, hi as u16));
     }
 
     max_depth
@@ -1027,7 +1100,7 @@ pub fn draw_timeline(
                         None => "GPU".to_string(),
                     };
                     merged_gpu_groups.push(MergedGpuGroup {
-                        tracks: vec![i], events: Vec::new(), stretch: Vec::new(), max_depth: 0, vi: 0, label,
+                        tracks: vec![i], events: std::sync::Arc::new(Vec::new()), stretch: std::sync::Arc::new(Vec::new()), max_depth: 0, vi: 0, label,
                     });
                 }
                 rank_group_idxs.push((rank, gi));
@@ -1056,6 +1129,31 @@ pub fn draw_timeline(
         false
     };
 
+    // The actual rebuild, hoisted out of the layout loop below so the rank
+    // groups can be packed in parallel: each group's Tetris packing is fully
+    // independent (disjoint track sets, own events/stretch buffers), and on
+    // a 32-rank trace fully zoomed out the sequential rebuild cost was the
+    // whole frame (~230ms of a ~235ms frame, `bench_draw_timeline` +
+    // `bench_merge_phases` in tests.rs). Layout then only READS each group's
+    // max_depth/events. Rayon runs on its regular thread pool natively and
+    // degrades to sequential on wasm32 (same as loader's
+    // `parse_chunks_parallel`), so this needs no target gating. `tracks` is
+    // taken and restored rather than borrowed because `par_iter_mut` needs
+    // exclusive access to the whole group struct anyway.
+    if merge_gpu && !merge_cache_valid {
+        use rayon::prelude::*;
+        merged_gpu_groups[..group_slot].par_iter_mut().for_each(|g| {
+            let group_tracks = std::mem::take(&mut g.tracks);
+            let mut events: Vec<(u32, u32, u16)> = std::mem::take(std::sync::Arc::get_mut(&mut g.events).unwrap_or(&mut Vec::new()));
+            let mut stretch: Vec<(u16, u16)> = std::mem::take(std::sync::Arc::get_mut(&mut g.stretch).unwrap_or(&mut Vec::new()));
+            let md = build_merged_group_events(trace, &group_tracks, view.t0, view.t1, hidden_names, &mut events, &mut stretch);
+            g.tracks = group_tracks;
+            g.events = std::sync::Arc::new(events);
+            g.stretch = std::sync::Arc::new(stretch);
+            g.max_depth = md;
+        });
+    }
+
     // Parallel to buf.visible/heights: whether each row has any event
     // actually overlapping the current view window. Feeds the even-spacing
     // pass below so rows with nothing to show at this zoom collapse instead
@@ -1074,25 +1172,13 @@ pub fn draw_timeline(
                 if emitted_ranks[ri] { continue; }
                 emitted_ranks[ri] = true;
                 let gi = rank_group_idxs[ri].1;
-                let g = &merged_gpu_groups[gi];
-                let group_tracks: Vec<usize> = g.tracks.clone();
-                let (md, is_empty) = if merge_cache_valid {
-                    (g.max_depth, g.events.is_empty())
-                } else {
-                    let mut events = std::mem::take(&mut merged_gpu_groups[gi].events);
-                    let mut stretch = std::mem::take(&mut merged_gpu_groups[gi].stretch);
-                    let md = build_merged_group_events(trace, &group_tracks, view.t0, view.t1, hidden_names, &mut events, &mut stretch);
-                    let is_empty = events.is_empty();
-                    merged_gpu_groups[gi].events = events;
-                    merged_gpu_groups[gi].stretch = stretch;
-                    (md, is_empty)
-                };
                 let g = &mut merged_gpu_groups[gi];
-                let first = group_tracks[0];
+                let first = g.tracks[0];
+                let md = g.max_depth;
+                let is_empty = g.events.is_empty();
                 let scale = track_scales.get(first).copied().unwrap_or(1.0);
                 let h = md as f32 * SUB_LANE_H * scale;
                 let vi = buf.visible.len();
-                g.max_depth = md;
                 g.vi = vi;
                 buf.visible.push(first);
                 buf.heights.push(h);
@@ -1159,7 +1245,7 @@ pub fn draw_timeline(
     for g in merged_gpu_groups.iter() {
         geom.merged.push(MergedGeom {
             vi: g.vi,
-            events: g.events.clone(),
+            events: std::sync::Arc::clone(&g.events),
         });
     }
 

@@ -516,7 +516,7 @@ impl Pane {
                 // (wrappers stripped) and apply the renderer's depth/y test.
                 let max_depth = group.events.iter().map(|&(_, _, d)| d).max().map(|d| d + 1).unwrap_or(1);
                 let sub_h = track_h / max_depth.max(1) as f32;
-                for &(ti32, ei32, depth) in &group.events {
+                for &(ti32, ei32, depth) in group.events.iter() {
                     let ev = &trace.tracks[ti32 as usize].events[ei32 as usize];
                     if !(ev.ts + ev.dur >= s0 && ev.ts <= s1) { continue; }
                     let ev_top = track_top + depth as f32 * sub_h;

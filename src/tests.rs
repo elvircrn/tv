@@ -1394,7 +1394,7 @@ fn test_merged_selection_excludes_unrendered_wrapper() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     // Packed row: kA at depth 0, kB at depth 1; wrapper (idx 0) intentionally omitted.
-    p.geom.merged = vec![MergedGeom { vi: 0, events: vec![(0, 1, 0), (0, 2, 1)] }];
+    p.geom.merged = vec![MergedGeom { vi: 0, events: vec![(0, 1, 0), (0, 2, 1)].into() }];
     p.geom.heights[0] = 40.0; // max_depth 2 * SUB_LANE_H(20)
     p.geom.y_offsets[0] = 0.0;
 
@@ -1426,7 +1426,7 @@ fn test_merged_selection_respects_depth_yrange() {
     );
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
-    p.geom.merged = vec![MergedGeom { vi: 0, events: vec![(0, 1, 0), (0, 2, 1)] }];
+    p.geom.merged = vec![MergedGeom { vi: 0, events: vec![(0, 1, 0), (0, 2, 1)].into() }];
     p.geom.heights[0] = 40.0;
     p.geom.y_offsets[0] = 0.0;
 
@@ -2582,4 +2582,81 @@ fn bench_parallel_occ_limit_parse() {
         t1.elapsed().as_secs_f64() * 1000.0,
         std::thread::available_parallelism().map(|p| p.get()).unwrap_or(0));
     assert_eq!(cache, cache2, "parallel result must match sequential");
+}
+
+// Phase breakdown of the merged-view rebuild (`build_merged_group_events`)
+// on a real trace — the hot path when "Merge Streams" is on during a pan/zoom
+// (cache miss every frame). Times the production builder end-to-end per rank
+// group, plus its collect and sort phases in isolation (the same calls the
+// builder makes) for attribution; the remainder is pack+stretch. Accepts a
+// single pre-merged .tvcache (same as bench_merge_filter). Run with:
+//   TV_BENCH_TRACE=<merged.tvcache> cargo test --release bench_merge_phases -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_merge_phases() {
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<merged.tvcache> to run this bench"); return; }
+    };
+    let counter = test_counter();
+    let trace = load_trace(&path, &counter, 8, None).expect("load trace");
+    eprintln!("{} tracks, {} events", trace.tracks.len(), trace.total_events);
+
+    // Group GPU tracks by rank, mirroring ui.rs merge pre-grouping.
+    let mut groups: Vec<(Option<usize>, Vec<usize>)> = Vec::new();
+    for i in 0..trace.tracks.len() {
+        if !trace.tracks[i].gpu { continue; }
+        let rank = parse_rank(&trace.tracks[i].label);
+        if let Some(g) = groups.iter_mut().find(|(r, _)| *r == rank) {
+            g.1.push(i);
+        } else {
+            groups.push((rank, vec![i]));
+        }
+    }
+    eprintln!("{} rank groups", groups.len());
+
+    let max_ts = trace.max_ts;
+    for &(label, frac) in &[("100%", 1.0), ("25%", 0.25), ("5%", 0.05)] {
+        let t0 = 0.0;
+        let t1 = max_ts * frac;
+        let mut t_collect = std::time::Duration::ZERO;
+        let mut t_full = std::time::Duration::ZERO;
+        let mut total_packed = 0usize;
+
+        let iters = 10;
+        let hidden: Vec<bool> = Vec::new();
+        for _ in 0..iters {
+            for (_r, tracks) in &groups {
+                // Collect exactly as the builder does, timed in isolation
+                // for attribution.
+                let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
+                let s = std::time::Instant::now();
+                for &ti in tracks {
+                    let gt = &trace.tracks[ti];
+                    crate::ui::collect_merged_track_events(gt, ti, t0, t1, &hidden, &mut ev_list);
+                }
+                t_collect += s.elapsed();
+                drop(ev_list);
+
+                // The production builder end-to-end (it re-collects
+                // internally, so merge+pack+stretch is t_full minus the
+                // collect phase above).
+                let mut events: Vec<(u32, u32, u16)> = Vec::new();
+                let mut stretch: Vec<(u16, u16)> = Vec::new();
+                let s = std::time::Instant::now();
+                let _md = crate::ui::build_merged_group_events(
+                    &trace, tracks, t0, t1, &hidden, &mut events, &mut stretch,
+                );
+                t_full += s.elapsed();
+                total_packed += events.len();
+            }
+        }
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 / iters as f64;
+        let full_ms = ms(t_full);
+        let other_ms = (full_ms - ms(t_collect)).max(0.0);
+        eprintln!(
+            "zoom={label:>4}  packed={:>9}  full build {full_ms:>7.2} ms  (collect {:.2} + merge/pack/stretch {other_ms:.2})  [sequential]",
+            total_packed / iters, ms(t_collect),
+        );
+    }
 }

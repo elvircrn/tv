@@ -311,13 +311,16 @@ impl DragKind {
 
 pub struct MergedGpuGroup {
     pub tracks: Vec<usize>,
-    pub events: Vec<(u32, u32, u16)>,
-    /// Parallel to `events`: each entry's (lo, hi) depth range after
-    /// stretching into empty neighboring slots (see `stretch_bounds`).
-    /// Cached alongside `events` under the same merge-cache lifecycle
-    /// (rebuilt together, always the same length) so the render loop never
-    /// has to recompute this per event on every redrawn frame.
-    pub stretch: Vec<(u16, u16)>,
+    /// (lo, hi) depth-range pairs, parallel to `events` (see the render loop
+    /// in draw_timeline). Shared behind an Arc with the per-pane `PaneGeom`
+    /// snapshot (`MergedGeom::events`) — draw_timeline used to deep-clone
+    /// these multi-million-entry buffers every frame into the snapshot;
+    /// the snapshot just bumps a refcount now, while the merge rebuild
+    /// (the only writer) swaps in a fresh Arc.
+    pub stretch: Arc<Vec<(u16, u16)>>,
+    /// Packed `(track_idx, event_idx, packed_depth)` triples. Shared behind
+    /// an Arc for the same reason as `stretch`.
+    pub events: Arc<Vec<(u32, u32, u16)>>,
     pub max_depth: u16,
     pub vi: usize,
     pub label: String,
@@ -344,8 +347,10 @@ pub struct MergedGeom {
     /// drawn in the merged row. The Tetris packing in `draw_timeline` already
     /// stripped grandparent wrappers (whole-stream spans) and hidden names, so a
     /// selection that iterates these matches the rendered row precisely instead of
-    /// sweeping in ghost events that were never drawn.
-    pub events: Vec<(u32, u32, u16)>,
+    /// sweeping in ghost events that were never drawn. Shares the same Arc as
+    /// `MergedGpuGroup::events` — the snapshot below is a refcount bump, not
+    /// a multi-million-entry clone.
+    pub events: Arc<Vec<(u32, u32, u16)>>,
 }
 
 #[derive(Default)]
