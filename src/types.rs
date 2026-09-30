@@ -51,6 +51,9 @@ pub const TRACK_SCALE_MAX: f32 = 30.0;
 pub const RESIZE_GRAB_H: f32 = 8.0;
 pub const ZOOM_ANIM_DUR: f32 = 0.35;
 pub const SEARCH_ZOOM_FILL: f64 = 0.8; // matches fill this fraction of the width
+/// Slack either side of a step when framing it via `[`/`]` or the Steps tab —
+/// fraction of the final view width, so the inter-step gaps stay visible.
+pub const STEP_PAD: f64 = 0.05;
 pub const ROW_PAD: f32 = 4.0;
 pub const HISTOGRAM_BAR_H: f32 = 18.0;
 pub const DETAIL_HIST_H: f32 = 90.0;
@@ -123,6 +126,13 @@ pub const ROW_BG_B: ImColor32 = ImColor32::from_rgba(32, 32, 32, 255);
 pub const RULER_BG: ImColor32 = ImColor32::from_rgba(18, 18, 18, 255);
 pub const RULER_TICK: ImColor32 = ImColor32::from_rgba(60, 60, 60, 255);
 pub const RULER_TEXT: ImColor32 = ImColor32::from_rgba(160, 160, 160, 255);
+// vLLM step bands on the ruler (see draw_ruler): even steps get a faint tint
+// over RULER_BG, and the step the [`/`] cursor is framed on gets a stronger
+// one so consecutive steps stay distinguishable from each other AND from the
+// cursor's step.
+pub const STEP_BAND: ImColor32 = ImColor32::from_rgba(38, 38, 44, 255);
+pub const STEP_BAND_CUR: ImColor32 = ImColor32::from_rgba(66, 66, 90, 255);
+pub const STEP_EDGE: ImColor32 = ImColor32::from_rgba(90, 90, 105, 255);
 
 pub struct Trace {
     pub tracks: Vec<Track>,
@@ -275,6 +285,62 @@ pub struct SelectionEntry {
     pub event_refs: Vec<(u32, u32)>,
 }
 
+/// Batch composition parsed from a vLLM execute-annotation span name.
+/// Two formats exist (see vLLM `gpu_worker.py:annotate_profile`):
+/// legacy `execute_context_1(4)_generation_1(1)` and detailed
+/// `execute_512_context_1(sq512sk388352sqsq262144sqsk198836224)_generation_0(sq0sk0sqsq0sqsk0)`
+/// (emitted with `profiler_config.detailed_trace_annotation`). The `kv`
+/// fields are None in the legacy format.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StepBatch {
+    /// Total scheduled tokens across all requests (detailed format only;
+    /// falls back to ctx+gen tokens for legacy).
+    pub total_tokens: u64,
+    /// Context (prefill / chunked-prefill) request count.
+    pub n_ctx: u64,
+    /// Context-phase scheduled tokens.
+    pub ctx_tokens: u64,
+    /// Sum of sequence lengths across context requests (total KV written).
+    pub ctx_kv: Option<u64>,
+    /// Generation (decode) request count.
+    pub n_gen: u64,
+    /// Generation-phase scheduled tokens (== n_gen for plain decode).
+    pub gen_tokens: u64,
+    /// Sum of sequence lengths across generation requests.
+    pub gen_kv: Option<u64>,
+}
+
+/// One vLLM scheduler step, derived from the `execute_context_*`
+/// `gpu_user_annotation` spans (CPU-side `user_annotation` as fallback).
+/// All spans share the same interned name — steps are distinguishable only
+/// by temporal order, so a "reference track" (the one holding the most
+/// spans, i.e. a busy CUDA stream) defines the canonical sequence and
+/// every other rank's span is assigned to the interval it overlaps most.
+/// Batch size / #tokens aren't recorded by these traces (`record_shapes=0`),
+/// so the summary is timing/counts only.
+pub struct StepInfo {
+    /// Step start: min span start across assigned spans (covers cross-rank
+    /// skew).
+    pub t0: f64,
+    /// Step end: max span end across assigned spans.
+    pub t1: f64,
+    /// Median assigned-span duration — the "typical rank's" GPU-busy time
+    /// for this step, robust against one straggler rank stretching t1.
+    pub gpu_dur: f64,
+    /// Gap from the previous step's end (0.0 for the first step).
+    pub idle_before: f64,
+    /// Number of distinct ranks with a span assigned to this step (via
+    /// `parse_rank` on track labels; 1 for single-rank traces).
+    pub n_ranks: u32,
+    /// `cat == "kernel"` events inside [t0, t1) across GPU tracks.
+    pub kernel_count: u32,
+    /// Batch composition parsed from the span name (token/req counts).
+    /// All spans of a step share one interned name, so this is the whole
+    /// step's composition. None when the name matches neither annotation
+    /// format (shouldn't happen for spans that got this far).
+    pub batch: Option<StepBatch>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DiffKind { Same, Added, Removed }
 
@@ -294,7 +360,7 @@ pub struct DiffResult {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum BottomTab { Detail, Selection }
+pub enum BottomTab { Detail, Selection, Steps }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum DragKind {

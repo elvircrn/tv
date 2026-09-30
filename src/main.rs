@@ -1470,6 +1470,7 @@ impl App {
                                     ui.text("S / Down          Zoom out");
                                     ui.text("A / Left          Pan left");
                                     ui.text("D / Right         Pan right");
+                                    ui.text("[ / ]             Previous / next vLLM step");
                                     ui.text("Home              Fit whole trace to view");
                                     ui.text("Scroll            Scroll tracks up / down");
                                     ui.text("Shift+Scroll      Pan left / right");
@@ -1609,6 +1610,11 @@ impl App {
 
         mark!("dividers", t_section);
         // ---- Bottom panel (active pane) ----
+        // Step row clicked in the Steps tab (index into pane.steps), filled
+        // by the bottom panel below and applied after it so frame_step's
+        // view.anim isn't clobbered by the remaining view handling later in
+        // the frame.
+        let mut step_clicked: Option<usize> = None;
         if state.panes[ai].has_trace() {
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 6.0]));
             ui.window("##bottom")
@@ -1744,11 +1750,44 @@ impl App {
                                 draw_hidden_clear(&ui, 16.0, &mut pane.hidden_names, &mut state.buf.fmt);
                             }
                         }
+
+                        // ---- Steps tab: per-vLLM-step summary, click a row to
+                        // frame that step. Only registered as a tab when the
+                        // trace actually has steps, so non-vLLM traces are
+                        // unaffected.
+                        if !pane.steps.is_empty() {
+                            let steps_flags = if pending == Some(BottomTab::Steps) {
+                                imgui::TabItemFlags::SET_SELECTED
+                            } else { imgui::TabItemFlags::empty() };
+                            if let Some(_t) = imgui::TabItem::new("Steps").flags(steps_flags).begin(&ui) {
+                                // Summary line first: totals over all steps.
+                                let n = pane.steps.len();
+                                let total_idle: f64 = pane.steps.iter().map(|s| s.idle_before).sum();
+                                let span = pane.steps.last().map(|s| s.t1).unwrap_or(0.0)
+                                    - pane.steps.first().map(|s| s.t0).unwrap_or(0.0);
+                                state.buf.fmt.clear();
+                                write!(state.buf.fmt, "{n} steps, ").unwrap();
+                                write_time(&mut state.buf.fmt, span);
+                                write!(state.buf.fmt, " span, ").unwrap();
+                                write_time(&mut state.buf.fmt, total_idle);
+                                write!(state.buf.fmt, " idle ({:.0}%)", total_idle / span.max(1e-9) * 100.0).unwrap();
+                                ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
+                                draw_steps_table(&ui, &pane.steps, pane.step_cursor, &mut state.buf, &mut step_clicked);
+                            }
+                        }
                     }
                 });
         }
 
         mark!("bottom", t_section);
+        // A Steps-tab row click: move the cursor and frame that step.
+        if let Some(i) = step_clicked.take() {
+            let pane = &mut state.panes[ai];
+            if i < pane.steps.len() {
+                pane.step_cursor = i;
+                pane.frame_step(i);
+            }
+        }
         // ---- Status bar (active pane) ----
         if state.panes[ai].has_trace() {
             let pane = &state.panes[ai];
@@ -1917,6 +1956,8 @@ impl App {
                         &mut pane.pending_focus,
                         &mut pane.merge_cache_key,
                         &mut pane.merged_gpu_groups,
+                        &pane.steps,
+                        pane.step_cursor,
                     );
                     hover_result = h;
                     click_result = c;
@@ -2175,6 +2216,14 @@ impl App {
             }
             if ui.is_key_pressed(imgui::Key::N) {
                 state.panes[ai].nav_search(!shift);
+            }
+            if !state.diff_popup_open {
+                if ui.is_key_pressed(imgui::Key::RightBracket) {
+                    state.panes[ai].nav_step(true);
+                }
+                if ui.is_key_pressed(imgui::Key::LeftBracket) {
+                    state.panes[ai].nav_step(false);
+                }
             }
         }
 

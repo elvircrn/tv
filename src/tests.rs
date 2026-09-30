@@ -1,7 +1,7 @@
 use super::*;
 use crate::parse::*;
 use crate::loader::{load_trace, detect_rank_groups, merge_traces};
-use crate::state::{parse_rank, find_exec_context_names, default_track_order};
+use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps};
 use imgui::ImColor32;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
@@ -1999,6 +1999,7 @@ fn bench_draw_timeline() {
                     &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
+                    &pane.steps, pane.step_cursor,
                 );
             });
         imgui.render();
@@ -2027,6 +2028,7 @@ fn bench_draw_timeline() {
                     &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
+                    &pane.steps, pane.step_cursor,
                 );
             });
         imgui.render();
@@ -2055,6 +2057,7 @@ fn bench_draw_timeline() {
                     &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
+                    &pane.steps, pane.step_cursor,
                 );
             });
         imgui.render();
@@ -2782,4 +2785,303 @@ fn bench_merge_phases() {
         let per = s.elapsed().as_secs_f64() * 1000.0 / iters as f64;
         eprintln!("windowed slice zoom={label:>4}  visited={:>9}  {:>7.2} ms/frame [sequential]", visited / iters, per);
     }
+}
+
+// ---- vLLM step derivation (compute_steps / nav_step / frame_step) ----
+
+/// Build a trace like `make_trace`, but with a proper cats table so
+/// gpu_user_annotation / user_annotation / kernel categories survive
+/// (make_trace hardcodes cat 0).
+fn make_stepped_trace(
+    cats: Vec<&str>,
+    names: Vec<&str>,
+    tracks: Vec<(&str, bool, Vec<(f64, f64, usize, usize)>)>, // (ts, dur, name_idx, cat_idx)
+) -> Trace {
+    let cat_strs: Vec<String> = cats.into_iter().map(String::from).collect();
+    let name_strs: Vec<String> = names.into_iter().map(String::from).collect();
+    let mut trs = Vec::new();
+    let mut max_ts: f64 = 0.0;
+    let mut total_events = 0;
+    for (label, gpu, raw) in tracks {
+        let mut events: Vec<Event> = raw.into_iter()
+            .map(|(ts, dur, name, cat)| Event { ts, dur, name: name as u32, cat: cat as u32, args_off: 0, args_len: 0, depth: 0 })
+            .collect();
+        // The loader guarantees ts-sorted track event lists (compute_steps'
+        // binary searches rely on it); the test helper must too.
+        events.sort_unstable_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+        for e in &events { max_ts = max_ts.max(e.ts + e.dur); }
+        total_events += events.len();
+        let n_events = events.len();
+        trs.push(Track {
+            label: label.to_string(), gpu, events,
+            max_depth: 1,
+            prefix_max_dur: vec![0.0; n_events],
+            raw_buf_idx: 0,
+        });
+    }
+    Trace {
+        tracks: trs, names: name_strs, cats: cat_strs,
+        raw_bufs: Vec::new(), stats: Vec::new(),
+        max_ts, min_ts: 0.0, total_events, device: String::new(),
+        vllm_version: String::new(),
+        dist_rank: -1, dist_world: 0,
+        flow_pairs: Vec::new(),
+        rank_paths: Vec::new(),
+    }
+}
+
+#[test]
+fn test_compute_steps_multi_rank() {
+    // 3 steps on the reference rank (Rank 0 stream), skewed +5us on Rank 1,
+    // plus kernels inside the steps. Names: 0=execute_context..., 1=kernel.
+    let ec = 0usize; // name idx
+    let k = 1usize; // name idx
+    let c_gua = 0usize; // cat idx: gpu_user_annotation
+    let c_kernel = 1usize; // cat idx: kernel
+    // Reference track spans: [0,10), [20,30), [40,50)
+    let r0 = vec![
+        (0.0, 10.0, ec, c_gua), (20.0, 10.0, ec, c_gua), (40.0, 10.0, ec, c_gua),
+        (1.0, 2.0, k, c_kernel), (22.0, 2.0, k, c_kernel),
+    ];
+    // Rank 1: same steps, +5 skew, its own kernels
+    let r1 = vec![
+        (5.0, 10.0, ec, c_gua), (25.0, 10.0, ec, c_gua), (45.0, 10.0, ec, c_gua),
+        (7.0, 1.0, k, c_kernel),
+    ];
+    let trace = make_stepped_trace(
+        vec!["gpu_user_annotation", "kernel"],
+        vec!["execute_context_0(0)_generation_1(1)", "some_kernel"],
+        vec![("Rank 0 stream 1", true, r0), ("Rank 1 stream 1", true, r1)],
+    );
+    let ec_names = find_exec_context_names(&trace.names);
+    let steps = compute_steps(&trace, &ec_names);
+    assert_eq!(steps.len(), 3);
+    // Step 0: min t0=0, max t1=15 (Rank 1's span ends at 15)
+    assert!((steps[0].t0 - 0.0).abs() < 1e-9);
+    assert!((steps[0].t1 - 15.0).abs() < 1e-9);
+    // gpu_dur = mean of assigned span durs = 10
+    assert!((steps[0].gpu_dur - 10.0).abs() < 1e-9);
+    // both ranks assigned
+    assert_eq!(steps[0].n_ranks, 2);
+    // kernels in [0,15): r0's at ts=1 and r1's at ts=7
+    assert_eq!(steps[0].kernel_count, 2);
+    // idle before step 1: 20 - 15 = 5
+    assert!((steps[1].idle_before - 5.0).abs() < 1e-9);
+    // step 2's kernels: only r0's ts=22 falls in [35,55)... no wait, that's
+    // step 1's range. Step 1: [20, 35); kernels at ts=22 -> 1.
+    assert_eq!(steps[1].kernel_count, 1);
+    // step 2: [40, 55); no kernels
+    assert_eq!(steps[2].kernel_count, 0);
+}
+
+#[test]
+fn test_compute_steps_prefers_gpu_side_and_falls_back() {
+    let ec = 0usize;
+    // CPU-only trace: user_annotation cat, no GPU side
+    let cpu_track = vec![(0.0, 5.0, ec, 0usize), (10.0, 5.0, ec, 0usize)];
+    let trace = make_stepped_trace(
+        vec!["user_annotation"],
+        vec!["execute_context_0(0)_generation_1(1)"],
+        vec![("Thread 7", false, cpu_track)],
+    );
+    let ec_names = find_exec_context_names(&trace.names);
+    let steps = compute_steps(&trace, &ec_names);
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].n_ranks, 1); // no rank in label; per-track distinct
+}
+
+#[test]
+fn test_compute_steps_empty_for_non_vllm() {
+    let trace = make_stepped_trace(
+        vec!["kernel"],
+        vec!["some_kernel"],
+        vec![("GPU 0", true, vec![(0.0, 1.0, 0usize, 0usize)])],
+    );
+    assert!(compute_steps(&trace, &[]).is_empty());
+}
+
+#[test]
+fn test_nav_step_and_frame_step() {
+    let ec = 0usize;
+    let r = vec![(0.0, 10.0, ec, 0usize), (20.0, 10.0, ec, 0usize), (40.0, 10.0, ec, 0usize)];
+    let trace = make_stepped_trace(
+        vec!["gpu_user_annotation"],
+        vec!["execute_context_0(0)_generation_1(1)"],
+        vec![("Rank 0 stream 1", true, r)],
+    );
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    // poll_loading normally does this before recompute_steps.
+    pane.exec_context_names = find_exec_context_names(&pane.trace.as_ref().unwrap().names);
+    pane.recompute_steps();
+    assert_eq!(pane.steps.len(), 3);
+
+    // View centered inside step 0; nav forward snaps the cursor to step 0,
+    // then advances to 1.
+    pane.view.t0 = -1.0;
+    pane.view.t1 = 11.0; // center = 5, inside step 0 [0,10)
+    pane.nav_step(true);
+    assert_eq!(pane.step_cursor, 1);
+    let anim = pane.view.anim.as_ref().unwrap();
+    // frames step 1 [20,30) with 5% pad either side: range = 10/(1-0.1)
+    let range = 10.0 / (1.0 - 2.0 * STEP_PAD);
+    let center = 25.0;
+    assert!((anim.to_t0 - (center - range / 2.0)).abs() < 1e-9);
+    assert!((anim.to_t1 - (center + range / 2.0)).abs() < 1e-9);
+
+    // Back from a view centered inside step 1: snaps to 1, then back to 0
+    pane.view.t0 = 19.0;
+    pane.view.t1 = 31.0; // center = 25, inside step 1
+    pane.view.anim = None;
+    pane.nav_step(false);
+    assert_eq!(pane.step_cursor, 0);
+
+    // Wrap-around: view centered inside the last step, forward wraps to 0
+    pane.step_cursor = 2;
+    pane.view.anim = None;
+    pane.view.t0 = 39.0;
+    pane.view.t1 = 41.0; // center = 40, inside step 2's [40,50)
+    pane.nav_step(true);
+    assert_eq!(pane.step_cursor, 0); // wrapped
+}
+
+#[test]
+#[ignore] // loads a 85MB local trace; run explicitly with --ignored
+fn test_steps_on_real_merged_trace() {
+    let path = "/Users/ecrncevi/vllm-profiles/20260923-114925.tvcache/_merged.tvcache";
+    let trace = match load_trace(path, &test_counter(), 8, None) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("could not load {path}: {e}, skipping"); return; }
+    };
+    let ec_names = find_exec_context_names(&trace.names);
+    let t0 = std::time::Instant::now();
+    let steps = compute_steps(&trace, &ec_names);
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("computed {} steps in {ms:.1} ms", steps.len());
+    assert!(!steps.is_empty(), "real merged trace must have steps");
+    for (i, s) in steps.iter().enumerate() {
+        eprintln!("step {i:>2}: [{:>12.1}, {:>12.1}] wall={:>7.1} gpu={:>7.1} idle={:>7.1} ranks={} kernels={}",
+            s.t0, s.t1, s.t1 - s.t0, s.gpu_dur, s.idle_before, s.n_ranks, s.kernel_count);
+    }
+}
+
+#[test]
+fn test_parse_exec_context_name_all_formats() {
+    use crate::state::parse_exec_context_name;
+    // Detailed format (20260914-125236, vLLM with detailed_trace_annotation)
+    let b = parse_exec_context_name(
+        "execute_512_context_1(sq512sk388352sqsq262144sqsk198836224)_generation_0(sq0sk0sqsq0sqsk0)",
+    ).unwrap();
+    assert_eq!(b.total_tokens, 512);
+    assert_eq!(b.n_ctx, 1);
+    assert_eq!(b.ctx_tokens, 512);
+    assert_eq!(b.ctx_kv, Some(388352));
+    assert_eq!(b.n_gen, 0);
+    assert_eq!(b.gen_tokens, 0);
+    assert_eq!(b.gen_kv, Some(0));
+
+    // Mixed prefill+decode
+    let b = parse_exec_context_name(
+        "execute_5_context_1(sq4sk4sqsq16sqsk16)_generation_1(sq1sk11sqsq1sqsk11)",
+    ).unwrap();
+    assert_eq!(b.total_tokens, 5);
+    assert_eq!(b.n_ctx, 1);
+    assert_eq!(b.ctx_tokens, 4);
+    assert_eq!(b.ctx_kv, Some(4));
+    assert_eq!(b.n_gen, 1);
+    assert_eq!(b.gen_tokens, 1);
+    assert_eq!(b.gen_kv, Some(11));
+
+    // Legacy format (older traces): tokens in parens, no kv
+    let b = parse_exec_context_name("execute_context_1(113)_generation_15(15)").unwrap();
+    assert_eq!(b.total_tokens, 128); // 113 + 15, derived
+    assert_eq!(b.n_ctx, 1);
+    assert_eq!(b.ctx_tokens, 113);
+    assert_eq!(b.ctx_kv, None);
+    assert_eq!(b.n_gen, 15);
+    assert_eq!(b.gen_tokens, 15);
+    assert_eq!(b.gen_kv, None);
+
+    // Zero-value legacy (20260923-114925): counts are literally 0(0)/1(1)
+    let b = parse_exec_context_name("execute_context_0(0)_generation_1(1)").unwrap();
+    assert_eq!(b.total_tokens, 1);
+    assert_eq!(b.n_gen, 1);
+    assert_eq!(b.gen_tokens, 1);
+
+    // Non-annotations must not parse
+    assert!(parse_exec_context_name("execute_model").is_none());
+    assert!(parse_exec_context_name("execute_mm_encoder").is_none());
+    assert!(parse_exec_context_name("vllm::silu_and_mul_kernel<...>").is_none());
+}
+
+#[test]
+fn test_find_exec_context_names_all_formats() {
+    use crate::state::find_exec_context_names;
+    let names = vec![
+        "execute_model".to_string(),
+        "execute_context_0(0)_generation_1(1)".to_string(),
+        "execute_512_context_1(sq512sk388352sqsq262144sqsk198836224)_generation_0(sq0sk0sqsq0sqsk0)".to_string(),
+        "execute_mm_encoder".to_string(),
+        "some_kernel".to_string(),
+    ];
+    let idxs = find_exec_context_names(&names);
+    assert_eq!(idxs, vec![1, 2]);
+}
+
+#[test]
+#[ignore] // exercises the Steps tab against a real trace; run with --ignored
+fn test_steps_table_real_trace() {
+    let path = "/Users/ecrncevi/vllm-profiles/20260923-114925.tvcache/_merged.tvcache";
+    let trace = match load_trace(path, &test_counter(), 8, None) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("could not load {path}: {e}, skipping"); return; }
+    };
+    let ec_names = find_exec_context_names(&trace.names);
+    let steps = compute_steps(&trace, &ec_names);
+    eprintln!("{} steps", steps.len());
+    assert!(!steps.is_empty());
+
+    let mut imgui = imgui::Context::create();
+    imgui.io_mut().display_size = [1600.0, 900.0];
+    imgui.fonts().build_rgba32_texture();
+    let mut buf = DrawBuf::default();
+    let mut step_clicked: Option<usize> = None;
+    // Render the table the way the bottom panel does, several frames.
+    for _ in 0..3 {
+        let ui = imgui.new_frame();
+        ui.window("steps")
+            .position([0.0, 700.0], imgui::Condition::Always)
+            .size([1600.0, 200.0], imgui::Condition::Always)
+            .build(|| {
+                let mut clicked: Option<usize> = None;
+                draw_steps_table(&ui, &steps, 0, &mut buf, &mut clicked);
+                step_clicked = clicked;
+            });
+        imgui.render();
+    }
+    eprintln!("table rendered OK");
+}
+
+#[test]
+#[ignore] // real-trace smoke test for the detailed-annotation format
+fn test_steps_detailed_annotation_trace() {
+    // 20260914-125236: vLLM with detailed_trace_annotation — batch counts
+    // encoded in span names. Use its merged cache.
+    let dir = "/Users/ecrncevi/vllm-profiles/20260914-125236.tvcache";
+    let path = format!("{dir}/_merged.tvcache");
+    let trace = match load_trace(&path, &test_counter(), 8, None) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("could not load {path}: {e}, skipping"); return; }
+    };
+    let ec_names = find_exec_context_names(&trace.names);
+    assert!(!ec_names.is_empty(), "detailed-format names must be found");
+    let steps = compute_steps(&trace, &ec_names);
+    eprintln!("{} steps", steps.len());
+    for (i, s) in steps.iter().enumerate() {
+        let b = s.batch.unwrap();
+        eprintln!("step {i}: wall={:>8.1} gpu={:>8.1} tokens={} ctx={}(sq{}) gen={}(sq{})",
+            s.t1 - s.t0, s.gpu_dur, b.total_tokens, b.n_ctx, b.ctx_tokens, b.n_gen, b.gen_tokens);
+    }
+    assert!(steps.iter().all(|s| s.batch.is_some()));
+    assert!(steps.iter().any(|s| s.batch.unwrap().total_tokens > 0));
 }

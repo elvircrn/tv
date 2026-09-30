@@ -791,6 +791,8 @@ pub fn winit_to_imgui(code: KeyCode) -> Option<imgui::Key> {
         KeyCode::SuperLeft => imgui::Key::LeftSuper,
         KeyCode::SuperRight => imgui::Key::RightSuper,
         KeyCode::KeyA => imgui::Key::A,
+        KeyCode::BracketLeft => imgui::Key::LeftBracket,
+        KeyCode::BracketRight => imgui::Key::RightBracket,
         KeyCode::KeyC => imgui::Key::C,
         KeyCode::KeyF => imgui::Key::F,
         KeyCode::KeyN => imgui::Key::N,
@@ -1045,6 +1047,9 @@ pub fn draw_timeline(
     focus: &mut Option<u32>,
     merge_cache_key: &mut Option<(Vec<bool>, Vec<usize>)>,
     merged_gpu_groups: &mut Vec<MergedGpuGroup>,
+    // vLLM scheduler steps for the ruler bands; empty slice is a no-op.
+    steps: &[StepInfo],
+    step_cursor: usize,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let t_dt_start = Instant::now();
     let dl = ui.get_window_draw_list();
@@ -1418,7 +1423,7 @@ pub fn draw_timeline(
     dl.add_rect([rect[0], rect[1]], [rect[2], rect[3]], BG_TIMELINE).filled(true).build();
 
     let ruler_rect = [tl_left, rect[1], rect[2], rect[1] + RULER_H];
-    draw_ruler(&dl, ruler_rect, view, &mut buf.fmt);
+    draw_ruler(&dl, ruler_rect, view, steps, step_cursor, &mut buf.fmt);
 
     dl.add_rect([rect[0], rect[1]], [tl_left, rect[3]], BG_LABELS).filled(true).build();
     dl.add_line([tl_left, rect[1]], [tl_left, rect[3]], DIVIDER).build();
@@ -2057,10 +2062,42 @@ pub fn draw_timeline(
     (hover_result, click_result, sel_change)
 }
 
-fn draw_ruler(dl: &imgui::DrawListMut, rect: [f32; 4], view: &View, fmt: &mut String) {
+fn draw_ruler(
+    dl: &imgui::DrawListMut,
+    rect: [f32; 4],
+    view: &View,
+    steps: &[StepInfo],
+    step_cursor: usize,
+    fmt: &mut String,
+) {
     dl.add_rect([rect[0], rect[1]], [rect[2], rect[3]], RULER_BG)
         .filled(true).build();
     let range = view.t1 - view.t0;
+    // vLLM scheduler-step bands: alternate shading between consecutive steps
+    // plus a boundary line at each step edge, so the step structure is
+    // visible at any zoom. The step the `[`/`]` cursor is on gets a stronger
+    // tint. Steps are ts-ordered, so a partition_point + scan window covers
+    // exactly the visible ones — O(log n + visible), negligible at any zoom.
+    if !steps.is_empty() {
+        let px_per_us = (rect[2] - rect[0]) as f64 / range;
+        let first = steps.partition_point(|s| s.t1 <= view.t0);
+        for (i, s) in steps.iter().enumerate().skip(first) {
+            if s.t0 >= view.t1 { break; }
+            let x0 = rect[0] + ((s.t0 - view.t0) * px_per_us).max(0.0) as f32;
+            let x1 = rect[0] + ((s.t1 - view.t0) * px_per_us).min(range) as f32;
+            if i % 2 == 0 {
+                let band = if i == step_cursor { STEP_BAND_CUR } else { STEP_BAND };
+                dl.add_rect([x0.max(rect[0]), rect[1]], [x1, rect[3]], band)
+                    .filled(true).build();
+            } else if i == step_cursor {
+                dl.add_rect([x0.max(rect[0]), rect[1]], [x1, rect[3]], STEP_BAND_CUR)
+                    .filled(true).build();
+            }
+            if x0 >= rect[0] {
+                dl.add_line([x0, rect[1]], [x0, rect[3]], STEP_EDGE).build();
+            }
+        }
+    }
     let interval = nice_interval(range);
     if interval <= 0.0 { return; }
     let first = (view.t0 / interval).floor() * interval;
@@ -2077,6 +2114,130 @@ fn draw_ruler(dl: &imgui::DrawListMut, rect: [f32; 4], view: &View, fmt: &mut St
         }
         tick += interval;
         count += 1;
+    }
+}
+
+/// The Steps tab's per-step table. One row per vLLM scheduler step in
+/// temporal order — deliberately NOT sortable (the natural order IS the
+/// index; sorting by duration etc. would break "next/prev" semantics).
+/// Clicking a row frames that step (`step_clicked` out-param, applied by
+/// the caller after the bottom panel finishes). The current step (from
+/// `[`/`]` navigation) is highlighted. Batch columns (Tokens, Ctx, Gen)
+/// show name-parsed composition when the trace's annotation carries it.
+pub fn draw_steps_table(
+    ui: &imgui::Ui,
+    steps: &[StepInfo],
+    step_cursor: usize,
+    buf: &mut DrawBuf,
+    step_clicked: &mut Option<usize>,
+) {
+    use imgui::{TableColumnFlags, TableColumnSetup, TableFlags};
+
+    const HEADERS: [&str; 10] = [
+        "Step", "Start", "Wall", "GPU busy", "Idle before",
+        "Tokens", "Ctx reqs", "Gen reqs", "Ranks", "Kernels",
+    ];
+    // Columns 5-7 (Tokens/Ctx/Gen) only when at least one step parsed a
+    // batch out of its span name; otherwise every row would read "0".
+    let has_batch = steps.iter()
+        .any(|s| s.batch.map_or(false, |b| b.total_tokens > 0 || b.n_ctx > 0 || b.n_gen > 0));
+    let flags = TableFlags::RESIZABLE
+        | TableFlags::ROW_BG
+        | TableFlags::BORDERS_INNER_V
+        | TableFlags::BORDERS_OUTER
+        | TableFlags::SCROLL_Y
+        | TableFlags::NO_SAVED_SETTINGS
+        | TableFlags::SIZING_FIXED_FIT;
+
+    let avail = ui.content_region_avail();
+    let num_w = ui.calc_text_size("0000.00 ms")[0]
+        .max(ui.calc_text_size("Idle before")[0] + 12.0);
+    let mk_col = |i: usize| {
+        let mut c = TableColumnSetup::new(HEADERS[i]);
+        if i == 0 {
+            c.flags |= TableColumnFlags::WIDTH_STRETCH | TableColumnFlags::NO_HIDE;
+        } else {
+            c.flags |= TableColumnFlags::WIDTH_FIXED;
+            c.init_width_or_weight = num_w;
+        }
+        c
+    };
+    // The table token MUST outlive the row loop below — binding it inside
+    // the if/else would drop (and end) the table before the first
+    // table_next_row, and imgui's C API then segfaults on the null
+    // current-table pointer. Same shape as draw_stats_table's binding.
+    let token = if has_batch {
+        let cols: [TableColumnSetup<&str>; 10] = std::array::from_fn(mk_col);
+        ui.begin_table_header_with_sizing("##steps", cols, flags, [avail[0], avail[1]], 0.0)
+    } else {
+        let cols: [TableColumnSetup<&str>; 7] = [0, 1, 2, 3, 4, 8, 9].map(mk_col);
+        ui.begin_table_header_with_sizing("##steps", cols, flags, [avail[0], avail[1]], 0.0)
+    };
+    let Some(_t) = token else { return };
+
+    let row_h = ui.current_font_size() + ROW_PAD;
+    let clipper = imgui::ListClipper::new(steps.len() as i32)
+        .items_height(row_h)
+        .begin(ui);
+    for row in clipper.iter() {
+        let i = row as usize;
+        let s = &steps[i];
+        ui.table_next_row();
+        // Batch columns participate only when the trace carries them; index
+        // into a compact list of the columns actually present.
+        let colmap: [usize; 10] = if has_batch {
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+        } else {
+            [0, 1, 2, 3, 4, 8, 8, 8, 8, 9]
+        };
+        ui.table_set_column_index(colmap[0]);
+        // Whole-row click target via a span-all-columns selectable.
+        if ui.selectable_config(format!("{i}")).span_all_columns(true).build() {
+            *step_clicked = Some(i);
+        }
+        // The remaining cells, in HEADERS order.
+        ui.table_set_column_index(colmap[1]);
+        buf.fmt.clear();
+        write_time(&mut buf.fmt, s.t0);
+        ui.text(&buf.fmt);
+        ui.table_set_column_index(colmap[2]);
+        buf.fmt.clear();
+        write_time(&mut buf.fmt, s.t1 - s.t0);
+        ui.text(&buf.fmt);
+        ui.table_set_column_index(colmap[3]);
+        buf.fmt.clear();
+        write_time(&mut buf.fmt, s.gpu_dur);
+        ui.text(&buf.fmt);
+        ui.table_set_column_index(colmap[4]);
+        buf.fmt.clear();
+        write_time(&mut buf.fmt, s.idle_before);
+        ui.text(&buf.fmt);
+        if has_batch {
+            match s.batch {
+                Some(b) => {
+                    ui.table_set_column_index(colmap[5]);
+                    ui.text(format!("{}", b.total_tokens));
+                    ui.table_set_column_index(colmap[6]);
+                    // Request count with the phase's token count — the
+                    // interesting part for chunked-prefill sizing.
+                    ui.text(format!("{} ({})", b.n_ctx, b.ctx_tokens));
+                    ui.table_set_column_index(colmap[7]);
+                    ui.text(format!("{} ({})", b.n_gen, b.gen_tokens));
+                }
+                None => {
+                    ui.table_set_column_index(colmap[5]);
+                    ui.text("-");
+                    ui.table_set_column_index(colmap[6]);
+                    ui.text("-");
+                    ui.table_set_column_index(colmap[7]);
+                    ui.text("-");
+                }
+            }
+        }
+        ui.table_set_column_index(colmap[8]);
+        ui.text(format!("{}", s.n_ranks));
+        ui.table_set_column_index(colmap[9]);
+        ui.text(format!("{}", s.kernel_count));
     }
 }
 

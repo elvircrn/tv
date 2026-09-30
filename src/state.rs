@@ -32,15 +32,226 @@ fn spawn_load_job(job: impl FnOnce() + Send + 'static) {
     job();
 }
 
-/// Interned name indices matching vLLM's per-generation `execute_context_*`
-/// wrapper span. Pulled out as a pure function so it's testable without
-/// spinning up the loader pipeline, and so `poll_loading` can compute it once
-/// per trace load instead of every toolbar frame.
+/// Interned name indices matching vLLM's per-generation execute wrapper span.
+/// Two formats exist (see vLLM `gpu_worker.py:annotate_profile`):
+///   legacy:   `execute_context_1(4)_generation_1(1)`
+///   detailed: `execute_512_context_1(sq512sk388352sqsq262144sqsk198836224)_generation_0(sq0sk0sqsq0sqsk0)`
+/// The detailed format has token counts in the name itself (see
+/// `parse_exec_context_name`). Pulled out as a pure function so it's
+/// testable without spinning up the loader pipeline, and so `poll_loading`
+/// can compute it once per trace load instead of every toolbar frame.
 pub(crate) fn find_exec_context_names(names: &[String]) -> Vec<usize> {
     names.iter().enumerate()
-        .filter(|(_, n)| n.contains("execute_context"))
+        .filter(|(_, n)| {
+            n.starts_with("execute_")
+                && n.contains("_context_")
+                && n.contains("_generation_")
+        })
         .map(|(i, _)| i)
         .collect()
+}
+
+/// Leading ASCII digits of `s`, returning the parsed number and the rest.
+/// None when `s` doesn't start with a digit (or doesn't parse).
+fn take_num(s: &str) -> Option<(u64, &str)> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if end == 0 { return None; }
+    Some((s[..end].parse().ok()?, &s[end..]))
+}
+
+/// Parse the counts out of an execute-annotation span name. Accepts both
+/// the legacy `execute_context_1(4)_generation_1(1)` and detailed
+/// `execute_512_context_1(sq512sk...)_generation_0(sq0sk...)` formats.
+/// Returns None for names that don't match either shape.
+pub(crate) fn parse_exec_context_name(name: &str) -> Option<StepBatch> {
+    let rest = name.strip_prefix("execute_")?;
+    // Legacy is `execute_context_1(4)...` — after the prefix strip the
+    // marker sits at the string start (no total-tokens prefix). Detailed is
+    // `execute_512_context_1(...)` — marker after a total-tokens prefix.
+    let (total_tokens, rest) = if let Some(r) = rest.strip_prefix("context_") {
+        (None, r)
+    } else {
+        let (tot, r) = rest.split_once("_context_")?;
+        (Some(tot.parse().ok()?), r)
+    };
+    // rest: "<n>(<ctx inner>)_generation_<n>(<gen inner>)
+    let (ctx_seg, gen_seg) = rest.split_once(")_generation_")?;
+    let (ctx_n_str, ctx_inner) = ctx_seg.split_once('(')?;
+    let ctx_n: u64 = ctx_n_str.parse().ok()?;
+    let (gen_n_str, gen_inner) = gen_seg.split_once('(')?;
+    let gen_n: u64 = gen_n_str.parse().ok()?;
+    let gen_inner = gen_inner.strip_suffix(')')?;
+
+    // Inner is "<tokens>" (legacy) or
+    // "sq<tokens>sk<kv>sqsq<qq>sqsk<qk>" (detailed). Parse positionally —
+    // the "sqsq"/"sqsk" markers contain "sk", so a plain split("sk") would
+    // mangle the KV number. The two trailing compute proxies (qq/qk) aren't
+    // needed for the summary table.
+    let parse_inner = |inner: &str| -> Option<(u64, Option<u64>)> {
+        if let Some(r) = inner.strip_prefix("sq") {
+            let (tokens, r) = take_num(r)?;
+            let kv = r.strip_prefix("sk").and_then(take_num).map(|(kv, _)| kv);
+            Some((tokens, kv))
+        } else {
+            Some((inner.parse().ok()?, None))
+        }
+    };
+    let (ctx_tokens, ctx_kv) = parse_inner(ctx_inner)?;
+    let (gen_tokens, gen_kv) = parse_inner(gen_inner)?;
+
+    let mut b = StepBatch {
+        total_tokens: total_tokens.unwrap_or(0),
+        n_ctx: ctx_n, n_gen: gen_n, ctx_tokens, ctx_kv, gen_tokens, gen_kv,
+    };
+    if b.total_tokens == 0 {
+        b.total_tokens = b.ctx_tokens + b.gen_tokens;
+    }
+    Some(b)
+}
+
+/// Derive the vLLM scheduler-step sequence from the trace's
+/// `execute_context_*` spans (see `StepInfo`). Returns an empty Vec when the
+/// trace has no such spans (non-vLLM trace, or none on any loaded track).
+///
+/// Pure function of the `Trace` so it's unit-testable and recomputable after
+/// clock sync / reload shifts timestamps.
+pub(crate) fn compute_steps(trace: &Trace, exec_context_names: &[usize]) -> Vec<StepInfo> {
+    if exec_context_names.is_empty() { return Vec::new(); }
+    let name_set: std::collections::HashSet<u32> =
+        exec_context_names.iter().map(|&i| i as u32).collect();
+
+    // Collect (ts, end, track_idx, name_idx) for every exec-context span,
+    // preferring the GPU-side projection (`gpu_user_annotation`): it
+    // brackets the actual GPU work rather than the CPU launch loop, and
+    // appears on every CUDA stream so per-rank assignment is direct. Fall
+    // back to CPU-side `user_annotation` for traces where the GPU
+    // projection was dropped.
+    let gpu_side: Vec<(f64, f64, usize, u32)> = collect_exec_spans(trace, &name_set, "gpu_user_annotation");
+    let spans = if gpu_side.is_empty() {
+        collect_exec_spans(trace, &name_set, "user_annotation")
+    } else {
+        gpu_side
+    };
+    if spans.is_empty() { return Vec::new(); }
+
+    // Reference track: the one with the most spans. Its spans are sequential
+    // and non-overlapping (one bracket per step per stream), so they define
+    // the canonical step list — no gap-based clustering needed, which would
+    // be fragile across skewed clocks.
+    let mut per_track_counts: std::collections::HashMap<usize, usize> = Default::default();
+    for &(_, _, ti, _) in &spans { *per_track_counts.entry(ti).or_default() += 1; }
+    let ref_track = per_track_counts.into_iter().max_by_key(|&(_, c)| c).unwrap().0;
+    let mut ref_spans: Vec<(f64, f64, u32)> = spans.iter()
+        .filter(|&&(_, _, ti, _)| ti == ref_track)
+        .map(|&(t0, t1, _, name)| (t0, t1, name))
+        .collect();
+    ref_spans.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    // Assign every span to the reference interval it overlaps most. The
+    // spans are ts-sorted per track by the loader, but the combined list
+    // isn't globally sorted, and overlap-most needs interval arithmetic per
+    // span anyway — a linear scan over reference intervals (advanced by a
+    // moving cursor, since a span can't overlap two far-apart steps) is
+    // O(spans + steps).
+    let n = ref_spans.len();
+    let mut bounds = vec![(f64::MAX, f64::MIN, 0f64); n]; // (min t0, max t1, sum dur)
+    let mut rank_sets: Vec<std::collections::HashSet<usize>> = (0..n).map(|_| Default::default()).collect();
+    for &(s0, s1, ti, _) in &spans {
+        let track = &trace.tracks[ti];
+        let rank = parse_rank(&track.label);
+        // Best-overlap reference interval. Reference spans are disjoint, so
+        // at most two can overlap a given span; scan a window around where
+        // the span falls.
+        let mut best = (0usize, 0f64);
+        for (i, &(r0, r1, _)) in ref_spans.iter().enumerate() {
+            if r0 >= s1 { break; }
+            let ov = (s1.min(r1) - s0.max(r0)).max(0.0);
+            if ov > best.1 { best = (i, ov); }
+        }
+        if best.1 <= 0.0 {
+            // Span falls between reference intervals (skewed rank, or an
+            // exec-context the reference stream didn't see). Attach it to the
+            // nearest interval so its time still counts.
+            let nearest = ref_spans.iter().enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    let da = (a.0 - s0).abs() + (a.1 - s1).abs();
+                    let db = (b.0 - s0).abs() + (b.1 - s1).abs();
+                    da.partial_cmp(&db).unwrap()
+                })
+                .map(|(i, _)| i).unwrap_or(0);
+            best.0 = nearest;
+        }
+        let i = best.0;
+        bounds[i].0 = bounds[i].0.min(s0);
+        bounds[i].1 = bounds[i].1.max(s1);
+        bounds[i].2 += s1 - s0;
+        rank_sets[i].insert(rank.unwrap_or(ti));
+    }
+
+    // Kernel counts: for each step, binary-search each GPU track's ts-sorted
+    // events for [t0, t1) and count `cat == "kernel"`. Load-time only, so
+    // O(steps * gpu_tracks * log n) is fine (30 steps * 256 tracks here).
+    let kernel_cat: Vec<u32> = trace.cats.iter()
+        .enumerate().filter(|(_, c)| c.as_str() == "kernel").map(|(i, _)| i as u32).collect();
+    let gpu_tracks: Vec<usize> = trace.tracks.iter().enumerate()
+        .filter(|(_, t)| t.gpu).map(|(ti, _)| ti).collect();
+
+    let mut steps = Vec::with_capacity(n);
+    let mut prev_t1 = 0.0;
+    for i in 0..n {
+        let (t0, t1, sum_dur) = bounds[i];
+        if t1 <= t0 { continue; } // reference interval with no surviving span (shouldn't happen)
+        let n_assigned = rank_sets[i].iter().filter(|&&r| r != usize::MAX).count().max(1);
+        let gpu_dur = sum_dur / n_assigned as f64;
+        let mut kernel_count = 0u32;
+        if !kernel_cat.is_empty() {
+            for &ti in &gpu_tracks {
+                let evs = &trace.tracks[ti].events;
+                let lo = evs.partition_point(|e| e.ts < t0);
+                let mut k = lo;
+                while k < evs.len() && evs[k].ts < t1 {
+                    if kernel_cat.contains(&evs[k].cat) { kernel_count += 1; }
+                    k += 1;
+                }
+            }
+        }
+        let idle_before = if steps.is_empty() { 0.0 } else { (t0 - prev_t1).max(0.0) };
+        prev_t1 = t1;
+        // Batch composition from the reference span's name — all spans of a
+        // step share one interned name (the annotation is identical across
+        // ranks and streams by construction).
+        let batch = parse_exec_context_name(&trace.names[ref_spans[i].2 as usize]);
+        steps.push(StepInfo {
+            t0, t1, gpu_dur, idle_before,
+            n_ranks: rank_sets[i].len() as u32,
+            kernel_count,
+            batch,
+        });
+    }
+    steps
+}
+
+/// All spans on any track whose name matches `name_set` and whose category
+/// is exactly `cat`, as (start, end, track_idx, name_idx). Track event lists
+/// are ts-sorted per track by the loader; the combined output is NOT
+/// globally sorted (callers don't need it to be).
+fn collect_exec_spans(
+    trace: &Trace,
+    name_set: &std::collections::HashSet<u32>,
+    cat: &str,
+) -> Vec<(f64, f64, usize, u32)> {
+    let cat_ids: Vec<u32> = trace.cats.iter().enumerate()
+        .filter(|(_, c)| c.as_str() == cat).map(|(i, _)| i as u32).collect();
+    if cat_ids.is_empty() { return Vec::new(); }
+    let mut out = Vec::new();
+    for (ti, track) in trace.tracks.iter().enumerate() {
+        for ev in &track.events {
+            if name_set.contains(&ev.name) && cat_ids.contains(&ev.cat) {
+                out.push((ev.ts, ev.ts + ev.dur, ti, ev.name));
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn parse_rank(label: &str) -> Option<usize> {
@@ -127,6 +338,13 @@ pub struct Pane {
     /// wrapper span. Computed once per trace load (see `poll_loading`), not
     /// per toolbar frame, since it only depends on `trace.names`.
     pub exec_context_names: Vec<usize>,
+    /// vLLM scheduler steps derived from those spans (see `compute_steps`).
+    /// Empty for traces without execute_context spans. Recomputed on load,
+    /// after clock sync (which shifts timestamps), and after auto-reload.
+    pub steps: Vec<StepInfo>,
+    /// Current step for `[`/`]` navigation and ruler highlighting. Index into
+    /// `steps`; meaningless while `steps` is empty.
+    pub step_cursor: usize,
     pub pending_tab: Option<BottomTab>,
     /// Track index whose row draw_timeline should scroll into view as part of an
     /// in-flight search zoom. Consumed (cleared) on the next timeline draw.
@@ -232,6 +450,8 @@ impl Pane {
             merge_cache_key: None,
             merged_gpu_groups: Vec::new(),
             exec_context_names: Vec::new(),
+            steps: Vec::new(),
+            step_cursor: 0,
             pending_tab: Some(BottomTab::Detail),
             pending_focus: None,
             sort_col: 2,
@@ -397,7 +617,11 @@ impl Pane {
         // isn't the out-of-bounds risk a reload is) but the merged view's
         // cached Tetris packing is order-dependent on those timestamps, and
         // the cache key doesn't otherwise change just because clocks synced.
-        if result.is_ok() { self.merge_cache_key = None; }
+        // Step boundaries are derived from the same timestamps.
+        if result.is_ok() {
+            self.merge_cache_key = None;
+            self.recompute_steps();
+        }
         result
     }
 
@@ -717,6 +941,7 @@ impl Pane {
                 self.exec_context_names = self.trace.as_ref()
                     .map(|t| find_exec_context_names(&t.names))
                     .unwrap_or_default();
+                self.recompute_steps();
             }
             Ok(Err(e)) => {
                 self.error = Some(e);
@@ -968,6 +1193,58 @@ impl Pane {
         self.selected = Some(EventRef { track_idx: ti, event_idx: ei });
         let dur = self.trace.as_ref().unwrap().tracks[ti as usize].events[ei as usize].dur;
         self.start_zoom_to(ts, dur, ti as usize);
+    }
+
+    /// Rebuild `steps` from the current trace + exec-context name list.
+    /// Called after load, clock sync, and auto-reload — the only events that
+    /// can shift the timestamps or name set the steps are derived from.
+    pub fn recompute_steps(&mut self) {
+        self.steps = match &self.trace {
+            Some(t) => compute_steps(t, &self.exec_context_names),
+            None => Vec::new(),
+        };
+        if self.step_cursor >= self.steps.len() { self.step_cursor = 0; }
+    }
+
+    /// `[`/`]`: step the cursor and smooth-zoom to that step, framed with a
+    /// little padding either side so the inter-step gaps stay visible.
+    /// Wraps around like search nav does.
+    pub fn nav_step(&mut self, forward: bool) {
+        let n = self.steps.len();
+        if n == 0 { return; }
+        // Snap the cursor to the step the view center is in before stepping,
+        // so `[` from an arbitrary zoom level goes to the *next* step from
+        // where you're looking, not from wherever the cursor last was.
+        let center = (self.view.t0 + self.view.t1) / 2.0;
+        if let Some(i) = self.steps.iter().position(|s| center < s.t1) {
+            self.step_cursor = i;
+        }
+        self.step_cursor = if forward {
+            (self.step_cursor + 1) % n
+        } else {
+            (self.step_cursor + n - 1) % n
+        };
+        self.frame_step(self.step_cursor);
+    }
+
+    /// Smooth-zoom so step `i` fills the view with `STEP_PAD` slack on each
+    /// side. Keeps the current vertical scroll — steps span all tracks, so
+    /// there's nothing specific to scroll to.
+    pub fn frame_step(&mut self, i: usize) {
+        let Some(s) = self.steps.get(i) else { return; };
+        let range = ((s.t1 - s.t0) / (1.0 - 2.0 * crate::types::STEP_PAD))
+            .max(crate::types::MIN_TIME_RANGE);
+        let center = (s.t0 + s.t1) / 2.0;
+        self.view.anim = Some(crate::types::ViewAnim {
+            from_t0: self.view.t0,
+            from_t1: self.view.t1,
+            to_t0: center - range / 2.0,
+            to_t1: center + range / 2.0,
+            from_scroll: self.view.scroll_y,
+            to_scroll: self.view.scroll_y,
+            elapsed: 0.0,
+            dur: crate::types::ZOOM_ANIM_DUR,
+        });
     }
 
     /// Start a smooth zoom that frames a single event (`ts`, `dur`) at
