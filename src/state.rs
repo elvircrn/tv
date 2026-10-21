@@ -556,6 +556,30 @@ impl Pane {
 
     pub fn has_trace(&self) -> bool { self.trace.is_some() }
 
+    /// "File > Export Merged TV Cache": writes this pane's trace to the
+    /// on-disk cache that opening a trace used to build automatically (it
+    /// no longer does — see `loader::cache_dir_for_folder`). For a
+    /// folder-opened pane that's `<folder>.tvcache/_merged.tvcache`; for a
+    /// bare single-file open it's a sibling `<file>.tvcache` (same format,
+    /// read back by `load_cache`). Already-cached sources (.tvcache family)
+    /// have nothing to export.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn export_tv_cache(&self) -> Result<String, String> {
+        let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;
+        if let Some(cd) = &self.cache_dir {
+            crate::loader::export_merged_cache(trace, cd)
+        } else if self.reload_paths.len() == 1 {
+            let path = &self.reload_paths[0].1;
+            if path.ends_with(".tvcache") || path.ends_with(".tvcache.xz") || path.ends_with(".tvcache.gz") {
+                Err("this trace was loaded from a cache file — nothing to export".to_string())
+            } else {
+                crate::loader::export_single_cache(trace, path)
+            }
+        } else {
+            Err("no folder or single source file to export a cache for".to_string())
+        }
+    }
+
     /// Exports this pane's GPU tracks (timings only, args stripped — see
     /// `loader::export_gpu_only`) to a sibling "<name>-gpu-only/" folder next
     /// to wherever the trace was actually opened from. `reload_paths` (set

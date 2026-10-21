@@ -822,10 +822,13 @@ fn cache_path(source: &str, cache_dir: Option<&str>) -> String {
     }
 }
 
+/// Computes `<dir>.tvcache` without touching the filesystem — the folder is
+/// only ever created by an explicit "File > Export Merged TV Cache"
+/// (`export_merged_cache`); opening a trace must not litter cache files
+/// next to the user's data. Loads still *read* from the path if an export
+/// (or a pre-explicit-export-era run) left one there.
 pub fn cache_dir_for_folder(dir: &str) -> String {
-    let cd = format!("{dir}.tvcache");
-    std::fs::create_dir_all(&cd).ok();
-    cd
+    format!("{dir}.tvcache")
 }
 
 fn source_meta(path: &str) -> Option<(u64, u64)> {
@@ -2336,6 +2339,32 @@ fn save_merged_cache(trace: &Trace, cache_dir: &str) {
     }
 }
 
+/// Explicit "File > Export Merged TV Cache": creates `<dir>.tvcache/` (which
+/// opening a trace no longer does — see `cache_dir_for_folder`) and writes
+/// the merged `_merged.tvcache` into it, so re-opening that folder loads in
+/// one decompress instead of re-parsing every rank.
+pub fn export_merged_cache(trace: &Trace, cache_dir: &str) -> Result<String, String> {
+    std::fs::create_dir_all(cache_dir).map_err(|e| format!("create {cache_dir}: {e}"))?;
+    save_merged_cache(trace, cache_dir);
+    let cp = format!("{cache_dir}/_merged.tvcache");
+    let len = std::fs::metadata(&cp).map_err(|e| format!("write {cp}: {e}"))?.len();
+    if len == 0 { return Err(format!("write {cp}: empty output")); }
+    Ok(cp)
+}
+
+/// Single-file counterpart of `export_merged_cache`, for panes opened from a
+/// bare file (no folder, hence no `<folder>.tvcache/` to write into): writes
+/// a sibling `<file>.tvcache` that `load_cache` picks up — mtime-validated —
+/// on the next open of the same file.
+pub fn export_single_cache(trace: &Trace, source_path: &str) -> Result<String, String> {
+    if source_path.is_empty() { return Err("no source file path available".into()); }
+    save_cache(trace, source_path, None);
+    let cp = cache_path(source_path, None);
+    let len = std::fs::metadata(&cp).map_err(|e| format!("write {cp}: {e}"))?.len();
+    if len == 0 { return Err(format!("write {cp}: empty output")); }
+    Ok(cp)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn load_merged_cache(cache_dir: &str) -> Option<Trace> {
     let cp = format!("{cache_dir}/_merged.tvcache");
@@ -2344,7 +2373,23 @@ fn load_merged_cache(cache_dir: &str) -> Option<Trace> {
     let stored_hash = u64::from_le_bytes(d[8..16].try_into().unwrap());
     let current_hash = merged_cache_hash(cache_dir);
     if stored_hash != current_hash { return None; }
-    load_cache_from_bytes(&d)
+    let trace = load_cache_from_bytes(&d)?;
+    // With auto-written per-file caches gone, an exported `<dir>.tvcache/`
+    // usually contains only `_merged.tvcache`, so the dir-contents hash above
+    // matches trivially and can't detect source edits. Guard against serving a
+    // stale export directly: any rank source with an mtime at or past the
+    // cache file's own mtime invalidates it (>= rather than > so an edit in
+    // the same second as the export can't slip through; the cost of a
+    // spurious miss is just a re-parse).
+    let cache_mtime = std::fs::metadata(&cp).ok()?
+        .modified().ok()?
+        .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    for (_, path) in &trace.rank_paths {
+        if let Some((_, mtime)) = source_meta(path) {
+            if mtime >= cache_mtime { return None; }
+        }
+    }
+    Some(trace)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2388,8 +2433,10 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
     let (raw, chunks, n_chunks) = decompress_parse(path, counter, max_parse_threads, &t0)?;
     let mut trace = build_trace(raw, chunks, n_chunks, &t0)?;
     compact_args(&mut trace);
-
-    save_cache(&trace, path, cache_dir);
+    // No automatic save_cache here (or in send_progressive below): caches are
+    // only written by an explicit "File > Export Merged TV Cache". Reads still
+    // go through load_cache above, mtime-validated, so an exported (or stale
+    // pre-change) cache is picked up or correctly ignored.
 
     let event_bytes: usize = trace.tracks.iter().map(|t| t.events.len() * std::mem::size_of::<Event>()).sum();
     let str_bytes: usize = trace.names.iter().chain(trace.cats.iter()).map(|s| s.len() + std::mem::size_of::<String>()).sum();
@@ -2420,13 +2467,12 @@ fn clone_trace(t: &Trace) -> Trace {
     }
 }
 
-fn send_progressive(trace: Trace, tx: &std::sync::mpsc::Sender<Result<Trace, String>>, t0: &Instant, source_path: &str, cache_dir: Option<&str>) {
+fn send_progressive(trace: Trace, tx: &std::sync::mpsc::Sender<Result<Trace, String>>, t0: &Instant, _source_path: &str, _cache_dir: Option<&str>) {
     eprintln!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
     let mut compact_trace = clone_trace(&trace);
     let _ = tx.send(Ok(trace));
 
     compact_args(&mut compact_trace);
-    save_cache(&compact_trace, source_path, cache_dir);
     let args_bytes: usize = compact_trace.raw_bufs.iter().map(|b| b.len()).sum();
     eprintln!("  compact: {:.2}s (args={}MB)", t0.elapsed().as_secs_f64(), args_bytes / 1024 / 1024);
     let _ = tx.send(Ok(compact_trace));
@@ -2943,11 +2989,16 @@ pub fn load_multi_progressive(
 ) {
     let t0 = Instant::now();
 
-    // On a watch-triggered reload (bypass_cache), skip the merged cache: its hash
-    // is keyed off the per-file .tvcache names+sizes, which don't reflect a
-    // source-file edit yet, so it would keep serving stale data. The per-file
-    // load_trace below still uses its mtime-validated caches, so unchanged ranks
-    // stay fast while the edited one is re-read and the merge re-saved.
+    // On a watch-triggered reload (bypass_cache), skip the merged cache: its
+    // hash is keyed off the per-file .tvcache names+sizes, which don't reflect
+    // a source-file edit yet, plus the source-mtime guard in load_merged_cache
+    // wouldn't catch an edit made in the same second as the export. The
+    // per-file load_trace below still reads its mtime-validated caches, so
+    // unchanged ranks stay fast while the edited one is re-read.
+    //
+    // No save_merged_cache after the merge anymore: the merged cache is only
+    // written by an explicit "File > Export Merged TV Cache" (see
+    // export_merged_cache), never as a side effect of opening a trace.
     if !bypass_cache {
         if let Some(cd) = cache_dir {
             if let Some(trace) = load_merged_cache(cd) {
@@ -2994,9 +3045,6 @@ pub fn load_multi_progressive(
     let mut trace = merge_traces(traces);
     trace.rank_paths = merged_rank_paths;
     eprintln!("  merged: {:.2}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
-    if let Some(cd) = cache_dir {
-        save_merged_cache(&trace, cd);
-    }
     let _ = tx.send(Ok(trace));
 }
 

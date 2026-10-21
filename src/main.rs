@@ -1392,38 +1392,68 @@ impl App {
                             #[cfg(not(target_arch = "wasm32"))]
                             let has_export_share = !pane.reload_paths.is_empty()
                                 && pane.trace.as_ref().is_some_and(|t| t.tracks.iter().any(|tr| tr.gpu));
+                            // Export Merged TV Cache needs somewhere to write:
+                            // the folder a directory-open came from, or the one
+                            // source file of a bare file open. Mirrors the
+                            // gating in `Pane::export_tv_cache`.
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let can_export_cache = pane.cache_dir.is_some()
+                                || (pane.reload_paths.len() == 1
+                                    && !pane.reload_paths[0].1.ends_with(".tvcache")
+                                    && !pane.reload_paths[0].1.ends_with(".tvcache.xz")
+                                    && !pane.reload_paths[0].1.ends_with(".tvcache.gz"));
                             let multi_rank = pane.reload_paths.len() >= 2
                                 || pane.trace.as_ref().is_some_and(|t| t.rank_paths.len() >= 2);
                             #[cfg(not(target_arch = "wasm32"))]
-                            if has_export_share {
+                            if has_export_share || can_export_cache {
                                 ui.menu("File", || {
-                                    let uploading = pane.share_link_job.is_some();
-                                    let include_cpu = pane.share_include_cpu;
-                                    if ui.menu_item_config("Share via Gist").enabled(!uploading).build() {
-                                        pane.start_share_upload(include_cpu);
-                                    }
-                                    if ui.is_item_hovered() {
-                                        let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "GPU-only timings (no args)" };
-                                        ui.tooltip_text(&format!("Export {what}, then upload it to a new secret GitHub gist via your locally logged-in `gh` CLI, and show a copyable ?gist= link — no browser login or pasted token, but it does need `gh auth login` already done on this machine"));
-                                    }
-                                    ui.menu_item_config("Include CPU data##sharecpu").build_with_ref(&mut pane.share_include_cpu);
-                                    if ui.is_item_hovered() {
-                                        ui.tooltip_text("Upload the whole trace (all CPU and GPU tracks, args left intact, not stripped) instead of just GPU-only timings — much larger, but complete");
-                                    }
-                                    match &pane.share_link_result {
-                                        Some((true, link)) if link.starts_with("https://") => {
-                                            ui.text_colored([0.4, 0.85, 0.4, 1.0], link);
-                                            ui.same_line();
-                                            if ui.small_button("Copy##sharelink") {
-                                                #[cfg(not(target_arch = "wasm32"))]
-                                                MacClipboard.set(link);
+                                    #[cfg(not(target_arch = "wasm32"))]
+                                    if has_export_share {
+                                        let uploading = pane.share_link_job.is_some();
+                                        let include_cpu = pane.share_include_cpu;
+                                        if ui.menu_item_config("Share via Gist").enabled(!uploading).build() {
+                                            pane.start_share_upload(include_cpu);
+                                        }
+                                        if ui.is_item_hovered() {
+                                            let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "GPU-only timings (no args)" };
+                                            ui.tooltip_text(&format!("Export {what}, then upload it to a new secret GitHub gist via your locally logged-in `gh` CLI, and show a copyable ?gist= link — no browser login or pasted token, but it does need `gh auth login` already done on this machine"));
+                                        }
+                                        ui.menu_item_config("Include CPU data##sharecpu").build_with_ref(&mut pane.share_include_cpu);
+                                        if ui.is_item_hovered() {
+                                            ui.tooltip_text("Upload the whole trace (all CPU and GPU tracks, args left intact, not stripped) instead of just GPU-only timings — much larger, but complete");
+                                        }
+                                        match &pane.share_link_result {
+                                            Some((true, link)) if link.starts_with("https://") => {
+                                                ui.text_colored([0.4, 0.85, 0.4, 1.0], link);
+                                                ui.same_line();
+                                                if ui.small_button("Copy##sharelink") {
+                                                    #[cfg(not(target_arch = "wasm32"))]
+                                                    MacClipboard.set(link);
+                                                }
                                             }
+                                            Some((ok, msg)) => {
+                                                let color = if *ok { [0.8, 0.8, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
+                                                ui.text_colored(color, msg);
+                                            }
+                                            None => {}
                                         }
-                                        Some((ok, msg)) => {
-                                            let color = if *ok { [0.8, 0.8, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
-                                            ui.text_colored(color, msg);
-                                        }
-                                        None => {}
+                                        ui.separator();
+                                    }
+                                    // Opening a trace no longer writes cache files
+                                    // next to the user's data — this is the only
+                                    // thing that does, and only on purpose.
+                                    if ui.menu_item("Export Merged TV Cache") {
+                                        pane.export_message = Some(match pane.export_tv_cache() {
+                                            Ok(p) => (true, format!("Wrote {p}")),
+                                            Err(e) => (false, e),
+                                        });
+                                    }
+                                    if ui.is_item_hovered() {
+                                        ui.tooltip_text("Write this trace to the fast on-disk cache (<folder>.tvcache/_merged.tvcache for a folder open, a sibling <file>.tvcache for a single file) so re-opening it loads instantly. Opening a trace never writes these automatically — this menu item is the only way they get created.");
+                                    }
+                                    if let Some((ok, msg)) = &pane.export_message {
+                                        let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
+                                        ui.text_colored(color, msg);
                                     }
                                 });
                             }

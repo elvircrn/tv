@@ -754,8 +754,10 @@ fn test_cache_roundtrip() {
     let path_str = path.to_str().unwrap();
 
     let original = load_trace(path_str, &test_counter(), 0, None).unwrap();
-    let cache_path = format!("{path_str}.tvcache");
-    assert!(std::path::Path::new(&cache_path).exists(), "cache file should be created");
+    // Opening a trace no longer writes caches as a side effect — export
+    // explicitly, the way File > Export Merged TV Cache does.
+    let cache_path = crate::loader::export_single_cache(&original, path_str)
+        .expect("explicit cache export should write the cache file");
 
     let cached = crate::loader::load_cache(path_str, None).expect("cache should load");
     assert_eq!(cached.total_events, original.total_events);
