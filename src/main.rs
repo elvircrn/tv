@@ -633,12 +633,32 @@ impl ApplicationHandler for App {
                                 entries.push(entry);
                             }
                         }
+                        // Fallback for drops whose items don't expose
+                        // webkitGetAsEntry(): a real OS drag always yields
+                        // entries, but a scripted/re-dispatched DataTransfer
+                        // (e.g. an embedding page forwarding a drop into this
+                        // app) returns null there. Like the entry scan above,
+                        // the File objects must be grabbed here, synchronously,
+                        // while the DataTransfer is still valid.
+                        let flat_files: Vec<web_sys::File> = if entries.is_empty() {
+                            dt.files().map(|files| {
+                                (0..files.length()).filter_map(|i| files.get(i)).collect()
+                            }).unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
                         let pending = pending.clone();
                         let proxy = proxy.clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             let mut files = Vec::new();
                             for entry in entries {
                                 files.extend(walk_dropped_entry(entry).await);
+                            }
+                            for file in flat_files {
+                                let name = file.name();
+                                if !crate::loader::is_trace_file(&name) { continue; }
+                                let Ok(buf) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await else { continue };
+                                files.push((name, js_sys::Uint8Array::new(&buf).to_vec()));
                             }
                             if !files.is_empty() {
                                 pending.borrow_mut().extend(files);
