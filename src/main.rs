@@ -11,6 +11,7 @@ mod state;
 mod ui;
 mod diff;
 mod time;
+mod ktz;
 
 use parse::{skip_value, parse_args_flat, FnvMap};
 use types::*;

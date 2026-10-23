@@ -309,7 +309,12 @@ where
 fn decompress_parse_seq(
     path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, t0: &Instant,
 ) -> Result<(RawData, Vec<ChunkState>, usize), String> {
-    let raw = read_bytes(path)?;
+    let raw = read_bytes(path, counter)?;
+    if path.ends_with(".ktz") {
+        // ktz decode already counted rendered events into the loader
+        // progress; restart the count so the parse phase reports fresh
+        counter.store(0, Ordering::Relaxed);
+    }
     eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
 
     let te = find_key(&raw, b"traceEvents").ok_or("no traceEvents found")?;
@@ -2538,6 +2543,7 @@ pub(crate) fn is_trace_file(name: &str) -> bool {
     name.ends_with(".json") || name.ends_with(".json.gz")
         || name.ends_with(".tar.gz") || name.ends_with(".tgz")
         || name.ends_with(".tvcache") || name.ends_with(".tvcache.xz") || name.ends_with(".tvcache.gz")
+        || name.ends_with(".ktz")
 }
 
 fn expand_dirs(paths: &[String]) -> Vec<String> {
@@ -3092,7 +3098,12 @@ fn read_gz_tolerant<R: std::io::Read>(reader: R) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-pub fn read_bytes(path: &str) -> Result<RawData, String> {
+pub fn read_bytes(path: &str, counter: &AtomicUsize) -> Result<RawData, String> {
+    if path.ends_with(".ktz") {
+        let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let json = crate::ktz::decode(&data, counter).map_err(|e| format!("{path}: {e}"))?;
+        return Ok(RawData::Vec(json));
+    }
     if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
         let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
         let gz = flate2::read::GzDecoder::new(BufReader::new(file));
@@ -3144,7 +3155,11 @@ pub fn read_bytes(path: &str) -> Result<RawData, String> {
 /// on `name` (typically `File::name()`) the same way `read_bytes` dispatches
 /// on the path's suffix.
 #[cfg(target_arch = "wasm32")]
-fn read_bytes_named(name: &str, raw: Vec<u8>) -> Result<RawData, String> {
+fn read_bytes_named(name: &str, raw: Vec<u8>, counter: &AtomicUsize) -> Result<RawData, String> {
+    if name.ends_with(".ktz") {
+        let json = crate::ktz::decode(&raw, counter).map_err(|e| format!("{name}: {e}"))?;
+        return Ok(RawData::Vec(json));
+    }
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         let gz = flate2::read::GzDecoder::new(std::io::Cursor::new(raw));
         let mut archive = tar::Archive::new(gz);
@@ -3210,7 +3225,7 @@ pub fn load_trace_from_bytes_progressive(
         // unchanged, same as on native.
         let decompressed = if raw_input.len() >= 4 && raw_input[0..4] == ZSTD_FRAME_MAGIC {
             let mut out = Vec::new();
-            match ruzstd::StreamingDecoder::new(&raw_input[..])
+            match ruzstd::decoding::StreamingDecoder::new(&raw_input[..])
                 .ok()
                 .and_then(|mut d| d.read_to_end(&mut out).ok())
             {
@@ -3230,10 +3245,15 @@ pub fn load_trace_from_bytes_progressive(
         return;
     }
 
-    let raw = match read_bytes_named(name, raw_input) {
+    let raw = match read_bytes_named(name, raw_input, counter) {
         Ok(r) => r,
         Err(e) => { let _ = tx.send(Err(e)); return; }
     };
+    if name.ends_with(".ktz") {
+        // ktz decode already counted rendered events into the loader
+        // progress; restart the count so the parse phase reports fresh
+        counter.store(0, Ordering::Relaxed);
+    }
     eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
 
     let te = match find_key(&raw, b"traceEvents") {

@@ -61,7 +61,9 @@ flate2 = { version = "1", features = ["rust_backend"], default-features = false 
 # _merged.tvcache — compression only happens when the native app saves one —
 # and a pure-Rust decoder is all that needs. Verified directly: decodes a
 # real cache file produced by the native `zstd` crate byte-for-byte.
-ruzstd = "0.7"
+# 0.9 for its 128MiB default window limit: .ktz files use windowLog-27
+# (128MiB) zstd frames, which 0.7's 100MB hard cap rejected.
+ruzstd = "0.9"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 # Real Web Worker-backed rayon parallelism — only for the atomics/bulk-memory

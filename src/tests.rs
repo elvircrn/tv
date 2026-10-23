@@ -1742,6 +1742,7 @@ fn test_is_trace_file() {
     assert!(crate::loader::is_trace_file("foo.json.gz"));
     assert!(crate::loader::is_trace_file("foo.tar.gz"));
     assert!(crate::loader::is_trace_file("foo.tgz"));
+    assert!(crate::loader::is_trace_file("foo.pt.trace.json.ktz"));
     assert!(!crate::loader::is_trace_file("foo.txt"));
     assert!(!crate::loader::is_trace_file("foo.csv"));
     assert!(!crate::loader::is_trace_file("foo.gz"));
@@ -3160,4 +3161,383 @@ fn test_steps_detailed_annotation_trace() {
     }
     assert!(steps.iter().all(|s| s.batch.is_some()));
     assert!(steps.iter().any(|s| s.batch.unwrap().total_tokens > 0));
+}
+
+// =========================== ktz decoding ===========================
+// Synthetic files hand-built to the ktz.cpp spec (varints, sections, zstd
+// framing) and decoded through ktz::decode; expected output is what
+// `ktz d` would emit, since that binary is the format's reference reader.
+
+fn ktz_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let mut b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 { b |= 0x80; }
+        buf.push(b);
+        if v == 0 { break; }
+    }
+}
+
+fn ktz_section(payload: &mut Vec<u8>, data: &[u8]) {
+    ktz_varint(payload, data.len() as u64);
+    payload.extend_from_slice(data);
+}
+
+fn ktz_zz(v: i64) -> u64 { ((v as u64) << 1) ^ ((v >> 63) as u64) }
+fn ktz_zz1(v: i64) -> u64 { ktz_zz(v) + 1 }
+
+fn ktz_symtab(syms: &[&[u8]]) -> Vec<u8> {
+    let mut s = Vec::new();
+    ktz_varint(&mut s, syms.len() as u64);
+    for sym in syms {
+        ktz_varint(&mut s, sym.len() as u64);
+        s.extend_from_slice(sym);
+    }
+    s
+}
+
+fn ktz_head_foot(head: &[u8], foot: &[u8]) -> Vec<u8> {
+    let mut s = Vec::new();
+    ktz_varint(&mut s, head.len() as u64);
+    s.extend_from_slice(head);
+    ktz_varint(&mut s, foot.len() as u64);
+    s.extend_from_slice(foot);
+    s
+}
+
+/// Frame a payload as a KTZ3/KTZ4 container (one zstd frame).
+fn ktz_framed(magic: &[u8; 4], n_events: u64, payload: &[u8]) -> Vec<u8> {
+    let comp = zstd::bulk::compress(payload, 3).unwrap();
+    let mut f = Vec::new();
+    f.extend_from_slice(magic);
+    ktz_varint(&mut f, n_events);
+    ktz_varint(&mut f, 1); // nFrames
+    ktz_varint(&mut f, payload.len() as u64);
+    ktz_varint(&mut f, comp.len() as u64);
+    f.extend_from_slice(&comp);
+    f
+}
+
+#[test]
+fn ktz_v4_synthetic() {
+    let syms: Vec<&[u8]> = vec![
+        b"",               // 0: reserved (absent)
+        b"\"X\"",          // 1: ph
+        b"1234",           // 2: pid (raw number span)
+        b"\"T-1\"",        // 3: tid
+        b"\"Op\"",         // 4: name
+        b"\"cat\"",        // 5: cat
+        b"\"a\"",          // 6: column/blob key
+        b"\"b\"",          // 7: column key
+        b"\"x\"",          // 8: column str value
+        b"\"k\"",          // 9: blob key
+        b"\"s\"",          // 10: blob key
+        b"\"hello\"",      // 11: blob string value
+        b"5678",           // 12: second pid
+        b"\"nested\"",     // 13: blob key
+        b"\"arr\"",        // 14: blob key
+    ];
+
+    // Event 1's blob: TK_INT (dmap update), TK_STR, a nested TK_OBJ with a
+    // TK_DINT, and a TK_ARR with TK_INTABS/TK_RAWNUM/TK_TRUE/TK_FALSE/TK_NULL.
+    let mut blob = Vec::new();
+    blob.push(3u8); ktz_varint(&mut blob, 9);  // "k":
+    blob.push(4u8); ktz_varint(&mut blob, ktz_zz(100)); // TK_INT 100
+    blob.push(3u8); ktz_varint(&mut blob, 10); // "s":
+    blob.push(3u8); ktz_varint(&mut blob, 11); // TK_STR "hello"
+    blob.push(3u8); ktz_varint(&mut blob, 13); // "nested":
+    blob.push(1u8); ktz_varint(&mut blob, 1);  // TK_OBJ {1 member}
+    blob.push(3u8); ktz_varint(&mut blob, 6);  //   "a":
+    blob.push(9u8); ktz_varint(&mut blob, ktz_zz(5)); // TK_DINT +5 (vs dmap=0)
+    blob.push(3u8); ktz_varint(&mut blob, 14); // "arr":
+    blob.push(2u8); ktz_varint(&mut blob, 5);  // TK_ARR {5 elems}
+    blob.push(10u8); ktz_varint(&mut blob, ktz_zz(5)); // TK_INTABS 5
+    blob.push(5u8); ktz_varint(&mut blob, 4); blob.extend_from_slice(b"1.25"); // TK_RAWNUM
+    blob.push(6u8); // true
+    blob.push(7u8); // false
+    blob.push(8u8); // null
+
+    // Per-name stream for name sym 4: 2 columns ("a" int, "b" str), wrap,
+    // flags 1/2/1, one blen for the flag-2 event.
+    let col_a: Vec<u8> = [ktz_zz(7), ktz_zz(9 - 7)].iter().flat_map(|v| {
+        let mut b = Vec::new(); ktz_varint(&mut b, *v); b
+    }).collect();
+    let col_b: Vec<u8> = [ktz_zz(8), ktz_zz(0)].iter().flat_map(|v| {
+        let mut b = Vec::new(); ktz_varint(&mut b, *v); b
+    }).collect();
+    let flags = [1u64, 2, 1];
+    let blens = [blob.len() as u64];
+    let mut stream = Vec::new();
+    ktz_varint(&mut stream, 2);          // nKeys
+    stream.push(1);                      // wrap: columns inside one "args"
+    ktz_varint(&mut stream, 6); stream.push(0); // key "a", kind int
+    ktz_varint(&mut stream, 7); stream.push(1); // key "b", kind str
+    ktz_varint(&mut stream, col_a.len() as u64); stream.extend_from_slice(&col_a);
+    ktz_varint(&mut stream, col_b.len() as u64); stream.extend_from_slice(&col_b);
+    ktz_varint(&mut stream, flags.len() as u64);
+    for f in flags { ktz_varint(&mut stream, f); }
+    ktz_varint(&mut stream, blens.len() as u64);
+    for b in blens { ktz_varint(&mut stream, b); }
+    stream.extend_from_slice(&blob);
+
+    let mut payload = Vec::new();
+    for col in [
+        vec![1u64, 1, 1],        // ph
+        vec![2u64, 12, 2],       // pid
+        vec![3u64, 3, 3],        // tid
+        vec![4u64, 4, 4],        // name
+        vec![5u64, 0, 0],        // cat (0 = absent)
+        vec![ktz_zz1(0), ktz_zz1(2_500_000), ktz_zz1(3_000_000)], // ts deltas
+        vec![ktz_zz1(1500), 0, ktz_zz1(-1500)],                   // dur
+    ] {
+        let mut sec = Vec::new();
+        for v in col { ktz_varint(&mut sec, v); }
+        ktz_section(&mut payload, &sec);
+    }
+    ktz_varint(&mut payload, 1); // nStreams
+    ktz_varint(&mut payload, 4); // nid = name sym 4
+    ktz_section(&mut payload, &stream);
+    ktz_section(&mut payload, &ktz_symtab(&syms));
+    ktz_section(&mut payload, &ktz_head_foot(b"{\"traceEvents\": [\n", b"]\n}\n"));
+
+    let file = ktz_framed(b"KTZ4", 3, &payload);
+    let got = ktz::decode(&file, &test_counter()).expect("decode");
+    let expected = concat!(
+        "{\"traceEvents\": [\n",
+        "  {\"ph\":\"X\",\"pid\":1234,\"tid\":\"T-1\",\"name\":\"Op\",\"cat\":\"cat\",\"ts\":0.000,\"dur\":1.500,\"args\":{\"a\":7,\"b\":\"x\"}},\n",
+        "  {\"ph\":\"X\",\"pid\":5678,\"tid\":\"T-1\",\"name\":\"Op\",\"ts\":2500.000,\"k\":100,\"s\":\"hello\",\"nested\":{\"a\":5},\"arr\":[5,1.25,true,false,null]},\n",
+        "  {\"ph\":\"X\",\"pid\":1234,\"tid\":\"T-1\",\"name\":\"Op\",\"ts\":3000.000,\"dur\":-1.500,\"args\":{\"a\":9,\"b\":\"x\"}}\n",
+        "]\n}\n",
+    );
+    assert_eq!(std::str::from_utf8(&got).unwrap(), expected);
+}
+
+#[test]
+fn ktz_v4_range_resets() {
+    // 8194 events crossing the 8192-event range boundary: column delta
+    // bases and the blob dmap must both reset at event index 8192. Events
+    // 8191/8192 are blob events sharing key "k" — without the dmap reset
+    // the TK_DINT at 8192 would decode as 5007 instead of 7.
+    const N: u64 = 8194;
+    let syms: Vec<&[u8]> = vec![b"", b"\"X\"", b"1234", b"7", b"\"Op\"", b"\"a\"", b"\"k\""];
+
+    let mut blob_8191 = Vec::new();
+    blob_8191.push(3u8); ktz_varint(&mut blob_8191, 6);   // "k":
+    blob_8191.push(4u8); ktz_varint(&mut blob_8191, ktz_zz(5000)); // TK_INT 5000
+    let mut blob_8192 = Vec::new();
+    blob_8192.push(3u8); ktz_varint(&mut blob_8192, 6);   // "k":
+    blob_8192.push(9u8); ktz_varint(&mut blob_8192, ktz_zz(7)); // TK_DINT +7 vs reset dmap
+
+    // Column "a" (int): flag-1 events are 0..=8190 (values = index) and
+    // 8193 (value 8193, first of range 1 so delta vs a reset base of 0).
+    let mut col_a = Vec::new();
+    for i in 0..=8190u64 {
+        ktz_varint(&mut col_a, ktz_zz(if i == 0 { 0 } else { 1 }));
+    }
+    ktz_varint(&mut col_a, ktz_zz(8193));
+
+    let mut stream = Vec::new();
+    ktz_varint(&mut stream, 1);          // nKeys
+    stream.push(1);                      // wrap
+    ktz_varint(&mut stream, 5); stream.push(0); // key "a", kind int
+    ktz_varint(&mut stream, col_a.len() as u64); stream.extend_from_slice(&col_a);
+    let mut flags = Vec::new();
+    for i in 0..N {
+        ktz_varint(&mut flags, if i == 8191 || i == 8192 { 2 } else { 1 });
+    }
+    ktz_varint(&mut stream, flags.len() as u64); stream.extend_from_slice(&flags);
+    ktz_varint(&mut stream, 2); // two blens (one per flag-2 event)
+    ktz_varint(&mut stream, blob_8191.len() as u64);
+    ktz_varint(&mut stream, blob_8192.len() as u64);
+    stream.extend_from_slice(&blob_8191);
+    stream.extend_from_slice(&blob_8192);
+
+    let mut payload = Vec::new();
+    let mut rep = |vals: &dyn Fn(u64) -> u64| {
+        let mut sec = Vec::new();
+        for i in 0..N { ktz_varint(&mut sec, vals(i)); }
+        ktz_section(&mut payload, &sec);
+    };
+    rep(&|_| 1);                 // ph
+    rep(&|_| 2);                 // pid
+    rep(&|_| 3);                 // tid
+    rep(&|_| 4);                 // name
+    rep(&|_| 0);                 // cat absent
+    rep(&|i| if i == 0 { ktz_zz1(0) } else { ktz_zz1(1000) }); // ts: i us
+    rep(&|_| 0);                 // dur absent
+    ktz_varint(&mut payload, 1); // nStreams
+    ktz_varint(&mut payload, 4); // nid
+    ktz_section(&mut payload, &stream);
+    ktz_section(&mut payload, &ktz_symtab(&syms));
+    ktz_section(&mut payload, &ktz_head_foot(b"[", b"]\n"));
+
+    let file = ktz_framed(b"KTZ4", N, &payload);
+    let got = ktz::decode(&file, &test_counter()).expect("decode");
+    let mut expected = String::from("[");
+    for i in 0..N {
+        expected.push_str("  {\"ph\":\"X\",\"pid\":1234,\"tid\":7,\"name\":\"Op\",\"ts\":");
+        expected.push_str(&format!("{i}.000"));
+        match i {
+            8191 => expected.push_str(",\"k\":5000"),
+            8192 => expected.push_str(",\"k\":7"), // dmap reset: 7, not 5007
+            _ => expected.push_str(&format!(",\"args\":{{\"a\":{i}}}")),
+        }
+        expected.push_str(if i + 1 < N { "},\n" } else { "}\n" });
+    }
+    expected.push_str("]\n");
+    assert_eq!(std::str::from_utf8(&got).unwrap(), expected);
+}
+
+#[test]
+fn ktz_v3_synthetic() {
+    // KTZ3: framed like KTZ4 but per-name streams are blens+blobs sections.
+    let syms: Vec<&[u8]> = vec![b"", b"\"X\"", b"1", b"2", b"\"Op\"", b"\"k\""];
+    let mut blob = Vec::new();
+    blob.push(3u8); ktz_varint(&mut blob, 5);            // "k":
+    blob.push(4u8); ktz_varint(&mut blob, ktz_zz(42));   // TK_INT 42
+
+    let mut blens = Vec::new();
+    ktz_varint(&mut blens, blob.len() as u64); // event 0: blob
+    ktz_varint(&mut blens, 0);                 // event 1: no args
+
+    let mut payload = Vec::new();
+    for col in [
+        vec![1u64, 1],                        // ph
+        vec![2u64, 2],                        // pid
+        vec![3u64, 3],                        // tid
+        vec![4u64, 4],                        // name
+        vec![0u64, 0],                        // cat
+        vec![ktz_zz1(500), ktz_zz1(250)],     // ts deltas (same pid,tid)
+        vec![0u64, 0],                        // dur
+    ] {
+        let mut sec = Vec::new();
+        for v in col { ktz_varint(&mut sec, v); }
+        ktz_section(&mut payload, &sec);
+    }
+    ktz_varint(&mut payload, 1); // nStreams
+    ktz_varint(&mut payload, 4); // nid
+    ktz_section(&mut payload, &blens);
+    ktz_section(&mut payload, &blob);
+    ktz_section(&mut payload, &ktz_symtab(&syms));
+    ktz_section(&mut payload, &ktz_head_foot(b"{\n\"traceEvents\": [\n", b"]\n}\n"));
+
+    let file = ktz_framed(b"KTZ3", 2, &payload);
+    let got = ktz::decode(&file, &test_counter()).expect("decode");
+    let expected = concat!(
+        "{\n\"traceEvents\": [\n",
+        "  {\"ph\":\"X\",\"pid\":1,\"tid\":2,\"name\":\"Op\",\"ts\":0.500,\"k\":42},\n",
+        "  {\"ph\":\"X\",\"pid\":1,\"tid\":2,\"name\":\"Op\",\"ts\":0.750}\n",
+        "]\n}\n",
+    );
+    assert_eq!(std::str::from_utf8(&got).unwrap(), expected);
+}
+
+#[test]
+fn ktz_v2_synthetic() {
+    // KTZ2: the whole file is one zstd frame holding KTZ2 + nEvents + the
+    // same v2-style sections as KTZ3.
+    let syms: Vec<&[u8]> = vec![b"", b"\"X\"", b"1", b"2", b"\"Op\"", b"\"k\""];
+    let mut blob = Vec::new();
+    blob.push(3u8); ktz_varint(&mut blob, 5);          // "k":
+    blob.push(4u8); ktz_varint(&mut blob, ktz_zz(42)); // TK_INT 42
+    let mut blens = Vec::new();
+    ktz_varint(&mut blens, blob.len() as u64); // event 0: blob
+    ktz_varint(&mut blens, 0);                 // event 1: no args
+
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"KTZ2");
+    ktz_varint(&mut payload, 2); // nEvents
+    for col in [
+        vec![1u64, 1],                        // ph
+        vec![2u64, 2],                        // pid
+        vec![3u64, 3],                        // tid
+        vec![4u64, 4],                        // name
+        vec![0u64, 0],                        // cat
+        vec![ktz_zz1(500), ktz_zz1(250)],     // ts deltas (same pid,tid)
+        vec![0u64, 0],                        // dur
+    ] {
+        let mut sec = Vec::new();
+        for v in col { ktz_varint(&mut sec, v); }
+        ktz_section(&mut payload, &sec);
+    }
+    ktz_varint(&mut payload, 1); // nStreams
+    ktz_varint(&mut payload, 4); // nid
+    ktz_section(&mut payload, &blens);
+    ktz_section(&mut payload, &blob);
+    ktz_section(&mut payload, &ktz_symtab(&syms));
+    ktz_section(&mut payload, &ktz_head_foot(b"{\n\"traceEvents\": [\n", b"]\n}\n"));
+
+    let file = zstd::bulk::compress(&payload, 3).unwrap();
+    let got = ktz::decode(&file, &test_counter()).expect("decode");
+    let expected = concat!(
+        "{\n\"traceEvents\": [\n",
+        "  {\"ph\":\"X\",\"pid\":1,\"tid\":2,\"name\":\"Op\",\"ts\":0.500,\"k\":42},\n",
+        "  {\"ph\":\"X\",\"pid\":1,\"tid\":2,\"name\":\"Op\",\"ts\":0.750}\n",
+        "]\n}\n",
+    );
+    assert_eq!(std::str::from_utf8(&got).unwrap(), expected);
+}
+
+#[test]
+fn ktz_rejects_garbage() {
+    let c = test_counter();
+    assert!(ktz::decode(b"not a ktz file at all", &c).is_err());
+    assert!(ktz::decode(b"KTZ4", &c).is_err()); // truncated header
+    let mut f = Vec::new();
+    f.extend_from_slice(b"KTZ4");
+    ktz_varint(&mut f, 1);
+    ktz_varint(&mut f, 1);
+    ktz_varint(&mut f, 100);
+    ktz_varint(&mut f, 5);
+    f.extend_from_slice(&[0u8; 3]); // frame shorter than declared
+    assert!(ktz::decode(&f, &c).is_err());
+}
+
+#[test]
+#[ignore]
+fn ktz_real_file_matches_ktz_d() {
+    let ktz_bin = "/Users/ecrncevi/CLionProjects/compression/ktz";
+    let sample = match std::env::var("TV_KTZ_SAMPLE") {
+        Ok(p) => p,
+        Err(_) => "/Users/ecrncevi/dsv4traces/dsv41-pd-1p1d-dep8-spec3-prof-001-20261022-2124-pd1p1d-dep8-spec3-vllm-profile-prefill/wide-ep-dss-vllm-dsv41-flash-0-5b1b47f7-prefill-0/dsv41-pd-1p1d-dep8-spec3-prof-001-20261022-2124-pd1p1d-dep8-spec3-c16-prefill_dp7_pp0_tp0_dcp0_ep7_rank0.1792698681095973251.pt.trace.json.ktz".to_string(),
+    };
+    if !std::path::Path::new(ktz_bin).exists() || !std::path::Path::new(&sample).exists() {
+        eprintln!("ktz binary or sample trace missing, skipping");
+        return;
+    }
+    let out_path = std::env::temp_dir().join(format!("tv_ktz_test_reference_{}.json", std::process::id()));
+    let status = std::process::Command::new(ktz_bin)
+        .args(["d", &sample, out_path.to_str().unwrap()])
+        .status()
+        .expect("spawn ktz");
+    assert!(status.success(), "ktz d failed");
+    let expected = std::fs::read(&out_path).expect("read ktz d output");
+    let data = std::fs::read(sample).expect("read ktz file");
+    let got = ktz::decode(&data, &test_counter()).expect("decode");
+    if got != expected {
+        let n = got.len().min(expected.len());
+        let pos = (0..n).find(|&i| got[i] != expected[i]).unwrap_or(n);
+        eprintln!(
+            "diverge at byte {pos}/{} (got {} bytes): got {:?} vs ktz d {:?}",
+            expected.len(),
+            got.len(),
+            String::from_utf8_lossy(&got[pos.saturating_sub(60)..(pos + 60).min(got.len())]),
+            String::from_utf8_lossy(&expected[pos.saturating_sub(60)..(pos + 60).min(expected.len())]),
+        );
+    }
+    assert_eq!(got, expected, "decoded output must match `ktz d` byte-for-byte");
+}
+
+#[test]
+#[ignore]
+fn ktz_real_file_loads_end_to_end() {
+    let sample = "/Users/ecrncevi/dsv4traces/dsv41-pd-1p1d-dep8-spec3-prof-001-20261022-2124-pd1p1d-dep8-spec3-vllm-profile-prefill/wide-ep-dss-vllm-dsv41-flash-0-5b1b47f7-prefill-0/dsv41-pd-1p1d-dep8-spec3-prof-001-20261022-2124-pd1p1d-dep8-spec3-c16-prefill_dp7_pp0_tp0_dcp0_ep7_rank0.1792698681095973251.pt.trace.json.ktz";
+    if !std::path::Path::new(sample).exists() {
+        eprintln!("sample trace missing, skipping");
+        return;
+    }
+    let trace = load_trace(sample, &test_counter(), 8, None).expect("load ktz trace");
+    eprintln!("loaded {} tracks, {} events", trace.tracks.len(), trace.total_events);
+    assert!(trace.total_events > 1_000_000);
+    assert!(!trace.tracks.is_empty());
 }
