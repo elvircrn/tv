@@ -26,6 +26,14 @@ rayon = "1"
 [features]
 mt = ["dep:wasm-bindgen-rayon"]
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Dock right-click "New Window" menu (src/dock_menu.rs). Pinned to the
+# versions objc2-app-kit/objc2-foundation 0.2 use among themselves (and that
+# other deps here already pull in), so the build keeps a single copy of each.
+objc2 = "0.5"
+objc2-foundation = "0.2"
+objc2-app-kit = "0.2"
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 imgui-sys = { version = "0.12", features = ["freetype"] }
 metal = "0.33"

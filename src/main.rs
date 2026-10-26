@@ -12,6 +12,8 @@ mod ui;
 mod diff;
 mod time;
 mod ktz;
+#[cfg(target_os = "macos")]
+mod dock_menu;
 
 use parse::{skip_value, parse_args_flat, FnvMap};
 use types::*;
@@ -2381,6 +2383,8 @@ fn main() {
         return;
     }
     let event_loop = EventLoop::new().unwrap();
+    #[cfg(target_os = "macos")]
+    dock_menu::install();
     let mut app = App::new(args);
     event_loop.run_app(&mut app).unwrap();
 }
