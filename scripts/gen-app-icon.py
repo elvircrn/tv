@@ -4,8 +4,8 @@
 Uses the exact vector geometry from `draw_vllm_logo` (src/ui.rs) — the
 official mark from vllm-project/media-kit, yellow triangle #fdb515 and blue
 quadrilateral #30a2ff on a 32-unit grid — rendered with supersampled
-coverage (anti-aliasing) over a dark rounded-rect background (#161616, the
-app's canvas color). Straight-alpha RGBA PNGs, stdlib only.
+coverage (anti-aliasing) over a white rounded-rect background. Straight-alpha RGBA
+PNGs, stdlib only.
 
 Usage: gen-app-icon.py <output.iconset>
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 # Coordinates copied from draw_vllm_logo (src/ui.rs), y-down, 32-unit grid.
 YELLOW = (253, 181, 21, 255)
 BLUE = (48, 162, 255, 255)
-BACKGROUND = (22, 22, 22, 255)
+BACKGROUND = (255, 255, 255, 255)
 YELLOW_PTS = [(13.417, 7.835), (13.417, 30.286), (2.191, 7.835)]
 BLUE_PTS = [(13.416, 30.286), (22.237, 30.286), (29.809, 1.714), (19.427, 7.179)]
 GRID = 32.0
