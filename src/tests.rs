@@ -503,6 +503,45 @@ fn test_capture_sel_events_direction_independent() {
 }
 
 #[test]
+fn test_collapsed_track_selection_matches_rendered_lanes() {
+    // A collapsed track renders ONLY its depth-0 events, spanning the whole
+    // (single-lane) row. capture_sel_events must resolve the same thing: a
+    // drag over a collapsed row selects the visible top-level events, not
+    // the hidden deeper lanes (which the old depth*sub_h mapping also
+    // squeezed into the same row).
+    let trace = make_trace(
+        vec!["", "outer", "mid", "inner"],
+        vec![(
+            "Thread 0",
+            false,
+            vec![
+                ev(0.0, 100.0, 1, 0),
+                ev(10.0, 50.0, 2, 1),
+                ev(20.0, 20.0, 3, 2),
+            ],
+        )],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    p.show_cpu = true;
+    p.collapsed = vec![true];
+    // Mirror what draw_timeline's layout does for a collapsed track: the row
+    // is one SUB_LANE_H lane regardless of max_depth.
+    p.geom.heights[0] = track_height(3, true, 1.0);
+
+    let row_bottom = p.geom.heights[0] as f64;
+    let sel = p.capture_sel_events([0.0, 100.0, 0.0, row_bottom]);
+    assert_eq!(sel.len(), 1, "collapsed row must select only the depth-0 event, got {:?} (depths of selected: hidden children must not leak in)", sel);
+    let (_, ei) = sel[0];
+    assert_eq!(ei, 0, "the selected event must be the top-level one");
+
+    // And the depth-0 event must be capturable from the BOTTOM of the row
+    // too — the render maps it across the full lane, not a top sliver.
+    let sel_bottom_half = p.capture_sel_events([0.0, 100.0, row_bottom * 0.5, row_bottom]);
+    assert_eq!(sel_bottom_half.len(), 1, "dragging over the bottom half of a collapsed row must still select the depth-0 event");
+}
+
+#[test]
 fn test_selection_survives_layout_change() {
     let trace = make_trace(
         vec!["", "gpu_kern", "cpu_kern"],

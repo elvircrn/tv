@@ -851,18 +851,24 @@ impl Pane {
                 let ti = self.geom.visible[vi];
                 let track = &trace.tracks[ti];
                 if !self.show_cpu && !track.gpu { continue; }
-                let sub_h = track_h / track.max_depth.max(1) as f32;
+                // Mirror the renderer exactly: a collapsed row is ONE lane
+                // showing only depth-0 events across its full height, so
+                // deeper events are invisible and must not be captured.
+                let is_collapsed = self.collapsed.get(ti).copied().unwrap_or(false);
+                let sub_h = track_h / if is_collapsed { 1 } else { track.max_depth.max(1) } as f32;
                 let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
                 let end = track.events.partition_point(|e| e.ts <= s1).max(start);
                 for (local_i, ev) in track.events[start..end].iter().enumerate() {
                     if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                    if is_collapsed && ev.depth > 0 { continue; }
                     let ev_top = track_top + ev.depth as f32 * sub_h;
                     let ev_bot = ev_top + sub_h;
                     if ev_bot < y0 || ev_top > y1 { continue; }
                     if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
                         out.push((ti as u32, (start + local_i) as u32));
                     }
-                }            }
+                }
+            }
         }
         out
     }

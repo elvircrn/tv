@@ -1633,7 +1633,11 @@ pub fn draw_timeline(
                 let orig_ti = buf.visible[vi];
                 let track = &trace.tracks[orig_ti];
                 let is_collapsed = collapsed.get(orig_ti).copied().unwrap_or(false);
-                let sub_h = track_h / track.max_depth.max(1) as f32;
+                // A collapsed row is a single lane showing only depth-0
+                // events across its full height — not max_depth lanes
+                // squeezed into one SUB_LANE_H (which made each bar
+                // sub-pixel, or negative once LANE_GAP exceeded sub_h).
+                let sub_h = track_h / if is_collapsed { 1 } else { track.max_depth.max(1) } as f32;
                 let lane_h = sub_h - LANE_GAP;
                 let start = bisect_overlap(&track.events, &track.prefix_max_dur, view.t0);
                 let end = track.events.partition_point(|e| e.ts <= view.t1);
