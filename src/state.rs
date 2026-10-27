@@ -836,8 +836,14 @@ impl Pane {
                     let ts = p.ts[gi];
                     let end_t = p.ends[gi];
                     if !(end_t >= s0 && ts <= s1) { continue; }
-                    let ev_top = track_top + depth as f32 * sub_h;
-                    let ev_bot = ev_top + sub_h;
+                    // Same stretch bounds the renderer draws (and the live
+                    // drag tests): a kernel stretched down into empty depth
+                    // lanes must be captured when the drag covers the lower
+                    // (stretched) part of its bar, not just its own lane.
+                    // Same stale-cache guard the render loop applies.
+                    let (lo, hi) = p.stretch.get(gi).copied().unwrap_or((depth, depth));
+                    let ev_top = track_top + lo as f32 * sub_h;
+                    let ev_bot = ev_top + (hi - lo + 1) as f32 * sub_h;
                     if ev_bot < y0 || ev_top > y1 { continue; }
                     out.push((ti32, ei32));
                 }
