@@ -1431,6 +1431,11 @@ pub struct AppState {
     pub pending_active_tab: Option<usize>,
     pub buf: DrawBuf,
     pub bottom_h: f32,
+    /// The tab strip's actual rendered width (the strip is an auto-resizing
+    /// window, so this is measured, not estimated). The toolbar sizes itself
+    /// against it, and a change requests the follow-up frame the auto-resize
+    /// needs to converge in Wait mode.
+    pub tabs_w: f32,
     pub drag: DragKind,
     pub show_diff: bool,
     pub diff_popup_open: bool,

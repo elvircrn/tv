@@ -106,6 +106,7 @@ fn make_state(trace: Trace) -> AppState {
         pending_active_tab: None,
         buf,
         bottom_h: DETAIL_H,
+        tabs_w: 0.0,
         drag: DragKind::None,
         show_diff: false,
         diff_popup_open: false,
@@ -3611,4 +3612,87 @@ fn resolve_tool_handles_no_path() {
     // and must still fall through to the prefix candidates.
     let r = resolve_tool_in(None, "tv-no-such-tool-anywhere");
     assert_eq!(r, std::path::Path::new("tv-no-such-tool-anywhere"));
+}
+
+#[test]
+fn tab_strip_hugs_content_and_lines_up_with_toolbar() {
+    // Reproduces the ##tracetabs strip exactly as main.rs builds it now:
+    // an ALWAYS_AUTO_RESIZE window pivoted at its right edge. The strip
+    // must (a) end up exactly as wide as its content — no estimate to
+    // drift from imgui's real per-tab overhead (the old label+32 estimate
+    // was ~9px short per strip plus the window padding, which squeezed
+    // tabs and left the strip misaligned from the right edge), (b) keep
+    // its right edge glued to the display's right edge, and (c) be
+    // exactly toolbar_h tall so it lines up with the toolbar row (the old
+    // fixed-height window was 2px short of the tab bar's real height).
+    let trace = make_trace(
+        vec!["", "kernel_a", "kernel_b"],
+        vec![("GPU 0", true, vec![ev(0.0, 10.0, 1, 0)])],
+    );
+    let state = make_state(trace);
+    let labels: Vec<String> = state.panes.iter()
+        .map(|p| tab_label(p).to_string())
+        .collect();
+
+    let mut imgui = imgui::Context::create();
+    imgui.io_mut().display_size = [1600.0, 900.0];
+    imgui.fonts().build_rgba32_texture();
+
+    let mut toolbar_h = 0.0f32;
+    let mut measured_w = 0.0f32;
+    let mut measured_h = 0.0f32;
+    let mut measured_right = 0.0f32;
+    // Auto-resize converges after the first frame; read the converged
+    // geometry on the last pass.
+    for _frame in 0..3 {
+        let ui = imgui.new_frame();
+        if _frame == 0 {
+            toolbar_h = ui.text_line_height() + 12.0;
+        }
+        {
+            let _pad = ui.push_style_var(imgui::StyleVar::WindowPadding([8.0, 3.0]));
+            let _min = ui.push_style_var(imgui::StyleVar::WindowMinSize([1.0, 1.0]));
+            ui.window("##tracetabs_test")
+                .position([1600.0, 0.0], imgui::Condition::Always)
+                .position_pivot([1.0, 0.0])
+                .size_constraints([1.0, 1.0], [1600.0 - 420.0, toolbar_h])
+                .flags(
+                    imgui::WindowFlags::NO_DECORATION
+                        | imgui::WindowFlags::NO_MOVE
+                        | imgui::WindowFlags::NO_SAVED_SETTINGS
+                        | imgui::WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
+                        | imgui::WindowFlags::ALWAYS_AUTO_RESIZE,
+                )
+                .build(|| {
+                    if let Some(_bar) = ui.tab_bar_with_flags(
+                        "##tracetabbar_test",
+                        imgui::TabBarFlags::FITTING_POLICY_SCROLL,
+                    ) {
+                        for (i, l) in labels.iter().enumerate() {
+                            let id = format!("{}##t{}", l, i);
+                            let mut open = true;
+                            if let Some(_t) = imgui::TabItem::new(&id).opened(&mut open).begin(&ui) {}
+                        }
+                    }
+                    let win = ui.window_size();
+                    let pos = ui.window_pos();
+                    measured_w = win[0];
+                    measured_h = win[1];
+                    measured_right = pos[0] + win[0];
+                });
+        }
+        drop(ui);
+        imgui.render();
+    }
+    eprintln!("strip: {}x{:.1} right_edge={:.1} toolbar_h={:.1}",
+              measured_w, measured_h, measured_right, toolbar_h);
+
+    assert!((measured_h - toolbar_h).abs() <= 0.5,
+        "tab strip height {measured_h:.1} must line up with the toolbar row ({toolbar_h:.1})");
+    assert!((measured_right - 1600.0).abs() <= 0.5,
+        "tab strip right edge {measured_right:.1} must be glued to the display's right edge");
+    // Sanity: a real, content-sized width (close button + paddings counted),
+    // not the old collapsed-to-padding or estimate-based size.
+    assert!(measured_w > 60.0,
+        "strip width {measured_w:.1} must reflect real content, not an estimate");
 }

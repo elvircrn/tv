@@ -235,6 +235,7 @@ impl App {
                 pending_active_tab: None,
                 buf: DrawBuf::default(),
                 bottom_h: DETAIL_H,
+                tabs_w: 0.0,
                 drag: DragKind::None,
                 show_diff: false,
                 diff_popup_open: false,
@@ -1193,39 +1194,47 @@ impl App {
         // once has_trace() is possible for any pane the strip is worth its
         // space again, even at one real tab.
         let show_tabs = should_show_tab_strip(&state.panes);
-        // Wide enough for every tab's actual label (so short names don't
-        // waste space and long ones aren't clipped unnecessarily), but never
-        // so wide it starves the toolbar — File/View/Help + the search box
-        // and its match-nav buttons need roughly this much room themselves.
+        // The strip must never starve the toolbar — File/View/Help + the
+        // search box and its match-nav buttons need roughly this much room
+        // themselves.
         let min_toolbar_w = 420.0f32;
-        let tabs_width = if show_tabs {
-            let natural: f32 = state.panes.iter()
-                .map(|p| ui.calc_text_size(tab_label(p))[0] + 32.0)
-                .sum();
-            natural.clamp(120.0, (display[0] - min_toolbar_w).max(120.0))
-        } else {
-            0.0
-        };
         let mut close_pane: Option<usize> = None;
+        let mut tabs_w = state.tabs_w;
         if show_tabs {
-            let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 4.0]));
-            // Dear ImGui floors every non-child, non-auto-resize window at
-            // style.WindowMinSize (32x32 by default) regardless of an
-            // explicit `.size()` — without this override a short strip
-            // gets silently grown to 32px and overlaps whatever's below it
-            // (see CalcWindowSizeAfterConstraint).
+            // 3px vertical padding (not 4): the tab bar's height is
+            // FontSize + FramePadding.y*2 (=6), so 2*3 + that exactly equals
+            // toolbar_h (text_line_height + 12) at ANY font size — the strip
+            // row lines up with the toolbar row instead of overflowing it
+            // (the old fixed-height window was 2px short of the tab bar's
+            // real height, which clipped tabs / surfaced a scrollbar).
+            let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 3.0]));
             let _min = ui.push_style_var(StyleVar::WindowMinSize([1.0, 1.0]));
             ui.window("##tracetabs")
-                .position([display[0] - tabs_width, 0.0], Condition::Always)
-                .size([tabs_width, toolbar_h], Condition::Always)
+                // Right-glued via pivot instead of positioning at
+                // (display - estimated_width): the old label+32-per-tab
+                // estimate diverged from imgui's real per-tab overhead
+                // (close button + paddings + the window's own padding), so
+                // the fixed-size window was narrower than its content —
+                // tabs got squeezed by the ResizeDown fitting policy and
+                // the strip read as "not lined up from the right". An
+                // auto-resizing window pivoted at its right edge is
+                // exactly as wide as its content, always flush with the
+                // right edge, and capped so it can't crowd the toolbar.
+                .position([display[0], 0.0], Condition::Always)
+                .position_pivot([1.0, 0.0])
+                .size_constraints([1.0, 1.0], [(display[0] - min_toolbar_w).max(120.0), toolbar_h])
                 .flags(
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
                         | WindowFlags::NO_SAVED_SETTINGS
-                        | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS,
+                        | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
+                        | WindowFlags::ALWAYS_AUTO_RESIZE,
                 )
                 .build(|| {
-                    if let Some(_bar) = ui.tab_bar("##tracetabbar") {
+                    if let Some(_bar) = ui.tab_bar_with_flags(
+                        "##tracetabbar",
+                        imgui::TabBarFlags::FITTING_POLICY_SCROLL,
+                    ) {
                         let pending = state.pending_active_tab.take();
                         for pi in 0..state.panes.len() {
                             let tab_id = format!("{}##tab{}", tab_label(&state.panes[pi]), pi);
@@ -1241,8 +1250,20 @@ impl App {
                             }
                         }
                     }
+                    // The toolbar (built later this frame) needs the strip's
+                    // actual rendered width. Auto-resize converges over
+                    // frames; `tabs_w_changed` requests the follow-up frame
+                    // so the converged width isn't left stale in Wait mode.
+                    tabs_w = ui.window_size()[0];
                 });
         }
+        // Track the strip's rendered width so (a) the toolbar sizes against
+        // what actually rendered and (b) a width change (tab opened/closed/
+        // relabeled) requests the follow-up frame the auto-resize needs to
+        // converge — the event loop is Wait-driven, so nobody else will.
+        let tabs_w_changed = show_tabs && (tabs_w - state.tabs_w).abs() > 0.5;
+        if !show_tabs { tabs_w = 0.0; }
+        state.tabs_w = tabs_w;
         if let Some(pi) = close_pane {
             if state.panes.len() > 1 {
                 state.remove_pane(pi);
@@ -1372,7 +1393,7 @@ impl App {
             let _min = ui.push_style_var(StyleVar::WindowMinSize([1.0, 1.0]));
             ui.window("##toolbar")
                 .position([0.0, 0.0], Condition::Always)
-                .size([display[0] - tabs_width, toolbar_h], Condition::Always)
+                .size([(display[0] - state.tabs_w).max(120.0), toolbar_h], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
@@ -2124,7 +2145,7 @@ impl App {
             }
         }
 
-        let needs_extra_frame = click_result.is_some() || new_selection.is_some();
+        let needs_extra_frame = click_result.is_some() || new_selection.is_some() || tabs_w_changed;
         if needs_extra_frame {
             window.request_redraw();
         }
