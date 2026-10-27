@@ -1865,9 +1865,13 @@ pub fn draw_timeline(
             let (sa, sb) = if s0 <= s1 { (s0, s1) } else { (s1, s0) };
             let (ya, yb) = if y0 <= y1 { (y0 as f32, y1 as f32) } else { (y1 as f32, y0 as f32) };
             let sx0 = t2x(sa, view.t0, px_per_us, tl_left).max(tl_left);
-            let sx1 = t2x(sb, view.t0, px_per_us, tl_left).min(rect[2]);
+            // A perfectly horizontal or vertical drag collapses one axis to
+            // zero width/height — clamp each axis to a 2px minimum so the
+            // selection still renders (and stays rendered) as a thin band
+            // instead of disappearing.
+            let sx1 = (t2x(sb, view.t0, px_per_us, tl_left).min(rect[2])).max(sx0 + 2.0);
             let sy0 = (tracks_top + ya - view.scroll_y).max(tracks_top);
-            let sy1 = (tracks_top + yb - view.scroll_y).min(rect[3]);
+            let sy1 = (tracks_top + yb - view.scroll_y).min(rect[3]).max(sy0 + 2.0);
             if sx1 > sx0 && sy1 > sy0 {
                 dl.add_rect([sx0, sy0], [sx1, sy1], ACCENT_FILL)
                     .filled(true).build();
