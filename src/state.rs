@@ -848,20 +848,15 @@ impl Pane {
                 let sub_h = track_h / track.max_depth.max(1) as f32;
                 let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
                 let end = track.events.partition_point(|e| e.ts <= s1).max(start);
-                let mut ancestor_sel = vec![false; track.max_depth as usize + 1];
                 for (local_i, ev) in track.events[start..end].iter().enumerate() {
                     if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
                     let ev_top = track_top + ev.depth as f32 * sub_h;
                     let ev_bot = ev_top + sub_h;
-                    for d in ev.depth as usize..ancestor_sel.len() { ancestor_sel[d] = false; }
                     if ev_bot < y0 || ev_top > y1 { continue; }
                     if ev.ts + ev.dur >= s0 && ev.ts <= s1 {
-                        ancestor_sel[ev.depth as usize] = true;
-                        if (0..ev.depth as usize).any(|d| ancestor_sel[d]) { continue; }
                         out.push((ti as u32, (start + local_i) as u32));
                     }
-                }
-            }
+                }            }
         }
         out
     }
