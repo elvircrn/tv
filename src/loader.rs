@@ -1667,7 +1667,41 @@ pub fn export_full_web(trace: &Trace, dest_path: &str) -> Result<(), String> {
 /// the ordinary git repository every gist actually is under the hood and
 /// pushes the real binary bytes via `git`, which never cares about
 /// encoding. Requires `gh auth setup-git` to have registered a git
-/// credential helper for gist.github.com; this runs it defensively (a
+/// Resolve an external tool to an absolute path.
+///
+/// Dock/Finder launches get launchd's minimal PATH (`/usr/bin:/bin:
+/// /usr/sbin:/sbin`), which excludes Homebrew — so `Command::new("gh")`
+/// fails with NotFound even though `gh` is installed. Try the inherited
+/// PATH first (terminal launches have the user's full PATH), then the
+/// standard Homebrew prefixes. Falls back to the bare name so a missing
+/// tool still surfaces as a spawn error naming it.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn resolve_tool(name: &str) -> std::path::PathBuf {
+    resolve_tool_in(std::env::var("PATH").ok().as_deref(), name)
+}
+
+/// `resolve_tool` with the PATH to search passed in explicitly, so the
+/// fallback order is testable without mutating process-global env vars.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn resolve_tool_in(path: Option<&str>, name: &str) -> std::path::PathBuf {
+    if let Some(path) = path {
+        for dir in std::env::split_paths(path) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        let candidate = std::path::Path::new(dir).join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    std::path::PathBuf::from(name)
+}
+
+/// Credential helper for gist.github.com; this runs it defensively (a
 /// harmless no-op if already done) before attempting the clone.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn upload_gist(file_path: &str) -> Result<String, String> {
@@ -1692,7 +1726,8 @@ pub fn upload_gist(file_path: &str) -> Result<String, String> {
         .ok_or_else(|| "invalid export file path".to_string())?
         .to_string();
 
-    let mut create = Command::new("gh");
+    let gh = resolve_tool("gh");
+    let mut create = Command::new(&gh);
     create.args(["gist", "create", "--desc", "trace-viewer GPU export (shared)", "-f", "placeholder.txt", "-"])
         .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = create.spawn().map_err(|e| format!("failed to run gh (is it installed?): {e}"))?;
@@ -1710,7 +1745,7 @@ pub fn upload_gist(file_path: &str) -> Result<String, String> {
         .ok_or_else(|| format!("couldn't parse gist id from gh output: {gist_url:?}"))?
         .to_string();
 
-    run(&mut Command::new("gh").args(["auth", "setup-git"])).ok();
+    run(&mut Command::new(&gh).args(["auth", "setup-git"])).ok();
 
     let tmp_dir = std::env::temp_dir().join(format!("tv-gist-upload-{gist_id}"));
     std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("create temp dir: {e}"))?;

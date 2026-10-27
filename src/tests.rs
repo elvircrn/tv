@@ -1,6 +1,6 @@
 use super::*;
 use crate::parse::*;
-use crate::loader::{load_trace, detect_rank_groups, merge_traces};
+use crate::loader::{load_trace, detect_rank_groups, merge_traces, resolve_tool_in};
 use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps};
 use imgui::ImColor32;
 use std::collections::HashMap;
@@ -3540,4 +3540,36 @@ fn ktz_real_file_loads_end_to_end() {
     eprintln!("loaded {} tracks, {} events", trace.tracks.len(), trace.total_events);
     assert!(trace.total_events > 1_000_000);
     assert!(!trace.tracks.is_empty());
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_tool_finds_first_match_on_path() {
+    // A tool present in a listed PATH dir resolves to that dir's copy,
+    // in listing order (first hit wins).
+    let tmp = std::env::temp_dir().join("tv-resolve-tool-test");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let tool = tmp.join("tv-fake-tool");
+    std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
+    let path = format!("{}:{}", tmp.display(), std::path::Path::new("/nonexistent-dir").display());
+    assert_eq!(resolve_tool_in(Some(&path), "tv-fake-tool"), tool);
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_tool_falls_back_to_bare_name_when_missing() {
+    // Not on PATH and not in the Homebrew prefixes (name is unique
+    // enough): the bare name comes back so a spawn error names the tool.
+    let missing = resolve_tool_in(Some("/nonexistent-dir"), "tv-no-such-tool-anywhere");
+    assert_eq!(missing, std::path::Path::new("tv-no-such-tool-anywhere"));
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_tool_handles_no_path() {
+    // Dock/Finder launches can have no useful PATH at all; must not panic
+    // and must still fall through to the prefix candidates.
+    let r = resolve_tool_in(None, "tv-no-such-tool-anywhere");
+    assert_eq!(r, std::path::Path::new("tv-no-such-tool-anywhere"));
 }
