@@ -2455,31 +2455,62 @@ fn decompress_parse(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: u
     }
 }
 
-pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, cache_dir: Option<&str>) -> Result<Trace, String> {
-    let t0 = Instant::now();
-
+/// Shared body of `load_trace` / `load_trace_for_merge`: the cache
+/// short-circuits plus decompress→parse→build, returning the trace and
+/// whether it came from a cache. Cached traces are already compacted
+/// (caches are exported post-compact) and must stay untouched: re-running
+/// `compact_args` on one wouldn't just waste a copy, it would truncate any
+/// args blob over 64KB, whose `args_len` the first compact capped at
+/// u16::MAX.
+fn load_trace_inner(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, cache_dir: Option<&str>, t0: &Instant) -> Result<(Trace, bool), String> {
     #[cfg(not(target_arch = "wasm32"))]
     if path.ends_with(".tvcache.xz") {
         return load_cache_xz(path)
-            .inspect(|t| eprintln!("  cache (xz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events));
+            .inspect(|t| eprintln!("  cache (xz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
+            .map(|t| (t, true));
     }
     #[cfg(not(target_arch = "wasm32"))]
     if path.ends_with(".tvcache.gz") {
         return load_cache_gz(path)
-            .inspect(|t| eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events));
+            .inspect(|t| eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
+            .map(|t| (t, true));
     }
     if path.ends_with(".tvcache") {
         return load_cache_direct(path)
-            .inspect(|t| eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events));
+            .inspect(|t| eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
+            .map(|t| (t, true));
     }
 
     if let Some(trace) = load_cache(path, cache_dir) {
         eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
-        return Ok(trace);
+        return Ok((trace, true));
     }
 
-    let (raw, chunks, n_chunks) = decompress_parse(path, counter, max_parse_threads, &t0)?;
-    let mut trace = build_trace(raw, chunks, n_chunks, &t0)?;
+    let (raw, chunks, n_chunks) = decompress_parse(path, counter, max_parse_threads, t0)?;
+    build_trace(raw, chunks, n_chunks, t0).map(|t| (t, false))
+}
+
+/// `load_trace_inner` for ranks going straight into `merge_traces`
+/// (multi-rank loads, the `--bench` multi-file branch), which runs its own
+/// `compact_args` over the merged args buffers. Compacting per-rank as well
+/// meant every args byte was copied twice, and the concurrent per-rank
+/// compacts fought each other for memory bandwidth: on 8x981MB .json.gz
+/// ranks (M4 Pro) they measured 0.6-1.0s each under contention, on top of
+/// the 0.91s merged compact. Skipping them removes one full ~2.3GB copy
+/// round with identical final output — the merge reads args_off/args_len
+/// from whatever buffer each rank's tracks point at, raw or compacted
+/// alike.
+pub fn load_trace_for_merge(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, cache_dir: Option<&str>, t0: &Instant) -> Result<Trace, String> {
+    load_trace_inner(path, counter, max_parse_threads, cache_dir, t0).map(|(t, _)| t)
+}
+
+pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, cache_dir: Option<&str>) -> Result<Trace, String> {
+    let t0 = Instant::now();
+    let (mut trace, from_cache) = load_trace_inner(path, counter, max_parse_threads, cache_dir, &t0)?;
+    if from_cache {
+        // Already compacted at export time; see load_trace_inner.
+        return Ok(trace);
+    }
     compact_args(&mut trace);
     // No automatic save_cache here (or in send_progressive below): caches are
     // only written by an explicit "File > Export Merged TV Cache". Reads still
@@ -3042,8 +3073,8 @@ pub fn load_multi_progressive(
     // hash is keyed off the per-file .tvcache names+sizes, which don't reflect
     // a source-file edit yet, plus the source-mtime guard in load_merged_cache
     // wouldn't catch an edit made in the same second as the export. The
-    // per-file load_trace below still reads its mtime-validated caches, so
-    // unchanged ranks stay fast while the edited one is re-read.
+    // per-file load_trace_for_merge below still reads its mtime-validated
+    // caches, so unchanged ranks stay fast while the edited one is re-read.
     //
     // No save_merged_cache after the merge anymore: the merged cache is only
     // written by an explicit "File > Export Merged TV Cache" (see
@@ -3066,7 +3097,7 @@ pub fn load_multi_progressive(
         let r = *rank;
         let ctr = counter.clone();
         let cd_ref = cd.as_deref();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_trace(path, &ctr, tpf, cd_ref))) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_trace_for_merge(path, &ctr, tpf, cd_ref, &t0))) {
             Ok(result) => Some((r, result)),
             Err(e) => {
                 let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
@@ -3247,18 +3278,38 @@ pub fn load_trace_from_bytes_progressive(
     tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
 ) {
     let t0 = Instant::now();
+    match load_trace_from_bytes_inner(name, raw_input, counter, &t0) {
+        Ok((mut trace, from_cache)) => {
+            if !from_cache {
+                compact_args(&mut trace);
+                eprintln!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
+            }
+            let _ = tx.send(Ok(trace));
+        }
+        Err(e) => { let _ = tx.send(Err(e)); }
+    }
+}
 
+/// wasm counterpart of `load_trace_inner` (see there for the `from_cache`
+/// flag): the cache short-circuits plus parse→build, without the trailing
+/// `compact_args` — for the single-file wrapper above and for ranks going
+/// straight into `merge_traces` (`load_multi_from_bytes_progressive`),
+/// which compacts the merged trace once at the end instead of once per
+/// rank and once merged.
+#[cfg(target_arch = "wasm32")]
+fn load_trace_from_bytes_inner(
+    name: &str, raw_input: Vec<u8>, counter: &Arc<AtomicUsize>, t0: &Instant,
+) -> Result<(Trace, bool), String> {
     if name.ends_with(".tvcache.gz") {
         let mut decoder = flate2::read::GzDecoder::new(&raw_input[..]);
         let mut buf = Vec::new();
-        match decoder.read_to_end(&mut buf).ok().and_then(|_| load_cache_from_bytes(&buf)) {
+        return match decoder.read_to_end(&mut buf).ok().and_then(|_| load_cache_from_bytes(&buf)) {
             Some(trace) => {
                 eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
-                let _ = tx.send(Ok(trace));
+                Ok((trace, true))
             }
-            None => { let _ = tx.send(Err(format!("{name}: {}", cache_load_error(&buf)))); }
-        }
-        return;
+            None => Err(format!("{name}: {}", cache_load_error(&buf))),
+        };
     }
     if name.ends_with(".tvcache") {
         // Same zstd-detection `read_and_decompress_cache` does natively,
@@ -3273,24 +3324,23 @@ pub fn load_trace_from_bytes_progressive(
                 .and_then(|mut d| d.read_to_end(&mut out).ok())
             {
                 Some(_) => out,
-                None => { let _ = tx.send(Err(format!("{name}: corrupt zstd-compressed .tvcache file"))); return; }
+                None => return Err(format!("{name}: corrupt zstd-compressed .tvcache file")),
             }
         } else {
             raw_input
         };
-        match load_cache_from_bytes(&decompressed) {
+        return match load_cache_from_bytes(&decompressed) {
             Some(trace) => {
                 eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
-                let _ = tx.send(Ok(trace));
+                Ok((trace, true))
             }
-            None => { let _ = tx.send(Err(format!("{name}: {}", cache_load_error(&decompressed)))); }
-        }
-        return;
+            None => Err(format!("{name}: {}", cache_load_error(&decompressed))),
+        };
     }
 
     let raw = match read_bytes_named(name, raw_input, counter) {
         Ok(r) => r,
-        Err(e) => { let _ = tx.send(Err(e)); return; }
+        Err(e) => return Err(e),
     };
     if name.ends_with(".ktz") {
         // ktz decode already counted rendered events into the loader
@@ -3301,15 +3351,14 @@ pub fn load_trace_from_bytes_progressive(
 
     let te = match find_key(&raw, b"traceEvents") {
         Some(v) => v,
-        None => { let _ = tx.send(Err(format!("{name}: no traceEvents found"))); return; }
+        None => return Err(format!("{name}: no traceEvents found")),
     };
     let mut pos = te + "\"traceEvents\"".len();
     pos = skip_ws(&raw, pos);
     if pos < raw.len() && raw[pos] == b':' { pos += 1; }
     pos = skip_ws(&raw, pos);
     if pos >= raw.len() || raw[pos] != b'[' {
-        let _ = tx.send(Err(format!("{name}: malformed traceEvents")));
-        return;
+        return Err(format!("{name}: malformed traceEvents"));
     }
     let array_start = pos + 1;
     let n_threads = calc_n_threads(raw.len(), 0);
@@ -3323,14 +3372,7 @@ pub fn load_trace_from_bytes_progressive(
         state
     });
 
-    match build_trace(raw, chunks, n_chunks, &t0) {
-        Ok(mut trace) => {
-            compact_args(&mut trace);
-            eprintln!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
-            let _ = tx.send(Ok(trace));
-        }
-        Err(e) => { let _ = tx.send(Err(e)); }
-    }
+    build_trace(raw, chunks, n_chunks, t0).map(|t| (t, false))
 }
 
 /// wasm equivalent of `detect_rank_groups`'s grouping logic (the part after
@@ -3371,6 +3413,9 @@ pub fn group_by_rank_bytes(
 /// wasm equivalent of `load_multi_progressive`: takes each rank's bytes
 /// already in memory instead of a path, and skips the merged-cache round
 /// trip entirely (no persistent cache on wasm — see `load_cache`'s stub).
+/// Each rank loads uncompacted via `load_trace_from_bytes_inner` —
+/// `merge_traces` compacts the merged trace once at the end, so a per-rank
+/// compact would only add a second copy round (see `load_trace_for_merge`).
 #[cfg(target_arch = "wasm32")]
 pub fn load_multi_from_bytes_progressive(
     rank_named_bytes: Vec<(usize, String, Vec<u8>)>,
@@ -3381,9 +3426,7 @@ pub fn load_multi_from_bytes_progressive(
 
     let results: Vec<(usize, Result<Trace, String>)> = rank_named_bytes.into_par_iter()
         .map(|(rank, name, bytes)| {
-            let (tx2, rx2) = std::sync::mpsc::channel();
-            load_trace_from_bytes_progressive(&name, bytes, counter, &tx2);
-            let result = rx2.try_recv().unwrap_or_else(|_| Err(format!("{name}: no result")));
+            let result = load_trace_from_bytes_inner(&name, bytes, counter, &t0).map(|(t, _)| t);
             (rank, result)
         })
         .collect();

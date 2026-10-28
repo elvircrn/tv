@@ -2363,7 +2363,7 @@ fn main() {
                 let ctr = counter.clone();
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let t = Instant::now();
-                    let res = loader::load_trace(path, &ctr, tpf, None);
+                    let res = loader::load_trace_for_merge(path, &ctr, tpf, None, &t);
                     (res, t.elapsed().as_secs_f64())
                 })) {
                     Ok((res, elapsed)) => Some((r, res, elapsed)),
