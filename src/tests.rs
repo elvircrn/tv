@@ -268,6 +268,65 @@ fn test_nice_interval_values() {
         "nice_interval(100) = {n}, expected 10/20/50");
 }
 
+// --- step_band_px (ruler step-band clamping) ---
+
+/// A 1200px ruler like the real one: [x0, y0, x1, y1].
+const RULER: [f32; 4] = [100.0, 0.0, 1300.0, 20.0];
+
+#[test]
+fn test_step_band_px_inside_view_unclamped() {
+    // Step fully inside the view maps 1:1 to its proportional slice.
+    let view = View { t0: 0.0, t1: 1000.0, ..Default::default() };
+    let (x0, x1) = step_band_px(250.0, 750.0, &view, RULER);
+    assert!((x0 - 400.0).abs() < 0.5, "x0 {x0} != 400");
+    assert!((x1 - 1000.0).abs() < 0.5, "x1 {x1} != 1000");
+}
+
+#[test]
+fn test_step_band_px_wider_than_view_clamps_to_ruler_edges() {
+    // Step spanning past both edges fills the whole ruler, at ANY zoom —
+    // this is the frame_step layout (step framed with slack), and the case
+    // the old `.min(range)` clamp broke: it clamped a pixel offset by the
+    // view's µs range, so any zoom tighter than ~1 band-per-screen
+    // collapsed the fill to a left-edge sliver that tracked the zoom level.
+    let view = View { t0: 400.0, t1: 600.0, ..Default::default() };
+    let (x0, x1) = step_band_px(100.0, 900.0, &view, RULER);
+    assert!((x0 - RULER[0]).abs() < 0.5, "x0 {x0} should pin to the left edge");
+    assert!((x1 - RULER[2]).abs() < 0.5, "x1 {x1} should pin to the right edge");
+}
+
+#[test]
+fn test_step_band_px_stays_pinned_while_zooming_in() {
+    // The "moves erratically when I zoom in" regression: keep the view
+    // centered inside one long step and shrink the range from the whole step
+    // down to kernel scale — the band must stay glued to both ruler edges
+    // through every zoom level, never sliding or narrowing.
+    let mut view = View { t0: 0.0, t1: 1000.0, ..Default::default() };
+    let mut range = 1000.0;
+    while range >= 0.001 {
+        let c = 500.0;
+        view.t0 = c - range / 2.0;
+        view.t1 = c + range / 2.0;
+        let (x0, x1) = step_band_px(0.0, 1000.0, &view, RULER);
+        assert!((x0 - RULER[0]).abs() < 0.5 && (x1 - RULER[2]).abs() < 0.5,
+            "range {range}: band [{x0}, {x1}] left the ruler edges");
+        range /= 4.0;
+    }
+}
+
+#[test]
+fn test_step_band_px_right_edge_clamp_is_pixels_not_time() {
+    // A step whose end is past the right edge at a zoom where the OLD clamp
+    // bound: pixel offset (600) < true extent, but the µs range (300) is
+    // smaller still, so the old code truncated the band to 300px. The band
+    // must instead run to the ruler's right edge.
+    let view = View { t0: 0.0, t1: 300.0, ..Default::default() };
+    let (x0, x1) = step_band_px(150.0, 1000.0, &view, RULER);
+    assert!((x0 - 700.0).abs() < 0.5, "x0 {x0} != 700");
+    assert!((x1 - RULER[2]).abs() < 0.5, "x1 {x1} should clamp at the ruler edge, not at range px");
+}
+
+
 // --- Color functions ---
 
 #[test]

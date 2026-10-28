@@ -2070,6 +2070,22 @@ pub fn draw_timeline(
     (hover_result, click_result, sel_change)
 }
 
+/// Pixel x-range of a scheduler step's ruler band, clamped to the ruler
+/// rect. Split out from `draw_ruler` so the clamp math is unit-testable —
+/// both clamps are on the band's PIXEL offset, so the edges they clamp to
+/// are 0 and the ruler's pixel width. Clamping the right edge by anything
+/// else (the view's time `range` was the trap: a µs count that only stays
+/// "big" while zoomed out) pins every band wider than the zoom range to a
+/// left-edge sliver whose width tracks the zoom level instead of the step —
+/// the highlight then slides around as you zoom in.
+pub fn step_band_px(s_t0: f64, s_t1: f64, view: &View, rect: [f32; 4]) -> (f32, f32) {
+    let px_w = (rect[2] - rect[0]) as f64;
+    let px_per_us = px_w / (view.t1 - view.t0);
+    let x0 = rect[0] + ((s_t0 - view.t0) * px_per_us).max(0.0) as f32;
+    let x1 = rect[0] + ((s_t1 - view.t0) * px_per_us).min(px_w) as f32;
+    (x0, x1)
+}
+
 fn draw_ruler(
     dl: &imgui::DrawListMut,
     rect: [f32; 4],
@@ -2087,12 +2103,10 @@ fn draw_ruler(
     // tint. Steps are ts-ordered, so a partition_point + scan window covers
     // exactly the visible ones — O(log n + visible), negligible at any zoom.
     if !steps.is_empty() {
-        let px_per_us = (rect[2] - rect[0]) as f64 / range;
         let first = steps.partition_point(|s| s.t1 <= view.t0);
         for (i, s) in steps.iter().enumerate().skip(first) {
             if s.t0 >= view.t1 { break; }
-            let x0 = rect[0] + ((s.t0 - view.t0) * px_per_us).max(0.0) as f32;
-            let x1 = rect[0] + ((s.t1 - view.t0) * px_per_us).min(range) as f32;
+            let (x0, x1) = step_band_px(s.t0, s.t1, view, rect);
             if i % 2 == 0 {
                 let band = if i == step_cursor { STEP_BAND_CUR } else { STEP_BAND };
                 dl.add_rect([x0.max(rect[0]), rect[1]], [x1, rect[3]], band)
