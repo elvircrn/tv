@@ -4,6 +4,16 @@ use std::sync::Arc;
 
 pub enum ArgsBuf {
     Heap(Vec<u8>),
+    /// The mmap'd source .json itself, kept alive zero-copy. `into_vec`-ing a
+    /// mapped file cost a full-file heap copy on every plain .json load
+    /// (0.36s and ~1.6GB of anon RSS on a 1.6GB file) that `compact_args`
+    /// then paid for a second time when it copied the args ranges out — so
+    /// events now hold `args_off` straight into the file's pages. The mapping
+    /// is file-backed (clean, reclaimable under pressure) and short-lived:
+    /// `compact_args` swaps in one Heap buffer and every live `Arc<ArgsBuf>`
+    /// to the mapping drops. Native-only, mirroring `RawData::Mmap`.
+    #[cfg(not(target_arch = "wasm32"))]
+    Mmap(memmap2::Mmap),
 }
 
 impl std::ops::Deref for ArgsBuf {
@@ -11,6 +21,8 @@ impl std::ops::Deref for ArgsBuf {
     fn deref(&self) -> &[u8] {
         match self {
             ArgsBuf::Heap(v) => v,
+            #[cfg(not(target_arch = "wasm32"))]
+            ArgsBuf::Mmap(m) => m,
         }
     }
 }

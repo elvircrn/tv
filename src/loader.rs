@@ -27,11 +27,15 @@ impl std::ops::Deref for RawData {
 }
 
 impl RawData {
-    fn into_vec(self) -> Vec<u8> {
+    /// Hand the raw bytes to `build_trace`'s `Arc<ArgsBuf>` without copying:
+    /// a mapped file becomes `ArgsBuf::Mmap` (events' args_offs point into
+    /// the file's pages; compact_args later reads them through Deref), and
+    /// heap buffers pass straight through.
+    fn into_args_buf(self) -> ArgsBuf {
         match self {
-            RawData::Vec(v) => v,
+            RawData::Vec(v) => ArgsBuf::Heap(v),
             #[cfg(not(target_arch = "wasm32"))]
-            RawData::Mmap(m) => m.to_vec(),
+            RawData::Mmap(m) => ArgsBuf::Mmap(m),
         }
     }
 }
@@ -674,7 +678,11 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     drop(name_idx);
     drop(cat_idx);
 
-    let raw_buf: Arc<ArgsBuf> = Arc::new(ArgsBuf::Heap(raw.into_vec()));
+    // Zero-copy on .json: a mapped file keeps pointing at its own pages
+    // instead of being memcpy'd to a heap buffer first (measured 0.36s /
+    // ~1.6GB on a 1.6GB file, before compact_args copied the args out
+    // again).
+    let raw_buf: Arc<ArgsBuf> = Arc::new(raw.into_args_buf());
 
     if min_ts == f64::MAX {
         return Err("no duration events found".into());
