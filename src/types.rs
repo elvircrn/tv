@@ -338,9 +338,12 @@ impl StepBatch {
 /// One vLLM scheduler step, derived from the `execute_context_*`
 /// `gpu_user_annotation` spans (CPU-side `user_annotation` as fallback).
 /// All spans share the same interned name — steps are distinguishable only
-/// by temporal order, so a "reference track" (the one holding the most
-/// spans, i.e. a busy CUDA stream) defines the canonical sequence and
-/// every other rank's span is assigned to the interval it overlaps most.
+/// by temporal order, so a "reference track" defines the canonical sequence
+/// and every other rank's span is assigned to the interval it overlaps most.
+/// The reference is the track with the most such spans, ties broken by total
+/// span duration then track index (see `compute_steps` for why the
+/// tie-breaks matter); roughly the busiest CUDA stream that brackets each
+/// step's full GPU extent.
 /// Batch size / #tokens aren't recorded by these traces (`record_shapes=0`),
 /// so the summary is timing/counts only.
 pub struct StepInfo {
@@ -349,8 +352,10 @@ pub struct StepInfo {
     pub t0: f64,
     /// Step end: max span end across assigned spans.
     pub t1: f64,
-    /// Median assigned-span duration — the "typical rank's" GPU-busy time
-    /// for this step, robust against one straggler rank stretching t1.
+    /// Median across ranks of each rank's GPU-busy time for this step —
+    /// the union of that rank's assigned projection spans (parallel
+    /// streams overlap, so they're merged, not summed). Robust against
+    /// one straggler rank stretching t1.
     pub gpu_dur: f64,
     /// Gap from the previous step's end (0.0 for the first step).
     pub idle_before: f64,

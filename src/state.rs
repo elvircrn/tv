@@ -138,9 +138,37 @@ pub(crate) fn compute_steps(trace: &Trace, exec_context_names: &[usize]) -> Vec<
     // and non-overlapping (one bracket per step per stream), so they define
     // the canonical step list — no gap-based clustering needed, which would
     // be fragile across skewed clocks.
-    let mut per_track_counts: std::collections::HashMap<usize, usize> = Default::default();
-    for &(_, _, ti, _) in &spans { *per_track_counts.entry(ti).or_default() += 1; }
-    let ref_track = per_track_counts.into_iter().max_by_key(|&(_, c)| c).unwrap().0;
+    //
+    // Ties are broken by total span duration, then by track index. The
+    // tie-breaks are load-bearing: `gpu_user_annotation` projects onto
+    // EVERY CUDA stream, so on a real multi-stream trace dozens of tracks
+    // tie at exactly one span per step, and which one wins decides how
+    // every other span is assigned. The old `max_by_key` over a HashMap
+    // resolved those ties by hash iteration order — a per-call lottery
+    // where the same trace computed different step bounds on every
+    // recompute, and a partial stream (one whose brackets cover only the
+    // head or tail of each step) as reference leaves spans overlapping no
+    // interval, which the nearest-interval fallback then attaches to the
+    // wrong step, stretching bounds across neighboring steps' kernels.
+    // Total duration prefers a stream that brackets the whole step — a
+    // projection can't exceed its CPU annotation's window, so the longest
+    // per-step brackets are the ones closest to each step's true GPU
+    // extent — and the index keeps the pick stable when several streams
+    // are equally good. Track indices are unique, so the composite order
+    // is total and the max is the same regardless of iteration order.
+    let mut per_track: std::collections::HashMap<usize, (usize, f64)> = Default::default();
+    for &(s0, s1, ti, _) in &spans {
+        let e = per_track.entry(ti).or_default();
+        e.0 += 1;
+        e.1 += s1 - s0;
+    }
+    let ref_track = per_track.into_iter()
+        .max_by(|a, b| {
+            a.1.0.cmp(&b.1.0)
+                .then(a.1.1.total_cmp(&b.1.1))
+                .then(b.0.cmp(&a.0))
+        })
+        .unwrap().0;
     let mut ref_spans: Vec<(f64, f64, u32)> = spans.iter()
         .filter(|&&(_, _, ti, _)| ti == ref_track)
         .map(|&(t0, t1, _, name)| (t0, t1, name))
@@ -154,8 +182,11 @@ pub(crate) fn compute_steps(trace: &Trace, exec_context_names: &[usize]) -> Vec<
     // moving cursor, since a span can't overlap two far-apart steps) is
     // O(spans + steps).
     let n = ref_spans.len();
-    let mut bounds = vec![(f64::MAX, f64::MIN, 0f64); n]; // (min t0, max t1, sum dur)
+    let mut bounds = vec![(f64::MAX, f64::MIN); n]; // (min t0, max t1)
     let mut rank_sets: Vec<std::collections::HashSet<usize>> = (0..n).map(|_| Default::default()).collect();
+    // Per (step, rank) assigned intervals, for the union-based gpu_dur below.
+    let mut rank_spans: Vec<std::collections::HashMap<usize, Vec<(f64, f64)>>> =
+        (0..n).map(|_| Default::default()).collect();
     // Rank -> DP-group id (from `rank_paths` filenames, when the trace is a
     // multi-rank merge). Ranks in the same DP group share one scheduler and
     // annotate identical batch info, so each group's parsed batch counts
@@ -203,8 +234,8 @@ pub(crate) fn compute_steps(trace: &Trace, exec_context_names: &[usize]) -> Vec<
         }
         bounds[i].0 = bounds[i].0.min(s0);
         bounds[i].1 = bounds[i].1.max(s1);
-        bounds[i].2 += s1 - s0;
         rank_sets[i].insert(rank.unwrap_or(ti));
+        rank_spans[i].entry(rank.unwrap_or(ti)).or_default().push((s0, s1));
     }
 
     // Kernel counts: for each step, binary-search each GPU track's ts-sorted
@@ -218,10 +249,18 @@ pub(crate) fn compute_steps(trace: &Trace, exec_context_names: &[usize]) -> Vec<
     let mut steps = Vec::with_capacity(n);
     let mut prev_t1 = 0.0;
     for i in 0..n {
-        let (t0, t1, sum_dur) = bounds[i];
+        let (t0, t1) = bounds[i];
         if t1 <= t0 { continue; } // reference interval with no surviving span (shouldn't happen)
-        let n_assigned = rank_sets[i].iter().filter(|&&r| r != usize::MAX).count().max(1);
-        let gpu_dur = sum_dur / n_assigned as f64;
+        // GPU busy: per rank, the UNION of that rank's assigned spans —
+        // the projections of one annotation onto parallel streams overlap
+        // in time, so summing raw span durations counts the same GPU time
+        // once per stream (on a ~50-stream trace the old sum/n_ranks
+        // reported ~3.5x the step's wall time). Then the median across
+        // ranks: the typical rank's busy time, robust against one
+        // straggler rank stretching the step.
+        let mut rank_durs: Vec<f64> = rank_spans[i].values_mut()
+            .map(|v| union_len(v)).collect();
+        let gpu_dur = if rank_durs.is_empty() { 0.0 } else { crate::types::median_inplace(&mut rank_durs) };
         let mut kernel_count = 0u32;
         if !kernel_cat.is_empty() {
             for &ti in &gpu_tracks {
@@ -263,6 +302,23 @@ pub(crate) fn compute_steps(trace: &Trace, exec_context_names: &[usize]) -> Vec<
         });
     }
     steps
+}
+
+/// Total length covered by the given intervals (sort + merge sweep).
+/// Reorders `spans`; callers pass a scratch list. Used by `compute_steps`
+/// to fold one rank's parallel-stream projections into that rank's actual
+/// busy time for a step.
+fn union_len(spans: &mut [(f64, f64)]) -> f64 {
+    spans.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    let mut total = 0.0f64;
+    let mut cur_end = f64::NEG_INFINITY;
+    for &(s0, s1) in spans.iter() {
+        if s1 > cur_end {
+            total += s1 - s0.max(cur_end);
+            cur_end = s1;
+        }
+    }
+    total
 }
 
 /// Maps rank id -> DP-group id for a merged multi-rank trace, from the

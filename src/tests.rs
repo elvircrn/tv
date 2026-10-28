@@ -2991,6 +2991,135 @@ fn test_compute_steps_multi_rank() {
 }
 
 #[test]
+fn test_compute_steps_deterministic_under_full_tie() {
+    // `gpu_user_annotation` projects each step onto EVERY CUDA stream, so on
+    // a real multi-stream trace dozens of tracks tie at exactly one span per
+    // step. All 32 tracks here tie on both count and total duration, so the
+    // reference pick runs through to the track-index tie-break — and the
+    // result must be identical on every call. The old count-only
+    // `max_by_key` over a `HashMap` resolved these ties by hash iteration
+    // order, a fresh lottery per call: the same trace computed different
+    // step bounds on every recompute (load, clock sync, auto-reload).
+    // Track 0 brackets the steps at [0,100) and [200,300); the other 31
+    // (identical to each other) at [120,220) and [320,420). Which geometry
+    // wins changes the assignment — e.g. under a shifted reference, track
+    // 0's [200,300) span overlaps only the shifted step-0 bracket, so it
+    // counts toward step 0 and stretches it to [0,300).
+    let ec = 0usize;
+    let c_gua = 0usize;
+    let mut tracks = vec![
+        ("Rank 0 stream 0", true, vec![
+            (0.0, 100.0, ec, c_gua), (200.0, 100.0, ec, c_gua),
+        ]),
+    ];
+    for _ in 1..32 {
+        // Labels needn't be distinct: the pick is by track index, and
+        // parse_rank maps them all to rank 0 regardless.
+        tracks.push((
+            "Rank 0 stream 1",
+            true,
+            vec![(120.0, 100.0, ec, c_gua), (320.0, 100.0, ec, c_gua)],
+        ));
+    }
+    let trace = make_stepped_trace(
+        vec!["gpu_user_annotation"],
+        vec!["execute_context_0(0)_generation_1(1)"],
+        tracks,
+    );
+    let ec_names = find_exec_context_names(&trace.names);
+    let project = |steps: &[crate::types::StepInfo]| -> Vec<(f64, f64, f64)> {
+        steps.iter().map(|s| (s.t0, s.t1, s.gpu_dur)).collect()
+    };
+    let first = project(&compute_steps(&trace, &ec_names));
+    for _ in 0..30 {
+        assert_eq!(project(&compute_steps(&trace, &ec_names)), first,
+            "compute_steps returned different steps across calls");
+    }
+    // Lowest index wins the full tie: track 0's brackets are the reference.
+    assert_eq!(first.len(), 2);
+    assert!((first[0].0 - 0.0).abs() < 1e-9 && (first[0].1 - 100.0).abs() < 1e-9);
+    assert!((first[1].0 - 120.0).abs() < 1e-9 && (first[1].1 - 420.0).abs() < 1e-9);
+}
+
+#[test]
+fn test_compute_steps_duration_tiebreak_beats_track_order() {
+    // Count tie between 15 clipped/shifted streams (brackets only part of
+    // each step) at the LOWER track indices and one full-bracket stream
+    // above them — the real-trace shape, where most projections are partial
+    // and only a few streams bracket every step fully. Total span duration
+    // must win the reference: a projection can't exceed its CPU annotation's
+    // window, so the longest per-step brackets are the ones closest to each
+    // step's true GPU extent. A count-only pick that fell back to track
+    // order would take a partial stream, whose intervals leave the full
+    // stream's spans overlapping nothing — the nearest-interval fallback
+    // then attaches [200,300) to step 0 and the step swallows the inter-step
+    // gap ([0,300) instead of [0,100)).
+    let ec = 0usize;
+    let c_gua = 0usize;
+    let mut tracks = Vec::new();
+    for _ in 0..15 {
+        // Partial brackets: [120,190) and [320,390), total dur 140.
+        tracks.push((
+            "Rank 0 stream P",
+            true,
+            vec![(120.0, 70.0, ec, c_gua), (320.0, 70.0, ec, c_gua)],
+        ));
+    }
+    // Full brackets: [0,100) and [200,300), total dur 200.
+    tracks.push((
+        "Rank 0 stream F",
+        true,
+        vec![(0.0, 100.0, ec, c_gua), (200.0, 100.0, ec, c_gua)],
+    ));
+    let trace = make_stepped_trace(
+        vec!["gpu_user_annotation"],
+        vec!["execute_context_0(0)_generation_1(1)"],
+        tracks,
+    );
+    let ec_names = find_exec_context_names(&trace.names);
+    let steps = compute_steps(&trace, &ec_names);
+    assert_eq!(steps.len(), 2);
+    assert!((steps[0].t0 - 0.0).abs() < 1e-9);
+    assert!((steps[0].t1 - 100.0).abs() < 1e-9);
+    assert!((steps[1].t0 - 120.0).abs() < 1e-9);
+    assert!((steps[1].t1 - 390.0).abs() < 1e-9);
+}
+
+#[test]
+fn test_compute_steps_gpu_dur_is_median_of_rank_unions() {
+    // GPU busy must merge a rank's parallel-stream projections (they overlap
+    // in time) before aggregating across ranks, and use the median so one
+    // straggler rank can't inflate it. The old metric summed every span and
+    // divided by rank count: rank 0's two identical 30us projections counted
+    // as 60, and rank 2's straggler dragged the mean — 140/3 = 46.7 instead
+    // of the true 30.
+    let ec = 0usize;
+    let c_gua = 0usize;
+    let step = |t0: f64| (t0, 30.0, ec, c_gua);
+    let trace = make_stepped_trace(
+        vec!["gpu_user_annotation"],
+        vec!["execute_context_0(0)_generation_1(1)"],
+        vec![
+            ("Rank 0 stream 0", true, vec![step(100.0), step(200.0)]),
+            ("Rank 0 stream 1", true, vec![step(100.0), step(200.0)]),
+            ("Rank 1 stream 0", true, vec![step(100.0), step(200.0)]),
+            // Straggler: single 50us projection in step 0 only.
+            ("Rank 2 stream 0", true, vec![(100.0, 50.0, ec, c_gua)]),
+        ],
+    );
+    let ec_names = find_exec_context_names(&trace.names);
+    let steps = compute_steps(&trace, &ec_names);
+    assert_eq!(steps.len(), 2);
+    // Step 0 bounds stretched by the straggler's end, but its busy time
+    // doesn't leak into the median: rank unions are 30, 30, 50.
+    assert!((steps[0].t0 - 100.0).abs() < 1e-9);
+    assert!((steps[0].t1 - 150.0).abs() < 1e-9);
+    assert_eq!(steps[0].n_ranks, 3);
+    assert!((steps[0].gpu_dur - 30.0).abs() < 1e-9);
+    assert!((steps[1].gpu_dur - 30.0).abs() < 1e-9);
+}
+
+#[test]
 fn test_compute_steps_prefers_gpu_side_and_falls_back() {
     let ec = 0usize;
     // CPU-only trace: user_annotation cat, no GPU side
@@ -3755,3 +3884,242 @@ fn tab_strip_hugs_content_and_lines_up_with_toolbar() {
     assert!(measured_w > 60.0,
         "strip width {measured_w:.1} must reflect real content, not an estimate");
 }
+
+// TEMP investigation dump: loads a real multi-rank trace dir exactly like the
+// app does (detect_rank_groups -> load_multi_progressive, no clock sync) and
+// prints the internals of compute_steps: which track becomes the reference,
+// per-rank span timelines vs the reference intervals, and where each step's
+// min/max bounds stretch past the reference interval.
+//   TV_STEPS_TRACE=<dir> cargo test debug_steps_dump -- --ignored --nocapture
+#[test]
+#[ignore]
+fn debug_steps_dump() {
+    let path = std::env::var("TV_STEPS_TRACE").expect("set TV_STEPS_TRACE");
+    let (groups, standalone) = crate::loader::detect_rank_groups(&[path.clone()]);
+    let mut rank_paths: Vec<(usize, String)> = Vec::new();
+    for (g, _) in groups { rank_paths.extend(g); }
+    for (p, _) in standalone { rank_paths.push((rank_paths.len(), p)); }
+    assert!(!rank_paths.is_empty(), "no trace files under {path}");
+    eprintln!("rank_paths: {:#?}", rank_paths.iter().map(|(r, p)| (r, p.rsplit('/').next().unwrap_or(p))).collect::<Vec<_>>());
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let counter = test_counter();
+    crate::loader::load_multi_progressive(rank_paths, &counter, 2, &tx, None, true);
+    let trace = rx.recv().expect("load result").expect("trace loaded");
+    eprintln!("merged: {} tracks, {} events, span 0..{:.0} us", trace.tracks.len(), trace.total_events, trace.max_ts);
+
+    let exec_names = find_exec_context_names(&trace.names);
+    eprintln!("exec-context names: {:?}",
+        exec_names.iter().map(|&i| trace.names[i].as_str()).collect::<Vec<_>>());
+    let name_set: std::collections::HashSet<u32> = exec_names.iter().map(|&i| i as u32).collect();
+
+    // Mirror collect_exec_spans for both categories.
+    let collect = |cat: &str| -> Vec<(f64, f64, usize, u32)> {
+        let cat_ids: Vec<u32> = trace.cats.iter().enumerate()
+            .filter(|(_, c)| c.as_str() == cat).map(|(i, _)| i as u32).collect();
+        let mut out = Vec::new();
+        for (ti, track) in trace.tracks.iter().enumerate() {
+            for ev in &track.events {
+                if name_set.contains(&ev.name) && cat_ids.contains(&ev.cat) {
+                    out.push((ev.ts, ev.ts + ev.dur, ti, ev.name));
+                }
+            }
+        }
+        out
+    };
+    let gpu_side = collect("gpu_user_annotation");
+    let cpu_side = collect("user_annotation");
+    eprintln!("gpu_user_annotation spans: {}, user_annotation spans: {}",
+        gpu_side.len(), cpu_side.len());
+    let spans = if gpu_side.is_empty() { cpu_side } else { gpu_side };
+
+    // Per-track (count, total duration) -> reference track, exactly like
+    // compute_steps: most spans, then longest total duration, then lowest
+    // track index. The tiebreak chain is a total order, so the winner is the
+    // same on every call (the old count-only max_by_key was a HashMap lottery
+    // among ~200 tracks tied at one span per step).
+    let mut per_track: Vec<(usize, usize, f64)> = Vec::new(); // (ti, count, dur)
+    for &(s0, s1, ti, _) in &spans {
+        match per_track.iter_mut().find(|(t, _, _)| *t == ti) {
+            Some((_, c, d)) => { *c += 1; *d += s1 - s0; }
+            None => per_track.push((ti, 1, s1 - s0)),
+        }
+    }
+    let (ref_track, _, _) = *per_track.iter().max_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then(a.2.total_cmp(&b.2))
+            .then(b.0.cmp(&a.0))
+    }).unwrap();
+    eprintln!("reference track: {} ({} of {} tracks with spans)",
+        trace.tracks[ref_track].label, per_track.len(), trace.tracks.len());
+
+    // Reference intervals + per-rank span lists (ts-sorted).
+    let mut ref_spans: Vec<(f64, f64)> = spans.iter()
+        .filter(|&&(_, _, ti, _)| ti == ref_track)
+        .map(|&(t0, t1, _, _)| (t0, t1)).collect();
+    ref_spans.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    eprintln!("reference track {} has {} intervals", trace.tracks[ref_track].label, ref_spans.len());
+    let mut by_rank: Vec<(usize, Vec<(f64, f64, usize)>)> = Vec::new(); // (rank, (s0,s1,ti))
+    for &(s0, s1, ti, _) in &spans {
+        let rank = parse_rank(&trace.tracks[ti].label).unwrap_or(ti);
+        match by_rank.iter_mut().find(|(r, _)| *r == rank) {
+            Some((_, v)) => v.push((s0, s1, ti)),
+            None => by_rank.push((rank, vec![(s0, s1, ti)])),
+        }
+    }
+    for (_rank, v) in &mut by_rank { v.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap()); }
+    by_rank.sort_by_key(|(r, _)| *r);
+
+    // Rank phase/skew vs the reference: for each rank, its k-th span start
+    // minus the reference's k-th span start (only ranks with equal counts
+    // line up index-for-index, but the drift pattern is what matters).
+    eprintln!("\nper-rank k-th span start minus reference k-th span start (us), k=0,10,20,...:");
+    for (rank, v) in &by_rank {
+        let mut line = format!("  rank {rank:2} ({} spans):", v.len());
+        for k in (0..v.len()).step_by(10) {
+            if k < ref_spans.len() {
+                line += &format!(" [{k}]{:+.0}", v[k].0 - ref_spans[k].0);
+            }
+        }
+        eprintln!("{line}");
+    }
+
+    // The steps compute_steps actually produces.
+    let steps = compute_steps(&trace, &exec_names);
+    eprintln!("\n{} steps from compute_steps:", steps.len());
+    for (i, s) in steps.iter().enumerate().take(40) {
+        let (r0, r1) = ref_spans.get(i).copied().unwrap_or((f64::NAN, f64::NAN));
+        let (bt0, bt1) = (s.t0, s.t1);
+        eprintln!("  step {i:3}: ref [{r0:10.1},{r1:10.1}] -> bounds [{bt0:10.1},{bt1:10.1}] \
+wall {:8.1} gpu_busy {:8.1} idle {:7.1} ranks {} kernels {}",
+            s.t1 - s.t0, s.gpu_dur, s.idle_before, s.n_ranks, s.kernel_count);
+    }
+
+    // Determinism check: call compute_steps repeatedly on the SAME trace and
+    // confirm the bounds don't move. Guards the total-order reference pick —
+    // the old count-only max_by_key let HashMap iteration order decide among
+    // ~200 tracks tied at 16 spans each, giving different bounds per call.
+    eprintln!("\ncompute_steps stability across 8 calls (step-8 t0 / wall):");
+    let first = compute_steps(&trace, &exec_names);
+    let mut all_same = true;
+    for k in 0..8 {
+        let s = compute_steps(&trace, &exec_names);
+        let same = s.len() == first.len() && s.iter().zip(&first)
+            .all(|(a, b)| a.t0 == b.t0 && a.t1 == b.t1 && a.gpu_dur == b.gpu_dur);
+        if !same { all_same = false; }
+        let st = s.get(8);
+        if let Some(st) = st {
+            eprintln!("  call {k}: t0={:10.1} t1={:10.1} wall {:8.1} gpu_busy {:8.1}{}",
+                st.t0, st.t1, st.t1 - st.t0, st.gpu_dur, if same { "" } else { "  <-- DIFFERS" });
+        }
+    }
+    assert!(all_same, "compute_steps is nondeterministic across calls");
+
+    // Assignment detail: for every step, which assigned spans reach outside
+    // the reference interval (the min/max stretch contributors)?
+    eprintln!("\nstretch contributors (spans outside the ref interval), per step:");
+    for (i, &(r0, r1)) in ref_spans.iter().enumerate() {
+        let mut viol: Vec<(f64, f64, &str)> = Vec::new();
+        for &(s0, s1, ti, _) in &spans {
+            let ov = (s1.min(r1) - s0.max(r0)).max(0.0);
+            if ov <= 0.0 { continue; }
+            // best-overlap interval for this span (same rule as compute_steps)
+            let mut best = (0usize, 0f64);
+            for (j, &(q0, q1)) in ref_spans.iter().enumerate() {
+                if q0 >= s1 { break; }
+                let o = (s1.min(q1) - s0.max(q0)).max(0.0);
+                if o > best.1 { best = (j, o); }
+            }
+            if best.0 != i { continue; }
+            if s0 < r0 - 1.0 || s1 > r1 + 1.0 {
+                viol.push((s0, s1, &trace.tracks[ti].label));
+            }
+        }
+        viol.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let n_out = viol.len();
+        if n_out > 0 {
+            eprintln!("  step {i:3} ref [{r0:9.1},{r1:9.1}]: {n_out} spans outside, earliest 6:");
+            for (s0, s1, label) in viol.iter().take(6) {
+                eprintln!("      [{s0:9.1},{s1:9.1}] dur {:8.1} left-stretch {:7.1}  {}",
+                    s1 - s0, r0 - s0, label);
+            }
+        }
+    }
+
+    // gpu_busy sanity: with per-rank union + median, GPU busy time can never
+    // exceed the step's wall time. The old sum-of-parallel-streams metric
+    // reported ~3.5x the wall time on this trace (38ms busy for an 11.5ms
+    // step), which is physically impossible.
+    eprintln!("\nsteps where gpu_busy > wall (should be none):");
+    let mut n_bad = 0;
+    for (i, s) in steps.iter().enumerate() {
+        if s.gpu_dur > s.t1 - s.t0 + 1.0 {
+            eprintln!("  step {i:3}: wall {:8.1} gpu_busy {:8.1}", s.t1 - s.t0, s.gpu_dur);
+            n_bad += 1;
+        }
+    }
+    if n_bad == 0 { eprintln!("  (none)"); }
+
+    // Exact replication of compute_steps' assignment (including the
+    // nearest-interval fallback), tracking WHICH span sets each step's
+    // t0 (argmin) and t1 (argmax).
+    eprintln!("\nargmin/argmax span per step (exact compute_steps assignment):");
+    {
+        let mut bounds: Vec<(f64, f64, usize, usize)> = (0..ref_spans.len())
+            .map(|_| (f64::MAX, f64::MIN, usize::MAX, usize::MAX)).collect(); // (t0, t1, argmin span idx, argmax span idx)
+        for (si, &(s0, s1, _ti, _)) in spans.iter().enumerate() {
+            let mut best = (0usize, 0f64);
+            for (j, &(q0, q1)) in ref_spans.iter().enumerate() {
+                if q0 >= s1 { break; }
+                let o = (s1.min(q1) - s0.max(q0)).max(0.0);
+                if o > best.1 { best = (j, o); }
+            }
+            let i = if best.1 > 0.0 { best.0 } else {
+                ref_spans.iter().enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        let da = (a.0 - s0).abs() + (a.1 - s1).abs();
+                        let db = (b.0 - s0).abs() + (b.1 - s1).abs();
+                        da.partial_cmp(&db).unwrap()
+                    }).map(|(j, _)| j).unwrap_or(0)
+            };
+            let b = &mut bounds[i];
+            if s0 < b.0 { b.0 = s0; b.2 = si; }
+            if s1 > b.1 { b.1 = s1; b.3 = si; }
+        }
+        for (i, b) in bounds.iter().enumerate() {
+            let (t0, t1, ai, ax) = *b;
+            if ai == usize::MAX { continue; }
+            let (s0, s1, ti0, _) = spans[ai];
+            let (e0, e1, tix, _) = spans[ax];
+            let (r0, r1) = ref_spans[i];
+            eprintln!("  step {i:3} ref [{r0:9.1},{r1:9.1}] -> [{t0:9.1},{t1:9.1}]");
+            eprintln!("      t0 from [{s0:9.1},{s1:9.1}] dur {:8.1}  {}",
+                s1 - s0, trace.tracks[ti0].label);
+            eprintln!("      t1 from [{e0:9.1},{e1:9.1}] dur {:8.1}  {}",
+                e1 - e0, trace.tracks[tix].label);
+        }
+    }
+
+    // Rank phase: per rank, the span assigned to each step whose start is the
+    // EARLIEST for that (rank, step) — i.e. that rank's own step start —
+    // versus the reference interval start.
+    eprintln!("\nper-rank own-step start minus ref interval start (us), steps 0..15:");
+    for (rank, v) in &by_rank {
+        // group this rank's spans by assigned step
+        let mut per_step: Vec<Vec<(f64, f64)>> = vec![Vec::new(); ref_spans.len()];
+        for &(s0, s1, _ti) in v {
+            let mut best = (0usize, 0f64);
+            for (j, &(q0, q1)) in ref_spans.iter().enumerate() {
+                if q0 >= s1 { break; }
+                let o = (s1.min(q1) - s0.max(q0)).max(0.0);
+                if o > best.1 { best = (j, o); }
+            }
+            if best.1 > 0.0 { per_step[best.0].push((s0, s1)); }
+        }
+        let mut line = format!("  rank {rank:2}:");
+        for (i, ps) in per_step.iter().enumerate().take(16) {
+            match ps.iter().map(|&(s0, _)| s0).fold(f64::INFINITY, f64::min) {
+                f64::INFINITY => line += "     -",
+                s => line += &format!(" {:+7.0}", s - ref_spans[i].0),
+            }
+        }
