@@ -511,6 +511,12 @@ pub fn draw_stats_table(
     // `None` in aggregate mode, where a row can span many launches and no
     // single limiting factor applies.
     event_refs: Option<&[(u32, u32)]>,
+    // Overlap-aware totals parallel to `stats` (aggregate mode only): when
+    // `Some`, the Total and % columns show the union of each row's launch
+    // intervals instead of the summed durations — see `Pane::sel_overlap`.
+    // `None` renders the plain sums (and is always passed for the
+    // per-event table, where a row is one launch and union == duration).
+    overlap_totals: Option<&[f64]>,
     // Bumped by `compute_aggregates` whenever the selection is rebuilt; part
     // of the sort cache key (see `sort_cache_key` below) so an unchanged
     // selection doesn't get re-sorted every redraw.
@@ -524,7 +530,7 @@ pub fn draw_stats_table(
     // the tab strip in main.rs), so a cache keyed on generation/params alone
     // could spuriously "match" a *different* pane's leftover cache from the
     // last time it was active and show its stale rows instead of recomputing.
-    sort_cache_key: &mut Option<(u64, usize, bool, usize, bool)>,
+    sort_cache_key: &mut Option<(u64, usize, bool, usize, bool, bool)>,
     sort_idx: &mut Vec<usize>,
     buf: &mut DrawBuf,
     table_id: &str,
@@ -598,9 +604,17 @@ pub fn draw_stats_table(
         });
     }
 
-    let total_sum: f64 = stats.iter().map(|s| s.total_dur).sum();
+    // Row total for the Total/% columns and their sorts: the overlap-aware
+    // union when the caller passed one, else the summed duration. Mean/
+    // Median/Max/Min always stay per-launch — they describe single
+    // launches, which overlap can't change.
+    let total_of = |si: usize| match overlap_totals {
+        Some(t) => t[si],
+        None => stats[si].total_dur,
+    };
+    let total_sum: f64 = (0..stats.len()).map(total_of).sum();
+    let pct_of = |si: usize| if total_sum > 0.0 { total_of(si) / total_sum } else { 0.0 };
     let avg = |s: &KernelStats| if s.count > 0 { s.total_dur / s.count as f64 } else { 0.0 };
-    let pct = |s: &KernelStats| if total_sum > 0.0 { s.total_dur / total_sum } else { 0.0 };
 
     let occ_limit_uncached = |si: usize| -> (&str, bool) {
         match event_refs.and_then(|r| r.get(si)) {
@@ -614,7 +628,7 @@ pub fn draw_stats_table(
     // could change the order has changed (measured ~120ms wasted per redraw
     // on a 1M-row selection even for a plain numeric column).
     let stats_is_individual = event_refs.is_some();
-    let cache_key = (generation, *sort_col, *sort_asc, stats.len(), stats_is_individual);
+    let cache_key = (generation, *sort_col, *sort_asc, stats.len(), stats_is_individual, overlap_totals.is_some());
     if *sort_cache_key != Some(cache_key) {
         // Sorting by Occ Limit naively (parsing each row's raw JSON args
         // inside the comparator) measured at 140ms for just 15k rows on its
@@ -643,8 +657,8 @@ pub fn draw_stats_table(
             let ord = match *sort_col {
                 0 => trace.names[sa.name as usize].cmp(&trace.names[sb.name as usize]),
                 1 => sa.count.cmp(&sb.count),
-                2 => sa.total_dur.partial_cmp(&sb.total_dur).unwrap(),
-                3 => pct(sa).partial_cmp(&pct(sb)).unwrap(),
+                2 => total_of(a).partial_cmp(&total_of(b)).unwrap(),
+                3 => pct_of(a).partial_cmp(&pct_of(b)).unwrap(),
                 4 => avg(sa).partial_cmp(&avg(sb)).unwrap(),
                 5 => sa.median_dur.partial_cmp(&sb.median_dur).unwrap(),
                 6 => sa.max_dur.partial_cmp(&sb.max_dur).unwrap(),
@@ -707,12 +721,12 @@ pub fn draw_stats_table(
         }
         if ui.table_set_column_index(2) {
             buf.fmt.clear();
-            write_time(&mut buf.fmt, s.total_dur);
+            write_time(&mut buf.fmt, total_of(si));
             ui.text(&buf.fmt);
         }
         if ui.table_set_column_index(3) {
             buf.fmt.clear();
-            write!(buf.fmt, "{:.1}%", pct(s) * 100.0).unwrap();
+            write!(buf.fmt, "{:.1}%", pct_of(si) * 100.0).unwrap();
             ui.text(&buf.fmt);
         }
         if ui.table_set_column_index(4) {

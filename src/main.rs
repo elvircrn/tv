@@ -1786,6 +1786,24 @@ impl App {
                             if !pane.selection_stats.is_empty() {
                                 ui.checkbox("Aggregate", &mut pane.sel_aggregate);
                                 ui.same_line();
+                                // Overlap-aware totals only exist for
+                                // aggregated rows (a per-event row is one
+                                // launch, whose union is itself), so the
+                                // toggle is inert in individual mode.
+                                let _dis = ui.begin_disabled(!pane.sel_aggregate);
+                                ui.checkbox("Overlap aware", &mut pane.sel_overlap);
+                                if ui.is_item_hovered() {
+                                    ui.tooltip_text(
+                                        "Total becomes the union of each kernel's launch\n\
+                                        intervals: wall-clock time covered, counting time\n\
+                                        once no matter how many parallel CUDA streams (or\n\
+                                        concurrent ranks) ran it. A kernel that overlaps\n\
+                                        heavily shrinks — it was sharing the GPU, not\n\
+                                        monopolizing it. Mean/Median/Max/Min stay per-launch.",
+                                    );
+                                }
+                                drop(_dis);
+                                ui.same_line();
                                 if ui.button("Hide Selected") {
                                     for se in &pane.selection_stats {
                                         if let Some(h) = pane.hidden_names.get_mut(se.name as usize) { *h = true; }
@@ -1812,9 +1830,16 @@ impl App {
                                 ui.separator();
                                 let t_tbl = Instant::now();
                                 if pane.sel_aggregate {
-                                    draw_stats_table(&ui, trace, &pane.sel_agg_stats, None, pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut pane.sort_cache_key, &mut pane.sort_idx, &mut state.buf, "##selstats");
+                                    // Runs after the checkbox above (so a
+                                    // same-frame toggle is covered) and takes
+                                    // &mut pane, so the table below re-borrows
+                                    // the trace instead of using the panel-wide
+                                    // `trace` binding.
+                                    if pane.sel_overlap { pane.ensure_sel_overlap_totals(); }
+                                    let overlap = if pane.sel_overlap { Some(&pane.sel_overlap_totals[..]) } else { None };
+                                    draw_stats_table(&ui, pane.trace.as_ref().unwrap(), &pane.sel_agg_stats, None, overlap, pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut pane.sort_cache_key, &mut pane.sort_idx, &mut state.buf, "##selstats");
                                 } else {
-                                    draw_stats_table(&ui, trace, &pane.sel_individual, Some(&pane.sel_individual_refs), pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut pane.sort_cache_key, &mut pane.sort_idx, &mut state.buf, "##selstats");
+                                    draw_stats_table(&ui, pane.trace.as_ref().unwrap(), &pane.sel_individual, Some(&pane.sel_individual_refs), None, pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut pane.sort_cache_key, &mut pane.sort_idx, &mut state.buf, "##selstats");
                                 }
                                 let tbl_ms = t_tbl.elapsed().as_secs_f64() * 1000.0;
                                 let tbl_rows = if pane.sel_aggregate { pane.sel_agg_stats.len() } else { pane.sel_individual.len() };

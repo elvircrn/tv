@@ -7,6 +7,16 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+/// imgui's context is a process-global singleton (C ImGui's current-context
+/// rule): `Context::create` panics while another context is still alive, and
+/// cargo's test harness runs tests on parallel threads. Every test that
+/// builds a Context holds this lock from just before `create` until the
+/// context is dropped — declare the guard FIRST so it outlives the context
+/// (locals drop in reverse order). Poisoning is ignored: a panicking test
+/// unwinds through the context's drop first, so the global is clear either
+/// way and one failure shouldn't cascade into every other context test.
+static IMGUI_CTX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn test_counter() -> Arc<AtomicUsize> {
     Arc::new(AtomicUsize::new(0))
 }
@@ -2058,6 +2068,7 @@ fn bench_draw_timeline() {
     };
     eprintln!("loaded: {} tracks, {} events, span 0..{:.0} us", trace.tracks.len(), trace.total_events, trace.max_ts);
 
+    let _imgui_ctx = IMGUI_CTX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut imgui = imgui::Context::create();
     imgui.io_mut().display_size = [1600.0, 900.0];
     imgui.fonts().build_rgba32_texture();
@@ -3120,6 +3131,140 @@ fn test_compute_steps_gpu_dur_is_median_of_rank_unions() {
 }
 
 #[test]
+fn test_sel_overlap_totals_merges_concurrent_launches() {
+    // "Overlap aware" totals must merge what actually overlaps in time and
+    // leave the rest alone: a kernel launched concurrently on two streams
+    // (or two ranks) counts once; sequential launches keep their full sum;
+    // partial overlaps merge into one span. SelectionStats' `durations`
+    // carry no timestamps, so the union must come from the trace through
+    // `event_refs`.
+    let trace = make_trace(
+        vec!["kernel_dup", "kernel_seq", "kernel_partial"],
+        vec![
+            ("Rank 0 stream 0", true, vec![
+                ev(100.0, 10.0, 0, 0),  // dup A: [100,110)
+                ev(200.0, 6.0, 1, 0),   // seq A: [200,206)
+                ev(100.0, 15.0, 2, 0),  // partial A: [100,115)
+            ]),
+            ("Rank 1 stream 0", true, vec![
+                ev(100.0, 10.0, 0, 0),  // dup B: concurrent with dup A
+                ev(210.0, 6.0, 1, 0),   // seq B: after seq A, no overlap
+                ev(110.0, 15.0, 2, 0),  // partial B: [110,125), overlaps A by 5
+            ]),
+        ],
+    );
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    // Populate selection_stats the way rebuild_selection_stats would;
+    // compute_aggregates maps it 1:1 into sel_agg_stats, so row order here
+    // is the row order of the overlap totals.
+    pane.selection_stats = vec![
+        crate::types::SelectionEntry {
+            name: 0, count: 2, total_dur: 20.0,
+            durations: vec![10.0, 10.0],
+            event_refs: vec![(0, 0), (1, 0)],
+        },
+        crate::types::SelectionEntry {
+            name: 1, count: 2, total_dur: 12.0,
+            durations: vec![6.0, 6.0],
+            event_refs: vec![(0, 1), (1, 1)],
+        },
+        crate::types::SelectionEntry {
+            name: 2, count: 2, total_dur: 30.0,
+            durations: vec![15.0, 15.0],
+            event_refs: vec![(0, 2), (1, 2)],
+        },
+    ];
+    pane.sel_generation += 1; // as compute_aggregates does on every rebuild
+    pane.ensure_sel_overlap_totals();
+    assert_eq!(pane.sel_overlap_totals.len(), 3);
+    assert!((pane.sel_overlap_totals[0] - 10.0).abs() < 1e-9); // fully concurrent: 10, not 20
+    assert!((pane.sel_overlap_totals[1] - 12.0).abs() < 1e-9); // sequential: nothing merges
+    assert!((pane.sel_overlap_totals[2] - 25.0).abs() < 1e-9); // partial: [100,125), not 30
+    // Cached: a repeat call on the same generation must not recompute.
+    pane.ensure_sel_overlap_totals();
+    assert!((pane.sel_overlap_totals[2] - 25.0).abs() < 1e-9);
+    // A new selection (generation bump) invalidates the cache.
+    pane.selection_stats.truncate(1);
+    pane.sel_generation += 1;
+    pane.ensure_sel_overlap_totals();
+    assert_eq!(pane.sel_overlap_totals.len(), 1);
+    assert!((pane.sel_overlap_totals[0] - 10.0).abs() < 1e-9);
+}
+
+#[test]
+fn stats_table_sorts_by_overlap_totals_when_overlap_aware() {
+    // Two kernels whose summed and union totals rank differently:
+    // "heavy_sum" launches 4x10us all concurrently (sum 40, union 10);
+    // "light_sum" launches 3x5us sequentially (sum 15, union 15). Sorting
+    // by Total desc must put heavy_sum first normally and light_sum first
+    // once overlap-aware — the re-ranking the Selection-tab checkbox
+    // exists to surface. Both draw calls share the pane's sort state and
+    // table id (exactly what toggling the checkbox does mid-selection), so
+    // this also pins that the sort cache key distinguishes the two modes.
+    let trace = make_trace(
+        vec!["", "heavy_sum", "light_sum"],
+        vec![
+            ("Rank 0 stream 0", true, vec![
+                ev(100.0, 10.0, 1, 0),
+                ev(210.0, 5.0, 2, 0),
+                ev(220.0, 5.0, 2, 0),
+                ev(230.0, 5.0, 2, 0),
+            ]),
+            ("Rank 0 stream 1", true, vec![
+                ev(100.0, 10.0, 1, 0),
+                ev(101.0, 10.0, 1, 0),
+                ev(102.0, 10.0, 1, 0),
+            ]),
+        ],
+    );
+    let stats = vec![
+        crate::types::KernelStats {
+            name: 1, count: 4, total_dur: 40.0,
+            median_dur: 10.0, max_dur: 10.0, min_dur: 10.0,
+        },
+        crate::types::KernelStats {
+            name: 2, count: 3, total_dur: 15.0,
+            median_dur: 5.0, max_dur: 5.0, min_dur: 5.0,
+        },
+    ];
+    let overlap = vec![10.0, 15.0];
+
+    let _imgui_ctx = IMGUI_CTX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut imgui = imgui::Context::create();
+    imgui.io_mut().display_size = [1600.0, 900.0];
+    imgui.fonts().build_rgba32_texture();
+    // Pane-owned sort state, shared across both calls like the real toggle.
+    let mut search = String::new();
+    let mut search_changed = false;
+    let mut sort_col = 2usize; // Total
+    let mut sort_asc = false;  // descending
+    let mut cache: Option<(u64, usize, bool, usize, bool, bool)> = None;
+    let mut sort_idx: Vec<usize> = Vec::new();
+    let mut buf = DrawBuf::default();
+    let mut run = |overlap: Option<&[f64]>| {
+        let ui = imgui.new_frame();
+        ui.window("##tblwin")
+            .flags(imgui::WindowFlags::NO_SAVED_SETTINGS | imgui::WindowFlags::NO_DECORATION)
+            .size([1600.0, 400.0], imgui::Condition::Always)
+            .build(|| {
+                draw_stats_table(
+                    &ui, &trace, &stats, None, overlap, 7,
+                    &mut search, &mut search_changed,
+                    &mut sort_col, &mut sort_asc, &mut cache, &mut sort_idx,
+                    &mut buf, "##selstats",
+                );
+            });
+        drop(ui);
+        imgui.render();
+        sort_idx.clone()
+    };
+    assert_eq!(run(None), vec![0, 1], "plain mode: heavy_sum (40us sum) sorts first");
+    assert_eq!(run(Some(&overlap)), vec![1, 0],
+        "overlap mode: light_sum (15us union) sorts first, and the cache key must force a re-sort");
+}
+
+#[test]
 fn test_compute_steps_prefers_gpu_side_and_falls_back() {
     let ec = 0usize;
     // CPU-only trace: user_annotation cat, no GPU side
@@ -3346,6 +3491,7 @@ fn test_steps_table_real_trace() {
     eprintln!("{} steps", steps.len());
     assert!(!steps.is_empty());
 
+    let _imgui_ctx = IMGUI_CTX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut imgui = imgui::Context::create();
     imgui.io_mut().display_size = [1600.0, 900.0];
     imgui.fonts().build_rgba32_texture();
@@ -3822,6 +3968,7 @@ fn tab_strip_hugs_content_and_lines_up_with_toolbar() {
         .map(|p| tab_label(p).to_string())
         .collect();
 
+    let _imgui_ctx = IMGUI_CTX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut imgui = imgui::Context::create();
     imgui.io_mut().display_size = [1600.0, 900.0];
     imgui.fonts().build_rgba32_texture();

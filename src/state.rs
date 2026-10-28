@@ -472,13 +472,14 @@ pub struct Pane {
     pub pending_focus: Option<u32>,
     pub sort_col: usize,
     pub sort_asc: bool,
-    /// (generation, sort_col, sort_asc, row count, is_individual_mode) from
-    /// the last time `sort_idx` was actually recomputed for THIS pane. Owned
-    /// per-pane, not on the shared `DrawBuf` — only one pane renders per
-    /// frame (see the tab strip in main.rs), so a shared cache would compare
-    /// against whichever *other* pane last rendered and could spuriously
-    /// "match" and show that pane's stale rows instead of recomputing.
-    pub sort_cache_key: Option<(u64, usize, bool, usize, bool)>,
+    /// (generation, sort_col, sort_asc, row count, is_individual_mode,
+    /// overlap_aware) from the last time `sort_idx` was actually recomputed
+    /// for THIS pane. Owned per-pane, not on the shared `DrawBuf` — only one
+    /// pane renders per frame (see the tab strip in main.rs), so a shared
+    /// cache would compare against whichever *other* pane last rendered and
+    /// could spuriously "match" and show that pane's stale rows instead of
+    /// recomputing.
+    pub sort_cache_key: Option<(u64, usize, bool, usize, bool, bool)>,
     pub sort_idx: Vec<usize>,
     /// (event name, show_cpu, bucket count) the Detail tab's
     /// duration-distribution histogram was last computed for, and the
@@ -502,6 +503,22 @@ pub struct Pane {
     /// (track_idx, event_idx) parallel to `sel_individual`, so the stats table
     /// can look up each row's raw args (e.g. CUDA occupancy-limiting factor).
     pub sel_individual_refs: Vec<(u32, u32)>,
+    /// "Overlap aware" toggle for the Selection tab's aggregate table. When
+    /// set, each row's Total is the union of that kernel's launch intervals
+    /// — wall-clock time covered, counting time only once no matter how many
+    /// parallel CUDA streams (or concurrent ranks) ran it — instead of the
+    /// plain sum of durations. Off by default; only meaningful in aggregate
+    /// mode (a per-event row is a single launch, whose union is itself).
+    pub sel_overlap: bool,
+    /// Union totals parallel to `sel_agg_stats` (same row order), computed
+    /// lazily by `ensure_sel_overlap_totals` the first frame the overlap
+    /// mode is shown after a selection rebuild. Lazy because the sweep is a
+    /// per-name sort over every selected event — comparable to the whole of
+    /// `compute_aggregates` — and pointless on rebuilds for selections
+    /// where the user never toggles the mode.
+    pub sel_overlap_totals: Vec<f64>,
+    /// `sel_generation` the cached `sel_overlap_totals` were computed for.
+    pub sel_overlap_gen: u64,
     /// Bumped every time `compute_aggregates` rebuilds `sel_agg_stats` /
     /// `sel_individual`. `draw_stats_table` uses this to skip re-sorting on
     /// redraws where the selection hasn't actually changed — the table
@@ -591,6 +608,9 @@ impl Pane {
             sel_agg_stats: Vec::new(),
             sel_individual: Vec::new(),
             sel_individual_refs: Vec::new(),
+            sel_overlap: false,
+            sel_overlap_totals: Vec::new(),
+            sel_overlap_gen: 0,
             sel_generation: 0,
             track_order: Vec::new(),
             auto_reload: false,
@@ -1440,6 +1460,35 @@ impl Pane {
                 return;
             }
         }
+    }
+
+    /// Compute `sel_overlap_totals` for the current selection if stale: one
+    /// row per `selection_stats` entry (same order `compute_aggregates`
+    /// builds `sel_agg_stats` in), each the union of that name's launch
+    /// intervals. Timestamps come from the trace via `event_refs` — the
+    /// `durations` list is duration-only, and overlap is a timestamp
+    /// property. Reuses `union_len` (the same merge sweep
+    /// `compute_steps` uses for per-rank GPU busy time).
+    pub fn ensure_sel_overlap_totals(&mut self) {
+        if self.sel_overlap_gen == self.sel_generation
+            && self.sel_overlap_totals.len() == self.selection_stats.len() {
+            return;
+        }
+        let trace = match &self.trace { Some(t) => t, None => return };
+        let mut spans: Vec<(f64, f64)> = Vec::new();
+        let totals: Vec<f64> = self.selection_stats.iter().map(|se| {
+            spans.clear();
+            for &(ti, ei) in &se.event_refs {
+                if let Some(ev) = trace.tracks.get(ti as usize)
+                    .and_then(|t| t.events.get(ei as usize))
+                {
+                    spans.push((ev.ts, ev.ts + ev.dur));
+                }
+            }
+            union_len(&mut spans)
+        }).collect();
+        self.sel_overlap_totals = totals;
+        self.sel_overlap_gen = self.sel_generation;
     }
 
     fn compute_aggregates(&mut self) {
