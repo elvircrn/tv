@@ -1788,18 +1788,20 @@ impl App {
                                 ui.same_line();
                                 // Overlap-aware totals only exist for
                                 // aggregated rows (a per-event row is one
-                                // launch, whose union is itself), so the
-                                // toggle is inert in individual mode.
+                                // launch), so the toggle is inert in
+                                // individual mode.
                                 let _dis = ui.begin_disabled(!pane.sel_aggregate);
                                 ui.checkbox("Overlap aware", &mut pane.sel_overlap);
                                 if ui.is_item_hovered() {
                                     ui.tooltip_text(
-                                        "Total becomes the union of each kernel's launch\n\
-                                        intervals: wall-clock time covered, counting time\n\
-                                        once no matter how many parallel CUDA streams (or\n\
-                                        concurrent ranks) ran it. A kernel that overlaps\n\
-                                        heavily shrinks — it was sharing the GPU, not\n\
-                                        monopolizing it. Mean/Median/Max/Min stay per-launch.",
+                                        "Total becomes each kernel's exclusive time:\n\
+                                        wall-clock time where it runs with no other\n\
+                                        selected kernel running, computed per rank and\n\
+                                        summed. Concurrent launches of the same kernel\n\
+                                        count once, and time hidden behind other kernels\n\
+                                        is dropped — a fully overlapped kernel totals\n\
+                                        near 0 however long it ran. Mean/Median/Max/Min\n\
+                                        stay per-launch.",
                                     );
                                 }
                                 drop(_dis);

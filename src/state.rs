@@ -504,18 +504,19 @@ pub struct Pane {
     /// can look up each row's raw args (e.g. CUDA occupancy-limiting factor).
     pub sel_individual_refs: Vec<(u32, u32)>,
     /// "Overlap aware" toggle for the Selection tab's aggregate table. When
-    /// set, each row's Total is the union of that kernel's launch intervals
-    /// — wall-clock time covered, counting time only once no matter how many
-    /// parallel CUDA streams (or concurrent ranks) ran it — instead of the
-    /// plain sum of durations. Off by default; only meaningful in aggregate
-    /// mode (a per-event row is a single launch, whose union is itself).
+    /// set, each row's Total is that kernel's *exclusive* time — wall-clock
+    /// time where it runs and no other selected kernel runs, summed over
+    /// rank scopes — instead of the plain sum of durations. Concurrent
+    /// launches of the kernel itself count once, and time hidden behind
+    /// other kernels is dropped. Off by default; only meaningful in
+    /// aggregate mode (a per-event row is a single launch).
     pub sel_overlap: bool,
-    /// Union totals parallel to `sel_agg_stats` (same row order), computed
-    /// lazily by `ensure_sel_overlap_totals` the first frame the overlap
-    /// mode is shown after a selection rebuild. Lazy because the sweep is a
-    /// per-name sort over every selected event — comparable to the whole of
-    /// `compute_aggregates` — and pointless on rebuilds for selections
-    /// where the user never toggles the mode.
+    /// Exclusive-time totals parallel to `sel_agg_stats` (same row order),
+    /// computed lazily by `ensure_sel_overlap_totals` the first frame the
+    /// overlap mode is shown after a selection rebuild. Lazy because the
+    /// sweep sorts every selected event's interval endpoints — comparable
+    /// to the whole of `compute_aggregates` — and pointless on rebuilds for
+    /// selections where the user never toggles the mode.
     pub sel_overlap_totals: Vec<f64>,
     /// `sel_generation` the cached `sel_overlap_totals` were computed for.
     pub sel_overlap_gen: u64,
@@ -1485,30 +1486,85 @@ impl Pane {
 
     /// Compute `sel_overlap_totals` for the current selection if stale: one
     /// row per `selection_stats` entry (same order `compute_aggregates`
-    /// builds `sel_agg_stats` in), each the union of that name's launch
-    /// intervals. Timestamps come from the trace via `event_refs` — the
-    /// `durations` list is duration-only, and overlap is a timestamp
-    /// property. Reuses `union_len` (the same merge sweep
-    /// `compute_steps` uses for per-rank GPU busy time).
+    /// builds `sel_agg_stats` in), each the *exclusive* time of that kernel
+    /// — wall-clock time where it runs and no other selected kernel runs,
+    /// summed over rank scopes. Timestamps come from the trace via
+    /// `event_refs` — the `durations` list is duration-only, and overlap is
+    /// a timestamp property.
+    ///
+    /// Exclusive time differs from the plain sum in both directions:
+    /// concurrent launches of the same kernel count once (their union), and
+    /// time where the kernel is overlapped by any *other* selected kernel
+    /// is dropped — a kernel fully hidden behind others totals ~0 however
+    /// long it ran. That hiding is the point: per rank, a GPU serializes
+    /// launches, so the sum already equals each kernel's own union and a
+    /// union metric would be a no-op; what changes conclusions is how much
+    /// of a kernel is covered by its neighbors.
+    ///
+    /// Scopes: events are grouped by `parse_rank` of their track's label —
+    /// the same grouping merged rows use — and each scope swept
+    /// independently, so a kernel hidden on rank 0 but solo on rank 1 keeps
+    /// its rank-1 time. Rank-synchronous traces would otherwise find
+    /// nothing solo globally (some rank always runs something). Tracks
+    /// without a rank label share one scope, which is also correct for a
+    /// single-rank trace.
     pub fn ensure_sel_overlap_totals(&mut self) {
         if self.sel_overlap_gen == self.sel_generation
             && self.sel_overlap_totals.len() == self.selection_stats.len() {
             return;
         }
         let trace = match &self.trace { Some(t) => t, None => return };
-        let mut spans: Vec<(f64, f64)> = Vec::new();
-        let totals: Vec<f64> = self.selection_stats.iter().map(|se| {
-            spans.clear();
+        // Bucket selected events by rank scope. usize::MAX is the shared
+        // scope for tracks without a rank label.
+        let mut buckets: std::collections::HashMap<usize, Vec<(f64, f64, u32)>> =
+            Default::default();
+        for se in &self.selection_stats {
             for &(ti, ei) in &se.event_refs {
-                if let Some(ev) = trace.tracks.get(ti as usize)
+                let Some(ev) = trace.tracks.get(ti as usize)
                     .and_then(|t| t.events.get(ei as usize))
-                {
-                    spans.push((ev.ts, ev.ts + ev.dur));
-                }
+                else { continue };
+                if ev.dur <= 0.0 { continue; } // no interval to own
+                let scope = parse_rank(&trace.tracks[ti as usize].label)
+                    .unwrap_or(usize::MAX);
+                buckets.entry(scope).or_default()
+                    .push((ev.ts, ev.ts + ev.dur, se.name));
             }
-            union_len(&mut spans)
-        }).collect();
-        self.sel_overlap_totals = totals;
+        }
+        let mut excl: Vec<f64> = vec![0.0; trace.names.len()];
+        for (_, events) in buckets {
+            // Sweep: points (time, ±1, name), ends sorted before starts at
+            // ties so back-to-back events don't count as overlapping.
+            // `active` maps name -> live-launch count, so self-overlapping
+            // launches keep the name active until its last one ends; the
+            // name is credited for a segment exactly when it is the only
+            // active one.
+            let mut points: Vec<(f64, i32, u32)> = Vec::with_capacity(events.len() * 2);
+            for &(ts, end, name) in &events {
+                points.push((ts, 1, name));
+                points.push((end, -1, name));
+            }
+            points.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let mut active: std::collections::HashMap<u32, u32> = Default::default();
+            let mut prev: Option<f64> = None;
+            for &(t, d, name) in &points {
+                if let Some(p) = prev {
+                    let dt = t - p;
+                    if dt > 0.0 && active.len() == 1 {
+                        let solo = *active.keys().next().unwrap();
+                        excl[solo as usize] += dt;
+                    }
+                }
+                if d > 0 {
+                    *active.entry(name).or_insert(0) += 1;
+                } else if let Some(c) = active.get_mut(&name) {
+                    *c -= 1;
+                    if *c == 0 { active.remove(&name); }
+                }
+                prev = Some(t);
+            }
+        }
+        self.sel_overlap_totals = self.selection_stats.iter()
+            .map(|se| excl[se.name as usize]).collect();
         self.sel_overlap_gen = self.sel_generation;
     }
 

@@ -512,10 +512,10 @@ pub fn draw_stats_table(
     // single limiting factor applies.
     event_refs: Option<&[(u32, u32)]>,
     // Overlap-aware totals parallel to `stats` (aggregate mode only): when
-    // `Some`, the Total and % columns show the union of each row's launch
-    // intervals instead of the summed durations — see `Pane::sel_overlap`.
+    // `Some`, the Total and % columns show each row's exclusive time
+    // instead of the summed durations — see `Pane::sel_overlap`.
     // `None` renders the plain sums (and is always passed for the
-    // per-event table, where a row is one launch and union == duration).
+    // per-event table, where a row is one launch).
     overlap_totals: Option<&[f64]>,
     // Bumped by `compute_aggregates` whenever the selection is rebuilt; part
     // of the sort cache key (see `sort_cache_key` below) so an unchanged
@@ -605,8 +605,8 @@ pub fn draw_stats_table(
     }
 
     // Row total for the Total/% columns and their sorts: the overlap-aware
-    // union when the caller passed one, else the summed duration. Mean/
-    // Median/Max/Min always stay per-launch — they describe single
+    // exclusive time when the caller passed one, else the summed duration.
+    // Mean/Median/Max/Min always stay per-launch — they describe single
     // launches, which overlap can't change.
     let total_of = |si: usize| match overlap_totals {
         Some(t) => t[si],

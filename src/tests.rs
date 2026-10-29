@@ -1697,12 +1697,13 @@ fn test_merged_thin_band_captures_all_lanes_for_overlap_totals() {
     let si = p.selection_stats.iter().position(|s| s.name == 1).unwrap();
     assert_eq!(p.selection_stats[si].count, 1, "the touched lane's own events are still captured");
 
-    // Overlap aware: the two K launches cover the same wall time — union 10,
-    // not the summed 20. Before the capture fix only one launch was
-    // captured, so this equaled the sum and the toggle "did nothing".
+    // Overlap aware: the two K launches cover the same wall time and K is
+    // the only selected kernel in it — exclusive time 10, not the summed
+    // 20. Before the capture fix only one launch was captured, so this
+    // equaled the sum and the toggle "did nothing".
     p.sel_overlap = true;
     p.ensure_sel_overlap_totals();
-    assert_eq!(p.sel_overlap_totals[ki], 10.0, "union of the two concurrent launches, not the 20us sum");
+    assert_eq!(p.sel_overlap_totals[ki], 10.0, "exclusive time of the two concurrent launches, not the 20us sum");
     assert!(p.sel_overlap_totals[ki] < p.selection_stats[ki].total_dur);
 }
 
@@ -3204,25 +3205,32 @@ fn test_compute_steps_gpu_dur_is_median_of_rank_unions() {
 }
 
 #[test]
-fn test_sel_overlap_totals_merges_concurrent_launches() {
-    // "Overlap aware" totals must merge what actually overlaps in time and
-    // leave the rest alone: a kernel launched concurrently on two streams
-    // (or two ranks) counts once; sequential launches keep their full sum;
-    // partial overlaps merge into one span. SelectionStats' `durations`
-    // carry no timestamps, so the union must come from the trace through
-    // `event_refs`.
+fn test_sel_overlap_totals_are_exclusive_time() {
+    // "Overlap aware" totals are exclusive time: wall time where a kernel
+    // runs with no other selected kernel running. Same-name concurrency
+    // counts once (partial's two overlapping launches on one rank total
+    // 15, not 30; solo's concurrent pair totals 10, not 20); time shared
+    // with a different name is dropped entirely (dup, covered by partial,
+    // totals 0; hidden, inside cover, totals 0). SelectionStats'
+    // `durations` carry no timestamps, so the sweep must come from the
+    // trace through `event_refs`.
     let trace = make_trace(
-        vec!["kernel_dup", "kernel_seq", "kernel_partial"],
+        vec!["kernel_dup", "kernel_seq", "kernel_partial",
+             "kernel_cover", "kernel_hidden", "kernel_solo"],
         vec![
             ("Rank 0 stream 0", true, vec![
-                ev(100.0, 10.0, 0, 0),  // dup A: [100,110)
+                ev(100.0, 10.0, 0, 0),  // dup: [100,110)
                 ev(200.0, 6.0, 1, 0),   // seq A: [200,206)
                 ev(100.0, 15.0, 2, 0),  // partial A: [100,115)
+                ev(300.0, 20.0, 3, 0),  // cover: [300,320)
+                ev(305.0, 5.0, 4, 0),   // hidden: [305,310), inside cover
+                ev(400.0, 10.0, 5, 0),  // solo A: [400,410)
             ]),
-            ("Rank 1 stream 0", true, vec![
-                ev(100.0, 10.0, 0, 0),  // dup B: concurrent with dup A
-                ev(210.0, 6.0, 1, 0),   // seq B: after seq A, no overlap
+            ("Rank 0 stream 1", true, vec![
+                ev(100.0, 10.0, 0, 0),  // dup again, concurrent with itself
+                ev(210.0, 6.0, 1, 0),   // seq B: [210,216), after seq A
                 ev(110.0, 15.0, 2, 0),  // partial B: [110,125), overlaps A by 5
+                ev(400.0, 10.0, 5, 0),  // solo B, concurrent with solo A
             ]),
         ],
     );
@@ -3247,17 +3255,38 @@ fn test_sel_overlap_totals_merges_concurrent_launches() {
             durations: vec![15.0, 15.0],
             event_refs: vec![(0, 2), (1, 2)],
         },
+        crate::types::SelectionEntry {
+            name: 3, count: 1, total_dur: 20.0,
+            durations: vec![20.0],
+            event_refs: vec![(0, 3)],
+        },
+        crate::types::SelectionEntry {
+            name: 4, count: 1, total_dur: 5.0,
+            durations: vec![5.0],
+            event_refs: vec![(0, 4)],
+        },
+        crate::types::SelectionEntry {
+            name: 5, count: 2, total_dur: 20.0,
+            durations: vec![10.0, 10.0],
+            event_refs: vec![(0, 5), (1, 3)],
+        },
     ];
     pane.sel_generation += 1; // as compute_aggregates does on every rebuild
     pane.ensure_sel_overlap_totals();
-    assert_eq!(pane.sel_overlap_totals.len(), 3);
-    assert!((pane.sel_overlap_totals[0] - 10.0).abs() < 1e-9); // fully concurrent: 10, not 20
-    assert!((pane.sel_overlap_totals[1] - 12.0).abs() < 1e-9); // sequential: nothing merges
-    assert!((pane.sel_overlap_totals[2] - 25.0).abs() < 1e-9); // partial: [100,125), not 30
+    assert_eq!(pane.sel_overlap_totals.len(), 6);
+    assert!((pane.sel_overlap_totals[0] - 0.0).abs() < 1e-9);  // dup: hidden behind partial
+    assert!((pane.sel_overlap_totals[1] - 12.0).abs() < 1e-9); // seq: sequential, always solo
+    assert!((pane.sel_overlap_totals[2] - 15.0).abs() < 1e-9); // partial: self-overlap kept, shared time dropped
+    assert!((pane.sel_overlap_totals[3] - 15.0).abs() < 1e-9); // cover: minus hidden's slice
+    assert!((pane.sel_overlap_totals[4] - 0.0).abs() < 1e-9);  // hidden: fully covered
+    assert!((pane.sel_overlap_totals[5] - 10.0).abs() < 1e-9); // solo: concurrent pair counts once
     // Cached: a repeat call on the same generation must not recompute.
     pane.ensure_sel_overlap_totals();
-    assert!((pane.sel_overlap_totals[2] - 25.0).abs() < 1e-9);
-    // A new selection (generation bump) invalidates the cache.
+    assert!((pane.sel_overlap_totals[2] - 15.0).abs() < 1e-9);
+    // A new selection (generation bump) invalidates the cache. Truncated to
+    // just the dup entry, dup is now the only selected kernel, so its
+    // exclusive time is its own union — 10, not the 0 it totaled while
+    // partial hid it.
     pane.selection_stats.truncate(1);
     pane.sel_generation += 1;
     pane.ensure_sel_overlap_totals();
@@ -3266,15 +3295,58 @@ fn test_sel_overlap_totals_merges_concurrent_launches() {
 }
 
 #[test]
+fn test_sel_overlap_totals_scope_per_rank() {
+    // Exclusive time is swept per rank scope (the same parse_rank grouping
+    // merged rows use) and summed, so a kernel overlapped on one rank but
+    // solo on another keeps its solo time. A single global sweep would
+    // credit K with 0 here (J covers it on rank 0, and rank 1's K co-runs
+    // with rank 0's J); the plain sum would say 20.
+    let trace = make_trace(
+        vec!["kernel_k", "kernel_j"],
+        vec![
+            ("Rank 0 stream 0", true, vec![
+                ev(100.0, 10.0, 0, 0),  // K: [100,110)
+                ev(95.0, 20.0, 1, 0),   // J: [95,115), covers K
+            ]),
+            ("Rank 1 stream 0", true, vec![
+                ev(100.0, 10.0, 0, 0),  // K again, concurrent across ranks
+            ]),
+        ],
+    );
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    pane.selection_stats = vec![
+        crate::types::SelectionEntry {
+            name: 0, count: 2, total_dur: 20.0,
+            durations: vec![10.0, 10.0],
+            event_refs: vec![(0, 0), (1, 0)],
+        },
+        crate::types::SelectionEntry {
+            name: 1, count: 1, total_dur: 20.0,
+            durations: vec![20.0],
+            event_refs: vec![(0, 1)],
+        },
+    ];
+    pane.sel_generation += 1;
+    pane.ensure_sel_overlap_totals();
+    // K: 0 on rank 0 (J covers [100,110)) + 10 on rank 1 (solo) = 10.
+    assert!((pane.sel_overlap_totals[0] - 10.0).abs() < 1e-9);
+    // J: solo on rank 0 for [95,100) + [110,115) = 10; absent on rank 1.
+    assert!((pane.sel_overlap_totals[1] - 10.0).abs() < 1e-9);
+}
+
+#[test]
 fn stats_table_sorts_by_overlap_totals_when_overlap_aware() {
-    // Two kernels whose summed and union totals rank differently:
-    // "heavy_sum" launches 4x10us all concurrently (sum 40, union 10);
-    // "light_sum" launches 3x5us sequentially (sum 15, union 15). Sorting
-    // by Total desc must put heavy_sum first normally and light_sum first
-    // once overlap-aware — the re-ranking the Selection-tab checkbox
-    // exists to surface. Both draw calls share the pane's sort state and
-    // table id (exactly what toggling the checkbox does mid-selection), so
-    // this also pins that the sort cache key distinguishes the two modes.
+    // Two kernels whose summed and exclusive totals rank differently:
+    // "heavy_sum" launches 4x10us all concurrently (sum 40, exclusive 12 —
+    // the span its overlapping launches cover, counted once);
+    // "light_sum" launches 3x5us sequentially (sum 15, exclusive 15).
+    // Sorting by Total desc must put heavy_sum first normally and
+    // light_sum first once overlap-aware — the re-ranking the
+    // Selection-tab checkbox exists to surface. Both draw calls share the
+    // pane's sort state and table id (exactly what toggling the checkbox
+    // does mid-selection), so this also pins that the sort cache key
+    // distinguishes the two modes.
     let trace = make_trace(
         vec!["", "heavy_sum", "light_sum"],
         vec![
@@ -3301,7 +3373,7 @@ fn stats_table_sorts_by_overlap_totals_when_overlap_aware() {
             median_dur: 5.0, max_dur: 5.0, min_dur: 5.0,
         },
     ];
-    let overlap = vec![10.0, 15.0];
+    let overlap = vec![12.0, 15.0];
 
     let _imgui_ctx = IMGUI_CTX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut imgui = imgui::Context::create();
@@ -4344,5 +4416,243 @@ wall {:8.1} gpu_busy {:8.1} idle {:7.1} ranks {} kernels {}",
             }
         }
         eprintln!("{line}");
+    }
+}
+
+// TEMP investigation dump: loads a real multi-rank trace dir exactly like the
+// app does and, for a set of kernel names (matched by substring), compares
+// the Selection tab's "Overlap aware" semantics on real data:
+//   - self-union: union of the kernel's OWN launch intervals — shrinks only
+//     when launches of the SAME kernel overlap (parallel streams /
+//     concurrent ranks);
+//   - exclusive: wall time where the kernel runs and NO other kernel in the
+//     scope runs — shrinks a kernel that is hidden behind other kernels.
+//     This is what the toggle computes since the exclusive-time rewrite.
+// Both are computed globally (all ranks) and per-rank (what a merged-row band
+// selection captures), plus the pairwise overlap between the watched kernels.
+// The tail blocks cross-check the production `ensure_sel_overlap_totals`
+// against an independent union-intersection computation.
+//   TV_SEL_TRACE=<dir> cargo test debug_sel_overlap_trace -- --ignored --nocapture
+#[test]
+#[ignore]
+fn debug_sel_overlap_trace() {
+    let path = std::env::var("TV_SEL_TRACE").expect("set TV_SEL_TRACE");
+    let (groups, standalone) = crate::loader::detect_rank_groups(&[path.clone()]);
+    let mut rank_paths: Vec<(usize, String)> = Vec::new();
+    for (g, _) in groups { rank_paths.extend(g); }
+    for (p, _) in standalone { rank_paths.push((rank_paths.len(), p)); }
+    assert!(!rank_paths.is_empty(), "no trace files under {path}");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let counter = test_counter();
+    crate::loader::load_multi_progressive(rank_paths, &counter, 2, &tx, None, true);
+    let trace = rx.recv().expect("load result").expect("trace loaded");
+    eprintln!("merged: {} tracks, {} events, span 0..{:.0} us", trace.tracks.len(), trace.total_events, trace.max_ts);
+
+    let needles = ["elastic::combine_impl", "humming<MmaOpClass", "combine_reduce_epilogue_impl"];
+    let watch: Vec<u32> = trace.names.iter().enumerate()
+        .filter(|(_, n)| needles.iter().any(|nd| n.contains(nd)))
+        .map(|(i, _)| i as u32).collect();
+    assert!(!watch.is_empty(), "none of {needles:?} found in trace names");
+    for &w in &watch {
+        eprintln!("  watch [{}] {}...", w, &trace.names[w as usize][..trace.names[w as usize].len().min(70)]);
+    }
+
+    // GPU events grouped by rank: rank -> Vec<(ts, end, name)>.
+    let mut per_rank: std::collections::BTreeMap<usize, Vec<(f64, f64, u32)>> = Default::default();
+    let mut global: Vec<(f64, f64, u32)> = Vec::new();
+    for track in &trace.tracks {
+        if !track.gpu { continue; }
+        let rank = crate::state::parse_rank(&track.label).unwrap_or(9999);
+        for ev in &track.events {
+            let e = (ev.ts, ev.ts + ev.dur, ev.name);
+            per_rank.entry(rank).or_default().push(e);
+            global.push(e);
+        }
+    }
+    eprintln!("ranks with GPU events: {}", per_rank.len());
+
+    // One sweep over a scope's events: per watched name -> exclusive time
+    // (sole kernel running); also the scope's busy union. `active` maps
+    // name -> live-launch count (matching the production sweep): a set of
+    // names evicts a self-overlapping name at its first end while it is
+    // still live, wrongly crediting whatever else runs.
+    let exclusive_sweep = |events: &[(f64, f64, u32)]| -> (Vec<f64>, f64) {
+        let mut points: Vec<(f64, i32, u32)> = Vec::with_capacity(events.len() * 2);
+        for &(ts, end, name) in events {
+            if end > ts {
+                points.push((ts, 1, name));
+                points.push((end, -1, name));
+            }
+        }
+        // Ends before starts at equal timestamps: touching intervals don't
+        // count as overlapping each other.
+        points.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut active: std::collections::HashMap<u32, u32> = Default::default();
+        let mut excl = vec![0.0f64; watch.len()];
+        let mut union = 0.0f64;
+        let mut live = 0usize;
+        let mut prev = f64::NAN;
+        for &(t, d, name) in &points {
+            if !prev.is_nan() && live > 0 {
+                let dt = t - prev;
+                union += dt;
+                if active.len() == 1 {
+                    if let Some(wi) = watch.iter().position(|&w| w == *active.keys().next().unwrap()) {
+                        excl[wi] += dt;
+                    }
+                }
+            }
+            prev = t;
+            live = (live as i32 + d) as usize;
+            if d > 0 {
+                *active.entry(name).or_insert(0) += 1;
+            } else if let Some(c) = active.get_mut(&name) {
+                *c -= 1;
+                if *c == 0 { active.remove(&name); }
+            }
+        }
+        (excl, union)
+    };
+    let counts_sums = |events: &[(f64, f64, u32)]| -> Vec<(u32, f64, f64)> {
+        // per watched name: (count, sum, self-union)
+        watch.iter().map(|&w| {
+            let mut spans: Vec<(f64, f64)> = events.iter()
+                .filter(|&&(_, _, n)| n == w).map(|&(ts, end, _)| (ts, end)).collect();
+            let count = spans.len() as u32;
+            let sum: f64 = spans.iter().map(|&(a, b)| b - a).sum();
+            let su = {
+                spans.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let (mut total, mut cur) = (0.0, f64::NEG_INFINITY);
+                for &(a, b) in spans.iter() {
+                    if b > cur { total += b - a.max(cur); cur = b; }
+                }
+                total
+            };
+            (count, sum, su)
+        }).collect()
+    };
+
+    // Pairwise intersection of two watched names' unions within a scope.
+    let pairwise = |events: &[(f64, f64, u32)], a: u32, b: u32| -> f64 {
+        let mut ia: Vec<(f64, f64)> = events.iter().filter(|&&(_, _, n)| n == a).map(|&(ts, e, _)| (ts, e)).collect();
+        let mut ib: Vec<(f64, f64)> = events.iter().filter(|&&(_, _, n)| n == b).map(|&(ts, e, _)| (ts, e)).collect();
+        ia.sort_unstable_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+        ib.sort_unstable_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+        let (mut i, mut j, mut total) = (0usize, 0usize, 0.0f64);
+        while i < ia.len() && j < ib.len() {
+            let lo = ia[i].0.max(ib[j].0);
+            let hi = ia[i].1.min(ib[j].1);
+            if hi > lo { total += hi - lo; }
+            if ia[i].1 < ib[j].1 { i += 1; } else { j += 1; }
+        }
+        total
+    };
+
+    let mut scopes: Vec<(String, &Vec<(f64, f64, u32)>)> = vec![("GLOBAL".to_string(), &global)];
+    for (r, evs) in &per_rank {
+        scopes.push((format!("rank {r}"), evs));
+    }
+    for (scope, events) in scopes {
+        let (excl, union) = exclusive_sweep(events);
+        let cs: Vec<(u32, f64, f64)> = counts_sums(events);
+        let sum_all: f64 = events.iter().map(|&(a, b, _)| b - a).sum();
+        eprintln!("\n=== scope {scope} (events {}, busy union {union:.1} us, raw sum {sum_all:.1} us)", events.len());
+        for (wi, &w) in watch.iter().enumerate() {
+            let (count, sum, su) = cs[wi];
+            if count == 0 { continue; }
+            let short: String = trace.names[w as usize].chars().take(46).collect();
+            eprintln!("  {short:46} n={count:5} sum {sum:9.1}  self-union {su:9.1} ({:4.0}% of sum)  exclusive {:9.1} ({:4.0}% of sum)",
+                su / sum * 100.0, excl[wi], excl[wi] / sum * 100.0);
+        }
+        // Pairwise overlap between watched kernels (how much of A is covered by B).
+        for (x, &a) in watch.iter().enumerate() {
+            for (y, &b) in watch.iter().enumerate().skip(x + 1) {
+                if cs[x].0 == 0 || cs[y].0 == 0 { continue; }
+                let inter = pairwise(events, a, b);
+                if inter > 0.0 {
+                    let na: String = trace.names[a as usize].chars().take(28).collect();
+                    let nb: String = trace.names[b as usize].chars().take(28).collect();
+                    eprintln!("  overlap {na:28} x {nb:28}: {inter:9.1} us");
+                }
+            }
+        }
+    }
+
+    let r0 = per_rank.keys().next().copied().unwrap();
+    // Independent ground truth for the production numbers below:
+    // exclusive(H) = |union(H)| - |union(H) ∩ union(others)| — pure interval
+    // algebra, no active-name bookkeeping, so same-name concurrency (the
+    // case the exclusive_sweep HashSet above mishandles: an early end of a
+    // self-overlapping name evicts it while still live) cannot skew it.
+    let rank0_events = &per_rank[&r0];
+    let union_of = |spans: &mut Vec<(f64, f64)>| -> Vec<(f64, f64)> {
+        spans.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        let mut out: Vec<(f64, f64)> = Vec::new();
+        for &(a, b) in spans.iter() {
+            if let Some(last) = out.last_mut() {
+                if a <= last.1 { last.1 = last.1.max(b); continue; }
+            }
+            out.push((a, b));
+        }
+        out
+    };
+    let inter_len = |a: &[(f64, f64)], b: &[(f64, f64)]| -> f64 {
+        let (mut i, mut j, mut t) = (0usize, 0usize, 0.0);
+        while i < a.len() && j < b.len() {
+            let lo = a[i].0.max(b[j].0);
+            let hi = a[i].1.min(b[j].1);
+            if hi > lo { t += hi - lo; }
+            if a[i].1 < b[j].1 { i += 1; } else { j += 1; }
+        }
+        t
+    };
+    eprintln!("\n=== union-intersection ground truth, rank {r0}");
+    for &w in &watch {
+        let mut hs: Vec<(f64, f64)> = rank0_events.iter()
+            .filter(|&&(_, _, n)| n == w).map(|&(a, b, _)| (a, b)).collect();
+        if hs.is_empty() { continue; }
+        let mut os: Vec<(f64, f64)> = rank0_events.iter()
+            .filter(|&&(_, _, n)| n != w).map(|&(a, b, _)| (a, b)).collect();
+        let hu = union_of(&mut hs);
+        let ou = union_of(&mut os);
+        let hl: f64 = hu.iter().map(|&(a, b)| b - a).sum();
+        let excl = hl - inter_len(&hu, &ou);
+        let short: String = trace.names[w as usize].chars().take(46).collect();
+        eprintln!("  {short:46} union {hl:9.1}  excl-truth {excl:9.1}");
+    }
+
+    // Cross-check the production path: build a Pane holding the whole trace
+    // with a selection of one rank's complete GPU events (what a band over
+    // that merged row captures) and run the real ensure_sel_overlap_totals.
+    // Its totals must match the per-rank exclusive numbers printed above
+    // (modulo this file's own sweep lacking same-name launch counting).
+    let mut by_name: std::collections::HashMap<u32, crate::types::SelectionEntry> =
+        Default::default();
+    for (ti, track) in trace.tracks.iter().enumerate() {
+        if !track.gpu || crate::state::parse_rank(&track.label) != Some(r0) { continue; }
+        for (ei, ev) in track.events.iter().enumerate() {
+            let se = by_name.entry(ev.name).or_insert_with(|| crate::types::SelectionEntry {
+                name: ev.name, count: 0, total_dur: 0.0,
+                durations: Vec::new(), event_refs: Vec::new(),
+            });
+            se.count += 1;
+            se.total_dur += ev.dur;
+            se.durations.push(ev.dur);
+            se.event_refs.push((ti as u32, ei as u32));
+        }
+    }
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    pane.selection_stats = by_name.into_values().collect();
+    pane.sel_generation += 1;
+    pane.ensure_sel_overlap_totals();
+    let trace = pane.trace.as_ref().unwrap();
+    eprintln!("\n=== production ensure_sel_overlap_totals, selection = rank {r0} all GPU events");
+    for &w in &watch {
+        let Some(si) = pane.selection_stats.iter().position(|s| s.name == w) else { continue };
+        let short: String = trace.names[w as usize].chars().take(46).collect();
+        eprintln!("  {short:46} sum {:9.1}  exclusive {:9.1}",
+            pane.selection_stats[si].total_dur, pane.sel_overlap_totals[si]);
     }
 }
