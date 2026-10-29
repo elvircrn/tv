@@ -1794,14 +1794,14 @@ impl App {
                                 ui.checkbox("Overlap aware", &mut pane.sel_overlap);
                                 if ui.is_item_hovered() {
                                     ui.tooltip_text(
-                                        "Total becomes each kernel's exclusive time:\n\
-                                        wall-clock time where it runs with no other\n\
-                                        selected kernel running, computed per rank and\n\
-                                        summed. Concurrent launches of the same kernel\n\
-                                        count once, and time hidden behind other kernels\n\
-                                        is dropped — a fully overlapped kernel totals\n\
-                                        near 0 however long it ran. Mean/Median/Max/Min\n\
-                                        stay per-launch.",
+                                        "Total splits every instant of wall time\n\
+                                        equally among the selected kernels running\n\
+                                        it, per rank: a kernel always alongside one\n\
+                                        other is worth half its sum, a solo kernel\n\
+                                        keeps it all. Totals sum to the selection's\n\
+                                        busy wall time — concurrency is never\n\
+                                        double-counted. Mean/Median/Max/Min stay\n\
+                                        per-launch.",
                                     );
                                 }
                                 drop(_dis);
