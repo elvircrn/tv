@@ -23,13 +23,17 @@ cargo build --profile dev-release
 ## Test
 
 ```
-cargo test
+cargo test --profile dev-release
 ```
+
+Tests run under `dev-release` (not the default `dev` profile) so they reuse the
+dev-release dependency tree instead of materializing a second multi-GB
+`target/debug` tree.
 
 Both build and tests should pass before committing:
 
 ```
-cargo build --profile dev-release && cargo test
+cargo build --profile dev-release && cargo test --profile dev-release
 ```
 
 ## Usage
