@@ -1601,36 +1601,109 @@ fn test_merged_selection_excludes_unrendered_wrapper() {
     assert_eq!(events[1].0, "kB");
 }
 
-// The renderer only highlights packed events whose depth lane intersects the
-// selection rectangle; stats/extract must apply the same y-test so they stay
-// in sync with the highlight — this is the exact precision that regressed
-// when an earlier version of this fix dropped merged-row depth matching
-// entirely ("selecting one item selected all items"). sub_h = 40/2 = 20, so a
-// y-range of [0,10] hits only depth-0 (kA), not depth-1 (kB).
+// Merged-row selection precision, both halves of the rule:
+//  - an event FULLY INSIDE the dragged time span is captured wherever its
+//    lane sits: a thin horizontal band means "this time range on this rank",
+//    not "these two rendering lanes" — events sharing a Tetris lane are
+//    disjoint by construction, so a lane-sliced capture can't overlap and
+//    the overlap-aware totals silently equal the plain sums;
+//  - events STRADDLING the span's edges keep exact lane precision, which is
+//    what preserves the older fix this test originally pinned ("selecting
+//    one item selected all items"): a shift-click is a zero-width rect that
+//    can't fully contain anything, so it still selects exactly the one bar
+//    under the cursor.
+// sub_h = 40/2 = 20, so a y-range of [0,10] hits only depth 0.
 #[test]
 fn test_merged_selection_respects_depth_yrange() {
     let trace = make_trace(
-        vec!["wrapper", "kA", "kB"],
+        vec!["wrapper", "kA", "kB", "kC", "kD"],
         vec![("GPU", true, vec![
-            ev(0.0, 100.0, 0, 0),
-            ev(0.0, 10.0, 1, 1),
-            ev(20.0, 10.0, 2, 1),
+            ev(0.0, 100.0, 0, 0),  // idx 0: whole-stream wrapper — stripped from merged row
+            ev(0.0, 10.0, 1, 0),   // idx 1: kA [0,10), depth 0
+            ev(2.0, 6.0, 4, 1),    // idx 2: kD [2,8), depth 1 — concurrent with kA
+            ev(12.0, 6.0, 3, 1),   // idx 3: kC [12,18), depth 1 — fully inside the band's span
+            ev(20.0, 10.0, 2, 1),  // idx 4: kB [20,30), depth 1 — straddles the span's end
         ])],
     );
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.geom.merged = vec![MergedGeom { vi: 0, pack: make_merged_pack(&[
         (0.0, 10.0, 0, 1, 0, 0, 0),
-        (20.0, 10.0, 0, 2, 1, 1, 1),
+        (2.0, 6.0, 0, 2, 1, 1, 1),
+        (12.0, 6.0, 0, 3, 1, 1, 1),
+        (20.0, 10.0, 0, 4, 1, 1, 1),
     ]).into() }];
     p.geom.heights[0] = 40.0;
     p.geom.y_offsets[0] = 0.0;
 
-    p.finished_sel = Some([0.0, 30.0, 0.0, 10.0]);
+    // Thin band over depth 0 only, time span [5,25): kA straddles the start
+    // (lane test → depth 0, touched → in), kD straddles the start (lane test
+    // → depth 1, untouched → out), kC is fully contained (in regardless of
+    // lane), kB straddles the end (lane test → depth 1 → out).
+    p.finished_sel = Some([5.0, 25.0, 0.0, 10.0]);
+    p.finished_sel_events = p.capture_sel_events(p.finished_sel.unwrap()).into_iter().collect();
+    let events = p.extract_selection_events();
+    let names: Vec<&str> = events.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["kA", "kC"], "straddlers respect the depth y-range; contained events are lane-agnostic");
+
+    // Shift-click (zero-width point rect) inside kA's bar: containment is
+    // impossible for a nonzero-duration event, so only the lane test applies
+    // — the concurrent kD one lane down must NOT ride along.
+    p.finished_sel = Some([4.0, 4.0, 5.0, 5.0]);
     p.finished_sel_events = p.capture_sel_events(p.finished_sel.unwrap()).into_iter().collect();
     let events = p.extract_selection_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].0, "kA");
+}
+
+// The reported bug: with "Overlap aware" off (the boot default), select a
+// thin horizontal band over a merged rank row and then enable it — nothing
+// changed. The band only crossed one Tetris lane, and same-lane events are
+// disjoint by construction, so the captured set's union equaled its sum no
+// matter how the totals were computed. The band must capture the rank's
+// whole kernel set in its time range for the toggle to have anything to
+// shrink.
+#[test]
+fn test_merged_thin_band_captures_all_lanes_for_overlap_totals() {
+    // One rank row: kernel K launched twice concurrently (exactly why
+    // packing puts the two launches in different lanes), plus a sequential
+    // kernel S behind them.
+    let trace = make_trace(
+        vec!["K", "S"],
+        vec![("GPU", true, vec![
+            ev(0.0, 10.0, 0, 0),  // idx 0: K, packs to depth 0
+            ev(0.0, 10.0, 0, 0),  // idx 1: K, concurrent — packs to depth 1
+            ev(20.0, 5.0, 1, 0),  // idx 2: S, depth 0
+        ])],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    p.geom.merged = vec![MergedGeom { vi: 0, pack: make_merged_pack(&[
+        (0.0, 10.0, 0, 0, 0, 0, 0),
+        (0.0, 10.0, 0, 1, 1, 1, 1),
+        (20.0, 5.0, 0, 2, 0, 0, 0),
+    ]).into() }];
+    p.geom.heights[0] = 40.0; // max_depth 2 * SUB_LANE_H(20)
+    p.geom.y_offsets[0] = 0.0;
+
+    // Thin band over lane 0 only (y in [0,10]), time span covering
+    // everything: the concurrent K on lane 1 must be captured too.
+    p.selection = Some([0.0, 30.0, 0.0, 10.0]);
+    p.finish_selection(&mut state.buf);
+
+    let ki = p.selection_stats.iter().position(|s| s.name == 0).unwrap();
+    assert_eq!(p.selection_stats[ki].count, 2, "both concurrent K launches must be captured from a thin band");
+    assert_eq!(p.selection_stats[ki].total_dur, 20.0);
+    let si = p.selection_stats.iter().position(|s| s.name == 1).unwrap();
+    assert_eq!(p.selection_stats[si].count, 1, "the touched lane's own events are still captured");
+
+    // Overlap aware: the two K launches cover the same wall time — union 10,
+    // not the summed 20. Before the capture fix only one launch was
+    // captured, so this equaled the sum and the toggle "did nothing".
+    p.sel_overlap = true;
+    p.ensure_sel_overlap_totals();
+    assert_eq!(p.sel_overlap_totals[ki], 10.0, "union of the two concurrent launches, not the 20us sum");
+    assert!(p.sel_overlap_totals[ki] < p.selection_stats[ki].total_dur);
 }
 
 #[test]
@@ -4270,3 +4343,6 @@ wall {:8.1} gpu_busy {:8.1} idle {:7.1} ranks {} kernels {}",
                 s => line += &format!(" {:+7.0}", s - ref_spans[i].0),
             }
         }
+        eprintln!("{line}");
+    }
+}

@@ -879,7 +879,9 @@ impl Pane {
     /// `(track_idx, event_idx)` pairs it covers, using `self.geom`/
     /// `hidden_names`/`show_cpu` exactly as they are right now (drag-finish
     /// time) — full precision, including which merged-row depth lane the drag
-    /// covered. The result is frozen from this point on: nothing that happens
+    /// covered for events straddling its time-span edges (events fully inside
+    /// the span are captured lane-agnostically; see the merged branch below).
+    /// The result is frozen from this point on: nothing that happens
     /// afterward (Show CPU toggle, track reorder/resize, hiding a name) can
     /// retroactively add, remove, or reassign what this selection refers to.
     /// That freezing is the fix — the old code re-derived "what's selected"
@@ -912,15 +914,34 @@ impl Pane {
                     let ts = p.ts[gi];
                     let end_t = p.ends[gi];
                     if !(end_t >= s0 && ts <= s1) { continue; }
-                    // Same stretch bounds the renderer draws (and the live
-                    // drag tests): a kernel stretched down into empty depth
-                    // lanes must be captured when the drag covers the lower
-                    // (stretched) part of its bar, not just its own lane.
-                    // Same stale-cache guard the render loop applies.
-                    let (lo, hi) = p.stretch.get(gi).copied().unwrap_or((depth, depth));
-                    let ev_top = track_top + lo as f32 * sub_h;
-                    let ev_bot = ev_top + (hi - lo + 1) as f32 * sub_h;
-                    if ev_bot < y0 || ev_top > y1 { continue; }
+                    // A merged row's depth lanes are a rendering artifact
+                    // (Tetris packing against overdraw), not a semantic
+                    // dimension: events sharing a lane are disjoint BY
+                    // CONSTRUCTION, so a thin horizontal band crossing one
+                    // or two lanes captures an arbitrary ~1/max_depth slice
+                    // of the rank's kernels — which then cannot overlap,
+                    // silently deflating the Selection tab's counts/sums
+                    // and making the overlap-aware totals equal the plain
+                    // sums (the toggle "did nothing"). An event FULLY
+                    // INSIDE the dragged time span is therefore captured
+                    // wherever its lane sits ("this time range on this
+                    // rank"). Only events straddling the span's edges keep
+                    // lane precision below — which is also what keeps a
+                    // shift-click (a zero-width rect that can't contain
+                    // anything) selecting exactly the one bar under the
+                    // cursor.
+                    if !(ts >= s0 && end_t <= s1) {
+                        // Same stretch bounds the renderer draws (and the
+                        // live drag tests): a kernel stretched down into
+                        // empty depth lanes must be captured when the drag
+                        // covers the lower (stretched) part of its bar, not
+                        // just its own lane. Same stale-cache guard the
+                        // render loop applies.
+                        let (lo, hi) = p.stretch.get(gi).copied().unwrap_or((depth, depth));
+                        let ev_top = track_top + lo as f32 * sub_h;
+                        let ev_bot = ev_top + (hi - lo + 1) as f32 * sub_h;
+                        if ev_bot < y0 || ev_top > y1 { continue; }
+                    }
                     out.push((ti32, ei32));
                 }
             } else {

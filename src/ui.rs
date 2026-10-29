@@ -1599,7 +1599,18 @@ pub fn draw_timeline(
                     let is_primary = selected.map_or(false, |s| s.track_idx == ti32 && s.event_idx as usize == ei);
                     let is_multi = multi_select_name.map_or(false, |n| ev.name == n);
                     let ev_track_y = buf.y_offsets[vi] + lo as f32 * sub_h;
-                    let is_selected = is_selected(ti32, ei as u32, ev_track_y, stretched_h, ev.ts, ev.dur);
+                    // Match capture_sel_events' containment rule so the
+                    // live preview shows the same set the finished
+                    // selection will freeze: a merged-row event fully
+                    // inside the drag's time span is selected wherever its
+                    // lane sits — testing its whole-ROW rect against the
+                    // band doubles as the row gate. Straddlers keep the
+                    // exact stretched-lane rect.
+                    let (sel_y, sel_h) = match active_bounds {
+                        Some((sa, sb, _, _)) if ev_ts >= sa && ev_end <= sb => (buf.y_offsets[vi], track_h),
+                        _ => (ev_track_y, stretched_h),
+                    };
+                    let is_selected = is_selected(ti32, ei as u32, sel_y, sel_h, ev.ts, ev.dur);
                     let is_sel_mask = !sel_mask.is_empty() && sel_mask.get(ev.name as usize).copied().unwrap_or(false);
 
                     let fill = if is_hovered { brighten(color, 30) } else if is_selected || is_sel_mask { brighten(color, 20) } else { color };
