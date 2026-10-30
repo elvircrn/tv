@@ -308,12 +308,15 @@ pub struct SelectionEntry {
     pub event_refs: Vec<(u32, u32)>,
 }
 
-/// Selection-tab GPU idle summary: over the selection's GPU-work events
-/// (clipped to its time range), the span from the leftmost to the
-/// rightmost kernel and how much of that span any of them covers.
-/// `t1 - t0 - busy` is the empty space between the selected kernels.
-/// Computed by `state::selection_gpu_summary` when the drag finishes.
+/// Selection-tab GPU idle summary, PER RANK scope: over the selection's
+/// GPU-work events on that rank's streams (clipped to its time range), the
+/// span from the rank's leftmost to rightmost kernel and how much of it
+/// any of them covers. `t1 - t0 - busy` is that rank's empty space between
+/// the selected kernels. One entry per rank present in the selection
+/// (None = unlabeled single-rank trace), sorted by rank. Computed by
+/// `state::selection_gpu_summary` when the drag finishes.
 pub struct SelGpuSummary {
+    pub rank: Option<usize>,
     pub t0: f64,
     pub t1: f64,
     pub busy: f64,

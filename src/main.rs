@@ -1852,10 +1852,13 @@ impl App {
                                 write_time(&mut state.buf.fmt, pane.sel_median);
                                 write!(state.buf.fmt, " median").unwrap();
                                 // GPU empty space between the selection's
-                                // leftmost and rightmost kernel (see
-                                // selection_gpu_summary): span minus the
-                                // busy union over the covered GPU tracks.
-                                if let Some(g) = &pane.sel_gpu {
+                                // leftmost and rightmost kernel, per rank
+                                // (see selection_gpu_summary): each rank's
+                                // span minus its busy union. One rank in
+                                // the selection stays on the summary line;
+                                // several get their own wrapped line below.
+                                if pane.sel_gpu.len() == 1 {
+                                    let g = &pane.sel_gpu[0];
                                     let span = g.t1 - g.t0;
                                     let idle = span - g.busy;
                                     let pct = if span > 0.0 { idle / span * 100.0 } else { 0.0 };
@@ -1866,6 +1869,23 @@ impl App {
                                     write!(state.buf.fmt, " ({:.0}%)", pct).unwrap();
                                 }
                                 ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
+                                if pane.sel_gpu.len() > 1 {
+                                    state.buf.fmt.clear();
+                                    write!(state.buf.fmt, "GPU idle per rank: ").unwrap();
+                                    for (i, g) in pane.sel_gpu.iter().enumerate() {
+                                        if i > 0 { state.buf.fmt.push_str(", "); }
+                                        let span = g.t1 - g.t0;
+                                        let idle = span - g.busy;
+                                        let pct = if span > 0.0 { idle / span * 100.0 } else { 0.0 };
+                                        write!(state.buf.fmt, "rank {}: ", g.rank.unwrap_or(0)).unwrap();
+                                        write_time(&mut state.buf.fmt, idle);
+                                        write!(state.buf.fmt, " of ").unwrap();
+                                        write_time(&mut state.buf.fmt, span);
+                                        write!(state.buf.fmt, " ({:.0}%)", pct).unwrap();
+                                    }
+                                    let _c = ui.push_style_color(StyleColor::Text, [0.6, 0.6, 0.6, 1.0]);
+                                    ui.text_wrapped(&state.buf.fmt);
+                                }
                                 // Fine-grained timing (separate from the coarse "bottom"
                                 // mark! bucket) so a slow Selection tab shows exactly
                                 // which piece is responsible instead of one lump sum.

@@ -5197,7 +5197,10 @@ fn selection_gpu_summary_measures_idle_between_kernels() {
     );
     let events: std::collections::HashSet<(u32, u32)> =
         [(0, 0), (0, 1), (1, 0), (2, 0)].into_iter().collect();
-    let g = selection_gpu_summary(&trace, &events, [0.0, 0.0, 100.0, 0.0]).unwrap();
+    let summary = selection_gpu_summary(&trace, &events, [0.0, 0.0, 100.0, 0.0]);
+    // Unlabeled streams share the single-rank scope: one entry.
+    assert_eq!(summary.len(), 1);
+    let g = &summary[0];
     assert_eq!(g.t0, 10.0);
     assert_eq!(g.t1, 60.0);
     assert!((g.busy - 20.0).abs() < 1e-12);
@@ -5218,7 +5221,9 @@ fn selection_gpu_summary_clips_to_selection_edges() {
     );
     let events: std::collections::HashSet<(u32, u32)> =
         [(0, 0), (0, 1)].into_iter().collect();
-    let g = selection_gpu_summary(&trace, &events, [10.0, 0.0, 100.0, 0.0]).unwrap();
+    let summary = selection_gpu_summary(&trace, &events, [10.0, 0.0, 100.0, 0.0]);
+    assert_eq!(summary.len(), 1);
+    let g = &summary[0];
     assert_eq!(g.t0, 10.0);
     assert_eq!(g.t1, 60.0);
     assert!((g.busy - 15.0).abs() < 1e-12);
@@ -5236,9 +5241,32 @@ fn selection_gpu_summary_requires_gpu_work() {
         &["kernel", "cpu_op", "gpu_user_annotation"],
     );
     let all: std::collections::HashSet<(u32, u32)> = [(0, 0), (1, 0)].into_iter().collect();
-    assert!(selection_gpu_summary(&trace, &all, [0.0, 0.0, 100.0, 0.0]).is_none());
+    assert!(selection_gpu_summary(&trace, &all, [0.0, 0.0, 100.0, 0.0]).is_empty());
     let cpu_only: std::collections::HashSet<(u32, u32)> = [(0, 0)].into_iter().collect();
-    assert!(selection_gpu_summary(&trace, &cpu_only, [0.0, 0.0, 100.0, 0.0]).is_none());
+    assert!(selection_gpu_summary(&trace, &cpu_only, [0.0, 0.0, 100.0, 0.0]).is_empty());
+}
+
+#[test]
+fn selection_gpu_summary_is_per_rank() {
+    // Rank 0: kernels [10,20] and [50,60] → span 50, busy 20, idle 30.
+    // Rank 1: one kernel [15,25] → span 10, busy 10, idle 0. Rank 1
+    // working must not mask rank 0's idle (and vice versa), so each rank
+    // gets its own entry, sorted by rank.
+    let trace = gaps_trace(
+        vec![
+            ("Rank 0 stream 7", true, vec![evc(10.0, 10.0, 0, 0), evc(50.0, 10.0, 1, 0)]),
+            ("Rank 1 stream 7", true, vec![evc(15.0, 10.0, 0, 0)]),
+        ],
+        &["kernel"],
+    );
+    let events: std::collections::HashSet<(u32, u32)> =
+        [(0, 0), (0, 1), (1, 0)].into_iter().collect();
+    let summary = selection_gpu_summary(&trace, &events, [0.0, 0.0, 100.0, 0.0]);
+    assert_eq!(summary.len(), 2);
+    assert_eq!(summary[0].rank, Some(0));
+    assert!((summary[0].t1 - summary[0].t0 - summary[0].busy - 30.0).abs() < 1e-12);
+    assert_eq!(summary[1].rank, Some(1));
+    assert!((summary[1].t1 - summary[1].t0 - summary[1].busy).abs() < 1e-12);
 }
 
 #[test]
