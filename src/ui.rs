@@ -2388,6 +2388,184 @@ fn hover_group_breakdown(
     });
 }
 
+/// The Gaps tab's "Why" classification for one gap: (label, text color).
+/// Pure so it's unit-testable alongside `compute_gaps`.
+///
+/// - CPU idle: the rank's CPU threads had nothing running either — the GPU
+///   starved while waiting on something off-CPU (a blocking sync whose
+///   runtime span ended before the gap, a collective, a timer).
+/// - runtime-bound: most of the CPU's time inside the gap was CUDA runtime
+///   calls. That's either many short launches (classic launch-bound) or one
+///   long blocking call — the "CPU was doing" column distinguishes them
+///   (cudaLaunchKernel x230 vs one cudaStreamSynchronize).
+/// - host-bound: the CPU was busy, but in framework/python work rather
+///   than issuing launches.
+pub(crate) fn gap_why(g: &GapInfo) -> (&'static str, [f32; 4]) {
+    if !g.has_cpu {
+        ("no CPU data", [0.5, 0.5, 0.5, 1.0])
+    } else if g.cpu_busy_frac < 0.2 {
+        ("CPU idle (starved)", [0.85, 0.5, 0.45, 1.0])
+    } else if g.runtime_frac >= g.cpu_busy_frac * 0.5 {
+        ("runtime-bound", [0.9, 0.75, 0.4, 1.0])
+    } else {
+        ("host-bound", [0.55, 0.7, 0.9, 1.0])
+    }
+}
+
+pub fn draw_gaps_table(
+    ui: &imgui::Ui,
+    trace: &Trace,
+    gaps: &[GapInfo],
+    buf: &mut DrawBuf,
+    gap_clicked: &mut Option<usize>,
+) {
+    use imgui::{TableColumnFlags, TableColumnSetup, TableFlags};
+
+    const HEADERS: [&str; 9] = [
+        "Rank", "Start", "Length", "CPU busy", "Runtime", "Why",
+        "CPU was doing", "After", "Resumes",
+    ];
+    let flags = TableFlags::RESIZABLE
+        | TableFlags::ROW_BG
+        | TableFlags::BORDERS_INNER_V
+        | TableFlags::BORDERS_OUTER
+        | TableFlags::SCROLL_Y
+        | TableFlags::NO_SAVED_SETTINGS
+        | TableFlags::SIZING_FIXED_FIT;
+
+    let avail = ui.content_region_avail();
+    let num_w = ui.calc_text_size("0000.00 ms")[0]
+        .max(ui.calc_text_size("Length")[0] + 12.0);
+    let why_w = ui.calc_text_size("CPU idle (starved)")[0] + 16.0;
+    // Representative kernel-name width — cells clip, hover shows the full
+    // name, and the columns are user-resizable anyway.
+    let kname_w = ui.calc_text_size("ncclDevKernel_AllReduce_430")[0] + 12.0;
+    let pct_w = ui.calc_text_size("Runtime")[0] + 18.0;
+    let mk_col = |i: usize| {
+        let mut c = TableColumnSetup::new(HEADERS[i]);
+        if i == 6 {
+            c.flags |= TableColumnFlags::WIDTH_STRETCH;
+        } else {
+            c.flags |= TableColumnFlags::WIDTH_FIXED;
+            c.init_width_or_weight = match i {
+                0 => ui.calc_text_size("Rank")[0] + 16.0,
+                1 | 2 => num_w,
+                3 | 4 => pct_w,
+                5 => why_w,
+                _ => kname_w,
+            };
+        }
+        c
+    };
+    // The table token must outlive the row loop below (same shape as
+    // draw_steps_table / draw_stats_table).
+    let cols: [TableColumnSetup<&str>; 9] = std::array::from_fn(mk_col);
+    let Some(_t) = ui.begin_table_header_with_sizing("##gaps", cols, flags, [avail[0], avail[1]], 0.0)
+    else {
+        return;
+    };
+
+    let row_h = ui.current_font_size() + ROW_PAD;
+    let clipper = imgui::ListClipper::new(gaps.len() as i32)
+        .items_height(row_h)
+        .begin(ui);
+    for row in clipper.iter() {
+        let g = &gaps[row as usize];
+        ui.table_next_row();
+
+        // Rank cell doubles as the whole-row click target (span-all-columns
+        // selectable, same pattern as the Steps table).
+        ui.table_set_column_index(0);
+        let rank_label = match g.rank {
+            Some(r) => format!("{r}"),
+            None => "-".to_string(),
+        };
+        if ui.selectable_config(rank_label).span_all_columns(true).build() {
+            *gap_clicked = Some(row as usize);
+        }
+
+        ui.table_set_column_index(1);
+        buf.fmt.clear();
+        write_time(&mut buf.fmt, g.t0);
+        ui.text(&buf.fmt);
+        ui.table_set_column_index(2);
+        buf.fmt.clear();
+        write_time(&mut buf.fmt, g.t1 - g.t0);
+        ui.text(&buf.fmt);
+
+        ui.table_set_column_index(3);
+        if g.has_cpu {
+            // Low CPU-busy during a big gap is the headline finding —
+            // color it so it scans without reading every row.
+            let col = if g.cpu_busy_frac < 0.2 {
+                [0.85, 0.5, 0.45, 1.0]
+            } else {
+                [0.8, 0.8, 0.8, 1.0]
+            };
+            ui.text_colored(col, format!("{:.0}%", g.cpu_busy_frac * 100.0));
+            if ui.is_item_hovered() {
+                ui.tooltip_text("Fraction of the gap covered by any event on this rank's CPU tracks");
+            }
+        } else {
+            ui.text("-");
+        }
+        ui.table_set_column_index(4);
+        if g.has_cpu {
+            ui.text(format!("{:.0}%", g.runtime_frac * 100.0));
+            if ui.is_item_hovered() {
+                ui.tooltip_text("Fraction of the gap covered by CUDA runtime calls (launches, syncs)");
+            }
+        } else {
+            ui.text("-");
+        }
+
+        ui.table_set_column_index(5);
+        let (why, col) = gap_why(g);
+        ui.text_colored(col, why);
+        if ui.is_item_hovered() && g.has_cpu {
+            ui.tooltip_text("runtime-bound: most of the CPU's time in the gap was CUDA runtime calls —\nmany short launches (launch-bound) or one long blocking call (sync).\nSee \"CPU was doing\" for which.");
+        }
+
+        ui.table_set_column_index(6);
+        buf.fmt.clear();
+        for (i, &(name, count, dur)) in g.cpu_top.iter().enumerate() {
+            if i > 0 { buf.fmt.push_str(", "); }
+            buf.fmt.push_str(&trace.names[name as usize]);
+            write!(buf.fmt, " x{count} (").unwrap();
+            write_time(&mut buf.fmt, dur);
+            buf.fmt.push(')');
+        }
+        if buf.fmt.is_empty() { buf.fmt.push('-'); }
+        ui.text(&buf.fmt);
+        if ui.is_item_hovered() && !g.cpu_top.is_empty() {
+            ui.tooltip(|| {
+                ui.text("CPU ops overlapping this gap, by covered time:");
+                for &(name, count, dur) in &g.cpu_top {
+                    buf.fmt.clear();
+                    buf.fmt.push_str(&trace.names[name as usize]);
+                    write!(buf.fmt, "  x{count} (").unwrap();
+                    write_time(&mut buf.fmt, dur);
+                    buf.fmt.push(')');
+                    ui.text(&buf.fmt);
+                }
+            });
+        }
+
+        for (col_idx, name) in [(7, g.prev_name), (8, g.next_name)] {
+            ui.table_set_column_index(col_idx);
+            match name {
+                Some(n) => {
+                    ui.text(&trace.names[n as usize]);
+                    if ui.is_item_hovered() {
+                        ui.tooltip_text(&trace.names[n as usize]);
+                    }
+                }
+                None => ui.text("-"),
+            }
+        }
+    }
+}
+
 pub fn nice_interval(range: f64) -> f64 {
     let rough = range / 8.0;
     if rough <= 0.0 { return 1.0; }

@@ -66,6 +66,12 @@ pub const SEARCH_ZOOM_FILL: f64 = 0.8; // matches fill this fraction of the widt
 /// Slack either side of a step when framing it via `[`/`]` or the Steps tab —
 /// fraction of the final view width, so the inter-step gaps stay visible.
 pub const STEP_PAD: f64 = 0.05;
+/// A GPU idle gap shorter than this isn't a bubble worth listing: kernel
+/// launch spacing alone leaves sub-µs holes between back-to-back kernels.
+pub const MIN_GAP_US: f64 = 1.0;
+/// How many gaps (biggest first) the Gaps tab keeps — the per-gap CPU
+/// annotation is the expensive part, so it runs on the top slice only.
+pub const GAP_TOP_N: usize = 500;
 pub const ROW_PAD: f32 = 4.0;
 pub const HISTOGRAM_BAR_H: f32 = 18.0;
 pub const DETAIL_HIST_H: f32 = 90.0;
@@ -411,7 +417,39 @@ pub struct DiffResult {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum BottomTab { Detail, Selection, Steps }
+pub enum BottomTab { Detail, Selection, Steps, Gaps }
+
+/// One GPU idle gap ("bubble"): a wall-time interval where a rank's GPU was
+/// doing no work at all, plus the CPU-side annotation that explains it.
+/// Computed by `state::compute_gaps`; see `Pane::gaps` for the cache.
+pub struct GapInfo {
+    /// Rank scope the gap belongs to (`parse_rank` of the GPU tracks'
+    /// labels; a multi-rank merge labels every track "  Rank N ...").
+    /// None = unlabeled tracks, i.e. a single-rank trace's one shared scope.
+    pub rank: Option<usize>,
+    pub t0: f64,
+    pub t1: f64,
+    /// Fraction of [t0, t1] covered by ANY event on this rank's CPU tracks,
+    /// as a union — nested call stacks (cpu_op ⊃ python_function) must not
+    /// double-count. 0.0 when the CPU was doing nothing.
+    pub cpu_busy_frac: f64,
+    /// Fraction of [t0, t1] covered by CUDA-runtime events (launch calls,
+    /// blocking syncs — both are `cat == "runtime"`).
+    pub runtime_frac: f64,
+    /// Whether the trace has ANY CPU tracks for this gap's scope. Without
+    /// one, the fractions above are 0 for lack of data, not because the CPU
+    /// was idle — the "Why" column must not claim starved.
+    pub has_cpu: bool,
+    /// Top CPU ops overlapping the gap, by covered time desc:
+    /// (name id, overlapping event count, covered time — per-name union).
+    pub cpu_top: Vec<(u32, u32, f64)>,
+    /// Name of the GPU work that ends at `t0` (what stalled).
+    pub prev_name: Option<u32>,
+    /// Name of the GPU work that starts at `t1` (what resumes).
+    pub next_name: Option<u32>,
+    /// A GPU track of this scope, for scroll-into-view on row click.
+    pub focus_track: u32,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum DragKind {

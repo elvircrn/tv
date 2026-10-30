@@ -1715,8 +1715,10 @@ impl App {
         // Step row clicked in the Steps tab (index into pane.steps), filled
         // by the bottom panel below and applied after it so frame_step's
         // view.anim isn't clobbered by the remaining view handling later in
-        // the frame.
+        // the frame. gap_clicked is the same pattern for the Gaps tab
+        // (index into pane.gaps).
         let mut step_clicked: Option<usize> = None;
+        let mut gap_clicked: Option<usize> = None;
         if state.panes[ai].has_trace() {
             let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 6.0]));
             ui.window("##bottom")
@@ -1913,6 +1915,41 @@ impl App {
                                 draw_steps_table(&ui, &pane.steps, &mut state.buf, &mut step_clicked);
                             }
                         }
+
+                        // ---- Gaps tab: top GPU idle gaps per rank, annotated
+                        // with what the rank's CPU threads were doing during
+                        // each (launch-bound vs truly idle). Click a row to
+                        // zoom to the gap. Only registered as a tab when the
+                        // trace has GPU tracks; computation is lazy
+                        // (ensure_gaps) so loading pays nothing for it.
+                        // The gate re-borrows pane.trace rather than using the
+                        // panel-wide `trace` binding — that one must not stay
+                        // live across ensure_sel_overlap_totals above.
+                        let has_gpu_tracks = pane.trace.as_ref()
+                            .is_some_and(|t| t.tracks.iter().any(|t| t.gpu));
+                        if has_gpu_tracks {
+                            let gaps_flags = if pending == Some(BottomTab::Gaps) {
+                                imgui::TabItemFlags::SET_SELECTED
+                            } else { imgui::TabItemFlags::empty() };
+                            if let Some(_t) = imgui::TabItem::new("Gaps").flags(gaps_flags).begin(&ui) {
+                                pane.ensure_gaps();
+                                let gaps = pane.gaps.as_deref().unwrap_or(&[]);
+                                state.buf.fmt.clear();
+                                if gaps.is_empty() {
+                                    write!(state.buf.fmt, "No GPU idle gaps ≥ ").unwrap();
+                                    write_time(&mut state.buf.fmt, MIN_GAP_US);
+                                    state.buf.fmt.push_str(" found");
+                                    ui.text_colored([0.5, 0.5, 0.5, 1.0], &state.buf.fmt);
+                                } else {
+                                    let total: f64 = gaps.iter().map(|g| g.t1 - g.t0).sum();
+                                    write!(state.buf.fmt, "{} gaps, ", gaps.len()).unwrap();
+                                    write_time(&mut state.buf.fmt, total);
+                                    write!(state.buf.fmt, " total idle. Per rank (streams unioned), top {} by length. Click a row to zoom.", GAP_TOP_N).unwrap();
+                                    ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
+                                }
+                                draw_gaps_table(&ui, pane.trace.as_ref().unwrap(), gaps, &mut state.buf, &mut gap_clicked);
+                            }
+                        }
                     }
                 });
         }
@@ -1924,6 +1961,17 @@ impl App {
             if i < pane.steps.len() {
                 pane.step_cursor = i;
                 pane.frame_step(i);
+            }
+        }
+        // A Gaps-tab row click: zoom to that gap and scroll its GPU track
+        // into view. The (t0, t1, focus_track) triple is copied out first —
+        // frame_gap takes &mut pane, which the gap borrow would block.
+        if let Some(i) = gap_clicked.take() {
+            let pane = &mut state.panes[ai];
+            let gap = pane.gaps.as_ref().and_then(|v| v.get(i))
+                .map(|g| (g.t0, g.t1, g.focus_track));
+            if let Some((t0, t1, ft)) = gap {
+                pane.frame_gap(t0, t1, ft);
             }
         }
         // ---- Status bar (active pane) ----

@@ -1,8 +1,8 @@
 use super::*;
 use crate::parse::*;
 use crate::loader::{load_trace, detect_rank_groups, merge_traces, resolve_tool_in};
-use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps, Pane};
-use crate::ui::{heat_color, heat_dim};
+use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps, compute_gaps, Pane};
+use crate::ui::{heat_color, heat_dim, gap_why};
 use imgui::ImColor32;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
@@ -23,6 +23,14 @@ fn test_counter() -> Arc<AtomicUsize> {
 
 fn ev(ts: f64, dur: f64, name: u32, depth: u16) -> Event {
     Event { ts, dur, name, cat: 0, args_off: 0, args_len: 0, depth }
+}
+
+/// `ev` with an explicit cat. `make_trace` hardcodes cats to one empty
+/// string, so gap tests overwrite `trace.cats` afterwards and build events
+/// with real category ids via this helper. Category constants per test:
+/// 0 = kernel, 1 = cpu_op, 2 = runtime, 3 = gpu_user_annotation.
+fn evc(ts: f64, dur: f64, name: u32, cat: u32) -> Event {
+    Event { ts, dur, name, cat, args_off: 0, args_len: 0, depth: 0 }
 }
 
 fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace {    let name_strs: Vec<String> = names.into_iter().map(String::from).collect();
@@ -4813,4 +4821,284 @@ fn draw_timeline_heat_mode_renders() {
             );
         });
     imgui.render();
+}
+
+// ------------------------------------------------------------------ Gaps ----
+// compute_gaps / gap_why coverage. Category ids referenced by evc calls in
+// these tests: 0 = kernel, 1 = cpu_op, 2 = runtime, 3 = gpu_user_annotation
+// (set per-test via trace.cats, since make_trace ships a single empty cat).
+
+fn gaps_trace(tracks: Vec<(&str, bool, Vec<Event>)>, cats: &[&str]) -> Trace {
+    let names = vec!["forward", "backward", "wrapper", "nested", "launch", "sync"];
+    let mut trace = make_trace(names, tracks);
+    trace.cats = cats.iter().map(|c| c.to_string()).collect();
+    trace
+}
+
+#[test]
+fn gaps_basic() {
+    let trace = gaps_trace(
+        vec![("stream 7", true, vec![
+            evc(0.0, 10.0, 0, 0),   // "forward" [0,10]
+            evc(30.0, 10.0, 1, 0), // "backward" [30,40]
+        ])],
+        &["kernel"],
+    );
+    let gaps = compute_gaps(&trace);
+    assert_eq!(gaps.len(), 1);
+    let g = &gaps[0];
+    // Unlabeled tracks share one scope → rank None.
+    assert_eq!(g.rank, None);
+    assert_eq!(g.t0, 10.0);
+    assert_eq!(g.t1, 30.0);
+    // "forward" closes the busy interval before the gap, "backward" opens
+    // the one after.
+    assert_eq!(g.prev_name, Some(0));
+    assert_eq!(g.next_name, Some(1));
+    assert_eq!(g.focus_track, 0);
+    // No CPU track in this scope: has_cpu distinguishes "no data" from idle.
+    assert!(!g.has_cpu);
+    assert_eq!(g.cpu_busy_frac, 0.0);
+    assert_eq!(g.runtime_frac, 0.0);
+    assert!(g.cpu_top.is_empty());
+}
+
+#[test]
+fn gaps_min_length_floor() {
+    // A 0.5µs gap is below MIN_GAP_US and must be dropped — without the
+    // floor, sub-µs scheduling jitter would flood the table.
+    let trace = gaps_trace(
+        vec![("stream 7", true, vec![
+            evc(0.0, 10.0, 0, 0),
+            evc(10.5, 10.0, 1, 0),
+        ])],
+        &["kernel"],
+    );
+    assert!(compute_gaps(&trace).is_empty());
+}
+
+#[test]
+fn gaps_zero_duration_events_are_not_busy() {
+    // Instant events add no busy time; they must not erase or split a gap
+    // either.
+    let trace = gaps_trace(
+        vec![("stream 7", true, vec![
+            evc(0.0, 10.0, 0, 0),
+            evc(15.0, 0.0, 1, 0),
+            evc(30.0, 10.0, 1, 0),
+        ])],
+        &["kernel"],
+    );
+    let gaps = compute_gaps(&trace);
+    assert_eq!(gaps.len(), 1);
+    assert_eq!((gaps[0].t0, gaps[0].t1), (10.0, 30.0));
+}
+
+#[test]
+fn gaps_gpu_user_annotation_is_not_busy() {
+    // gpu_user_annotation is a CPU bracket projected onto the stream, so it
+    // spans the step's internal idle. Counting it as GPU work would erase
+    // exactly the gaps this view exists to find.
+    let trace = gaps_trace(
+        vec![("stream 7", true, vec![
+            evc(0.0, 10.0, 0, 0),
+            evc(12.0, 16.0, 1, 3), // annotation [12,28] covering the gap
+            evc(30.0, 10.0, 1, 0),
+        ])],
+        &["kernel", "cpu_op", "runtime", "gpu_user_annotation"],
+    );
+    let gaps = compute_gaps(&trace);
+    assert_eq!(gaps.len(), 1);
+    assert_eq!((gaps[0].t0, gaps[0].t1), (10.0, 30.0));
+}
+
+#[test]
+fn gaps_gpu_memcpy_counts_as_work() {
+    // gpu_memcpy is real GPU work and must erase a gap it covers.
+    let trace = gaps_trace(
+        vec![("stream 7", true, vec![
+            evc(0.0, 10.0, 0, 0),
+            evc(10.0, 20.0, 1, 4), // memcpy [10,30]
+            evc(30.0, 10.0, 1, 0),
+        ])],
+        &["kernel", "cpu_op", "runtime", "gpu_user_annotation", "gpu_memcpy"],
+    );
+    assert!(compute_gaps(&trace).is_empty());
+}
+
+#[test]
+fn gaps_same_rank_streams_unioned() {
+    // Both streams carry the same rank label, so their busy intervals are
+    // unioned before gaps are taken: a full cover erases the gap, a partial
+    // cover shortens it instead of leaving two gaps on one stream each.
+    let trace = gaps_trace(
+        vec![
+            ("Rank 0 stream 7", true, vec![
+                evc(0.0, 10.0, 0, 0),
+                evc(30.0, 10.0, 1, 0),
+            ]),
+            ("Rank 0 stream 3", true, vec![evc(10.0, 15.0, 0, 0)]),
+        ],
+        &["kernel"],
+    );
+    let gaps = compute_gaps(&trace);
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].rank, Some(0));
+    // Busy union is [0,25] ∪ [30,40]: only [25,30] remains.
+    assert_eq!((gaps[0].t0, gaps[0].t1), (25.0, 30.0));
+}
+
+#[test]
+fn gaps_full_cover_by_second_stream_erases_gap() {
+    let trace = gaps_trace(
+        vec![
+            ("Rank 0 stream 7", true, vec![
+                evc(0.0, 10.0, 0, 0),
+                evc(30.0, 10.0, 1, 0),
+            ]),
+            ("Rank 0 stream 3", true, vec![evc(10.0, 20.0, 0, 0)]),
+        ],
+        &["kernel"],
+    );
+    assert!(compute_gaps(&trace).is_empty());
+}
+
+#[test]
+fn gaps_per_rank_scoping() {
+    // A gap on rank 0 while rank 1 is busy still counts: gaps are scoped
+    // per rank (device level), not across the whole merged trace.
+    let trace = gaps_trace(
+        vec![
+            ("Rank 0 stream 7", true, vec![
+                evc(0.0, 10.0, 0, 0),
+                evc(30.0, 10.0, 1, 0),
+            ]),
+            ("Rank 1 stream 7", true, vec![evc(0.0, 40.0, 0, 0)]),
+        ],
+        &["kernel"],
+    );
+    let gaps = compute_gaps(&trace);
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].rank, Some(0));
+    assert_eq!((gaps[0].t0, gaps[0].t1), (10.0, 30.0));
+}
+
+#[test]
+fn gaps_cpu_fractions_are_union_not_sum() {
+    // The CPU annotation must use interval unions: a nested call stack
+    // inside a wrapper must not double-count wall time. Wrapper [5,32]
+    // covers the whole gap; nested [12,16] sits inside it.
+    let trace = gaps_trace(
+        vec![
+            ("stream 7", true, vec![
+                evc(0.0, 10.0, 0, 0),
+                evc(30.0, 10.0, 1, 0),
+            ]),
+            ("cpu", false, vec![
+                evc(5.0, 27.0, 2, 1),   // wrapper [5,32]
+                evc(12.0, 4.0, 3, 1),   // nested [12,16]
+                evc(20.0, 5.0, 4, 2),   // runtime [20,25]
+            ]),
+        ],
+        &["kernel", "cpu_op", "runtime"],
+    );
+    let gaps = compute_gaps(&trace);
+    assert_eq!(gaps.len(), 1);
+    let g = &gaps[0];
+    assert!(g.has_cpu);
+    // Gap [10,30]: union of {[10,30], [12,16], [20,25]} is 20µs → 100%.
+    // A naive sum would give 24/20 = 1.2.
+    assert!((g.cpu_busy_frac - 1.0).abs() < 1e-12);
+    // Only the runtime event's 5µs counts toward runtime_frac.
+    assert!((g.runtime_frac - 0.25).abs() < 1e-12);
+    // cpu_top is by covered time, union per name: wrapper 20, nested 4,
+    // runtime 5 → wrapper, runtime, nested.
+    assert_eq!(g.cpu_top.len(), 3);
+    assert_eq!(g.cpu_top[0].0, 2);
+    assert!((g.cpu_top[0].2 - 20.0).abs() < 1e-12);
+    assert_eq!(g.cpu_top[1].0, 4);
+    assert!((g.cpu_top[1].2 - 5.0).abs() < 1e-12);
+    assert_eq!(g.cpu_top[2].0, 3);
+    assert!((g.cpu_top[2].2 - 4.0).abs() < 1e-12);
+    // Counts are per-name launch counts inside the gap.
+    assert_eq!(g.cpu_top.iter().map(|&(_, c, _)| c).sum::<u32>(), 3);
+}
+
+#[test]
+fn gaps_cpu_present_but_idle() {
+    // A CPU track exists for the scope but had nothing running inside the
+    // gap: has_cpu is true and the fractions are 0 — "CPU idle", which
+    // gap_why reports as starved rather than "no CPU data".
+    let trace = gaps_trace(
+        vec![
+            ("stream 7", true, vec![
+                evc(0.0, 10.0, 0, 0),
+                evc(30.0, 10.0, 1, 0),
+            ]),
+            ("cpu", false, vec![evc(40.0, 5.0, 2, 1)]),
+        ],
+        &["kernel", "cpu_op"],
+    );
+    let gaps = compute_gaps(&trace);
+    assert_eq!(gaps.len(), 1);
+    assert!(gaps[0].has_cpu);
+    assert_eq!(gaps[0].cpu_busy_frac, 0.0);
+    assert_eq!(gaps[0].runtime_frac, 0.0);
+}
+
+#[test]
+fn gaps_top_n_truncation() {
+    // 600 gaps of strictly increasing length: only GAP_TOP_N survive, and
+    // they must be the biggest ones, biggest first.
+    let mut events = Vec::new();
+    let mut t = 0.0;
+    for i in 1..=600 {
+        events.push(evc(t, 1.0, 0, 0));
+        t += 1.0;
+        t += i as f64;
+    }
+    events.push(evc(t, 1.0, 0, 0));
+    let trace = gaps_trace(
+        vec![("stream 7", true, events)],
+        &["kernel"],
+    );
+    let gaps = compute_gaps(&trace);
+    assert_eq!(gaps.len(), GAP_TOP_N);
+    assert_eq!(gaps[0].t1 - gaps[0].t0, 600.0);
+    assert_eq!(gaps[GAP_TOP_N - 1].t1 - gaps[GAP_TOP_N - 1].t0, 101.0);
+    // Sorted descending by length.
+    for w in gaps.windows(2) {
+        assert!(w[0].t1 - w[0].t0 >= w[1].t1 - w[1].t0);
+    }
+}
+
+#[test]
+fn gaps_no_gpu_work_cats() {
+    // A trace with GPU tracks but no kernel/gpu_* cats (e.g. an
+    // annotation-only projection) has no GPU busy intervals to gap.
+    let trace = gaps_trace(
+        vec![
+            ("stream 7", true, vec![evc(0.0, 10.0, 0, 1)]),
+            ("stream 8", true, vec![evc(30.0, 10.0, 1, 1)]),
+        ],
+        &["kernel", "cpu_op"],
+    );
+    assert!(compute_gaps(&trace).is_empty());
+}
+
+#[test]
+fn gap_why_classification() {
+    let mk = |has_cpu: bool, cpu: f64, rt: f64| GapInfo {
+        rank: None, t0: 0.0, t1: 1.0,
+        cpu_busy_frac: cpu, runtime_frac: rt, has_cpu,
+        cpu_top: Vec::new(), prev_name: None, next_name: None, focus_track: 0,
+    };
+    // No CPU tracks at all → can't tell, say so instead of "idle".
+    assert_eq!(gap_why(&mk(false, 0.0, 0.0)).0, "no CPU data");
+    // CPU tracks existed but were ~empty → the GPU starved.
+    assert_eq!(gap_why(&mk(true, 0.1, 0.0)).0, "CPU idle (starved)");
+    // Runtime covered at least half of the CPU's busy time → launch-bound.
+    assert_eq!(gap_why(&mk(true, 0.8, 0.5)).0, "runtime-bound");
+    // CPU busy with framework work rather than issuing launches.
+    assert_eq!(gap_why(&mk(true, 0.8, 0.1)).0, "host-bound");
 }

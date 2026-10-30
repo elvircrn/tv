@@ -321,6 +321,126 @@ fn union_len(spans: &mut [(f64, f64)]) -> f64 {
     total
 }
 
+/// GPU idle gaps ("bubbles") for the Gaps tab: per rank scope, the wall-time
+/// intervals where NO gpu-work event covers that rank's timeline, biggest
+/// first, capped at `GAP_TOP_N` and annotated with what the rank's CPU
+/// threads were doing inside each one.
+///
+/// "GPU work" is cat `kernel` plus `gpu_*` EXCEPT `gpu_user_annotation`:
+/// annotations are CPU-side brackets projected onto every stream, so they
+/// span each step's internal idle — counting them as busy would erase
+/// exactly the gaps this exists to find. Zero-duration events are skipped
+/// for the same reason (an instant adds no busy time but would split a gap
+/// in two). Scoping is per rank (`parse_rank` of the track label) so a gap
+/// on one rank while another works still counts; unlabeled tracks (a
+/// single-rank trace) share one scope.
+///
+/// Pure function of the `Trace` so it's unit-testable and recomputable
+/// after clock sync / reload shifts timestamps.
+pub(crate) fn compute_gaps(trace: &Trace) -> Vec<GapInfo> {
+    let mut is_work = vec![false; trace.cats.len()];
+    let mut any_work = false;
+    for (i, c) in trace.cats.iter().enumerate() {
+        let c = c.as_str();
+        if c == "kernel" || (c.starts_with("gpu_") && c != "gpu_user_annotation") {
+            is_work[i] = true;
+            any_work = true;
+        }
+    }
+    if !any_work { return Vec::new(); }
+    let runtime_cat = trace.cats.iter().position(|c| c.as_str() == "runtime").map(|i| i as u32);
+
+    // Per-scope busy intervals from GPU tracks, plus one focus track and the
+    // CPU track list per scope for the annotation pass.
+    let mut scopes: std::collections::HashMap<usize, Vec<(f64, f64, u32)>> = Default::default();
+    let mut focus_track: std::collections::HashMap<usize, u32> = Default::default();
+    let mut cpu_tracks: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+    for (ti, track) in trace.tracks.iter().enumerate() {
+        let scope = parse_rank(&track.label).unwrap_or(usize::MAX);
+        if track.gpu {
+            focus_track.entry(scope).or_insert(ti as u32);
+            for ev in &track.events {
+                if ev.dur > 0.0 && is_work[ev.cat as usize] {
+                    scopes.entry(scope).or_default().push((ev.ts, ev.ts + ev.dur, ev.name));
+                }
+            }
+        } else {
+            cpu_tracks.entry(scope).or_default().push(ti);
+        }
+    }
+
+    // Raw gaps across all scopes: (scope, t0, t1, prev, next, focus_track).
+    let mut raw: Vec<(usize, f64, f64, Option<u32>, Option<u32>, u32)> = Vec::new();
+    for (scope, mut ivs) in scopes {
+        ivs.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap()));
+        // Merge into the union of busy intervals. Each merged interval
+        // remembers the name that opens it (earliest start) and closes it
+        // (latest end) — the gap's "after"/"resumes" kernels.
+        let mut merged: Vec<(f64, f64, u32, u32)> = Vec::new();
+        for (s, e, name) in ivs {
+            match merged.last_mut() {
+                Some(m) if s <= m.1 => {
+                    if e > m.1 { m.1 = e; m.3 = name; }
+                }
+                _ => merged.push((s, e, name, name)),
+            }
+        }
+        let ft = focus_track[&scope];
+        for w in merged.windows(2) {
+            let len = w[1].0 - w[0].1;
+            if len >= crate::types::MIN_GAP_US {
+                raw.push((scope, w[0].1, w[1].0, Some(w[0].3), Some(w[1].2), ft));
+            }
+        }
+    }
+    raw.sort_unstable_by(|a, b| (b.2 - b.1).partial_cmp(&(a.2 - a.1)).unwrap());
+    raw.truncate(crate::types::GAP_TOP_N);
+
+    // CPU annotation, only for the kept top gaps.
+    let mut gaps: Vec<GapInfo> = Vec::with_capacity(raw.len());
+    for (scope, g0, g1, prev_name, next_name, ft) in raw {
+        let dur = g1 - g0;
+        let cts = cpu_tracks.get(&scope).map(|v| &v[..]).unwrap_or(&[]);
+        let mut any: Vec<(f64, f64)> = Vec::new();
+        let mut runtime: Vec<(f64, f64)> = Vec::new();
+        let mut per_name: std::collections::HashMap<u32, (u32, Vec<(f64, f64)>)> = Default::default();
+        for &ti in cts {
+            let track = &trace.tracks[ti];
+            let start = bisect_overlap(&track.events, &track.prefix_max_dur, g0);
+            let end = track.events.partition_point(|e| e.ts <= g1);
+            for ev in &track.events[start..end] {
+                // Clip to the gap; skip events that only touch its edges.
+                let s = ev.ts.max(g0);
+                let e = (ev.ts + ev.dur).min(g1);
+                if e <= s { continue; }
+                any.push((s, e));
+                if Some(ev.cat) == runtime_cat { runtime.push((s, e)); }
+                let en = per_name.entry(ev.name).or_insert((0, Vec::new()));
+                en.0 += 1;
+                en.1.push((s, e));
+            }
+        }
+        let mut cpu_top: Vec<(u32, u32, f64)> = per_name.into_iter()
+            .map(|(name, (count, mut spans))| (name, count, union_len(&mut spans)))
+            .collect();
+        cpu_top.sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        cpu_top.truncate(3);
+        gaps.push(GapInfo {
+            rank: if scope == usize::MAX { None } else { Some(scope) },
+            t0: g0,
+            t1: g1,
+            cpu_busy_frac: union_len(&mut any) / dur,
+            runtime_frac: union_len(&mut runtime) / dur,
+            has_cpu: !cts.is_empty(),
+            cpu_top,
+            prev_name,
+            next_name,
+            focus_track: ft,
+        });
+    }
+    gaps
+}
+
 /// Maps rank id -> DP-group id for a merged multi-rank trace, from the
 /// per-rank source filenames persisted in `Trace::rank_paths`
 /// (`dp{N}_pp{P}_tp{T}_dcp{D}_ep{E}_rank{R}...`, built by vLLM's
@@ -466,6 +586,12 @@ pub struct Pane {
     /// Current step for `[`/`]` navigation and ruler highlighting. Index into
     /// `steps`; meaningless while `steps` is empty.
     pub step_cursor: usize,
+    /// GPU idle gaps for the Gaps tab (see `compute_gaps`). `None` = dirty:
+    /// computed lazily by `ensure_gaps` the first time the tab opens (the
+    /// sweep sorts every GPU event — pointless on loads where the user never
+    /// looks), cleared on reload and clock sync, which shift the timestamps
+    /// the gaps are derived from.
+    pub gaps: Option<Vec<GapInfo>>,
     pub pending_tab: Option<BottomTab>,
     /// Track index whose row draw_timeline should scroll into view as part of an
     /// in-flight search zoom. Consumed (cleared) on the next timeline draw.
@@ -603,6 +729,7 @@ impl Pane {
             exec_context_names: Vec::new(),
             steps: Vec::new(),
             step_cursor: 0,
+            gaps: None,
             pending_tab: Some(BottomTab::Detail),
             pending_focus: None,
             sort_col: 2,
@@ -770,6 +897,8 @@ impl Pane {
         if result.is_ok() {
             self.merge_cache_key = None;
             self.recompute_steps();
+            // Shifted timestamps move every gap boundary.
+            self.gaps = None;
         }
         result
     }
@@ -1076,8 +1205,9 @@ impl Pane {
                 let is_reload = self.trace.is_some();
                 // Heat-map bounds are a function of the trace's durations;
                 // a new (or reloaded, possibly changed) trace invalidates
-                // them.
+                // them, and gap timestamps don't survive the swap either.
                 self.heat_bounds = None;
+                self.gaps = None;
                 if is_reload {
                     let n_tracks = trace.tracks.len();
                     let n_names = trace.names.len();
@@ -1425,6 +1555,38 @@ impl Pane {
             to_scroll: self.view.scroll_y,
             elapsed: 0.0,
             dur: crate::types::ZOOM_ANIM_DUR,
+        });
+    }
+
+    /// Smooth-zoom to [t0, t1] with the same `STEP_PAD` framing as
+    /// `frame_step`, and scroll `focus_track`'s row into view — the Gaps
+    /// tab's row-click navigation (the gap belongs to that rank, so its row
+    /// is where the eye should land).
+    pub fn frame_gap(&mut self, t0: f64, t1: f64, focus_track: u32) {
+        let range = ((t1 - t0) / (1.0 - 2.0 * crate::types::STEP_PAD))
+            .max(crate::types::MIN_TIME_RANGE);
+        let center = (t0 + t1) / 2.0;
+        self.view.anim = Some(crate::types::ViewAnim {
+            from_t0: self.view.t0,
+            from_t1: self.view.t1,
+            to_t0: center - range / 2.0,
+            to_t1: center + range / 2.0,
+            from_scroll: self.view.scroll_y,
+            to_scroll: self.view.scroll_y, // resolved in draw_timeline from layout
+            elapsed: 0.0,
+            dur: crate::types::ZOOM_ANIM_DUR,
+        });
+        self.pending_focus = Some(focus_track);
+    }
+
+    /// Compute `gaps` if dirty (see the field doc). Called from the Gaps
+    /// tab body, so the sort cost lands on the first frame the tab is
+    /// actually open, never on the load path.
+    pub fn ensure_gaps(&mut self) {
+        if self.gaps.is_some() { return; }
+        self.gaps = Some(match &self.trace {
+            Some(t) => compute_gaps(t),
+            None => Vec::new(),
         });
     }
 
