@@ -850,7 +850,7 @@ impl Pane {
             focused_gap: None,
             gap_filter: GapFilter::default(),
             sel_scopes: Vec::new(),
-            pending_tab: Some(BottomTab::Detail),
+            pending_tab: Some(BottomTab::Selection),
             pending_focus: None,
             sort_col: 2,
             sort_asc: false,
