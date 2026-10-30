@@ -2168,13 +2168,13 @@ fn draw_ruler(
 /// temporal order — deliberately NOT sortable (the natural order IS the
 /// index; sorting by duration etc. would break "next/prev" semantics).
 /// Clicking a row frames that step (`step_clicked` out-param, applied by
-/// the caller after the bottom panel finishes). The current step (from
-/// `[`/`]` navigation) is highlighted. Batch columns (Tokens, Ctx, Gen)
-/// show name-parsed composition when the trace's annotation carries it.
+/// the caller after the bottom panel finishes; the current step's
+/// highlighting lives in the ruler via `draw_ruler`). Batch columns
+/// (Tokens, Ctx, Gen) show name-parsed composition when the trace's
+/// annotation carries it.
 pub fn draw_steps_table(
     ui: &imgui::Ui,
     steps: &[StepInfo],
-    step_cursor: usize,
     buf: &mut DrawBuf,
     step_clicked: &mut Option<usize>,
 ) {

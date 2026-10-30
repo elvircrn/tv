@@ -657,38 +657,6 @@ impl Pane {
         }
     }
 
-    /// Exports this pane's GPU tracks (timings only, args stripped — see
-    /// `loader::export_gpu_only`) to a sibling "<name>-gpu-only/" folder next
-    /// to wherever the trace was actually opened from. `reload_paths` (set
-    /// by every native open path — `open`, `open_multi`, and CLI/drag-drop
-    /// in main.rs) always has at least one real file path even for a
-    /// multi-rank trace, unlike `trace_path`, which is a synthetic "N ranks:
-    /// ..." label in that case, not a real filesystem path.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn export_gpu_only(&self) -> Result<String, String> {
-        let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;
-        let sample_path = self.reload_paths.first().map(|(_, p)| p.as_str())
-            .ok_or_else(|| "no source file path available for this trace".to_string())?;
-        let base = std::path::Path::new(sample_path);
-        let parent = base.parent().unwrap_or_else(|| std::path::Path::new("."));
-
-        let stem = match &self.reload_dir {
-            Some(dir) => std::path::Path::new(dir).file_name()
-                .and_then(|s| s.to_str()).unwrap_or("trace").to_string(),
-            None => {
-                let s = base.file_stem().and_then(|s| s.to_str()).unwrap_or("trace");
-                // file_stem() on "trace.json.gz" only strips ".gz" -> "trace.json";
-                // peel one more layer so the export folder name reads cleanly.
-                s.strip_suffix(".json").or_else(|| s.strip_suffix(".tar")).unwrap_or(s).to_string()
-            }
-        };
-
-        let out_path = parent.join(format!("{stem}-gpu-only")).join("gpu-only.tvcache.xz");
-        let out_str = out_path.to_str().ok_or_else(|| "non-UTF-8 destination path".to_string())?;
-        crate::loader::export_gpu_only(trace, out_str)?;
-        Ok(out_path.to_string_lossy().into_owned())
-    }
-
     /// Sibling-folder naming shared by `export_gpu_only_web`/`export_full_web`:
     /// derived from the source path (or the merge directory's own name for a
     /// multi-rank trace, since `reload_paths` for those points at individual
@@ -711,11 +679,12 @@ impl Pane {
         Ok((parent, stem))
     }
 
-    /// Same as `export_gpu_only`, but via `loader::export_gpu_only_web`
-    /// (plain layout, gzip instead of xz) so the result can be uploaded
-    /// somewhere with permissive CORS and opened through the web build's
-    /// `?src=<url>` shareable-link loader, which has no LZMA decoder and
-    /// can't reverse `export_gpu_only`'s columnar/kernel-grouped encoding.
+    /// Exports this pane's GPU tracks (timings only, args stripped) via
+    /// `loader::export_gpu_only_web` (plain layout, gzip instead of xz) so
+    /// the result can be uploaded somewhere with permissive CORS and opened
+    /// through the web build's `?src=<url>` shareable-link loader, which has
+    /// no LZMA decoder and can't reverse the xz format's columnar/kernel-
+    /// grouped encoding.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn export_gpu_only_web(&self) -> Result<String, String> {
         let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;

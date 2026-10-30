@@ -1882,7 +1882,7 @@ impl App {
                                     write!(state.buf.fmt, ", {n_groups} DP groups (batch summed per group; hover cells for breakdown)").unwrap();
                                 }
                                 ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
-                                draw_steps_table(&ui, &pane.steps, pane.step_cursor, &mut state.buf, &mut step_clicked);
+                                draw_steps_table(&ui, &pane.steps, &mut state.buf, &mut step_clicked);
                             }
                         }
                     }
@@ -2347,6 +2347,9 @@ impl App {
             renderer.render(draw_data);
         }
         mark!("render", t_section);
+        // mark!'s trailing reassignment is dead on the final call — read
+        // t_section once so the macro can stay uniform across call sites.
+        let _ = t_section;
         let frame_ms = now.elapsed().as_secs_f64() * 1000.0;
         if frame_ms > 50.0 {
             eprintln!("\nSLOW FRAME: {:.0}ms", frame_ms);

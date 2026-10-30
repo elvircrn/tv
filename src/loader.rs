@@ -882,8 +882,8 @@ fn pad_to_8(w: &mut impl std::io::Write, written: usize) {
 const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
 /// Wraps the main `.tvcache`/`_merged.tvcache` cache format in zstd —
-/// unlike `export_gpu_only`'s xz (an occasional manual export), this needs
-/// to stay fast enough on *every* trace load/save to not be felt. Measured
+/// this needs to stay fast enough on *every* trace load/save to not be
+/// felt. Measured
 /// directly on a real 234MB (post synth-args-encoding) cache: level 3
 /// compresses in ~0.1s and decompresses in ~0.1s for a 9.4x further
 /// reduction (234MB -> 25MB) — see Cargo.toml's comment on this dependency
@@ -1022,9 +1022,9 @@ fn append_synth_python_args(out: &mut Vec<u8>, template: &[Vec<u8>; 4], id: i64,
 /// real 2.6M-event trace, "id predicted exactly" holds 99.9975% of the
 /// time and "ev - id" is a single constant for the *entire* trace, so the
 /// residual stream is almost all zeroes — trivially small even completely
-/// uncompressed, which this on-disk format always is (no xz here, unlike
-/// the `export_gpu_only` side of this codebase — see `save_cache`'s doc
-/// comment on why the main cache stays a flat mmap-able blob).
+/// uncompressed, which this on-disk format always is (no xz here — see
+/// `save_cache`'s doc comment on why the main cache stays a flat
+/// mmap-able blob).
 /// Builds the args buffer that actually gets written to disk (`new_args`)
 /// and per-track sentinel-flagged `Event` copies to write instead of
 /// `tracks[..].events` directly. Unlike a naive "add a trailing synth
@@ -1226,227 +1226,17 @@ fn expand_synth_python_args(d: &[u8], mut fpos: usize, base_args: &[u8], tracks:
     Some(buf)
 }
 
-/// Writes a GPU-only, xz-compressed ".tvcache.xz" containing just the GPU
-/// tracks' timing skeleton (ts/dur/name/cat/depth) with every event's args
-/// stripped (args_off/args_len zeroed) — the args blob is typically the
-/// bulk of a trace's size (kernel launch params etc.), and isn't "timing,"
-/// which is the whole point of this export. Also drops kernel stats and
-/// flow pairs (CPU<->GPU launch correlations, meaningless without the CPU
-/// side).
-///
-/// Compressed with xz specifically, not gzip: measured directly against a
-/// real 87MB args blob from a production trace, xz got ~265x vs gzip's
-/// ~65x — the repeated-schema, low-cardinality-field JSON these traces
-/// produce is exactly what LZMA's larger dictionary window is good at. A
-/// smarter kernel-aware template/dedup scheme was also measured (same
-/// data) and lost badly to plain xz (4.1x vs 272x on the same kernel's
-/// launches) — xz's entropy coding already captures both the fully-
-/// constant fields and the few-distinct-values-repeated-thousands-of-times
-/// fields far better than a naive text-based template split can.
-///
-/// The whole binary blob is built in memory first, then compressed as one
-/// unit — deliberately NOT the streaming mmap-based approach the main
-/// cache (`save_cache`/`load_cache_from_mmap`) uses for near-instant
-/// reloads: compressed bytes can't be randomly accessed/zero-copy-mapped,
-/// so reading this back (`load_cache_xz`) always fully decompresses into
-/// a heap buffer first. Fine for an occasional manual export/re-import,
-/// wrong for the automatic reload-on-every-open path, which is why only
-/// this export uses it and the main cache format is untouched.
-///
-/// Deliberately a standalone writer rather than sharing `save_cache`'s
-/// body: that function silently swallows I/O errors (`.ok()`) since it's a
-/// best-effort background cache, whereas this is a user-initiated export
-/// that should surface a real error if it fails.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn export_gpu_only(trace: &Trace, dest_path: &str) -> Result<(), String> {
-    let gpu_tracks: Vec<Track> = trace.tracks.iter()
-        .filter(|t| t.gpu)
-        .map(|t| Track {
-            label: t.label.clone(),
-            gpu: true,
-            events: t.events.iter().map(|e| Event { args_off: 0, args_len: 0, ..*e }).collect(),
-            max_depth: t.max_depth,
-            prefix_max_dur: t.prefix_max_dur.clone(),
-            raw_buf_idx: 0,
-        })
-        .collect();
-    if gpu_tracks.is_empty() {
-        return Err("this trace has no GPU tracks".to_string());
-    }
-
-    let total_events: u64 = gpu_tracks.iter().map(|t| t.events.len() as u64).sum();
-    let (mut min_ts, mut max_ts) = (f64::MAX, f64::MIN);
-    for t in &gpu_tracks {
-        for e in &t.events {
-            min_ts = min_ts.min(e.ts);
-            max_ts = max_ts.max(e.ts + e.dur);
-        }
-    }
-
-    let dest = std::path::Path::new(dest_path);
-    let dir = dest.parent().ok_or_else(|| "invalid destination path".to_string())?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("create dir: {e}"))?;
-    let io_err = |e: std::io::Error| e.to_string();
-    let mut w: Vec<u8> = Vec::new();
-
-    w.write_all(CACHE_MAGIC).map_err(io_err)?;
-    write_u32(&mut w, CACHE_VERSION);
-    write_u64(&mut w, 0); // no live source file to validate freshness against
-    write_u64(&mut w, 0);
-    write_f64(&mut w, max_ts);
-    write_f64(&mut w, min_ts);
-    write_u64(&mut w, total_events);
-    write_u32(&mut w, gpu_tracks.len() as u32);
-    write_u32(&mut w, trace.names.len() as u32);
-    write_u32(&mut w, trace.cats.len() as u32);
-    write_u32(&mut w, 0); // no kernel stats in a timing-only export
-    write_u32(&mut w, trace.device.len() as u32);
-    write_u64(&mut w, 0); // no args buffer
-    write_u32(&mut w, 0); // padding to 80
-
-    let mut written = 80usize;
-    write_strings(&mut w, &trace.names);
-    written += trace.names.iter().map(|s| 4 + s.len()).sum::<usize>();
-    write_strings(&mut w, &trace.cats);
-    written += trace.cats.iter().map(|s| 4 + s.len()).sum::<usize>();
-    write_u32(&mut w, trace.device.len() as u32);
-    w.write_all(trace.device.as_bytes()).map_err(io_err)?;
-    written += 4 + trace.device.len();
-
-    for t in &gpu_tracks {
-        let label = t.label.as_bytes();
-        let mut hdr = [0u8; 13];
-        hdr[0..2].copy_from_slice(&(label.len() as u16).to_le_bytes());
-        hdr[2] = 1; // gpu
-        hdr[3..5].copy_from_slice(&t.max_depth.to_le_bytes());
-        hdr[5..13].copy_from_slice(&(t.events.len() as u64).to_le_bytes());
-        w.write_all(&hdr).map_err(io_err)?;
-        w.write_all(label).map_err(io_err)?;
-        written += 13 + label.len();
-    }
-
-    pad_to_8(&mut w, written);
-
-    // Slim columnar (SoA) event encoding instead of the interleaved 32-byte
-    // AoS struct: each field gets its own contiguous run (ts delta-encoded
-    // per track, from 0), and args_off/args_len are dropped from disk
-    // entirely rather than merely zeroed. Measured on a real export: ~28%
-    // smaller after xz than writing standard AoS `Event` bytes directly —
-    // grouping same-typed, row-correlated values together (especially the
-    // per-track-monotonic timestamp deltas) gives LZMA far more exploitable
-    // redundancy than the interleaved layout does. `expand_gpu_export` (in
-    // `load_cache_xz`) reverses this back into standard AoS bytes before
-    // handing them to `load_cache_from_bytes`, so no other reader needs to
-    // understand this encoding.
-    //
-    // Timestamps and durations are additionally stored at their real
-    // precision instead of full f64: measured directly against a real
-    // 114K-event export, every delta-ts was an exact multiple of 1/2048ms
-    // (the trace's actual clock tick) and every duration an exact multiple
-    // of 1us. Storing them as u32 instead of f64 cuts these two fields —
-    // ~94% of the compressed export — by a further ~13%.
-    //
-    // ts uses a plain u32 tick count: 2048 is a power of two, so
-    // `ticks as f64 / 2048.0` reconstructs the *exact* original f64 bits
-    // (binary division by a power of two is exact), with zero precision
-    // loss. dur uses integer microseconds byte-plane-split (all low bytes,
-    // then all 2nd bytes, ...) instead of interleaved u32: most durations
-    // are under 65536us, so the top two planes are almost entirely zero
-    // and compress away for nearly free (measured ~26% smaller than plain
-    // interleaved u32; plane-splitting ts made it *worse* since tick values
-    // span a much wider range with no reliably-zero byte). Unlike ts, dur's
-    // reconstruction (`us as f64 / 1000.0`) is not a bit-exact round trip —
-    // division by a non-power-of-two can differ from the original stored
-    // double by 1 ULP (~1e-9 relative) — inconsequential at microsecond
-    // magnitude but real, so a re-imported dur may not be `==` the source.
-    //
-    // ts and dur are additionally stored in kernel-grouped order rather
-    // than chronological per-track order: same kernel + same problem size
-    // means near-identical (often exactly identical) durations and similar
-    // inter-launch gaps, so grouping same-`name` events adjacent lets LZMA
-    // find far longer matching runs (measured on a real export: ~14%
-    // smaller combined). This costs nothing extra to store — the grouping
-    // permutation is a stable sort by `name`, and `name` is itself stored
-    // below in original chronological order, so `expand_gpu_export`
-    // re-derives the identical permutation from it and scatters ts/dur
-    // back to their original positions. `name`/`cat`/`depth` stay in
-    // chronological order (already near-free to compress; permuting them
-    // too would only cost decode-time complexity for no size benefit).
-    let ts_ticks: Vec<u32> = gpu_tracks.iter().flat_map(|t| {
-        let mut prev = 0.0f64;
-        t.events.iter().map(move |e| {
-            let ticks = ((e.ts - prev) * 2048.0).round() as u32;
-            prev = e.ts;
-            ticks
-        })
-    }).collect();
-    let dur_us: Vec<u32> = gpu_tracks.iter()
-        .flat_map(|t| t.events.iter().map(|e| (e.dur * 1000.0).round() as u32))
-        .collect();
-    let names_flat: Vec<u32> = gpu_tracks.iter()
-        .flat_map(|t| t.events.iter().map(|e| e.name))
-        .collect();
-
-    let mut perm: Vec<u32> = (0..total_events as u32).collect();
-    perm.sort_by_key(|&i| names_flat[i as usize]);
-
-    for &i in &perm {
-        write_u32(&mut w, ts_ticks[i as usize]);
-    }
-    let dur_grouped: Vec<u32> = perm.iter().map(|&i| dur_us[i as usize]).collect();
-    for shift in [0u32, 8, 16, 24] {
-        for v in &dur_grouped {
-            w.write_all(&[((v >> shift) & 0xFF) as u8]).map_err(io_err)?;
-        }
-    }
-    for &name in &names_flat {
-        write_u32(&mut w, name);
-    }
-    for t in &gpu_tracks {
-        for e in &t.events { write_u32(&mut w, e.cat); }
-    }
-    for t in &gpu_tracks {
-        for e in &t.events { w.write_all(&e.depth.to_le_bytes()).map_err(io_err)?; }
-    }
-    for t in &gpu_tracks {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                t.prefix_max_dur.as_ptr() as *const u8,
-                t.prefix_max_dur.len() * 8,
-            )
-        };
-        w.write_all(bytes).map_err(io_err)?;
-    }
-    // No stats bytes (count written as 0 above) and no args buffer (len 0).
-    write_u32(&mut w, 0); // no flow pairs — CPU<->GPU correlations don't apply here
-
-    write_u32(&mut w, trace.vllm_version.len() as u32);
-    w.write_all(trace.vllm_version.as_bytes()).map_err(io_err)?;
-    write_u32(&mut w, trace.dist_rank as u32);
-    write_u32(&mut w, trace.dist_world as u32);
-    write_rank_paths_trailer(&mut w, &trace.rank_paths);
-
-    let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 9);
-    encoder.write_all(&w).map_err(io_err)?;
-    let compressed = encoder.finish().map_err(io_err)?;
-
-    let tmp = format!("{dest_path}.tmp");
-    std::fs::write(&tmp, &compressed).map_err(|e| format!("write: {e}"))?;
-    std::fs::rename(&tmp, dest).map_err(|e| format!("rename: {e}"))?;
-    Ok(())
-}
-
-/// Same GPU-only, args-stripped filtering as `export_gpu_only`, but written
-/// in the plain interleaved-AoS layout `load_cache_from_bytes` already
-/// understands natively, then gzip- (not xz-) compressed, as `.tvcache.gz`.
-/// Exists solely for sharing: the wasm build's `?src=<url>` loader has no
-/// LZMA decoder and can't reverse `export_gpu_only`'s columnar/kernel-
-/// grouped encoding, so a `.tvcache.xz` export can't be opened over the
-/// web. gzip (`flate2`) and this plain layout both already work unchanged
-/// on both platforms, at the cost of a several-times-larger file than
-/// `export_gpu_only` produces (no columnar/precision/grouping tricks, and
-/// gzip's smaller window loses to xz) — the right tradeoff for a one-off
-/// shared link over a local re-import.
+/// GPU-only, args-stripped export written in the plain interleaved-AoS
+/// layout `load_cache_from_bytes` already understands natively, then
+/// gzip- (not xz-) compressed, as `.tvcache.gz`. Exists solely for
+/// sharing: the wasm build's `?src=<url>` loader has no LZMA decoder and
+/// can't reverse the columnar/kernel-grouped `.tvcache.xz` encoding (see
+/// `load_cache_xz`), so a `.tvcache.xz` file can't be opened over the web.
+/// gzip (`flate2`) and this plain layout both already work unchanged on
+/// both platforms, at the cost of a several-times-larger file than the xz
+/// format (no columnar/precision/grouping tricks, and gzip's smaller
+/// window loses to xz) — the right tradeoff for a one-off shared link
+/// over a local re-import.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn export_gpu_only_web(trace: &Trace, dest_path: &str) -> Result<(), String> {
     let gpu_tracks: Vec<Track> = trace.tracks.iter()
@@ -1567,7 +1357,7 @@ pub fn export_gpu_only_web(trace: &Trace, dest_path: &str) -> Result<(), String>
 /// no new wasm-side support: `load_trace_from_bytes_progressive`'s
 /// `.tvcache` branch already knows how to decompress it via `ruzstd`.
 /// `source_size`/`source_mtime` are written as 0 (there's no live source
-/// file to freshness-check an export against, same as `export_gpu_only`).
+/// file to freshness-check an export against, same as the other exports).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn export_full_web(trace: &Trace, dest_path: &str) -> Result<(), String> {
     let dest = std::path::Path::new(dest_path);
@@ -2112,12 +1902,12 @@ fn load_cache_direct(cache_path: &str) -> Result<Trace, String> {
 #[cfg(target_arch = "wasm32")]
 fn load_cache_direct(_cache_path: &str) -> Result<Trace, String> { Err("not supported on web".to_string()) }
 
-/// Reverses `export_gpu_only`'s slim-SoA + per-track delta-encoded-timestamp
-/// event encoding back into the standard AoS `Event` layout that
+/// Reverses the `.tvcache.xz` export's slim-SoA + per-track delta-encoded-
+/// timestamp event encoding back into the standard AoS `Event` layout that
 /// `load_cache_from_bytes` expects. Re-derives track boundaries from the
 /// (unchanged) header/track-header section, then rebuilds a full
 /// 32-byte-per-event array (args_off/args_len reconstituted as 0, matching
-/// what `export_gpu_only` zeroed before ever writing them). Returns `None`
+/// what the export zeroed before ever writing them). Returns `None`
 /// on any malformed input, matching `load_cache_from_bytes`'s own
 /// bounds-checked style.
 #[cfg(not(target_arch = "wasm32"))]
@@ -2168,7 +1958,7 @@ fn expand_gpu_export(d: &[u8]) -> Option<Vec<u8>> {
     let mut events_start = header_end;
     if events_start % 8 != 0 { events_start += 8 - events_start % 8; }
 
-    // Mirrors export_gpu_only's layout: ts as plain u32 ticks of 1/2048ms,
+    // Mirrors the .tvcache.xz writer's layout: ts as plain u32 ticks of 1/2048ms,
     // dur as u32 microseconds byte-plane-split (4 separate n-byte runs,
     // least-significant plane first) — both stored in kernel-grouped
     // (stable-sorted-by-name) order rather than chronological order. Read
@@ -2232,7 +2022,7 @@ fn expand_gpu_export(d: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Reads an xz-compressed export (see `export_gpu_only`) — always a full
+/// Reads an xz-compressed `.tvcache.xz` export — always a full
 /// decompress into memory first, unlike `load_cache_direct`'s mmap-based
 /// zero-copy path, since compressed bytes can't be randomly accessed.
 #[cfg(not(target_arch = "wasm32"))]

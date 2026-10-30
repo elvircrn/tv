@@ -3666,7 +3666,7 @@ fn test_steps_table_real_trace() {
             .size([1600.0, 200.0], imgui::Condition::Always)
             .build(|| {
                 let mut clicked: Option<usize> = None;
-                draw_steps_table(&ui, &steps, 0, &mut buf, &mut clicked);
+                draw_steps_table(&ui, &steps, &mut buf, &mut clicked);
                 step_clicked = clicked;
             });
         imgui.render();
