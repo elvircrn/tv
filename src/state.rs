@@ -335,6 +335,15 @@ fn union_len(spans: &mut [(f64, f64)]) -> f64 {
 /// on one rank while another works still counts; unlabeled tracks (a
 /// single-rank trace) share one scope.
 ///
+/// "CPU busy" counts only cats kineto instruments as executed host work:
+/// `cpu_op` (aten ops) plus the CUDA API cats (`runtime`/`cuda_runtime`,
+/// `cuda_driver`). `python_function` and `user_annotation` spans are stack
+/// extent, not work — a thread parked in `queue.get` for 7 seconds holds an
+/// open python frame the whole time, and counting that as busy would label
+/// every starved gap "host-bound" (found on a real with_stack trace). Those
+/// cats still show in the timeline itself for context; they just don't
+/// feed the fractions or the top-ops list.
+///
 /// Pure function of the `Trace` so it's unit-testable and recomputable
 /// after clock sync / reload shifts timestamps.
 pub(crate) fn compute_gaps(trace: &Trace) -> Vec<GapInfo> {
@@ -348,7 +357,15 @@ pub(crate) fn compute_gaps(trace: &Trace) -> Vec<GapInfo> {
         }
     }
     if !any_work { return Vec::new(); }
-    let runtime_cat = trace.cats.iter().position(|c| c.as_str() == "runtime").map(|i| i as u32);
+    // Host-work cats for the CPU annotation (see the doc above): what the
+    // thread actually executed, vs. the stack extent python/annotation
+    // frames describe. `cuda_runtime` is the cat name real kineto traces
+    // carry ("runtime" is the older spelling; driver-level calls belong to
+    // the same launch path).
+    let is_cpu_work = |c: &str| {
+        c == "cpu_op" || c == "runtime" || c == "cuda_runtime" || c == "cuda_driver"
+    };
+    let is_runtime = |c: &str| c == "runtime" || c == "cuda_runtime" || c == "cuda_driver";
 
     // Per-scope busy intervals from GPU tracks, plus one focus track and the
     // CPU track list per scope for the annotation pass.
@@ -409,12 +426,17 @@ pub(crate) fn compute_gaps(trace: &Trace) -> Vec<GapInfo> {
             let start = bisect_overlap(&track.events, &track.prefix_max_dur, g0);
             let end = track.events.partition_point(|e| e.ts <= g1);
             for ev in &track.events[start..end] {
+                // Only executed host work (cpu_op / CUDA API) — python and
+                // annotation frames describe where the stack was parked, not
+                // that the thread was running (see the fn doc).
+                let cat = trace.cats[ev.cat as usize].as_str();
+                if !is_cpu_work(cat) { continue; }
                 // Clip to the gap; skip events that only touch its edges.
                 let s = ev.ts.max(g0);
                 let e = (ev.ts + ev.dur).min(g1);
                 if e <= s { continue; }
                 any.push((s, e));
-                if Some(ev.cat) == runtime_cat { runtime.push((s, e)); }
+                if is_runtime(cat) { runtime.push((s, e)); }
                 let en = per_name.entry(ev.name).or_insert((0, Vec::new()));
                 en.0 += 1;
                 en.1.push((s, e));

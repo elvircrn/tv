@@ -5047,6 +5047,66 @@ fn gaps_cpu_present_but_idle() {
 }
 
 #[test]
+fn gaps_python_frames_are_not_cpu_busy() {
+    // Real with_stack traces hold python_function / user_annotation frames
+    // open while a thread is PARKED (queue.get, lock.acquire) — they record
+    // stack extent, not executed work. Counting them as busy made every
+    // starved gap read "host-bound" on such traces (cpu_busy 1.000 from a
+    // thread blocked for seconds inside one open frame). Only executed
+    // host work (cpu_op / CUDA API cats) feeds the fractions and cpu_top.
+    let trace = gaps_trace(
+        vec![
+            ("stream 7", true, vec![
+                evc(0.0, 10.0, 0, 0),
+                evc(30.0, 10.0, 1, 0),
+            ]),
+            ("cpu", false, vec![
+                evc(5.0, 27.0, 2, 1),   // python wrapper [5,32] spans the gap
+                evc(12.0, 4.0, 3, 2),   // user annotation [12,16], same story
+            ]),
+        ],
+        &["kernel", "python_function", "user_annotation"],
+    );
+    let gaps = compute_gaps(&trace);
+    assert_eq!(gaps.len(), 1);
+    let g = &gaps[0];
+    assert!(g.has_cpu);
+    assert_eq!(g.cpu_busy_frac, 0.0);
+    assert_eq!(g.runtime_frac, 0.0);
+    assert!(g.cpu_top.is_empty());
+    assert_eq!(gap_why(g).0, "CPU idle (starved)");
+}
+
+#[test]
+fn gaps_cuda_runtime_cat_aliases() {
+    // Real kineto traces carry the CUDA API cats as `cuda_runtime` and
+    // `cuda_driver`, not the older `runtime` spelling — launch and sync
+    // calls must still count toward runtime_frac (and busy), or every gap
+    // reads as zero runtime and the launch-bound case disappears.
+    let trace = gaps_trace(
+        vec![
+            ("stream 7", true, vec![
+                evc(0.0, 10.0, 0, 0),
+                evc(30.0, 10.0, 1, 0),
+            ]),
+            ("cpu", false, vec![
+                evc(10.0, 8.0, 4, 1),   // cuda_runtime launch [10,18]
+                evc(20.0, 6.0, 5, 2),   // cuda_driver sync [20,26]
+            ]),
+        ],
+        &["kernel", "cuda_runtime", "cuda_driver"],
+    );
+    let gaps = compute_gaps(&trace);
+    assert_eq!(gaps.len(), 1);
+    let g = &gaps[0];
+    // Gap [10,30]: 8µs launch + 6µs sync = 14/20 busy, all of it runtime.
+    assert!((g.cpu_busy_frac - 0.7).abs() < 1e-12);
+    assert!((g.runtime_frac - 0.7).abs() < 1e-12);
+    assert_eq!(g.cpu_top.len(), 2);
+    assert_eq!(gap_why(g).0, "runtime-bound");
+}
+
+#[test]
 fn gaps_top_n_truncation() {
     // 600 gaps of strictly increasing length: only GAP_TOP_N survive, and
     // they must be the biggest ones, biggest first.
