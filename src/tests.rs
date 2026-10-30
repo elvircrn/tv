@@ -1,7 +1,12 @@
 use super::*;
 use crate::parse::*;
 use crate::loader::{load_trace, detect_rank_groups, merge_traces, resolve_tool_in};
-use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps, compute_gaps, compute_gaps_in, selection_gpu_summary, Pane};
+use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps, compute_gaps_in, selection_gpu_summary, Pane};
+/// Test-local shorthand for the unfiltered sweep (production code always
+/// goes through compute_gaps_in with a real GapFilter).
+fn compute_gaps(trace: &Trace) -> Vec<GapInfo> {
+    compute_gaps_in(trace, GapFilter::default())
+}
 use crate::ui::{heat_color, heat_dim, gap_why};
 use imgui::ImColor32;
 use std::sync::atomic::AtomicUsize;
@@ -5197,7 +5202,7 @@ fn selection_gpu_summary_measures_idle_between_kernels() {
     );
     let events: std::collections::HashSet<(u32, u32)> =
         [(0, 0), (0, 1), (1, 0), (2, 0)].into_iter().collect();
-    let summary = selection_gpu_summary(&trace, &events, [0.0, 0.0, 100.0, 0.0]);
+    let summary = selection_gpu_summary(&trace, &events, [0.0, 100.0, 0.0, 0.0]);
     // Unlabeled streams share the single-rank scope: one entry.
     assert_eq!(summary.len(), 1);
     let g = &summary[0];
@@ -5221,7 +5226,7 @@ fn selection_gpu_summary_clips_to_selection_edges() {
     );
     let events: std::collections::HashSet<(u32, u32)> =
         [(0, 0), (0, 1)].into_iter().collect();
-    let summary = selection_gpu_summary(&trace, &events, [10.0, 0.0, 100.0, 0.0]);
+    let summary = selection_gpu_summary(&trace, &events, [10.0, 100.0, 0.0, 0.0]);
     assert_eq!(summary.len(), 1);
     let g = &summary[0];
     assert_eq!(g.t0, 10.0);
@@ -5241,9 +5246,9 @@ fn selection_gpu_summary_requires_gpu_work() {
         &["kernel", "cpu_op", "gpu_user_annotation"],
     );
     let all: std::collections::HashSet<(u32, u32)> = [(0, 0), (1, 0)].into_iter().collect();
-    assert!(selection_gpu_summary(&trace, &all, [0.0, 0.0, 100.0, 0.0]).is_empty());
+    assert!(selection_gpu_summary(&trace, &all, [0.0, 100.0, 0.0, 0.0]).is_empty());
     let cpu_only: std::collections::HashSet<(u32, u32)> = [(0, 0)].into_iter().collect();
-    assert!(selection_gpu_summary(&trace, &cpu_only, [0.0, 0.0, 100.0, 0.0]).is_empty());
+    assert!(selection_gpu_summary(&trace, &cpu_only, [0.0, 100.0, 0.0, 0.0]).is_empty());
 }
 
 #[test]
@@ -5261,7 +5266,7 @@ fn selection_gpu_summary_is_per_rank() {
     );
     let events: std::collections::HashSet<(u32, u32)> =
         [(0, 0), (0, 1), (1, 0)].into_iter().collect();
-    let summary = selection_gpu_summary(&trace, &events, [0.0, 0.0, 100.0, 0.0]);
+    let summary = selection_gpu_summary(&trace, &events, [0.0, 100.0, 0.0, 0.0]);
     assert_eq!(summary.len(), 2);
     assert_eq!(summary[0].rank, Some(0));
     assert!((summary[0].t1 - summary[0].t0 - summary[0].busy - 30.0).abs() < 1e-12);

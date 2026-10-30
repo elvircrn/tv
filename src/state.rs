@@ -359,10 +359,6 @@ pub(crate) fn is_gpu_work_cat(c: &str) -> bool {
 /// `compute_gaps_in` additionally applies a `GapFilter`: window clip and
 /// max length, both BEFORE the top-N cut, so profiler-artifact gaps don't
 /// consume list slots (see `GapFilter`'s doc).
-pub(crate) fn compute_gaps(trace: &Trace) -> Vec<GapInfo> {
-    compute_gaps_in(trace, GapFilter::default())
-}
-
 pub(crate) fn compute_gaps_in(trace: &Trace, f: GapFilter) -> Vec<GapInfo> {
     let mut is_work = vec![false; trace.cats.len()];
     let mut any_work = false;
@@ -506,7 +502,11 @@ pub(crate) fn selection_gpu_summary(
     events: &std::collections::HashSet<(u32, u32)>,
     sel: [f64; 4],
 ) -> Vec<SelGpuSummary> {
-    let (s0, s1) = if sel[0] <= sel[2] { (sel[0], sel[2]) } else { (sel[2], sel[0]) };
+    // Rect layout is [t_a, t_b, y_a, y_b] (see where the drag builds it in
+    // draw_timeline) — same normalization capture_sel_events applies. Reading
+    // t_b from index 2 instead mixed a y pixel into the time window and
+    // clipped away every selected event (the summary never fired).
+    let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
     let mut per_rank: Vec<(Option<usize>, Vec<(f64, f64)>)> = Vec::new();
     for &(ti, ei) in events {
         let track = &trace.tracks[ti as usize];

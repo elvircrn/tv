@@ -1869,22 +1869,44 @@ impl App {
                                     write!(state.buf.fmt, " ({:.0}%)", pct).unwrap();
                                 }
                                 ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
+                                // Several ranks: a compact aligned table beats
+                                // a wrapped comma list (unreadable past a
+                                // handful of ranks). Auto-height, no scroll —
+                                // rank counts are world-size small.
                                 if pane.sel_gpu.len() > 1 {
-                                    state.buf.fmt.clear();
-                                    write!(state.buf.fmt, "GPU idle per rank: ").unwrap();
-                                    for (i, g) in pane.sel_gpu.iter().enumerate() {
-                                        if i > 0 { state.buf.fmt.push_str(", "); }
-                                        let span = g.t1 - g.t0;
-                                        let idle = span - g.busy;
-                                        let pct = if span > 0.0 { idle / span * 100.0 } else { 0.0 };
-                                        write!(state.buf.fmt, "rank {}: ", g.rank.unwrap_or(0)).unwrap();
-                                        write_time(&mut state.buf.fmt, idle);
-                                        write!(state.buf.fmt, " of ").unwrap();
-                                        write_time(&mut state.buf.fmt, span);
-                                        write!(state.buf.fmt, " ({:.0}%)", pct).unwrap();
+                                    use imgui::{TableColumnSetup, TableFlags};
+                                    const GH: [&str; 4] = ["Rank", "GPU idle", "Span", "Idle %"];
+                                    let cols: [TableColumnSetup<&str>; 4] =
+                                        std::array::from_fn(|i| TableColumnSetup::new(GH[i]));
+                                    let flags = TableFlags::ROW_BG
+                                        | TableFlags::BORDERS_INNER_V
+                                        | TableFlags::SIZING_FIXED_FIT
+                                        | TableFlags::NO_SAVED_SETTINGS;
+                                    if let Some(_t) = ui.begin_table_header_with_sizing(
+                                        "##selgpu", cols, flags, [0.0, 0.0], 0.0,
+                                    ) {
+                                        for g in &pane.sel_gpu {
+                                            let span = g.t1 - g.t0;
+                                            let idle = span - g.busy;
+                                            let pct = if span > 0.0 { idle / span * 100.0 } else { 0.0 };
+                                            ui.table_next_row();
+                                            ui.table_set_column_index(0);
+                                            match g.rank {
+                                                Some(r) => ui.text(format!("rank {r}")),
+                                                None => ui.text("trace"),
+                                            }
+                                            ui.table_set_column_index(1);
+                                            state.buf.fmt.clear();
+                                            write_time(&mut state.buf.fmt, idle);
+                                            ui.text(&state.buf.fmt);
+                                            ui.table_set_column_index(2);
+                                            state.buf.fmt.clear();
+                                            write_time(&mut state.buf.fmt, span);
+                                            ui.text(&state.buf.fmt);
+                                            ui.table_set_column_index(3);
+                                            ui.text(format!("{pct:.0}%"));
+                                        }
                                     }
-                                    let _c = ui.push_style_color(StyleColor::Text, [0.6, 0.6, 0.6, 1.0]);
-                                    ui.text_wrapped(&state.buf.fmt);
                                 }
                                 // Fine-grained timing (separate from the coarse "bottom"
                                 // mark! bucket) so a slow Selection tab shows exactly
