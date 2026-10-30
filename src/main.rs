@@ -1935,11 +1935,11 @@ impl App {
                                 // Filter row: real traces carry seconds-long
                                 // profiler-artifact gaps that fill the whole
                                 // top-N list. Zoom into the known-good region
-                                // and press "Use view" to restrict detection
-                                // to it; "Max" (ms, 0 = unlimited) cuts
-                                // artifact-sized gaps inside the range too.
-                                // Either changing invalidates the cached gaps
-                                // and the row focus so they re-detect.
+                                // and press "Limit to view" to restrict
+                                // detection to it; "Max" (ms, 0 = unlimited)
+                                // cuts artifact-sized gaps inside the range
+                                // too. Either changing invalidates the cached
+                                // gaps and the row focus so they re-detect.
                                 let view_range = (pane.view.t0, pane.view.t1);
                                 let mut filter_changed = false;
                                 ui.text("Range:");
@@ -1955,9 +1955,13 @@ impl App {
                                 }
                                 ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
                                 ui.same_line();
-                                if ui.button("Use view") {
+                                if ui.button("Limit to view") {
                                     pane.gap_filter.window = Some(view_range);
                                     filter_changed = true;
+                                }
+                                if ui.is_item_hovered() {
+                                    ui.tooltip_text(
+                                        "Only look for gaps inside the time range currently visible in the timeline. Zoom into the good region first.");
                                 }
                                 if pane.gap_filter.window.is_some() {
                                     ui.same_line();
