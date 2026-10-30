@@ -346,7 +346,15 @@ fn union_len(spans: &mut [(f64, f64)]) -> f64 {
 ///
 /// Pure function of the `Trace` so it's unit-testable and recomputable
 /// after clock sync / reload shifts timestamps.
+///
+/// `compute_gaps_in` additionally applies a `GapFilter`: window clip and
+/// max length, both BEFORE the top-N cut, so profiler-artifact gaps don't
+/// consume list slots (see `GapFilter`'s doc).
 pub(crate) fn compute_gaps(trace: &Trace) -> Vec<GapInfo> {
+    compute_gaps_in(trace, GapFilter::default())
+}
+
+pub(crate) fn compute_gaps_in(trace: &Trace, f: GapFilter) -> Vec<GapInfo> {
     let mut is_work = vec![false; trace.cats.len()];
     let mut any_work = false;
     for (i, c) in trace.cats.iter().enumerate() {
@@ -409,6 +417,19 @@ pub(crate) fn compute_gaps(trace: &Trace) -> Vec<GapInfo> {
                 raw.push((scope, w[0].1, w[1].0, Some(w[0].3), Some(w[1].2), ft));
             }
         }
+    }
+    // User filter before the sort/top-N cut: clip each gap to the window,
+    // then drop edge-clipped shavings and anything over the max length, so
+    // artifact-sized gaps never take list slots from real bubbles.
+    if f.window.is_some() || f.max_len.is_some() {
+        raw.retain_mut(|g| {
+            if let Some((w0, w1)) = f.window {
+                g.1 = g.1.max(w0);
+                g.2 = g.2.min(w1);
+            }
+            let len = g.2 - g.1;
+            len >= crate::types::MIN_GAP_US && f.max_len.map_or(true, |m| len <= m)
+        });
     }
     raw.sort_unstable_by(|a, b| (b.2 - b.1).partial_cmp(&(a.2 - a.1)).unwrap());
     raw.truncate(crate::types::GAP_TOP_N);
@@ -618,6 +639,11 @@ pub struct Pane {
     /// drawn as a red band on the timeline/ruler. Index into `gaps`, cleared
     /// wherever `gaps` is invalidated (the indices go stale with it).
     pub focused_gap: Option<usize>,
+    /// Gaps-tab detection filter (window + max length; see `GapFilter`).
+    /// Changing it in the UI clears `gaps`/`focused_gap` to force a
+    /// recompute. The window is timestamp-based, so it's also cleared on
+    /// reload and clock sync like `gaps` itself; `max_len` survives those.
+    pub gap_filter: GapFilter,
     pub pending_tab: Option<BottomTab>,
     /// Track index whose row draw_timeline should scroll into view as part of an
     /// in-flight search zoom. Consumed (cleared) on the next timeline draw.
@@ -757,6 +783,7 @@ impl Pane {
             step_cursor: 0,
             gaps: None,
             focused_gap: None,
+            gap_filter: GapFilter::default(),
             pending_tab: Some(BottomTab::Detail),
             pending_focus: None,
             sort_col: 2,
@@ -927,6 +954,8 @@ impl Pane {
             // Shifted timestamps move every gap boundary.
             self.gaps = None;
             self.focused_gap = None;
+            // The filter window was picked in pre-shift timestamps.
+            self.gap_filter.window = None;
         }
         result
     }
@@ -1237,6 +1266,8 @@ impl Pane {
                 self.heat_bounds = None;
                 self.gaps = None;
                 self.focused_gap = None;
+                // New trace, new timestamps: the filter window is stale.
+                self.gap_filter.window = None;
                 if is_reload {
                     let n_tracks = trace.tracks.len();
                     let n_names = trace.names.len();
@@ -1614,7 +1645,7 @@ impl Pane {
     pub fn ensure_gaps(&mut self) {
         if self.gaps.is_some() { return; }
         self.gaps = Some(match &self.trace {
-            Some(t) => compute_gaps(t),
+            Some(t) => compute_gaps_in(t, self.gap_filter),
             None => Vec::new(),
         });
     }

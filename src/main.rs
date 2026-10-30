@@ -1932,6 +1932,62 @@ impl App {
                                 imgui::TabItemFlags::SET_SELECTED
                             } else { imgui::TabItemFlags::empty() };
                             if let Some(_t) = imgui::TabItem::new("Gaps").flags(gaps_flags).begin(&ui) {
+                                // Filter row: real traces carry seconds-long
+                                // profiler-artifact gaps that fill the whole
+                                // top-N list. Zoom into the known-good region
+                                // and press "Use view" to restrict detection
+                                // to it; "Max" (ms, 0 = unlimited) cuts
+                                // artifact-sized gaps inside the range too.
+                                // Either changing invalidates the cached gaps
+                                // and the row focus so they re-detect.
+                                let view_range = (pane.view.t0, pane.view.t1);
+                                let mut filter_changed = false;
+                                ui.text("Range:");
+                                ui.same_line();
+                                state.buf.fmt.clear();
+                                match pane.gap_filter.window {
+                                    Some((w0, w1)) => {
+                                        write_time(&mut state.buf.fmt, w0);
+                                        state.buf.fmt.push_str(" \u{2013} ");
+                                        write_time(&mut state.buf.fmt, w1);
+                                    }
+                                    None => state.buf.fmt.push_str("whole trace"),
+                                }
+                                ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
+                                ui.same_line();
+                                if ui.button("Use view") {
+                                    pane.gap_filter.window = Some(view_range);
+                                    filter_changed = true;
+                                }
+                                if pane.gap_filter.window.is_some() {
+                                    ui.same_line();
+                                    if ui.button("Clear") {
+                                        pane.gap_filter.window = None;
+                                        filter_changed = true;
+                                    }
+                                }
+                                ui.same_line();
+                                ui.text("Max (ms):");
+                                ui.same_line();
+                                let mut max_ms = pane.gap_filter.max_len
+                                    .map(|m| (m / 1000.0) as f32).unwrap_or(0.0);
+                                let _w = ui.push_item_width(80.0);
+                                if ui.input_float("##gapmax", &mut max_ms)
+                                    .step(10.0).build()
+                                {
+                                    pane.gap_filter.max_len = if max_ms > 0.0 {
+                                        Some(max_ms as f64 * 1000.0)
+                                    } else { None };
+                                    filter_changed = true;
+                                }
+                                drop(_w);
+                                if ui.is_item_hovered() {
+                                    ui.tooltip_text("Ignore gaps longer than this (0 = unlimited)");
+                                }
+                                if filter_changed {
+                                    pane.gaps = None;
+                                    pane.focused_gap = None;
+                                }
                                 pane.ensure_gaps();
                                 let gaps = pane.gaps.as_deref().unwrap_or(&[]);
                                 state.buf.fmt.clear();

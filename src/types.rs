@@ -456,6 +456,23 @@ pub struct GapInfo {
     pub focus_track: u32,
 }
 
+/// Gaps-tab detection filter (per pane): real traces often carry
+/// seconds-long idle spans that are profiler artifacts (ramp-up, ranks
+/// parked for the whole capture), which would otherwise fill the entire
+/// top-N list. Both fields are applied in `compute_gaps_in` BEFORE the
+/// top-N cut, so filtered-out artifacts don't consume list slots.
+#[derive(Clone, Copy, PartialEq, Default)]
+pub struct GapFilter {
+    /// Restrict detection to [t0, t1]: gaps are clipped to the window and
+    /// ones falling outside it are dropped. Set from the current view in
+    /// the Gaps tab ("Use view"), so zooming into the known-good region
+    /// then re-detecting is the intended flow. None = whole trace.
+    pub window: Option<(f64, f64)>,
+    /// Drop gaps longer than this many µs (the massive-artifact cut).
+    /// None = unlimited.
+    pub max_len: Option<f64>,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub enum DragKind {
     None,

@@ -1,7 +1,7 @@
 use super::*;
 use crate::parse::*;
 use crate::loader::{load_trace, detect_rank_groups, merge_traces, resolve_tool_in};
-use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps, compute_gaps, Pane};
+use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps, compute_gaps, compute_gaps_in, Pane};
 use crate::ui::{heat_color, heat_dim, gap_why};
 use imgui::ImColor32;
 use std::sync::atomic::AtomicUsize;
@@ -5104,6 +5104,81 @@ fn gaps_cuda_runtime_cat_aliases() {
     assert!((g.runtime_frac - 0.7).abs() < 1e-12);
     assert_eq!(g.cpu_top.len(), 2);
     assert_eq!(gap_why(g).0, "runtime-bound");
+}
+
+#[test]
+fn gaps_filter_window_clips_and_drops() {
+    // Kernels [0,10] and [50,60]: one 40µs gap [10,50]. The window clips
+    // each gap to its intersection with [w0, w1] and drops ones that fall
+    // outside it entirely (or shave to under MIN_GAP_US at an edge).
+    let trace = gaps_trace(
+        vec![("stream 7", true, vec![
+            evc(0.0, 10.0, 0, 0),
+            evc(50.0, 10.0, 1, 0),
+        ])],
+        &["kernel"],
+    );
+    let f = |w0: f64, w1: f64| GapFilter { window: Some((w0, w1)), max_len: None };
+
+    // Window strictly inside the gap: clipped to the intersection.
+    let gaps = compute_gaps_in(&trace, f(20.0, 35.0));
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].t0, 20.0);
+    assert_eq!(gaps[0].t1, 35.0);
+
+    // Straddling the gap's left edge: clipped from the window start.
+    let gaps = compute_gaps_in(&trace, f(5.0, 15.0));
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].t0, 10.0);
+    assert_eq!(gaps[0].t1, 15.0);
+
+    // Edge shaving below MIN_GAP_US disappears.
+    assert!(compute_gaps_in(&trace, f(49.5, 60.0)).is_empty());
+
+    // Window entirely outside the gap: nothing left.
+    assert!(compute_gaps_in(&trace, f(70.0, 90.0)).is_empty());
+}
+
+#[test]
+fn gaps_filter_max_len_drops_artifacts() {
+    // Kernels at [0,10], [20,30], [50,60]: gaps [10,20] (10µs) and
+    // [30,50] (20µs, the "artifact"). max_len 15µs keeps only the real
+    // bubble. 0/None keeps both.
+    let trace = gaps_trace(
+        vec![("stream 7", true, vec![
+            evc(0.0, 10.0, 0, 0),
+            evc(20.0, 10.0, 1, 0),
+            evc(50.0, 10.0, 0, 0),
+        ])],
+        &["kernel"],
+    );
+    let gaps = compute_gaps_in(&trace, GapFilter { window: None, max_len: Some(15.0) });
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].t0, 10.0);
+    assert_eq!(gaps[0].t1, 20.0);
+    assert_eq!(compute_gaps_in(&trace, GapFilter::default()).len(), 2);
+}
+
+#[test]
+fn gaps_filter_applies_before_top_n() {
+    // Same 600-gap ladder as gaps_top_n_truncation (lengths 1..600µs).
+    // The max-length cut must happen BEFORE the top-N truncation: with
+    // max 400µs the 200 artifact-sized gaps are dropped first and all 400
+    // real ones listed — not the top 500 of the unfiltered list minus the
+    // artifacts (which would leave only 100).
+    let mut events = Vec::new();
+    let mut t = 0.0;
+    for i in 1..=600 {
+        events.push(evc(t, 1.0, 0, 0));
+        t += 1.0;
+        t += i as f64;
+    }
+    events.push(evc(t, 1.0, 0, 0));
+    let trace = gaps_trace(vec![("stream 7", true, events)], &["kernel"]);
+    let gaps = compute_gaps_in(&trace, GapFilter { window: None, max_len: Some(400.0) });
+    assert_eq!(gaps.len(), 400);
+    assert_eq!(gaps[0].t1 - gaps[0].t0, 400.0);
+    assert_eq!(gaps[399].t1 - gaps[399].t0, 1.0);
 }
 
 #[test]
