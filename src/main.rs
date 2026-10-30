@@ -95,6 +95,24 @@ fn tab_label(pane: &Pane) -> &str {
     shown.rsplit('/').next().unwrap_or(shown)
 }
 
+/// Tab-strip label: `tab_label` middle-ellipsized to `max` chars. Real vLLM
+/// run-directory names run 70+ chars, which at full length makes every tab
+/// wider than the toolbar and pushes the strip into its scroll arrows. The
+/// head carries the model/run prefix and the tail the prefill/decode
+/// suffix — the two parts that actually tell tabs apart — and the full name
+/// goes in the tab's tooltip instead.
+fn strip_tab_label(full: &str, max: usize) -> String {
+    let n = full.chars().count();
+    if n <= max { return full.to_string(); }
+    let head = max * 2 / 3;
+    let tail = max - head - 1; // -1 for the ellipsis
+    let mut out = String::with_capacity(max);
+    out.extend(full.chars().take(head));
+    out.push('\u{2026}');
+    out.extend(full.chars().skip(n - tail));
+    out
+}
+
 /// Whether the tab strip is worth a row at all — hidden for the single
 /// default empty pane (nothing opened yet, or everything was closed back
 /// down to it), since a lone "Untitled" tab over the splash screen is just
@@ -1198,94 +1216,6 @@ impl App {
         let toolbar_h = ui.text_line_height() + 12.0;
         let state = &mut self.state;
 
-        // ---- Tab strip: one tab per open trace ----
-        // Inline with the toolbar row (same y, to its right) instead of a
-        // separate row below it — saves a whole row of vertical space.
-        // Hidden entirely when there's nothing open yet (or everything was
-        // closed back to the single default pane) — a lone "Untitled" tab
-        // for a pane with no trace just reads as clutter over the splash;
-        // once has_trace() is possible for any pane the strip is worth its
-        // space again, even at one real tab.
-        let show_tabs = should_show_tab_strip(&state.panes);
-        // The strip must never starve the toolbar — File/View/Help + the
-        // search box and its match-nav buttons need roughly this much room
-        // themselves.
-        let min_toolbar_w = 420.0f32;
-        let mut close_pane: Option<usize> = None;
-        let mut tabs_w = state.tabs_w;
-        if show_tabs {
-            // 3px vertical padding (not 4): the tab bar's height is
-            // FontSize + FramePadding.y*2 (=6), so 2*3 + that exactly equals
-            // toolbar_h (text_line_height + 12) at ANY font size — the strip
-            // row lines up with the toolbar row instead of overflowing it
-            // (the old fixed-height window was 2px short of the tab bar's
-            // real height, which clipped tabs / surfaced a scrollbar).
-            let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 3.0]));
-            let _min = ui.push_style_var(StyleVar::WindowMinSize([1.0, 1.0]));
-            ui.window("##tracetabs")
-                // Right-glued via pivot instead of positioning at
-                // (display - estimated_width): the old label+32-per-tab
-                // estimate diverged from imgui's real per-tab overhead
-                // (close button + paddings + the window's own padding), so
-                // the fixed-size window was narrower than its content —
-                // tabs got squeezed by the ResizeDown fitting policy and
-                // the strip read as "not lined up from the right". An
-                // auto-resizing window pivoted at its right edge is
-                // exactly as wide as its content, always flush with the
-                // right edge, and capped so it can't crowd the toolbar.
-                .position([display[0], 0.0], Condition::Always)
-                .position_pivot([1.0, 0.0])
-                .size_constraints([1.0, 1.0], [(display[0] - min_toolbar_w).max(120.0), toolbar_h])
-                .flags(
-                    WindowFlags::NO_DECORATION
-                        | WindowFlags::NO_MOVE
-                        | WindowFlags::NO_SAVED_SETTINGS
-                        | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
-                        | WindowFlags::ALWAYS_AUTO_RESIZE,
-                )
-                .build(|| {
-                    if let Some(_bar) = ui.tab_bar_with_flags(
-                        "##tracetabbar",
-                        imgui::TabBarFlags::FITTING_POLICY_SCROLL,
-                    ) {
-                        let pending = state.pending_active_tab.take();
-                        for pi in 0..state.panes.len() {
-                            let tab_id = format!("{}##tab{}", tab_label(&state.panes[pi]), pi);
-                            let mut open = true;
-                            let flags = if pending == Some(pi) {
-                                imgui::TabItemFlags::SET_SELECTED
-                            } else { imgui::TabItemFlags::empty() };
-                            if let Some(_t) = imgui::TabItem::new(&tab_id).opened(&mut open).flags(flags).begin(&ui) {
-                                state.active = pi;
-                            }
-                            if !open {
-                                close_pane = Some(pi);
-                            }
-                        }
-                    }
-                    // The toolbar (built later this frame) needs the strip's
-                    // actual rendered width. Auto-resize converges over
-                    // frames; `tabs_w_changed` requests the follow-up frame
-                    // so the converged width isn't left stale in Wait mode.
-                    tabs_w = ui.window_size()[0];
-                });
-        }
-        // Track the strip's rendered width so (a) the toolbar sizes against
-        // what actually rendered and (b) a width change (tab opened/closed/
-        // relabeled) requests the follow-up frame the auto-resize needs to
-        // converge — the event loop is Wait-driven, so nobody else will.
-        let tabs_w_changed = show_tabs && (tabs_w - state.tabs_w).abs() > 0.5;
-        if !show_tabs { tabs_w = 0.0; }
-        state.tabs_w = tabs_w;
-        if let Some(pi) = close_pane {
-            if state.panes.len() > 1 {
-                state.remove_pane(pi);
-            } else {
-                state.panes[0] = Pane::new();
-            }
-            window.request_redraw();
-        }
-
         let ai = state.active;
         let has_trace = state.panes[ai].has_trace();
         let bottom_h = if has_trace { state.bottom_h } else { 0.0 };
@@ -1406,7 +1336,7 @@ impl App {
             let _min = ui.push_style_var(StyleVar::WindowMinSize([1.0, 1.0]));
             ui.window("##toolbar")
                 .position([0.0, 0.0], Condition::Always)
-                .size([(display[0] - state.tabs_w).max(120.0), toolbar_h], Condition::Always)
+                .size([display[0].max(120.0), toolbar_h], Condition::Always)
                 .flags(
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
@@ -1689,6 +1619,111 @@ impl App {
         }
 
         mark!("toolbar", t_section);
+
+        // ---- Tab strip: one tab per open trace ----
+        // Inline with the toolbar row (same y, at its right end) instead of
+        // a separate row below it — saves a whole row of vertical space.
+        // Hidden entirely when there's nothing open yet (or everything was
+        // closed back to the single default pane) — a lone "Untitled" tab
+        // for a pane with no trace just reads as clutter over the splash;
+        // once has_trace() is possible for any pane the strip is worth its
+        // space again, even at one real tab.
+        //
+        // Built AFTER the toolbar and overlaid on its right end (the
+        // toolbar spans the full width underneath): sizing the toolbar
+        // against the strip's width coupled the two across frames —
+        // auto-resize converges one frame late, so every tab open/close/
+        // relabel made the toolbar's right edge jump a beat after the
+        // strip's left edge did, which read as janky. Overlaying decouples
+        // them: the strip's width is now nobody else's business.
+        let show_tabs = should_show_tab_strip(&state.panes);
+        // The strip must never crowd the toolbar's content — File/View/Help
+        // + the search box, its match-nav buttons and the "N matches" text
+        // need roughly this much room themselves.
+        let min_toolbar_w = 520.0f32;
+        let mut close_pane: Option<usize> = None;
+        let mut strip_switched = false;
+        let mut tabs_w = state.tabs_w;
+        if show_tabs {
+            // 3px vertical padding (not 4): the tab bar's height is
+            // FontSize + FramePadding.y*2 (=6), so 2*3 + that exactly equals
+            // toolbar_h (text_line_height + 12) at ANY font size — the strip
+            // row lines up with the toolbar row instead of overflowing it
+            // (the old fixed-height window was 2px short of the tab bar's
+            // real height, which clipped tabs / surfaced a scrollbar).
+            let _pad = ui.push_style_var(StyleVar::WindowPadding([8.0, 3.0]));
+            let _min = ui.push_style_var(StyleVar::WindowMinSize([1.0, 1.0]));
+            ui.window("##tracetabs")
+                // Right-glued via pivot instead of positioning at
+                // (display - estimated_width): the old label+32-per-tab
+                // estimate diverged from imgui's real per-tab overhead
+                // (close button + paddings + the window's own padding), so
+                // the fixed-size window was narrower than its content —
+                // tabs got squeezed by the ResizeDown fitting policy and
+                // the strip read as "not lined up from the right". An
+                // auto-resizing window pivoted at its right edge is
+                // exactly as wide as its content, always flush with the
+                // right edge, and capped so it can't crowd the toolbar.
+                // NO_BACKGROUND: the toolbar's own background shows through
+                // where the strip is empty, so the tabs read as part of the
+                // chrome row instead of a floating grey pill on top of it.
+                .position([display[0], 0.0], Condition::Always)
+                .position_pivot([1.0, 0.0])
+                .size_constraints([1.0, 1.0], [(display[0] - min_toolbar_w).max(120.0), toolbar_h])
+                .flags(
+                    WindowFlags::NO_DECORATION
+                        | WindowFlags::NO_MOVE
+                        | WindowFlags::NO_SAVED_SETTINGS
+                        | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
+                        | WindowFlags::NO_BACKGROUND
+                        | WindowFlags::NO_SCROLLBAR
+                        | WindowFlags::ALWAYS_AUTO_RESIZE,
+                )
+                .build(|| {
+                    if let Some(_bar) = ui.tab_bar_with_flags(
+                        "##tracetabbar",
+                        imgui::TabBarFlags::FITTING_POLICY_SCROLL,
+                    ) {
+                        let pending = state.pending_active_tab.take();
+                        for pi in 0..state.panes.len() {
+                            let full = tab_label(&state.panes[pi]).to_string();
+                            let tab_id = format!("{}##tab{}", strip_tab_label(&full, 28), pi);
+                            let mut open = true;
+                            let flags = if pending == Some(pi) {
+                                imgui::TabItemFlags::SET_SELECTED
+                            } else { imgui::TabItemFlags::empty() };
+                            if let Some(_t) = imgui::TabItem::new(&tab_id).opened(&mut open).flags(flags).begin(&ui) {
+                                // The strip renders after the toolbar/bottom
+                                // panel, so a switch (or close) lands one
+                                // frame late for them — strip_switched
+                                // requests the follow-up frame that applies
+                                // it everywhere.
+                                if state.active != pi {
+                                    state.active = pi;
+                                    strip_switched = true;
+                                }
+                            }
+                            if ui.is_item_hovered() && full.chars().count() > 28 {
+                                ui.tooltip_text(&full);
+                            }
+                            if !open {
+                                close_pane = Some(pi);
+                            }
+                        }
+                    }
+                    // Auto-resize converges over frames; `tabs_w_changed`
+                    // requests the follow-up frame so the converged width
+                    // isn't left stale in Wait mode.
+                    tabs_w = ui.window_size()[0];
+                });
+        }
+        // Track the strip's rendered width so a width change (tab opened/
+        // closed/relabeled) requests the follow-up frame the auto-resize
+        // needs to converge — the event loop is Wait-driven, so nobody else
+        // will.
+        let tabs_w_changed = show_tabs && (tabs_w - state.tabs_w).abs() > 0.5;
+        if !show_tabs { tabs_w = 0.0; }
+        state.tabs_w = tabs_w;
         // ---- Diff trigger ----
         if let Some(other) = diff_clicked_against {
             let seq_a = state.panes[ai].extract_selection_events();
@@ -2389,7 +2424,20 @@ impl App {
             }
         }
 
-        let needs_extra_frame = click_result.is_some() || new_selection.is_some() || tabs_w_changed;
+        // A tab close was clicked in the strip above: remove the pane HERE,
+        // after the canvas/bottom panel finished rendering against the old
+        // pane list — `ai` was copied before the strip ran, so removing
+        // mid-frame would leave the rest indexing a dead slot.
+        let closed_tab = close_pane.is_some();
+        if let Some(pi) = close_pane {
+            if state.panes.len() > 1 {
+                state.remove_pane(pi);
+            } else {
+                state.panes[0] = Pane::new();
+            }
+        }
+
+        let needs_extra_frame = click_result.is_some() || new_selection.is_some() || tabs_w_changed || strip_switched || closed_tab;
         if needs_extra_frame {
             window.request_redraw();
         }
