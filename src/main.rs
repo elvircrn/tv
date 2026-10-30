@@ -274,6 +274,37 @@ impl App {
             pending_download_progress: std::rc::Rc::new(std::cell::RefCell::new(None)),
         }
     }
+
+    /// Opens the argv trace paths into panes: directory arguments expand to
+    /// multi-rank groups, bare files to standalone panes. Pure fs + channels
+    /// + `rayon::spawn` — no window/renderer/imgui needed — so `main` calls
+    /// it BEFORE `EventLoop::new` (etc.) and the parse overlaps all the GUI
+    /// init instead of waiting for `resumed` to finish it (measured ~130ms
+    /// of macOS/ImGui/renderer setup on an M4 Pro that loading used to sit
+    /// behind). `resumed` calls it again as a no-op fallback (it drains
+    /// `pending_files`), which is what actually opens files on wasm, where
+    /// the launch paths arrive after the loop is already running.
+    fn open_launch_files(&mut self) {
+        let (rank_groups, standalone) = crate::loader::detect_rank_groups(&self.pending_files);
+        let mut pi = 0;
+        for (group, source_dir) in rank_groups {
+            if pi >= self.state.panes.len() {
+                self.state.panes.push(Pane::new());
+            }
+            set_reload_dir(&mut self.state.panes[pi], source_dir.as_deref());
+            self.state.panes[pi].open_multi(group);
+            pi += 1;
+        }
+        for (path, source_dir) in standalone {
+            if pi >= self.state.panes.len() {
+                self.state.panes.push(Pane::new());
+            }
+            set_reload_dir(&mut self.state.panes[pi], source_dir.as_deref());
+            self.state.panes[pi].open(path);
+            pi += 1;
+        }
+        self.pending_files.clear();
+    }
 }
 
 const NAV_W: u8 = 1;
@@ -771,25 +802,7 @@ impl ApplicationHandler for App {
         self.imgui = Some(imgui);
         self.renderer = Some(renderer);
 
-        let (rank_groups, standalone) = crate::loader::detect_rank_groups(&self.pending_files);
-        let mut pi = 0;
-        for (group, source_dir) in rank_groups {
-            if pi >= self.state.panes.len() {
-                self.state.panes.push(Pane::new());
-            }
-            set_reload_dir(&mut self.state.panes[pi], source_dir.as_deref());
-            self.state.panes[pi].open_multi(group);
-            pi += 1;
-        }
-        for (path, source_dir) in standalone {
-            if pi >= self.state.panes.len() {
-                self.state.panes.push(Pane::new());
-            }
-            set_reload_dir(&mut self.state.panes[pi], source_dir.as_deref());
-            self.state.panes[pi].open(path);
-            pi += 1;
-        }
-        self.pending_files.clear();
+        self.open_launch_files();
     }
 
     // Fired when the browser-side `resize` listener installed in `resumed()`
@@ -2433,10 +2446,15 @@ fn main() {
         }
         return;
     }
+    let mut app = App::new(args);
+    // Start loading argv traces before any macOS/winit/ImGui/renderer init —
+    // the load job is fs + channels + rayon only, so the parse overlaps all
+    // of it instead of waiting for `resumed` to finish (see
+    // `open_launch_files`).
+    app.open_launch_files();
     let event_loop = EventLoop::new().unwrap();
     #[cfg(target_os = "macos")]
     dock_menu::install();
-    let mut app = App::new(args);
     event_loop.run_app(&mut app).unwrap();
 }
 
