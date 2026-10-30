@@ -473,18 +473,25 @@ pub struct GapInfo {
 /// Gaps-tab detection filter (per pane): real traces often carry
 /// seconds-long idle spans that are profiler artifacts (ramp-up, ranks
 /// parked for the whole capture), which would otherwise fill the entire
-/// top-N list. Both fields are applied in `compute_gaps_in` BEFORE the
+/// top-N list. All fields are applied in `compute_gaps_in` BEFORE the
 /// top-N cut, so filtered-out artifacts don't consume list slots.
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, PartialEq, Default)]
 pub struct GapFilter {
     /// Restrict detection to [t0, t1]: gaps are clipped to the window and
     /// ones falling outside it are dropped. Set from the current view in
-    /// the Gaps tab ("Use view"), so zooming into the known-good region
-    /// then re-detecting is the intended flow. None = whole trace.
+    /// the Gaps tab ("Limit to view"), so zooming into the known-good
+    /// region then re-detecting is the intended flow. None = whole trace.
+    /// While a timeline selection is active it is overridden by the
+    /// selection's own range (see `Pane::ensure_gaps`).
     pub window: Option<(f64, f64)>,
     /// Drop gaps longer than this many µs (the massive-artifact cut).
     /// None = unlimited.
     pub max_len: Option<f64>,
+    /// Restrict detection to these rank scopes, keyed like
+    /// `compute_gaps_in` scopes them (`parse_rank(...).unwrap_or(MAX)`).
+    /// Set from a finished timeline selection while it's active; None =
+    /// every rank.
+    pub scopes: Option<Vec<usize>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]

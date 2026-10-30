@@ -1940,34 +1940,47 @@ impl App {
                                 // cuts artifact-sized gaps inside the range
                                 // too. Either changing invalidates the cached
                                 // gaps and the row focus so they re-detect.
+                                // While a selection is active it takes over
+                                // the range (and scopes the ranks), so the
+                                // manual range buttons are hidden — they'd be
+                                // silently overridden.
                                 let view_range = (pane.view.t0, pane.view.t1);
+                                let sel_range = pane.gap_sel_window();
                                 let mut filter_changed = false;
                                 ui.text("Range:");
                                 ui.same_line();
                                 state.buf.fmt.clear();
-                                match pane.gap_filter.window {
+                                match sel_range.or(pane.gap_filter.window) {
                                     Some((w0, w1)) => {
                                         write_time(&mut state.buf.fmt, w0);
                                         state.buf.fmt.push_str(" \u{2013} ");
                                         write_time(&mut state.buf.fmt, w1);
+                                        if sel_range.is_some() {
+                                            state.buf.fmt.push_str(" (selection)");
+                                        }
                                     }
                                     None => state.buf.fmt.push_str("whole trace"),
                                 }
                                 ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
-                                ui.same_line();
-                                if ui.button("Limit to view") {
-                                    pane.gap_filter.window = Some(view_range);
-                                    filter_changed = true;
+                                if sel_range.is_some() && ui.is_item_hovered() {
+                                    ui.tooltip_text("Gaps are limited to the active selection's time range and ranks. Clear the selection to use a manual range.");
                                 }
-                                if ui.is_item_hovered() {
-                                    ui.tooltip_text(
-                                        "Only look for gaps inside the time range currently visible in the timeline. Zoom into the good region first.");
-                                }
-                                if pane.gap_filter.window.is_some() {
+                                if sel_range.is_none() {
                                     ui.same_line();
-                                    if ui.button("Clear") {
-                                        pane.gap_filter.window = None;
+                                    if ui.button("Limit to view") {
+                                        pane.gap_filter.window = Some(view_range);
                                         filter_changed = true;
+                                    }
+                                    if ui.is_item_hovered() {
+                                        ui.tooltip_text(
+                                            "Only look for gaps inside the time range currently visible in the timeline. Zoom into the good region first.");
+                                    }
+                                    if pane.gap_filter.window.is_some() {
+                                        ui.same_line();
+                                        if ui.button("Clear") {
+                                            pane.gap_filter.window = None;
+                                            filter_changed = true;
+                                        }
                                     }
                                 }
                                 ui.same_line();
@@ -2367,8 +2380,11 @@ impl App {
             }
 
             if state.panes[ai].selection_dirty && !ui.io().mouse_down[0] {
+                // No pending_tab here on purpose: auto-switching to the
+                // Selection tab on every drag yanks the user off whatever
+                // tab they're working in (Gaps especially, which reacts to
+                // the selection itself). The Selection tab is a click away.
                 state.panes[ai].finish_selection(&mut state.buf);
-                state.panes[ai].pending_tab = Some(BottomTab::Selection);
                 state.panes[ai].selection_dirty = false;
             }
         }

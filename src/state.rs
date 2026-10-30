@@ -356,9 +356,9 @@ pub(crate) fn is_gpu_work_cat(c: &str) -> bool {
 /// Pure function of the `Trace` so it's unit-testable and recomputable
 /// after clock sync / reload shifts timestamps.
 ///
-/// `compute_gaps_in` additionally applies a `GapFilter`: window clip and
-/// max length, both BEFORE the top-N cut, so profiler-artifact gaps don't
-/// consume list slots (see `GapFilter`'s doc).
+/// `compute_gaps_in` additionally applies a `GapFilter`: window clip, max
+/// length, and rank scoping, all BEFORE the top-N cut, so profiler-artifact
+/// gaps don't consume list slots (see `GapFilter`'s doc).
 pub(crate) fn compute_gaps_in(trace: &Trace, f: GapFilter) -> Vec<GapInfo> {
     let mut is_work = vec![false; trace.cats.len()];
     let mut any_work = false;
@@ -401,6 +401,9 @@ pub(crate) fn compute_gaps_in(trace: &Trace, f: GapFilter) -> Vec<GapInfo> {
     // Raw gaps across all scopes: (scope, t0, t1, prev, next, focus_track).
     let mut raw: Vec<(usize, f64, f64, Option<u32>, Option<u32>, u32)> = Vec::new();
     for (scope, mut ivs) in scopes {
+        // Selection scoping: ranks the selection rect didn't cross are
+        // skipped entirely (an empty scope list therefore yields no gaps).
+        if f.scopes.as_ref().is_some_and(|s| !s.contains(&scope)) { continue; }
         ivs.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap()));
         // Merge into the union of busy intervals. Each merged interval
         // remembers the name that opens it (earliest start) and closes it
@@ -700,6 +703,11 @@ pub struct Pane {
     /// recompute. The window is timestamp-based, so it's also cleared on
     /// reload and clock sync like `gaps` itself; `max_len` survives those.
     pub gap_filter: GapFilter,
+    /// Rank scopes the finished selection's y-range crossed, frozen at
+    /// drag-finish time (see `capture_sel_scopes`). While a non-zero-width
+    /// selection is active, `ensure_gaps` scopes gap detection to these —
+    /// empty when nothing is selected.
+    pub sel_scopes: Vec<usize>,
     pub pending_tab: Option<BottomTab>,
     /// Track index whose row draw_timeline should scroll into view as part of an
     /// in-flight search zoom. Consumed (cleared) on the next timeline draw.
@@ -841,6 +849,7 @@ impl Pane {
             gaps: None,
             focused_gap: None,
             gap_filter: GapFilter::default(),
+            sel_scopes: Vec::new(),
             pending_tab: Some(BottomTab::Detail),
             pending_focus: None,
             sort_col: 2,
@@ -1080,6 +1089,11 @@ impl Pane {
         self.finished_sel_events.clear();
         self.selection_stats.clear();
         self.sel_gpu.clear();
+        self.sel_scopes.clear();
+        // The Gaps tab was scoped to the selection; without one it falls
+        // back to the manual filter, so the cached list is stale.
+        self.gaps = None;
+        self.focused_gap = None;
         self.sel_mask.clear();
         self.sel_median = 0.0;
         self.sel_agg_stats.clear();
@@ -1098,6 +1112,12 @@ impl Pane {
     pub fn finish_selection(&mut self, buf: &mut DrawBuf) {
         self.finished_sel = self.selection;
         self.finished_sel_events = self.selection.map(|s| self.capture_sel_events(s).into_iter().collect()).unwrap_or_default();
+        // Freeze the rank scopes the rect crossed too (same layout-freezing
+        // rationale), and invalidate the cached gaps: they're scoped to the
+        // selection, so a new selection means a new list.
+        self.sel_scopes = self.selection.map(|s| self.capture_sel_scopes(s)).unwrap_or_default();
+        self.gaps = None;
+        self.focused_gap = None;
         self.selection = None;
         self.rebuild_selection_stats(buf);
         self.sel_mask.clear();
@@ -1196,6 +1216,48 @@ impl Pane {
             }
         }
         out
+    }
+
+    /// Rank scopes of every visible row the selection rect's y-range
+    /// crosses, resolved against the layout at drag-finish time — same
+    /// freezing rationale as `capture_sel_events` (re-deriving from the raw
+    /// y range against a later layout would silently change the answer as
+    /// rows are reordered/resized/toggled). Merged rows contribute every
+    /// packed track: depth lanes are a rendering artifact, not a semantic
+    /// dimension (see `capture_sel_events`). Keyed the way
+    /// `compute_gaps_in` scopes gaps: `parse_rank(...).unwrap_or(MAX)`.
+    pub(crate) fn capture_sel_scopes(&self, sel: [f64; 4]) -> Vec<usize> {
+        let trace = match &self.trace { Some(t) => t, None => return Vec::new() };
+        let (y0, y1) = if sel[2] <= sel[3] { (sel[2] as f32, sel[3] as f32) } else { (sel[3] as f32, sel[2] as f32) };
+        let mut out: std::collections::HashSet<usize> = Default::default();
+        for vi in 0..self.geom.visible.len() {
+            let track_top = self.geom.y_offsets[vi];
+            let track_bot = track_top + self.geom.heights[vi];
+            if track_bot < y0 || track_top > y1 { continue; }
+            if let Some(group) = self.geom.merged.iter().find(|g| g.vi == vi) {
+                for &(ti, _) in &group.pack.refs {
+                    out.insert(parse_rank(&trace.tracks[ti as usize].label).unwrap_or(usize::MAX));
+                }
+            } else {
+                let ti = self.geom.visible[vi];
+                let track = &trace.tracks[ti];
+                if !self.show_cpu && !track.gpu { continue; }
+                out.insert(parse_rank(&track.label).unwrap_or(usize::MAX));
+            }
+        }
+        let mut v: Vec<usize> = out.into_iter().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The finished selection's time range when it should take over gap
+    /// detection: non-zero-width drag selections only (a shift-click's
+    /// zero-width rect picks one event and would clip every gap away).
+    /// None = no selection scoping, use the manual `gap_filter` window.
+    pub fn gap_sel_window(&self) -> Option<(f64, f64)> {
+        let sel = self.finished_sel?;
+        let (s0, s1) = if sel[0] <= sel[1] { (sel[0], sel[1]) } else { (sel[1], sel[0]) };
+        (s1 > s0).then_some((s0, s1))
     }
 
     pub fn open(&mut self, path: String) {
@@ -1708,8 +1770,17 @@ impl Pane {
     /// actually open, never on the load path.
     pub fn ensure_gaps(&mut self) {
         if self.gaps.is_some() { return; }
+        // A finished selection takes over detection: gaps are clipped to its
+        // time range and scoped to the ranks its rect crossed. Without one
+        // (or for a zero-width pick, see gap_sel_window) the manual filter
+        // applies. Either way max_len stacks on top.
+        let mut f = self.gap_filter.clone();
+        if let Some((s0, s1)) = self.gap_sel_window() {
+            f.window = Some((s0, s1));
+            f.scopes = Some(self.sel_scopes.clone());
+        }
         self.gaps = Some(match &self.trace {
-            Some(t) => compute_gaps_in(t, self.gap_filter),
+            Some(t) => compute_gaps_in(t, f),
             None => Vec::new(),
         });
     }

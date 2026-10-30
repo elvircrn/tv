@@ -5123,7 +5123,7 @@ fn gaps_filter_window_clips_and_drops() {
         ])],
         &["kernel"],
     );
-    let f = |w0: f64, w1: f64| GapFilter { window: Some((w0, w1)), max_len: None };
+    let f = |w0: f64, w1: f64| GapFilter { window: Some((w0, w1)), max_len: None, ..Default::default() };
 
     // Window strictly inside the gap: clipped to the intersection.
     let gaps = compute_gaps_in(&trace, f(20.0, 35.0));
@@ -5157,7 +5157,7 @@ fn gaps_filter_max_len_drops_artifacts() {
         ])],
         &["kernel"],
     );
-    let gaps = compute_gaps_in(&trace, GapFilter { window: None, max_len: Some(15.0) });
+    let gaps = compute_gaps_in(&trace, GapFilter { window: None, max_len: Some(15.0), ..Default::default() });
     assert_eq!(gaps.len(), 1);
     assert_eq!(gaps[0].t0, 10.0);
     assert_eq!(gaps[0].t1, 20.0);
@@ -5180,10 +5180,45 @@ fn gaps_filter_applies_before_top_n() {
     }
     events.push(evc(t, 1.0, 0, 0));
     let trace = gaps_trace(vec![("stream 7", true, events)], &["kernel"]);
-    let gaps = compute_gaps_in(&trace, GapFilter { window: None, max_len: Some(400.0) });
+    let gaps = compute_gaps_in(&trace, GapFilter { window: None, max_len: Some(400.0), ..Default::default() });
     assert_eq!(gaps.len(), 400);
     assert_eq!(gaps[0].t1 - gaps[0].t0, 400.0);
     assert_eq!(gaps[399].t1 - gaps[399].t0, 1.0);
+}
+
+#[test]
+fn gaps_filter_scopes_to_selected_ranks() {
+    // Two ranks, each with a 40µs gap at [10,50]. Scoping to one rank's
+    // scope keeps only its gap; an empty scope list (a selection over empty
+    // space) yields nothing; None keeps both.
+    let trace = gaps_trace(
+        vec![
+            ("Rank 0 stream 7", true, vec![
+                evc(0.0, 10.0, 0, 0),
+                evc(50.0, 10.0, 1, 0),
+            ]),
+            ("Rank 1 stream 7", true, vec![
+                evc(0.0, 10.0, 0, 0),
+                evc(50.0, 10.0, 1, 0),
+            ]),
+        ],
+        &["kernel"],
+    );
+    let f = |scopes: Option<Vec<usize>>| GapFilter { scopes, ..Default::default() };
+
+    // Whole trace, no scoping: one gap per rank.
+    let gaps = compute_gaps_in(&trace, f(None));
+    assert_eq!(gaps.len(), 2);
+
+    // Scoped to rank 0 (the key compute_gaps_in itself uses): only its gap.
+    let gaps = compute_gaps_in(&trace, f(Some(vec![0])));
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].rank, Some(0));
+    assert_eq!(gaps[0].t0, 10.0);
+    assert_eq!(gaps[0].t1, 50.0);
+
+    // Empty scope set: no rank is in it, so nothing is listed.
+    assert!(compute_gaps_in(&trace, f(Some(Vec::new()))).is_empty());
 }
 
 #[test]
@@ -5424,3 +5459,4 @@ fn gaps_table_rows_are_clickable() {
     run_frame(&mut imgui, &mut row_rects, &mut clicked);
     assert_eq!(clicked, vec![12], "click on row 12 must register exactly row 12");
 }
+
