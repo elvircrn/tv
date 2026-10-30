@@ -1070,6 +1070,13 @@ pub fn draw_timeline(
     // `Pane::ensure_heat_bounds`); ignored otherwise.
     color_by_dur: bool,
     heat_bounds: Option<(f64, f64)>,
+    // The Gaps-tab focused gap (t0, t1, rank), if any: drawn as a
+    // translucent red band on the ruler and — vertically scoped to the
+    // gap's rank rows — across the canvas, so the clicked row stays
+    // visible after the zoom without painting over other ranks' tracks.
+    // rank None (unlabeled single-rank trace) matches every unlabeled
+    // track, i.e. spans the canvas like any other time-range annotation.
+    focused_gap: Option<(f64, f64, Option<usize>)>,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let t_dt_start = Instant::now();
     let dl = ui.get_window_draw_list();
@@ -1443,7 +1450,7 @@ pub fn draw_timeline(
     dl.add_rect([rect[0], rect[1]], [rect[2], rect[3]], BG_TIMELINE).filled(true).build();
 
     let ruler_rect = [tl_left, rect[1], rect[2], rect[1] + RULER_H];
-    draw_ruler(&dl, ruler_rect, view, steps, step_cursor, &mut buf.fmt);
+    draw_ruler(&dl, ruler_rect, view, steps, step_cursor, focused_gap.map(|(t0, t1, _)| (t0, t1)), &mut buf.fmt);
 
     dl.add_rect([rect[0], rect[1]], [tl_left, rect[3]], BG_LABELS).filled(true).build();
     dl.add_line([tl_left, rect[1]], [tl_left, rect[3]], DIVIDER).build();
@@ -1904,6 +1911,43 @@ pub fn draw_timeline(
             }
         }
 
+        // Focused-gap highlight (a Gaps-tab row click): translucent red band
+        // with edge lines over the gap interval, vertically scoped to the
+        // gap's rank rows — that rank's GPU row plus its CPU threads, not
+        // the whole canvas. After the click zooms in, the boundaries are
+        // what you need to see; the red family reads as "idle time",
+        // matching the table's Why-column starved color.
+        if let Some((g0, g1, rank)) = focused_gap {
+            let gx0 = t2x(g0, view.t0, px_per_us, tl_left).max(tl_left);
+            let gx1 = t2x(g1, view.t0, px_per_us, tl_left).min(rect[2]);
+            // Rows come from buf (visible + y_offsets/heights, scroll-space),
+            // so merged per-rank GPU groups are covered too — their
+            // buf.visible entry is the group's first track, whose label
+            // carries the rank. No matching rows on screen (scrolled away,
+            // CPU hidden) means no band; the ruler band still shows.
+            let mut band_y: Option<(f32, f32)> = None;
+            for vi in 0..buf.visible.len() {
+                let t = &trace.tracks[buf.visible[vi]];
+                if crate::state::parse_rank(&t.label) != rank { continue; }
+                let y0 = tracks_top + buf.y_offsets[vi] - view.scroll_y;
+                let y1 = y0 + buf.heights[vi];
+                band_y = Some(match band_y {
+                    None => (y0, y1),
+                    Some((a, b)) => (a.min(y0), b.max(y1)),
+                });
+            }
+            if let Some((by0, by1)) = band_y {
+                let by0 = by0.max(tracks_top);
+                let by1 = by1.min(rect[3]);
+                if gx1 > gx0 && by1 > by0 {
+                    dl.add_rect([gx0, by0], [gx1, by1], GAP_BAND_FILL)
+                        .filled(true).build();
+                    dl.add_line([gx0, by0], [gx0, by1], GAP_BAND_LINE).build();
+                    dl.add_line([gx1, by0], [gx1, by1], GAP_BAND_LINE).build();
+                }
+            }
+        }
+
         if let Some([s0, s1, y0, y1]) = active_sel {
             let (sa, sb) = if s0 <= s1 { (s0, s1) } else { (s1, s0) };
             let (ya, yb) = if y0 <= y1 { (y0 as f32, y1 as f32) } else { (y1 as f32, y0 as f32) };
@@ -2172,6 +2216,7 @@ fn draw_ruler(
     view: &View,
     steps: &[StepInfo],
     step_cursor: usize,
+    focused_gap: Option<(f64, f64)>,
     fmt: &mut String,
 ) {
     dl.add_rect([rect[0], rect[1]], [rect[2], rect[3]], RULER_BG)
@@ -2197,6 +2242,21 @@ fn draw_ruler(
             }
             if x0 >= rect[0] {
                 dl.add_line([x0, rect[1]], [x0, rect[3]], STEP_EDGE).build();
+            }
+        }
+    }
+    // Focused-gap band on top of the step bands so it stays findable at any
+    // zoom, same red family as the canvas highlight.
+    if let Some((g0, g1)) = focused_gap {
+        let (x0, x1) = step_band_px(g0, g1, view, rect);
+        if x1 > x0 {
+            dl.add_rect([x0.max(rect[0]), rect[1]], [x1, rect[3]], GAP_BAND_FILL)
+                .filled(true).build();
+            if x0 >= rect[0] {
+                dl.add_line([x0, rect[1]], [x0, rect[3]], GAP_BAND_LINE).build();
+            }
+            if x1 < rect[2] {
+                dl.add_line([x1, rect[1]], [x1, rect[3]], GAP_BAND_LINE).build();
             }
         }
     }
@@ -2416,6 +2476,9 @@ pub fn draw_gaps_table(
     ui: &imgui::Ui,
     trace: &Trace,
     gaps: &[GapInfo],
+    // Index into `gaps` of the row the user last clicked (the highlighted
+    // one; the timeline shows its interval as a red band).
+    focused: Option<usize>,
     buf: &mut DrawBuf,
     gap_clicked: &mut Option<usize>,
 ) {
@@ -2474,13 +2537,21 @@ pub fn draw_gaps_table(
         ui.table_next_row();
 
         // Rank cell doubles as the whole-row click target (span-all-columns
-        // selectable, same pattern as the Steps table).
+        // selectable, same pattern as the Steps table). The `##gap{row}`
+        // suffix is load-bearing: ImGui hashes the label into the widget ID,
+        // and rows of the same rank must not share one — duplicate IDs make
+        // the rows unclickable (verified by gaps_table_rows_are_clickable).
+        // The Steps table gets uniqueness for free from its row-index label.
         ui.table_set_column_index(0);
         let rank_label = match g.rank {
-            Some(r) => format!("{r}"),
-            None => "-".to_string(),
+            Some(r) => format!("{r}##gap{row}"),
+            None => format!("-##gap{row}"),
         };
-        if ui.selectable_config(rank_label).span_all_columns(true).build() {
+        if ui.selectable_config(rank_label)
+            .selected(focused == Some(row as usize))
+            .span_all_columns(true)
+            .build()
+        {
             *gap_clicked = Some(row as usize);
         }
 

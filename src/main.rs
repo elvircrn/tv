@@ -1947,7 +1947,7 @@ impl App {
                                     write!(state.buf.fmt, " total idle. Per rank (streams unioned), top {} by length. Click a row to zoom.", GAP_TOP_N).unwrap();
                                     ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
                                 }
-                                draw_gaps_table(&ui, pane.trace.as_ref().unwrap(), gaps, &mut state.buf, &mut gap_clicked);
+                                draw_gaps_table(&ui, pane.trace.as_ref().unwrap(), gaps, pane.focused_gap, &mut state.buf, &mut gap_clicked);
                             }
                         }
                     }
@@ -1963,11 +1963,14 @@ impl App {
                 pane.frame_step(i);
             }
         }
-        // A Gaps-tab row click: zoom to that gap and scroll its GPU track
-        // into view. The (t0, t1, focus_track) triple is copied out first —
-        // frame_gap takes &mut pane, which the gap borrow would block.
+        // A Gaps-tab row click: highlight that row (focused_gap drives the
+        // table selection and the timeline's red band) and zoom to the gap,
+        // scrolling its GPU track into view. The (t0, t1, focus_track) triple
+        // is copied out first — frame_gap takes &mut pane, which the gap
+        // borrow would block.
         if let Some(i) = gap_clicked.take() {
             let pane = &mut state.panes[ai];
+            pane.focused_gap = Some(i);
             let gap = pane.gaps.as_ref().and_then(|v| v.get(i))
                 .map(|g| (g.t0, g.t1, g.focus_track));
             if let Some((t0, t1, ft)) = gap {
@@ -2106,8 +2109,12 @@ impl App {
                     let pane = &mut state.panes[ai];
                     // Heat bounds are trace-derived; ensure them before the
                     // immutable `trace` borrow below pins the pane for the
-                    // rest of this block.
+                    // rest of this block. Same for the focused gap's
+                    // (t0, t1, rank), copied out for the same reason.
                     if pane.color_by_dur { pane.ensure_heat_bounds(); }
+                    let focused_gap = pane.focused_gap.and_then(|i| {
+                        pane.gaps.as_ref().and_then(|v| v.get(i)).map(|g| (g.t0, g.t1, g.rank))
+                    });
                     let trace = pane.trace.as_ref().unwrap();
                     let rect = [pos[0], pos[1], pos[0] + avail[0], pos[1] + avail[1]];
                     let (h, c, sel) = draw_timeline(
@@ -2150,6 +2157,7 @@ impl App {
                         pane.step_cursor,
                         pane.color_by_dur,
                         pane.heat_bounds,
+                        focused_gap,
                     );
                     hover_result = h;
                     click_result = c;

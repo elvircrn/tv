@@ -151,6 +151,11 @@ pub const RULER_TEXT: ImColor32 = ImColor32::from_rgba(160, 160, 160, 255);
 pub const STEP_BAND: ImColor32 = ImColor32::from_rgba(38, 38, 44, 255);
 pub const STEP_BAND_CUR: ImColor32 = ImColor32::from_rgba(66, 66, 90, 255);
 pub const STEP_EDGE: ImColor32 = ImColor32::from_rgba(90, 90, 105, 255);
+// Focused-gap highlight (a Gaps-tab row click): a red-family band — idle
+// time, matching the Why column's "CPU idle (starved)" — over the ruler and
+// the canvas, drawn like a range selection.
+pub const GAP_BAND_FILL: ImColor32 = ImColor32::from_rgba(235, 85, 65, 36);
+pub const GAP_BAND_LINE: ImColor32 = ImColor32::from_rgba(235, 85, 65, 190);
 
 pub struct Trace {
     pub tracks: Vec<Track>,

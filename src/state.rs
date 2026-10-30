@@ -592,6 +592,10 @@ pub struct Pane {
     /// looks), cleared on reload and clock sync, which shift the timestamps
     /// the gaps are derived from.
     pub gaps: Option<Vec<GapInfo>>,
+    /// Gaps-tab row the user last clicked: highlighted in the table and
+    /// drawn as a red band on the timeline/ruler. Index into `gaps`, cleared
+    /// wherever `gaps` is invalidated (the indices go stale with it).
+    pub focused_gap: Option<usize>,
     pub pending_tab: Option<BottomTab>,
     /// Track index whose row draw_timeline should scroll into view as part of an
     /// in-flight search zoom. Consumed (cleared) on the next timeline draw.
@@ -730,6 +734,7 @@ impl Pane {
             steps: Vec::new(),
             step_cursor: 0,
             gaps: None,
+            focused_gap: None,
             pending_tab: Some(BottomTab::Detail),
             pending_focus: None,
             sort_col: 2,
@@ -899,6 +904,7 @@ impl Pane {
             self.recompute_steps();
             // Shifted timestamps move every gap boundary.
             self.gaps = None;
+            self.focused_gap = None;
         }
         result
     }
@@ -1208,6 +1214,7 @@ impl Pane {
                 // them, and gap timestamps don't survive the swap either.
                 self.heat_bounds = None;
                 self.gaps = None;
+                self.focused_gap = None;
                 if is_reload {
                     let n_tracks = trace.tracks.len();
                     let n_names = trace.names.len();

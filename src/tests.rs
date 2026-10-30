@@ -2194,7 +2194,7 @@ fn bench_draw_timeline() {
                     &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
-                    &pane.steps, pane.step_cursor, false, None,
+                    &pane.steps, pane.step_cursor, false, None, None,
                 );
             });
         imgui.render();
@@ -2223,7 +2223,7 @@ fn bench_draw_timeline() {
                     &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
-                    &pane.steps, pane.step_cursor, false, None,
+                    &pane.steps, pane.step_cursor, false, None, None,
                 );
             });
         imgui.render();
@@ -2252,7 +2252,7 @@ fn bench_draw_timeline() {
                     &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
-                    &pane.steps, pane.step_cursor, false, None,
+                    &pane.steps, pane.step_cursor, false, None, None,
                 );
             });
         imgui.render();
@@ -4817,7 +4817,7 @@ fn draw_timeline_heat_mode_renders() {
                 &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                 &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                 &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
-                &pane.steps, pane.step_cursor, pane.color_by_dur, pane.heat_bounds,
+                &pane.steps, pane.step_cursor, pane.color_by_dur, pane.heat_bounds, None,
             );
         });
     imgui.render();
@@ -5101,4 +5101,98 @@ fn gap_why_classification() {
     assert_eq!(gap_why(&mk(true, 0.8, 0.5)).0, "runtime-bound");
     // CPU busy with framework work rather than issuing launches.
     assert_eq!(gap_why(&mk(true, 0.8, 0.1)).0, "host-bound");
+}
+
+/// Regression for "most gaps are not clickable": mimics draw_gaps_table
+/// (span-all-columns selectables labeled by visible rank with a `##gap{row}`
+/// ID suffix, tooltip-bearing text cells) and clicks a middle row, on a
+/// column to the right of the selectable's own cell. The label suffix is
+/// load-bearing — with the bare rank as the label, rows of the same rank
+/// share an ImGui ID and clicks stop registering (reproduced here before the
+/// fix); the Steps table avoids this by labeling rows with their index.
+#[test]
+fn gaps_table_rows_are_clickable() {
+    let _imgui_ctx = IMGUI_CTX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut imgui = imgui::Context::create();
+    imgui.io_mut().display_size = [1600.0, 900.0];
+    imgui.fonts().build_rgba32_texture();
+
+    const N_ROWS: i32 = 20;
+    let mut row_rects: Vec<([f32; 2], [f32; 2])> = Vec::new();
+    let mut clicked: Vec<i32> = Vec::new();
+
+    let run_frame = |imgui: &mut imgui::Context, row_rects: &mut Vec<([f32; 2], [f32; 2])>, clicked: &mut Vec<i32>| {
+        let ui = imgui.new_frame();
+        ui.window("bottom")
+            .position([0.0, 300.0], imgui::Condition::Always)
+            .size([1600.0, 600.0], imgui::Condition::Always)
+            .flags(imgui::WindowFlags::NO_DECORATION | imgui::WindowFlags::NO_SAVED_SETTINGS)
+            .build(|| {
+                use imgui::{TableColumnFlags, TableColumnSetup, TableFlags};
+                let headers: [&str; 4] = ["Rank", "Start", "Length", "Why"];
+                let flags = TableFlags::RESIZABLE
+                    | TableFlags::ROW_BG
+                    | TableFlags::BORDERS_INNER_V
+                    | TableFlags::SCROLL_Y
+                    | TableFlags::NO_SAVED_SETTINGS
+                    | TableFlags::SIZING_FIXED_FIT;
+                let mk_col = |i: usize| {
+                    let mut c = TableColumnSetup::new(headers[i]);
+                    if i == 3 { c.flags |= TableColumnFlags::WIDTH_STRETCH; }
+                    c
+                };
+                let cols: [TableColumnSetup<&str>; 4] = std::array::from_fn(mk_col);
+                if let Some(_t) = ui.begin_table_header_with_sizing("##gaps", cols, flags, [1600.0, 550.0], 0.0) {
+                    let row_h = ui.current_font_size() + ROW_PAD;
+                    let clipper = imgui::ListClipper::new(N_ROWS)
+                        .items_height(row_h)
+                        .begin(&ui);
+                    for row in clipper.iter() {
+                        ui.table_next_row();
+                        ui.table_set_column_index(0);
+                        // Rank-duplicated visible text + unique ID suffix,
+                        // exactly like the fixed draw_gaps_table.
+                        let label = format!("{}##gap{row}", row % 4);
+                        let pressed = ui.selectable_config(label)
+                            .span_all_columns(true)
+                            .build();
+                        let min = ui.item_rect_min();
+                        let max = [min[0] + ui.item_rect_size()[0], min[1] + ui.item_rect_size()[1]];
+                        if row_rects.len() == row as usize { row_rects.push((min, max)); }
+                        if pressed { clicked.push(row); }
+                        ui.table_set_column_index(1);
+                        ui.text("100.0 ms");
+                        ui.table_set_column_index(2);
+                        ui.text("20.0 ms");
+                        ui.table_set_column_index(3);
+                        ui.text_colored([0.9, 0.5, 0.5, 1.0], "runtime-bound");
+                        if ui.is_item_hovered() {
+                            ui.tooltip_text("tooltip body");
+                        }
+                    }
+                }
+            });
+        imgui.render();
+    };
+
+    // Frame 1: layout only, capture row rects.
+    imgui.io_mut().add_mouse_pos_event([-1000.0, -1000.0]);
+    run_frame(&mut imgui, &mut row_rects, &mut clicked);
+    assert!(row_rects.len() == N_ROWS as usize);
+
+    // Click row 12 in the middle of the "Why" column (right of col 0).
+    let (min, max) = row_rects[12];
+    let target = [min[0] + (max[0] - min[0]) * 0.5, (min[1] + max[1]) / 2.0];
+    // A few hover frames so tooltips/steady state settle.
+    for _ in 0..3 {
+        imgui.io_mut().add_mouse_pos_event(target);
+        run_frame(&mut imgui, &mut row_rects, &mut clicked);
+    }
+    imgui.io_mut().add_mouse_pos_event(target);
+    imgui.io_mut().add_mouse_button_event(imgui::MouseButton::Left, true);
+    run_frame(&mut imgui, &mut row_rects, &mut clicked);
+    imgui.io_mut().add_mouse_pos_event(target);
+    imgui.io_mut().add_mouse_button_event(imgui::MouseButton::Left, false);
+    run_frame(&mut imgui, &mut row_rects, &mut clicked);
+    assert_eq!(clicked, vec![12], "click on row 12 must register exactly row 12");
 }
