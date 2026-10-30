@@ -1064,6 +1064,12 @@ pub fn draw_timeline(
     // vLLM scheduler steps for the ruler bands; empty slice is a no-op.
     steps: &[StepInfo],
     step_cursor: usize,
+    // View > Color > By Duration: color events by duration (heat map over
+    // `heat_bounds`) instead of by name hash. `heat_bounds` is guaranteed
+    // Some by the caller whenever `color_by_dur` is set (see
+    // `Pane::ensure_heat_bounds`); ignored otherwise.
+    color_by_dur: bool,
+    heat_bounds: Option<(f64, f64)>,
 ) -> (Option<EventRef>, Option<EventRef>, Option<Option<[f64; 4]>>) {
     let t_dt_start = Instant::now();
     let dl = ui.get_window_draw_list();
@@ -1481,6 +1487,30 @@ pub fn draw_timeline(
     // the hot loop below instead.
     let name_colors: Vec<ImColor32> = trace.names.iter().map(|n| name_color(n)).collect();
     let name_dim_colors: Vec<ImColor32> = trace.names.iter().map(|n| dim_color(n)).collect();
+    // Heat-mode LUT: 256 quantized (base, dim) color pairs over the pane's
+    // log10 duration bounds, so the hot loops below pay one log10 + one
+    // table read per event instead of the colormap interpolation.
+    let heat_lut: Vec<(ImColor32, ImColor32)> = if color_by_dur {
+        (0..=255u32).map(|i| { let c = heat_color(i as f32 / 255.0); (c, heat_dim(c)) }).collect()
+    } else {
+        Vec::new()
+    };
+    // Event color picker shared by all four render paths: name-hash palette,
+    // or the duration heat map; `matches == false` means the event is
+    // currently filtered out (active search/selection) and gets the dim
+    // variant of either.
+    let ev_color = |matches: bool, name: u32, dur: f64| -> ImColor32 {
+        if color_by_dur {
+            let (lo, hi) = heat_bounds.unwrap_or((0.0, 1.0));
+            let t = ((dur.log10() - lo) / (hi - lo)).clamp(0.0, 1.0);
+            let (b, d) = heat_lut[(t * 255.0) as usize];
+            if matches { b } else { d }
+        } else if matches {
+            name_colors[name as usize]
+        } else {
+            name_dim_colors[name as usize]
+        }
+    };
     dl.with_clip_rect([tl_left, tracks_top], [rect[2], rect[3]], || {
         let interval = nice_interval(view.t1 - view.t0);
         if interval > 0.0 {
@@ -1570,11 +1600,7 @@ pub fn draw_timeline(
                         if px == *slot { continue; }
                         *slot = px;
                         let ev_y = y + lo as f32 * sub_h + EV_INSET;
-                        let color = if matches {
-                            name_colors[p.name[gi] as usize]
-                        } else {
-                            name_dim_colors[p.name[gi] as usize]
-                        };
+                        let color = ev_color(matches, p.name[gi], ev_end - ev_ts);
                         // Draw AT the snapped column (not the raw x0), so the
                         // dot's on-screen position and its dedupe key agree and
                         // both stay put under small pans.
@@ -1585,11 +1611,7 @@ pub fn draw_timeline(
 
                     let ev_y = y + lo as f32 * sub_h + EV_INSET;
                     let name = &trace.names[ev.name as usize];
-                    let color = if matches {
-                        name_colors[ev.name as usize]
-                    } else {
-                        name_dim_colors[ev.name as usize]
-                    };
+                    let color = ev_color(matches, ev.name, ev.dur);
                     let ev_rect = [x0, ev_y, x1, ev_y + stretched_h];
 
                     let is_hovered = hover_in_timeline
@@ -1687,22 +1709,14 @@ pub fn draw_timeline(
                         if px == buf.last_px[ev.depth as usize] { continue; }
                         buf.last_px[ev.depth as usize] = px;
                         let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
-                        let color = if matches {
-                            name_colors[ev.name as usize]
-                        } else {
-                            name_dim_colors[ev.name as usize]
-                        };
+                        let color = ev_color(matches, ev.name, ev.dur);
                         dl.add_rect([x0, ev_y], [x0 + 1.0, ev_y + lane_h], color).filled(true).build();
                         continue;
                     }
 
                     let ev_y = y + ev.depth as f32 * sub_h + EV_INSET;
                     let name = &trace.names[ev.name as usize];
-                    let color = if matches {
-                        name_colors[ev.name as usize]
-                    } else {
-                        name_dim_colors[ev.name as usize]
-                    };
+                    let color = ev_color(matches, ev.name, ev.dur);
                     let ev_rect = [x0, ev_y, x1, ev_y + lane_h];
 
                     let is_hovered = hover_in_timeline
@@ -2090,6 +2104,47 @@ pub fn draw_timeline(
             "  draw_timeline: {total_ms:.1}ms total (layout {layout_ms:.1}ms incl. merge-group build, draw-loop {draw_ms:.1}ms, post {:.1}ms)",
             total_ms - layout_ms - draw_ms,
         );
+    }
+
+    // ---- Heat-mode legend ----
+    // A gradient nobody can decode is decoration, not information: while
+    // color-by-duration is on, pin a compact legend chip to the timeline's
+    // bottom-right showing what the scale means. The end labels are the
+    // trace's actual p5/p95 GPU-event durations (`heat_bounds`, the same
+    // numbers the LUT maps onto), not abstract 0%/100%. Drawn on the
+    // existing `dl` (single-instance rule) as a non-interactive overlay —
+    // mouse events pass through to the events underneath.
+    if color_by_dur {
+        let (lo, hi) = heat_bounds.unwrap_or((0.0, 1.0));
+        let text_h = ui.calc_text_size("X")[1];
+        const LEG_W: f32 = 130.0;
+        const LEG_SEG: usize = 26;
+        let x1 = rect[2] - 12.0;
+        let x0 = x1 - LEG_W;
+        let label_y = rect[3] - 12.0 - text_h;
+        let bar_y1 = label_y - 5.0 - 9.0;
+        let bar_y0 = bar_y1 - 9.0;
+        let cap_y = bar_y0 - 5.0 - text_h;
+        dl.add_rect([x0 - 8.0, cap_y - 4.0], [x1 + 8.0, rect[3] - 8.0], col32(16, 16, 16, 210))
+            .filled(true)
+            .rounding(4.0)
+            .build();
+        for i in 0..LEG_SEG {
+            let t = i as f32 / (LEG_SEG - 1) as f32;
+            let sx = x0 + LEG_W * t;
+            // +0.5 overlaps segments so adjacent rects leave no seam.
+            dl.add_rect([sx, bar_y0], [sx + LEG_W / LEG_SEG as f32 + 0.5, bar_y1], heat_color(t))
+                .filled(true)
+                .build();
+        }
+        dl.add_text([x0, cap_y], col32(140, 140, 140, 255), "duration");
+        buf.fmt.clear();
+        write_time(&mut buf.fmt, 10f64.powf(lo));
+        dl.add_text([x0, label_y], col32(160, 160, 160, 255), &buf.fmt);
+        buf.fmt.clear();
+        write_time(&mut buf.fmt, 10f64.powf(hi));
+        let hi_w = ui.calc_text_size(&buf.fmt)[0];
+        dl.add_text([x1 - hi_w, label_y], col32(160, 160, 160, 255), &buf.fmt);
     }
 
     (hover_result, click_result, sel_change)
@@ -2802,6 +2857,47 @@ pub fn palette_color(name: &str, brightness: u32) -> ImColor32 {
 
 pub fn name_color(name: &str) -> ImColor32 { palette_color(name, 155) }
 pub fn dim_color(name: &str) -> ImColor32 { palette_color(name, 85) }
+
+/// Blue → cyan → green → yellow → red ramp for the View > Color > By
+/// Duration mode: short events read cold, slow ones hot. `t` is clamped to
+/// [0, 1]; the caller maps log10(duration) onto that range via the pane's
+/// `heat_bounds`. Stop values sit at the same ~60% brightness budget as
+/// `name_color` (palette_color at 155/255) — full-saturation stops rendered
+/// noticeably brighter than every other event fill on the dark timeline.
+pub fn heat_color(t: f32) -> ImColor32 {
+    let t = t.clamp(0.0, 1.0);
+    const STOPS: [(f32, [u8; 3]); 5] = [
+        (0.00, [38, 60, 134]),
+        (0.25, [36, 122, 122]),
+        (0.50, [58, 134, 58]),
+        (0.75, [152, 134, 36]),
+        (1.00, [143, 43, 33]),
+    ];
+    for w in STOPS.windows(2) {
+        let (t0, c0) = w[0];
+        let (t1, c1) = w[1];
+        if t <= t1 {
+            let f = if t1 > t0 { ((t - t0) / (t1 - t0)).clamp(0.0, 1.0) } else { 0.0 };
+            let ch = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f) as u8;
+            return ImColor32::from_rgb(ch(c0[0], c1[0]), ch(c0[1], c1[1]), ch(c0[2], c1[2]));
+        }
+    }
+    ImColor32::from_rgb(235, 70, 55)
+}
+
+/// Dimmed variant of a heat color, for events filtered out by search/
+/// selection while the mode is on — the name-palette equivalent is
+/// `dim_color` (brightness 85 of 155, i.e. ~55%). Same ratio here.
+pub fn heat_dim(c: ImColor32) -> ImColor32 {
+    let v: u32 = c.into();
+    let scale = |x: u32| (x * 55 / 100) as u8;
+    ImColor32::from_rgba(
+        scale(v & 0xFF),
+        scale((v >> 8) & 0xFF),
+        scale((v >> 16) & 0xFF),
+        ((v >> 24) & 0xFF) as u8,
+    )
+}
 
 pub fn brighten(c: ImColor32, amt: u8) -> ImColor32 {
     let v: u32 = c.into();

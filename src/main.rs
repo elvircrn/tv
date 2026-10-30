@@ -1517,6 +1517,21 @@ impl App {
                                 if pane.reload_dir.is_some() || !pane.reload_paths.is_empty() {
                                     ui.menu_item_config("Watch").build_with_ref(&mut pane.auto_reload);
                                 }
+                                // ---- Color section: how timeline events get
+                                // their fill. Name-hash (identity) or a
+                                // duration heat map.
+                                ui.separator();
+                                ui.menu("Color", || {
+                                    if ui.menu_item_config("By Name").selected(!pane.color_by_dur).build() {
+                                        pane.color_by_dur = false;
+                                    }
+                                    if ui.menu_item_config("By Duration").selected(pane.color_by_dur).build() {
+                                        pane.color_by_dur = true;
+                                    }
+                                    if ui.is_item_hovered() {
+                                        ui.tooltip_text("Heat-map events by duration (blue = short, red = long) instead of by name.\nThe scale is fixed per trace at the 5th-95th percentile of GPU-event durations,\nso slow kernels stand out even at zoom levels where labels don't fit.\nA legend with the actual durations sits at the bottom-right of the timeline.");
+                                    }
+                                });
                                 if multi_rank {
                                     ui.separator();
                                     if ui.menu_item("Sync Clocks") {
@@ -2041,6 +2056,10 @@ impl App {
                     let active = ui.is_item_active();
 
                     let pane = &mut state.panes[ai];
+                    // Heat bounds are trace-derived; ensure them before the
+                    // immutable `trace` borrow below pins the pane for the
+                    // rest of this block.
+                    if pane.color_by_dur { pane.ensure_heat_bounds(); }
                     let trace = pane.trace.as_ref().unwrap();
                     let rect = [pos[0], pos[1], pos[0] + avail[0], pos[1] + avail[1]];
                     let (h, c, sel) = draw_timeline(
@@ -2081,6 +2100,8 @@ impl App {
                         &mut pane.merged_gpu_groups,
                         &pane.steps,
                         pane.step_cursor,
+                        pane.color_by_dur,
+                        pane.heat_bounds,
                     );
                     hover_result = h;
                     click_result = c;

@@ -554,6 +554,18 @@ pub struct Pane {
     /// Result of the last "Sync Clocks" click (success summary, or an
     /// error) — shown next to the button until the next click replaces it.
     pub sync_message: Option<(bool, String)>,
+    /// View > Color > By Duration: heat-map events by duration instead of
+    /// hashing the name. Per-pane like show_cpu/merge_gpu so two tabs can
+    /// use different modes.
+    pub color_by_dur: bool,
+    /// Log10 duration bounds (p5, p95) the heat map maps onto blue→red,
+    /// computed lazily by `ensure_heat_bounds` the first frame the mode is
+    /// on, and cleared whenever a new trace lands. Percentiles (sampled to
+    /// ~100k events) rather than min/max so one huge memcpy outlier can't
+    /// push every kernel into the cold end of the scale. GPU-track events
+    /// only: CPU spans include whole-step wrappers that would otherwise
+    /// dominate the top of the range and flatten the kernel scale.
+    pub heat_bounds: Option<(f64, f64)>,
 }
 
 impl Pane {
@@ -628,6 +640,8 @@ impl Pane {
             #[cfg(not(target_arch = "wasm32"))]
             share_include_cpu: false,
             sync_message: None,
+            color_by_dur: false,
+            heat_bounds: None,
         }
     }
 
@@ -1060,6 +1074,10 @@ impl Pane {
         match rx.try_recv() {
             Ok(Ok(trace)) => {
                 let is_reload = self.trace.is_some();
+                // Heat-map bounds are a function of the trace's durations;
+                // a new (or reloaded, possibly changed) trace invalidates
+                // them.
+                self.heat_bounds = None;
                 if is_reload {
                     let n_tracks = trace.tracks.len();
                     let n_names = trace.names.len();
@@ -1538,6 +1556,49 @@ impl Pane {
         self.sel_overlap_totals = self.selection_stats.iter()
             .map(|se| share[se.name as usize]).collect();
         self.sel_overlap_gen = self.sel_generation;
+    }
+
+    /// Compute `heat_bounds` if stale (see the field doc). Sampling keeps
+    /// this at ~100k durations regardless of trace size — enough for stable
+    /// p5/p95 on a log scale, at a fraction of a full collect+select on the
+    /// 1M+ events a large trace carries.
+    pub fn ensure_heat_bounds(&mut self) {
+        if self.heat_bounds.is_some() { return; }
+        let bounds = match &self.trace {
+            Some(t) => {
+                let n_gpu: usize = t.tracks.iter().filter(|tr| tr.gpu).map(|tr| tr.events.len()).sum();
+                if n_gpu == 0 {
+                    (0.0, 1.0)
+                } else {
+                    let stride = (n_gpu / 100_000).max(1);
+                    let mut logs: Vec<f64> = Vec::with_capacity(n_gpu / stride + 1);
+                    for track in t.tracks.iter().filter(|tr| tr.gpu) {
+                        for ev in track.events.iter().step_by(stride) {
+                            if ev.dur > 0.0 { logs.push(ev.dur.log10()); }
+                        }
+                    }
+                    if logs.is_empty() {
+                        (0.0, 1.0)
+                    } else {
+                        // Two in-place selections: after the p5 select, the
+                        // lower half is all <= logs[i5], so the p95 select can
+                        // run on the upper slice without disturbing it.
+                        let i5 = (logs.len() as f64 * 0.05).clamp(0.0, (logs.len() - 1) as f64) as usize;
+                        logs.select_nth_unstable_by(i5, |a, b| a.partial_cmp(b).unwrap());
+                        let i95 = (logs.len() as f64 * 0.95).clamp(0.0, (logs.len() - 1) as f64) as usize;
+                        if i95 > i5 {
+                            logs[i5..].select_nth_unstable_by(i95 - i5, |a, b| a.partial_cmp(b).unwrap());
+                        }
+                        let (mut lo, mut hi) = (logs[i5], logs[i95]);
+                        if hi <= lo { hi = lo + 1.0; }
+                        if lo < 0.0 { lo = 0.0; } // sub-µs floor; log10 of tiny durs still sorts fine
+                        (lo, hi)
+                    }
+                }
+            }
+            None => (0.0, 1.0),
+        };
+        self.heat_bounds = Some(bounds);
     }
 
     fn compute_aggregates(&mut self) {

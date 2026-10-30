@@ -1,9 +1,9 @@
 use super::*;
 use crate::parse::*;
 use crate::loader::{load_trace, detect_rank_groups, merge_traces, resolve_tool_in};
-use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps};
+use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps, Pane};
+use crate::ui::{heat_color, heat_dim};
 use imgui::ImColor32;
-use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
@@ -2186,7 +2186,7 @@ fn bench_draw_timeline() {
                     &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
-                    &pane.steps, pane.step_cursor,
+                    &pane.steps, pane.step_cursor, false, None,
                 );
             });
         imgui.render();
@@ -2215,7 +2215,7 @@ fn bench_draw_timeline() {
                     &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
-                    &pane.steps, pane.step_cursor,
+                    &pane.steps, pane.step_cursor, false, None,
                 );
             });
         imgui.render();
@@ -2244,7 +2244,7 @@ fn bench_draw_timeline() {
                     &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
-                    &pane.steps, pane.step_cursor,
+                    &pane.steps, pane.step_cursor, false, None,
                 );
             });
         imgui.render();
@@ -4694,3 +4694,123 @@ fn debug_sel_overlap_trace() {
     }
 }
 
+// ---- View > Color > By Duration ----
+
+fn col_rgb(c: ImColor32) -> (u8, u8, u8) {
+    let v: u32 = c.into();
+    ((v & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, ((v >> 16) & 0xFF) as u8)
+}
+
+#[test]
+fn heat_color_ramp_runs_cold_to_hot() {
+    let (cr, _cg, cb) = col_rgb(heat_color(0.0));
+    assert!(cb > cr, "cold end must be blue-dominant, got r={cr} b={cb}");
+    let (hr, _hg, hb) = col_rgb(heat_color(1.0));
+    assert!(hr > hb, "hot end must be red-dominant, got r={hr} b={hb}");
+    // Out-of-range t clamps instead of extrapolating past the stops.
+    assert_eq!(col_rgb(heat_color(-0.5)), col_rgb(heat_color(0.0)));
+    assert_eq!(col_rgb(heat_color(2.0)), col_rgb(heat_color(1.0)));
+    // Middle of the ramp is greenish: both red and blue below green.
+    let (mr, mg, mb) = col_rgb(heat_color(0.5));
+    assert!(mg > mr && mg > mb, "mid ramp must peak green, got r={mr} g={mg} b={mb}");
+}
+
+#[test]
+fn heat_dim_scales_channels() {
+    let (r, g, b) = col_rgb(heat_dim(ImColor32::from_rgba(100, 200, 50, 255)));
+    assert_eq!(r, 55);
+    assert_eq!(g, 110);
+    assert_eq!(b, 27);
+}
+
+#[test]
+fn heat_bounds_percentiles_resist_outliers() {
+    // 100 ordinary kernels plus one giant memcpy: the p95 bound must stay
+    // near the bulk, not stretch to the outlier.
+    let mut events = Vec::new();
+    for i in 0..100 {
+        events.push(ev(i as f64 * 20.0, 10.0, 0, 0));
+    }
+    events.push(ev(1e6, 1_000_000.0, 0, 0));
+    let trace = make_trace(vec!["k"], vec![("stream 7", true, events)]);
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    pane.ensure_heat_bounds();
+    let (lo, hi) = pane.heat_bounds.expect("bounds computed");
+    assert!(lo <= 1.0, "p5 bound below the bulk's log10(10), got {lo}");
+    assert!(hi >= 1.0 && hi < 5.0, "p95 bound near the bulk, got {hi}");
+    // Idempotent: a second call keeps the same bounds.
+    pane.ensure_heat_bounds();
+    assert_eq!(pane.heat_bounds, Some((lo, hi)));
+}
+
+#[test]
+fn heat_bounds_fall_back_without_gpu_events() {
+    let trace = make_trace(
+        vec!["op"],
+        vec![("python (CPU)", false, vec![ev(0.0, 5.0, 0, 0)])],
+    );
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    pane.ensure_heat_bounds();
+    assert_eq!(pane.heat_bounds, Some((0.0, 1.0)));
+    // And no trace at all.
+    let mut pane = Pane::new();
+    pane.ensure_heat_bounds();
+    assert_eq!(pane.heat_bounds, Some((0.0, 1.0)));
+}
+
+/// One full draw_timeline frame with View > Color > By Duration active:
+/// exercises the heat LUT lookup in all render paths and the bottom-right
+/// legend overlay (chip, gradient segments, write_time labels). Assertions
+/// are "runs without panicking" plus the bounds sanity — imgui gives no
+/// pixel access to assert colors against.
+#[test]
+fn draw_timeline_heat_mode_renders() {
+    let _imgui_ctx = IMGUI_CTX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut imgui = imgui::Context::create();
+    imgui.io_mut().display_size = [1600.0, 900.0];
+    imgui.fonts().build_rgba32_texture();
+
+    let trace = make_trace(
+        vec!["fast", "slow"],
+        vec![
+            ("python (CPU)", false, vec![ev(0.0, 30.0, 0, 0), ev(5.0, 2.0, 0, 1)]),
+            ("stream 7", true, vec![ev(1.0, 1.0, 0, 0), ev(10.0, 40.0, 1, 0)]),
+        ],
+    );
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    pane.collapsed = vec![false; 2];
+    pane.track_scales = vec![1.0; 2];
+    pane.track_order = vec![0, 1];
+    pane.hidden_names = vec![false; 2];
+    pane.show_cpu = true;
+    pane.view.t0 = 0.0;
+    pane.view.t1 = 60.0;
+    pane.color_by_dur = true;
+    pane.ensure_heat_bounds();
+    let (lo, hi) = pane.heat_bounds.expect("bounds computed");
+    assert!(hi > lo, "degenerate heat bounds {lo}..{hi}");
+
+    let mut buf = DrawBuf::default();
+    let mut drag = DragKind::None;
+    let ui = imgui.new_frame();
+    ui.window("t")
+        .position([0.0, 0.0], imgui::Condition::Always)
+        .size([1600.0, 900.0], imgui::Condition::Always)
+        .build(|| {
+            draw_timeline(
+                ui, pane.trace.as_ref().unwrap(), &mut pane.view, pane.show_cpu, &mut buf,
+                [0.0, 0.0, 1600.0, 900.0], 0, false, false, false,
+                [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0, false, false,
+                &pane.search_mask, pane.selection, &pane.finished_sel_events,
+                &mut pane.collapsed, &pane.hidden_names, pane.selected, pane.multi_select_name,
+                &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
+                &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
+                &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
+                &pane.steps, pane.step_cursor, pane.color_by_dur, pane.heat_bounds,
+            );
+        });
+    imgui.render();
+}
