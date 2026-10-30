@@ -1851,6 +1851,20 @@ impl App {
                                 write!(state.buf.fmt, " total, ").unwrap();
                                 write_time(&mut state.buf.fmt, pane.sel_median);
                                 write!(state.buf.fmt, " median").unwrap();
+                                // GPU empty space between the selection's
+                                // leftmost and rightmost kernel (see
+                                // selection_gpu_summary): span minus the
+                                // busy union over the covered GPU tracks.
+                                if let Some(g) = &pane.sel_gpu {
+                                    let span = g.t1 - g.t0;
+                                    let idle = span - g.busy;
+                                    let pct = if span > 0.0 { idle / span * 100.0 } else { 0.0 };
+                                    write!(state.buf.fmt, ", GPU idle ").unwrap();
+                                    write_time(&mut state.buf.fmt, idle);
+                                    write!(state.buf.fmt, " of ").unwrap();
+                                    write_time(&mut state.buf.fmt, span);
+                                    write!(state.buf.fmt, " ({:.0}%)", pct).unwrap();
+                                }
                                 ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
                                 // Fine-grained timing (separate from the coarse "bottom"
                                 // mark! bucket) so a slow Selection tab shows exactly

@@ -1,7 +1,7 @@
 use super::*;
 use crate::parse::*;
 use crate::loader::{load_trace, detect_rank_groups, merge_traces, resolve_tool_in};
-use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps, compute_gaps, compute_gaps_in, Pane};
+use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps, compute_gaps, compute_gaps_in, selection_gpu_summary, Pane};
 use crate::ui::{heat_color, heat_dim, gap_why};
 use imgui::ImColor32;
 use std::sync::atomic::AtomicUsize;
@@ -5179,6 +5179,66 @@ fn gaps_filter_applies_before_top_n() {
     assert_eq!(gaps.len(), 400);
     assert_eq!(gaps[0].t1 - gaps[0].t0, 400.0);
     assert_eq!(gaps[399].t1 - gaps[399].t0, 1.0);
+}
+
+#[test]
+fn selection_gpu_summary_measures_idle_between_kernels() {
+    // Two GPU streams plus a CPU event the summary must ignore: the span
+    // runs from the leftmost kernel start to the rightmost kernel end,
+    // busy is the UNION across streams (overlap [12,18] inside [10,20]
+    // must not double-count), idle = span - busy.
+    let trace = gaps_trace(
+        vec![
+            ("stream 7", true, vec![evc(10.0, 10.0, 0, 0), evc(50.0, 10.0, 1, 0)]),
+            ("stream 8", true, vec![evc(12.0, 6.0, 2, 0)]),
+            ("cpu", false, vec![evc(25.0, 20.0, 3, 1)]),
+        ],
+        &["kernel", "cpu_op"],
+    );
+    let events: std::collections::HashSet<(u32, u32)> =
+        [(0, 0), (0, 1), (1, 0), (2, 0)].into_iter().collect();
+    let g = selection_gpu_summary(&trace, &events, [0.0, 0.0, 100.0, 0.0]).unwrap();
+    assert_eq!(g.t0, 10.0);
+    assert_eq!(g.t1, 60.0);
+    assert!((g.busy - 20.0).abs() < 1e-12);
+    // Idle 30µs of the 50µs span.
+    assert!((g.t1 - g.t0 - g.busy - 30.0).abs() < 1e-12);
+}
+
+#[test]
+fn selection_gpu_summary_clips_to_selection_edges() {
+    // A kernel straddling the selection's left edge counts only its inside
+    // portion (the span and busy both start at the clipped edge).
+    let trace = gaps_trace(
+        vec![("stream 7", true, vec![
+            evc(5.0, 10.0, 0, 0),   // [5,15]; selection starts at 10
+            evc(50.0, 10.0, 1, 0),  // [50,60]
+        ])],
+        &["kernel"],
+    );
+    let events: std::collections::HashSet<(u32, u32)> =
+        [(0, 0), (0, 1)].into_iter().collect();
+    let g = selection_gpu_summary(&trace, &events, [10.0, 0.0, 100.0, 0.0]).unwrap();
+    assert_eq!(g.t0, 10.0);
+    assert_eq!(g.t1, 60.0);
+    assert!((g.busy - 15.0).abs() < 1e-12);
+}
+
+#[test]
+fn selection_gpu_summary_requires_gpu_work() {
+    // CPU-only selections — and GPU tracks carrying only annotations —
+    // have nothing to measure: None, so the summary line stays hidden.
+    let trace = gaps_trace(
+        vec![
+            ("cpu", false, vec![evc(10.0, 10.0, 0, 1)]),
+            ("stream 7", true, vec![evc(20.0, 5.0, 1, 2)]), // gpu_user_annotation
+        ],
+        &["kernel", "cpu_op", "gpu_user_annotation"],
+    );
+    let all: std::collections::HashSet<(u32, u32)> = [(0, 0), (1, 0)].into_iter().collect();
+    assert!(selection_gpu_summary(&trace, &all, [0.0, 0.0, 100.0, 0.0]).is_none());
+    let cpu_only: std::collections::HashSet<(u32, u32)> = [(0, 0)].into_iter().collect();
+    assert!(selection_gpu_summary(&trace, &cpu_only, [0.0, 0.0, 100.0, 0.0]).is_none());
 }
 
 #[test]

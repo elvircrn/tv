@@ -308,6 +308,17 @@ pub struct SelectionEntry {
     pub event_refs: Vec<(u32, u32)>,
 }
 
+/// Selection-tab GPU idle summary: over the selection's GPU-work events
+/// (clipped to its time range), the span from the leftmost to the
+/// rightmost kernel and how much of that span any of them covers.
+/// `t1 - t0 - busy` is the empty space between the selected kernels.
+/// Computed by `state::selection_gpu_summary` when the drag finishes.
+pub struct SelGpuSummary {
+    pub t0: f64,
+    pub t1: f64,
+    pub busy: f64,
+}
+
 /// Batch composition parsed from a vLLM execute-annotation span name.
 /// Two formats exist (see vLLM `gpu_worker.py:annotate_profile`):
 /// legacy `execute_context_1(4)_generation_1(1)` and detailed

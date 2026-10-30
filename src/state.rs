@@ -321,6 +321,15 @@ fn union_len(spans: &mut [(f64, f64)]) -> f64 {
     total
 }
 
+/// Whether a cat counts as GPU work: `kernel` plus `gpu_*` EXCEPT
+/// `gpu_user_annotation` (annotations are CPU-side brackets projected onto
+/// every stream — counting them as busy would erase exactly the idle the
+/// Gaps tab and the selection's empty-space summary exist to measure).
+/// Shared by `compute_gaps_in` and `selection_gpu_summary`.
+pub(crate) fn is_gpu_work_cat(c: &str) -> bool {
+    c == "kernel" || (c.starts_with("gpu_") && c != "gpu_user_annotation")
+}
+
 /// GPU idle gaps ("bubbles") for the Gaps tab: per rank scope, the wall-time
 /// intervals where NO gpu-work event covers that rank's timeline, biggest
 /// first, capped at `GAP_TOP_N` and annotated with what the rank's CPU
@@ -358,8 +367,7 @@ pub(crate) fn compute_gaps_in(trace: &Trace, f: GapFilter) -> Vec<GapInfo> {
     let mut is_work = vec![false; trace.cats.len()];
     let mut any_work = false;
     for (i, c) in trace.cats.iter().enumerate() {
-        let c = c.as_str();
-        if c == "kernel" || (c.starts_with("gpu_") && c != "gpu_user_annotation") {
+        if is_gpu_work_cat(c) {
             is_work[i] = true;
             any_work = true;
         }
@@ -484,6 +492,37 @@ pub(crate) fn compute_gaps_in(trace: &Trace, f: GapFilter) -> Vec<GapInfo> {
     gaps
 }
 
+/// The selection's GPU empty space, for the Selection tab summary: the
+/// selection's GPU-work events (from the frozen `finished_sel_events` set),
+/// clipped to its time range, span from the leftmost to the rightmost
+/// kernel; `busy` is the union of the clipped spans — concurrent streams
+/// must not double-count. `t1 - t0 - busy` is the empty space between the
+/// selected kernels. None when the selection holds no GPU work events
+/// (CPU-only selection, or annotations only).
+pub(crate) fn selection_gpu_summary(
+    trace: &Trace,
+    events: &std::collections::HashSet<(u32, u32)>,
+    sel: [f64; 4],
+) -> Option<SelGpuSummary> {
+    let (s0, s1) = if sel[0] <= sel[2] { (sel[0], sel[2]) } else { (sel[2], sel[0]) };
+    let mut spans: Vec<(f64, f64)> = Vec::new();
+    for &(ti, ei) in events {
+        let track = &trace.tracks[ti as usize];
+        if !track.gpu { continue; }
+        let ev = &track.events[ei as usize];
+        if ev.dur <= 0.0 || !is_gpu_work_cat(trace.cats[ev.cat as usize].as_str()) { continue; }
+        let a = ev.ts.max(s0);
+        let b = (ev.ts + ev.dur).min(s1);
+        if b > a { spans.push((a, b)); }
+    }
+    if spans.is_empty() { return None; }
+    Some(SelGpuSummary {
+        t0: spans.iter().map(|s| s.0).fold(f64::INFINITY, f64::min),
+        t1: spans.iter().map(|s| s.1).fold(f64::NEG_INFINITY, f64::max),
+        busy: union_len(&mut spans),
+    })
+}
+
 /// Maps rank id -> DP-group id for a merged multi-rank trace, from the
 /// per-rank source filenames persisted in `Trace::rank_paths`
 /// (`dp{N}_pp{P}_tp{T}_dcp{D}_ep{E}_rank{R}...`, built by vLLM's
@@ -592,6 +631,11 @@ pub struct Pane {
     /// silently changes which events are "selected".
     pub finished_sel_events: std::collections::HashSet<(u32, u32)>,
     pub selection_stats: Vec<SelectionEntry>,
+    /// GPU empty space inside the finished selection (see
+    /// `selection_gpu_summary`): span from its leftmost to rightmost kernel
+    /// and the busy union within. None = no GPU work in the selection.
+    /// Recomputed with `selection_stats` in `rebuild_selection_stats`.
+    pub sel_gpu: Option<SelGpuSummary>,
     pub selection_dirty: bool,
     pub sel_mask: Vec<bool>,
     pub collapsed: Vec<bool>,
@@ -769,6 +813,7 @@ impl Pane {
             finished_sel: None,
             finished_sel_events: std::collections::HashSet::new(),
             selection_stats: Vec::new(),
+            sel_gpu: None,
             selection_dirty: false,
             sel_mask: Vec::new(),
             collapsed: Vec::new(),
@@ -1022,6 +1067,7 @@ impl Pane {
         self.finished_sel = None;
         self.finished_sel_events.clear();
         self.selection_stats.clear();
+        self.sel_gpu = None;
         self.sel_mask.clear();
         self.sel_median = 0.0;
         self.sel_agg_stats.clear();
@@ -1358,7 +1404,7 @@ impl Pane {
         let t_start = crate::time::Instant::now();
         if self.trace.is_none() { return; }
         if self.finished_sel.is_none() {
-            self.selection_stats.clear(); self.sel_agg_stats.clear(); self.sel_individual.clear(); self.sel_individual_refs.clear(); self.sel_median = 0.0;
+            self.selection_stats.clear(); self.sel_gpu = None; self.sel_agg_stats.clear(); self.sel_individual.clear(); self.sel_individual_refs.clear(); self.sel_median = 0.0;
             return;
         }
         // finished_sel_events is the frozen (track_idx, event_idx) set
@@ -1389,6 +1435,12 @@ impl Pane {
             });
         }
         self.selection_stats.sort_unstable_by(|a, b| b.total_dur.partial_cmp(&a.total_dur).unwrap().then(a.name.cmp(&b.name)));
+        // GPU empty-space summary over the same frozen event set. Scoped so
+        // the `trace`/`finished_sel_events` borrows end before the assign.
+        self.sel_gpu = {
+            let trace = self.trace.as_ref().unwrap();
+            selection_gpu_summary(trace, &self.finished_sel_events, self.finished_sel.unwrap())
+        };
         let ev_count: u32 = self.selection_stats.iter().map(|e| e.count).sum();
         eprintln!("  select: {:.1}ms ({} events, {} names)", t_start.elapsed().as_secs_f64() * 1000.0, ev_count, self.selection_stats.len());
 
