@@ -1674,7 +1674,16 @@ impl App {
                     WindowFlags::NO_DECORATION
                         | WindowFlags::NO_MOVE
                         | WindowFlags::NO_SAVED_SETTINGS
-                        | WindowFlags::NO_BRING_TO_FRONT_ON_FOCUS
+                        // NO_BRING_TO_FRONT_ON_FOCUS is deliberately NOT set
+                        // here (unlike the other chrome windows): imgui
+                        // z-orders windows by creation/focus order, not
+                        // per-frame submission order, and ##toolbar is
+                        // created on frame 1 — earlier in the array = in
+                        // front. Since the strip now overlays the
+                        // full-width toolbar, it must be brought to front
+                        // when it appears (and on tab clicks) or the
+                        // toolbar's opaque background draws straight over
+                        // it and the tabs vanish.
                         | WindowFlags::NO_BACKGROUND
                         | WindowFlags::NO_SCROLLBAR
                         | WindowFlags::ALWAYS_AUTO_RESIZE,
