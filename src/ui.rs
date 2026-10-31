@@ -476,6 +476,9 @@ pub fn draw_hidden_clear(ui: &imgui::Ui, spacing: f32, hidden_names: &mut [bool]
     ui.same_line_with_spacing(0.0, spacing);
     fmt.clear();
     write!(fmt, "{} hidden", n_hidden).unwrap();
+    // Align with the Clear button this shares its line with (plain text sits
+    // at text-line height, framed widgets center on FramePadding).
+    ui.align_text_to_frame_padding();
     ui.text_colored([1.0, 0.7, 0.3, 1.0], fmt);
     ui.same_line_with_spacing(0.0, 4.0);
     if ui.small_button("Clear##unhide") {

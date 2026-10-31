@@ -1391,6 +1391,8 @@ impl App {
                                         }
                                         match &pane.share_link_result {
                                             Some((true, link)) if link.starts_with("https://") => {
+                                                // Align with the Copy button on the same line.
+                                                ui.align_text_to_frame_padding();
                                                 ui.text_colored([0.4, 0.85, 0.4, 1.0], link);
                                                 ui.same_line();
                                                 if ui.small_button("Copy##sharelink") {
