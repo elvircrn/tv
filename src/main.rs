@@ -1991,8 +1991,16 @@ impl App {
                                 let view_range = (pane.view.t0, pane.view.t1);
                                 let sel_range = pane.gap_sel_window();
                                 let mut filter_changed = false;
+                                // align_text_to_frame_padding: the row mixes
+                                // plain text with buttons and an input field,
+                                // and raw text sits at text-line height while
+                                // framed widgets center on FramePadding —
+                                // without the align, "Range:" rides high
+                                // next to "Limit to view".
+                                ui.align_text_to_frame_padding();
                                 ui.text("Range:");
                                 ui.same_line();
+                                ui.align_text_to_frame_padding();
                                 state.buf.fmt.clear();
                                 match sel_range.or(pane.gap_filter.window) {
                                     Some((w0, w1)) => {
@@ -2028,6 +2036,7 @@ impl App {
                                     }
                                 }
                                 ui.same_line();
+                                ui.align_text_to_frame_padding();
                                 ui.text("Max (ms):");
                                 ui.same_line();
                                 let mut max_ms = pane.gap_filter.max_len
