@@ -5123,7 +5123,7 @@ fn gaps_filter_window_clips_and_drops() {
         ])],
         &["kernel"],
     );
-    let f = |w0: f64, w1: f64| GapFilter { window: Some((w0, w1)), max_len: None, ..Default::default() };
+    let f = |w0: f64, w1: f64| GapFilter { window: Some((w0, w1)), ..Default::default() };
 
     // Window strictly inside the gap: clipped to the intersection.
     let gaps = compute_gaps_in(&trace, f(20.0, 35.0));
@@ -5145,32 +5145,14 @@ fn gaps_filter_window_clips_and_drops() {
 }
 
 #[test]
-fn gaps_filter_max_len_drops_artifacts() {
-    // Kernels at [0,10], [20,30], [50,60]: gaps [10,20] (10µs) and
-    // [30,50] (20µs, the "artifact"). max_len 15µs keeps only the real
-    // bubble. 0/None keeps both.
-    let trace = gaps_trace(
-        vec![("stream 7", true, vec![
-            evc(0.0, 10.0, 0, 0),
-            evc(20.0, 10.0, 1, 0),
-            evc(50.0, 10.0, 0, 0),
-        ])],
-        &["kernel"],
-    );
-    let gaps = compute_gaps_in(&trace, GapFilter { window: None, max_len: Some(15.0), ..Default::default() });
-    assert_eq!(gaps.len(), 1);
-    assert_eq!(gaps[0].t0, 10.0);
-    assert_eq!(gaps[0].t1, 20.0);
-    assert_eq!(compute_gaps_in(&trace, GapFilter::default()).len(), 2);
-}
-
-#[test]
 fn gaps_filter_applies_before_top_n() {
-    // Same 600-gap ladder as gaps_top_n_truncation (lengths 1..600µs).
-    // The max-length cut must happen BEFORE the top-N truncation: with
-    // max 400µs the 200 artifact-sized gaps are dropped first and all 400
-    // real ones listed — not the top 500 of the unfiltered list minus the
-    // artifacts (which would leave only 100).
+    // Same 600-gap ladder as gaps_top_n_truncation (lengths 1..600µs):
+    // gap i spans [i + i(i-1)/2 + 1, i + i(i-1)/2 + 1 + i], so gap 400
+    // ends at exactly 80600 and gap 401 starts at 80601. The window cut
+    // must happen BEFORE the top-N truncation: with window [0, 80600]
+    // the 200 gaps past it are dropped first and all 400 in-window ones
+    // listed — not the top 500 of the unfiltered list clipped to the
+    // window (which would leave only 300).
     let mut events = Vec::new();
     let mut t = 0.0;
     for i in 1..=600 {
@@ -5180,7 +5162,7 @@ fn gaps_filter_applies_before_top_n() {
     }
     events.push(evc(t, 1.0, 0, 0));
     let trace = gaps_trace(vec![("stream 7", true, events)], &["kernel"]);
-    let gaps = compute_gaps_in(&trace, GapFilter { window: None, max_len: Some(400.0), ..Default::default() });
+    let gaps = compute_gaps_in(&trace, GapFilter { window: Some((0.0, 80600.0)), ..Default::default() });
     assert_eq!(gaps.len(), 400);
     assert_eq!(gaps[0].t1 - gaps[0].t0, 400.0);
     assert_eq!(gaps[399].t1 - gaps[399].t0, 1.0);

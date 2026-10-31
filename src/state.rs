@@ -425,17 +425,16 @@ pub(crate) fn compute_gaps_in(trace: &Trace, f: GapFilter) -> Vec<GapInfo> {
             }
         }
     }
-    // User filter before the sort/top-N cut: clip each gap to the window,
-    // then drop edge-clipped shavings and anything over the max length, so
-    // artifact-sized gaps never take list slots from real bubbles.
-    if f.window.is_some() || f.max_len.is_some() {
+    // User filter before the sort/top-N cut: clip each gap to the window
+    // and drop edge-clipped shavings, so artifact-sized gaps outside the
+    // viewed region don't take list slots from real bubbles.
+    if f.window.is_some() {
         raw.retain_mut(|g| {
             if let Some((w0, w1)) = f.window {
                 g.1 = g.1.max(w0);
                 g.2 = g.2.min(w1);
             }
-            let len = g.2 - g.1;
-            len >= crate::types::MIN_GAP_US && f.max_len.map_or(true, |m| len <= m)
+            g.2 - g.1 >= crate::types::MIN_GAP_US
         });
     }
     raw.sort_unstable_by(|a, b| (b.2 - b.1).partial_cmp(&(a.2 - a.1)).unwrap());
@@ -698,10 +697,10 @@ pub struct Pane {
     /// drawn as a red band on the timeline/ruler. Index into `gaps`, cleared
     /// wherever `gaps` is invalidated (the indices go stale with it).
     pub focused_gap: Option<usize>,
-    /// Gaps-tab detection filter (window + max length; see `GapFilter`).
+    /// Gaps-tab detection filter (window; see `GapFilter`).
     /// Changing it in the UI clears `gaps`/`focused_gap` to force a
     /// recompute. The window is timestamp-based, so it's also cleared on
-    /// reload and clock sync like `gaps` itself; `max_len` survives those.
+    /// reload and clock sync like `gaps` itself.
     pub gap_filter: GapFilter,
     /// Rank scopes the finished selection's y-range crossed, frozen at
     /// drag-finish time (see `capture_sel_scopes`). While a non-zero-width
@@ -1773,7 +1772,7 @@ impl Pane {
         // A finished selection takes over detection: gaps are clipped to its
         // time range and scoped to the ranks its rect crossed. Without one
         // (or for a zero-width pick, see gap_sel_window) the manual filter
-        // applies. Either way max_len stacks on top.
+        // applies.
         let mut f = self.gap_filter.clone();
         if let Some((s0, s1)) = self.gap_sel_window() {
             f.window = Some((s0, s1));

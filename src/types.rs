@@ -484,9 +484,6 @@ pub struct GapFilter {
     /// While a timeline selection is active it is overridden by the
     /// selection's own range (see `Pane::ensure_gaps`).
     pub window: Option<(f64, f64)>,
-    /// Drop gaps longer than this many µs (the massive-artifact cut).
-    /// None = unlimited.
-    pub max_len: Option<f64>,
     /// Restrict detection to these rank scopes, keyed like
     /// `compute_gaps_in` scopes them (`parse_rank(...).unwrap_or(MAX)`).
     /// Set from a finished timeline selection while it's active; None =

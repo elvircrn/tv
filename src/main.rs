@@ -1982,23 +1982,20 @@ impl App {
                                 // profiler-artifact gaps that fill the whole
                                 // top-N list. Zoom into the known-good region
                                 // and press "Limit to view" to restrict
-                                // detection to it; "Max" (ms, 0 = unlimited)
-                                // cuts artifact-sized gaps inside the range
-                                // too. Either changing invalidates the cached
-                                // gaps and the row focus so they re-detect.
-                                // While a selection is active it takes over
-                                // the range (and scopes the ranks), so the
-                                // manual range buttons are hidden — they'd be
+                                // detection to it; changing it invalidates
+                                // the cached gaps and the row focus so they
+                                // re-detect. While a selection is active it
+                                // takes over the range (and scopes the
+                                // ranks), so the button is hidden — it'd be
                                 // silently overridden.
                                 let view_range = (pane.view.t0, pane.view.t1);
                                 let sel_range = pane.gap_sel_window();
                                 let mut filter_changed = false;
                                 // align_text_to_frame_padding: the row mixes
-                                // plain text with buttons and an input field,
+                                // plain text with the "Limit to view" button,
                                 // and raw text sits at text-line height while
                                 // framed widgets center on FramePadding —
-                                // without the align, "Range:" rides high
-                                // next to "Limit to view".
+                                // without the align, "Range:" rides high.
                                 ui.align_text_to_frame_padding();
                                 ui.text("Range:");
                                 ui.same_line();
@@ -2029,32 +2026,6 @@ impl App {
                                         ui.tooltip_text(
                                             "Only look for gaps inside the time range currently visible in the timeline. Zoom into the good region first.");
                                     }
-                                    if pane.gap_filter.window.is_some() {
-                                        ui.same_line();
-                                        if ui.button("Clear") {
-                                            pane.gap_filter.window = None;
-                                            filter_changed = true;
-                                        }
-                                    }
-                                }
-                                ui.same_line();
-                                ui.align_text_to_frame_padding();
-                                ui.text("Max (ms):");
-                                ui.same_line();
-                                let mut max_ms = pane.gap_filter.max_len
-                                    .map(|m| (m / 1000.0) as f32).unwrap_or(0.0);
-                                let _w = ui.push_item_width(80.0);
-                                if ui.input_float("##gapmax", &mut max_ms)
-                                    .step(10.0).build()
-                                {
-                                    pane.gap_filter.max_len = if max_ms > 0.0 {
-                                        Some(max_ms as f64 * 1000.0)
-                                    } else { None };
-                                    filter_changed = true;
-                                }
-                                drop(_w);
-                                if ui.is_item_hovered() {
-                                    ui.tooltip_text("Ignore gaps longer than this (0 = unlimited)");
                                 }
                                 // Selection-scoped idle, per rank: when a range
                                 // selection exists, each rank's empty space
