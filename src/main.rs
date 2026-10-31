@@ -105,10 +105,10 @@ fn strip_tab_label(full: &str, max: usize) -> String {
     let n = full.chars().count();
     if n <= max { return full.to_string(); }
     let head = max * 2 / 3;
-    let tail = max - head - 1; // -1 for the ellipsis
+    let tail = max - head - 3; // -3 for the "..."
     let mut out = String::with_capacity(max);
     out.extend(full.chars().take(head));
-    out.push('\u{2026}');
+    out.push_str("...");
     out.extend(full.chars().skip(n - tail));
     out
 }
@@ -1264,9 +1264,9 @@ impl App {
             if near_icon {
                 ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
                 let tip = if state.panes[ai].even_spacing {
-                    "Tracks are fit to the visible height — click to go back to their normal (scrollable) sizes."
+                    "Tracks are fit to the visible height - click to go back to their normal (scrollable) sizes."
                 } else {
-                    "Fit all tracks to evenly fill the space down to this divider — handy for the merged view, where a few rank rows otherwise leave a lot of dead space. Double-clicking the divider does the same thing."
+                    "Fit all tracks to evenly fill the space down to this divider - handy for the merged view, where a few rank rows otherwise leave a lot of dead space. Double-clicking the divider does the same thing."
                 };
                 ui.tooltip_text(tip);
             }
@@ -1383,11 +1383,11 @@ impl App {
                                         }
                                         if ui.is_item_hovered() {
                                             let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "GPU-only timings (no args)" };
-                                            ui.tooltip_text(&format!("Export {what}, then upload it to a new secret GitHub gist via your locally logged-in `gh` CLI, and show a copyable ?gist= link — no browser login or pasted token, but it does need `gh auth login` already done on this machine"));
+                                            ui.tooltip_text(&format!("Export {what}, then upload it to a new secret GitHub gist via your locally logged-in `gh` CLI, and show a copyable ?gist= link - no browser login or pasted token, but it does need `gh auth login` already done on this machine"));
                                         }
                                         ui.menu_item_config("Include CPU data##sharecpu").build_with_ref(&mut pane.share_include_cpu);
                                         if ui.is_item_hovered() {
-                                            ui.tooltip_text("Upload the whole trace (all CPU and GPU tracks, args left intact, not stripped) instead of just GPU-only timings — much larger, but complete");
+                                            ui.tooltip_text("Upload the whole trace (all CPU and GPU tracks, args left intact, not stripped) instead of just GPU-only timings - much larger, but complete");
                                         }
                                         match &pane.share_link_result {
                                             Some((true, link)) if link.starts_with("https://") => {
@@ -1418,7 +1418,7 @@ impl App {
                                         });
                                     }
                                     if ui.is_item_hovered() {
-                                        ui.tooltip_text("Write this trace to the fast on-disk cache (<folder>.tvcache/_merged.tvcache for a folder open, a sibling <file>.tvcache for a single file) so re-opening it loads instantly. Opening a trace never writes these automatically — this menu item is the only way they get created.");
+                                        ui.tooltip_text("Write this trace to the fast on-disk cache (<folder>.tvcache/_merged.tvcache for a folder open, a sibling <file>.tvcache for a single file) so re-opening it loads instantly. Opening a trace never writes these automatically - this menu item is the only way they get created.");
                                     }
                                     if let Some((ok, msg)) = &pane.export_message {
                                         let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
@@ -1473,7 +1473,7 @@ impl App {
                                         });
                                     }
                                     if ui.is_item_hovered() {
-                                        ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) — aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
+                                        ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) - aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
                                     }
                                     if let Some((ok, msg)) = &pane.sync_message {
                                         let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
@@ -2007,7 +2007,7 @@ impl App {
                                 match sel_range.or(pane.gap_filter.window) {
                                     Some((w0, w1)) => {
                                         write_time(&mut state.buf.fmt, w0);
-                                        state.buf.fmt.push_str(" \u{2013} ");
+                                        state.buf.fmt.push_str(" - ");
                                         write_time(&mut state.buf.fmt, w1);
                                         if sel_range.is_some() {
                                             state.buf.fmt.push_str(" (selection)");
@@ -2069,7 +2069,7 @@ impl App {
                                     state.buf.fmt.clear();
                                     state.buf.fmt.push_str("In selection ");
                                     write_time(&mut state.buf.fmt, pane.sel_gpu.iter().map(|g| g.t0).fold(f64::INFINITY, f64::min));
-                                    state.buf.fmt.push_str(" \u{2013} ");
+                                    state.buf.fmt.push_str(" - ");
                                     write_time(&mut state.buf.fmt, pane.sel_gpu.iter().map(|g| g.t1).fold(f64::NEG_INFINITY, f64::max));
                                     state.buf.fmt.push(':');
                                     ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
@@ -2115,7 +2115,7 @@ impl App {
                                 let gaps = pane.gaps.as_deref().unwrap_or(&[]);
                                 state.buf.fmt.clear();
                                 if gaps.is_empty() {
-                                    write!(state.buf.fmt, "No GPU idle gaps ≥ ").unwrap();
+                                    write!(state.buf.fmt, "No GPU idle gaps >= ").unwrap();
                                     write_time(&mut state.buf.fmt, MIN_GAP_US);
                                     state.buf.fmt.push_str(" found");
                                     ui.text_colored([0.5, 0.5, 0.5, 1.0], &state.buf.fmt);

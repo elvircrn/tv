@@ -1886,7 +1886,7 @@ fn cache_load_error(d: &[u8]) -> String {
         let version = u32::from_le_bytes(d[4..8].try_into().unwrap());
         if version > CACHE_VERSION {
             return format!(
-                "this file uses a newer cache format (v{version}) than this version of Trace Viewer understands (up to v{CACHE_VERSION}) — update Trace Viewer to open it"
+                "this file uses a newer cache format (v{version}) than this version of Trace Viewer understands (up to v{CACHE_VERSION}) - update Trace Viewer to open it"
             );
         }
     }

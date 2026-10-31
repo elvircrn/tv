@@ -909,7 +909,7 @@ impl Pane {
         } else if self.reload_paths.len() == 1 {
             let path = &self.reload_paths[0].1;
             if path.ends_with(".tvcache") || path.ends_with(".tvcache.xz") || path.ends_with(".tvcache.gz") {
-                Err("this trace was loaded from a cache file — nothing to export".to_string())
+                Err("this trace was loaded from a cache file - nothing to export".to_string())
             } else {
                 crate::loader::export_single_cache(trace, path)
             }

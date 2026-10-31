@@ -340,7 +340,7 @@ pub fn draw_duration_histogram(
         buf.fmt.clear();
         write!(buf.fmt, "{} call{} in ", hist_bins[b], if hist_bins[b] == 1 { "" } else { "s" }).unwrap();
         write_time(&mut buf.fmt, lo);
-        buf.fmt.push_str(" – ");
+        buf.fmt.push_str(" - ");
         write_time(&mut buf.fmt, hi);
         ui.tooltip_text(&buf.fmt);
     }
@@ -2597,7 +2597,7 @@ pub fn draw_gaps_table(
         let (why, col) = gap_why(g);
         ui.text_colored(col, why);
         if ui.is_item_hovered() && g.has_cpu {
-            ui.tooltip_text("runtime-bound: most of the CPU's time in the gap was CUDA runtime calls —\nmany short launches (launch-bound) or one long blocking call (sync).\nSee \"CPU was doing\" for which.");
+            ui.tooltip_text("runtime-bound: most of the CPU's time in the gap was CUDA runtime calls -\nmany short launches (launch-bound) or one long blocking call (sync).\nSee \"CPU was doing\" for which.");
         }
 
         ui.table_set_column_index(6);
