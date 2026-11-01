@@ -2415,24 +2415,6 @@ impl App {
             }
         }
 
-        // A tab close was clicked in the strip above: remove the pane HERE,
-        // after the canvas/bottom panel finished rendering against the old
-        // pane list — `ai` was copied before the strip ran, so removing
-        // mid-frame would leave the rest indexing a dead slot.
-        let closed_tab = close_pane.is_some();
-        if let Some(pi) = close_pane {
-            if state.panes.len() > 1 {
-                state.remove_pane(pi);
-            } else {
-                state.panes[0] = Pane::new();
-            }
-        }
-
-        let needs_extra_frame = click_result.is_some() || new_selection.is_some() || tabs_w_changed || strip_switched || closed_tab;
-        if needs_extra_frame {
-            window.request_redraw();
-        }
-
         mark!("clicks", t_section);
         // ---- Hover tooltip (active pane) ----
         if !state.diff_popup_open {
@@ -2595,6 +2577,26 @@ impl App {
 
         if search_changed {
             state.panes[ai].rebuild_search();
+        }
+
+        // A tab close was clicked in the strip above: remove the pane HERE,
+        // at the very end of the frame — `ai` was copied before the strip
+        // ran and the canvas/bottom panel/tooltip/keybind blocks between
+        // still index `state.panes[ai]`, so removing any earlier (as an
+        // older version did, after just the canvas) left them indexing a
+        // dead slot and panicked when the closed tab was the active one.
+        let closed_tab = close_pane.is_some();
+        if let Some(pi) = close_pane {
+            if state.panes.len() > 1 {
+                state.remove_pane(pi);
+            } else {
+                state.panes[0] = Pane::new();
+            }
+        }
+
+        let needs_extra_frame = click_result.is_some() || new_selection.is_some() || tabs_w_changed || strip_switched || closed_tab;
+        if needs_extra_frame {
+            window.request_redraw();
         }
 
         mark!("keybinds", t_section);
