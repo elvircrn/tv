@@ -1400,9 +1400,15 @@ impl Pane {
                     self.search_nav.clear();
                     self.search_cursor = 0;
                     // The reloaded trace may have fewer events; a retained
-                    // EventRef would index out of bounds in the Detail panel.
+                    // EventRef would index out of bounds in the Detail panel,
+                    // and the finished selection's frozen event set has the
+                    // same hazard in every Selection-tab consumer
+                    // (rebuild_multi_stats, sel_events_list,
+                    // copy_selection_text, selection_gpu_summary) — they all
+                    // index tracks/events directly. clear_selection() drops
+                    // the whole selection-derived family at once.
                     self.selected = None;
-                    self.selection_stats.clear();
+                    self.clear_selection();
                     // Same reasoning: the merged-view Tetris-packing cache
                     // stores raw (track_idx, event_idx) pairs keyed on
                     // (view range, hidden names, track order) — none of

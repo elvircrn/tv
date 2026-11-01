@@ -2118,6 +2118,30 @@ fn bench_merge_filter() {
     }
 }
 
+// Times the app's real load path (load_trace_progressive), not the bench
+// shortcut: the first receive is what gates the first interactive frame, and
+// the second (compacted) copy replaces it shortly after. Run with:
+//   TV_BENCH_TRACE=<trace> cargo test --release bench_progressive_load -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_progressive_load() {
+    use crate::loader::load_trace_progressive;
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<trace> to run this bench"); return; }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let counter = test_counter();
+    let t0 = std::time::Instant::now();
+    load_trace_progressive(&path, &counter, 0, &tx, None);
+    let mut n = 0;
+    while let Ok(Ok(t)) = rx.try_recv() {
+        n += 1;
+        eprintln!("  receive {n}: +{:.2}s ({} tracks, {} events)",
+            t0.elapsed().as_secs_f64(), t.tracks.len(), t.total_events);
+    }
+}
+
 // Measures a *full* draw_timeline call (real imgui context, no renderer
 // backend needed — draw lists are plain in-memory data) at several zoom
 // levels, to see where the frame budget actually goes beyond the
@@ -2314,6 +2338,45 @@ fn bench_selection_stats() {
     let t0 = std::time::Instant::now();
     pane.rebuild_selection_stats(&mut buf);
     eprintln!("total rebuild_selection_stats: {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
+}
+
+#[test]
+fn reload_clears_finished_selection_refs() {
+    // A reload swaps in a possibly-smaller trace. The finished selection's
+    // frozen (track_idx, event_idx) set indexes the OLD trace, and every
+    // Selection-tab consumer (rebuild_selection_stats,
+    // extract_selection_events, copy_selection_text,
+    // selection_gpu_summary) reads it with a direct index — leaving it set
+    // across the swap panicked on smaller reloaded traces, the same class
+    // as the stale-EventRef Detail-panel bug the reload branch already
+    // guarded against.
+    let mut pane = Pane::new();
+    pane.trace = Some(make_trace(
+        vec!["a"],
+        vec![("GPU 0", true, vec![ev(0.0, 1.0, 0, 0)])],
+    ));
+    pane.selection = Some([0.0, 10.0, 0.0, 10.0]);
+    pane.finished_sel = Some([0.0, 10.0, 0.0, 10.0]);
+    // Stale refs: track 5 / event 100 exist in no plausible reloaded trace.
+    pane.finished_sel_events = [(5u32, 100u32)].into_iter().collect();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Ok(make_trace(
+        vec!["a"],
+        vec![("GPU 0", true, vec![ev(0.0, 1.0, 0, 0)])],
+    ))).unwrap();
+    pane.loading = Some(rx);
+    pane.poll_loading();
+
+    // The whole selection-derived family is gone after the swap...
+    assert!(pane.selection.is_none());
+    assert!(pane.finished_sel.is_none());
+    assert!(pane.finished_sel_events.is_empty());
+    // ...so the direct-indexing consumers are safe to call.
+    let mut buf = DrawBuf::default();
+    pane.rebuild_selection_stats(&mut buf);
+    assert!(pane.extract_selection_events().is_empty());
+    assert!(pane.copy_selection_text().is_none());
 }
 
 #[test]
