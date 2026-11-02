@@ -1,14 +1,132 @@
-use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
-
-#[derive(Default)]
-pub struct IdentityHasher(u64);
-impl Hasher for IdentityHasher {
-    fn finish(&self) -> u64 { self.0 }
-    fn write(&mut self, _bytes: &[u8]) { unreachable!() }
-    fn write_u64(&mut self, i: u64) { self.0 = i; }
+/// Interning table for parse-time strings (event names, categories, arg
+/// keys/values): byte string -> u32 id, where the id is an *index into
+/// `strings* — no pointers anywhere.
+///
+/// Data-oriented replacement for the old `(Vec<String>, HashMap<u64, u32>)`
+/// pair keyed by the string's fnv1a hash: the hash table is one flat
+/// open-addressed `Vec<u64>` of slots instead of hashbrown's bucket array.
+/// Each slot packs the id in the low 32 bits (stored as id+1, so a slot of
+/// 0 means empty) and the HIGH 32 bits of the hash in the upper bits — the
+/// tag rides the same cache line as the id and is checked before the second
+/// access into `hashes` that confirms the full 64-bit hash (preserving the
+/// exact hash-identity semantics of the map this replaced). Linear probing
+/// plus a 75% load cap keeps lookups to a slot or two for the small tables
+/// interning produces (real traces have hundreds to low thousands of
+/// distinct names, not millions).
+pub struct InternTable {
+    strings: Vec<String>,
+    hashes: Vec<u64>,
+    slots: Vec<u64>,
+    mask: usize,
 }
-pub type FnvMap<V> = HashMap<u64, V, BuildHasherDefault<IdentityHasher>>;
+
+const INTERN_MIN_SLOTS: usize = 64;
+
+impl InternTable {
+    /// An empty table with the empty string pre-interned at id 0 — the old
+    /// tables' `insert(0, 0)` seed, so id 0 always means "".
+    pub fn new() -> Self {
+        let mut t = Self {
+            strings: Vec::new(),
+            hashes: Vec::new(),
+            slots: vec![0; INTERN_MIN_SLOTS],
+            mask: INTERN_MIN_SLOTS - 1,
+        };
+        t.insert_entry(0, String::new());
+        t
+    }
+
+    pub fn len(&self) -> usize { self.strings.len() }
+
+    pub fn str(&self, id: u32) -> &str { &self.strings[id as usize] }
+
+    /// Hand off the interned strings (for building a `Trace`, whose name/
+    /// cat columns are plain `Vec<String>` once loading is done).
+    pub fn into_strings(self) -> Vec<String> { self.strings }
+
+    /// id for `bytes`, interning it if new. Identity is the fnv1a hash,
+    /// exactly as in the `HashMap<u64, u32>` this replaced.
+    pub fn intern(&mut self, bytes: &[u8]) -> u32 {
+        let hash = fnv1a(bytes);
+        if let Some(id) = self.lookup(hash) { return id; }
+        let s = match String::from_utf8(bytes.to_vec()) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        };
+        self.insert_entry(hash, s)
+    }
+
+    /// id for `s`, interning it if new (merge paths, which hold `&str`s).
+    pub fn intern_str(&mut self, s: &str) -> u32 {
+        let hash = fnv1a(s.as_bytes());
+        if let Some(id) = self.lookup(hash) { return id; }
+        self.insert_entry(hash, s.to_string())
+    }
+
+    /// Remap a local table's ids onto this (global) table, interning any
+    /// string the global side hasn't seen. Replaces `merge_intern_table` /
+    /// `merge_intern_direct`: iterating the local side is a straight walk
+    /// over its parallel `hashes`/`strings` arrays — no map entries to
+    /// chase.
+    pub fn merge_from(&mut self, local: &InternTable) -> Vec<u32> {
+        let mut remap = vec![0u32; local.strings.len()];
+        for (i, (&hash, s)) in local.hashes.iter().zip(&local.strings).enumerate() {
+            remap[i] = self.lookup(hash).unwrap_or_else(|| self.insert_entry(hash, s.clone()));
+        }
+        remap
+    }
+
+    /// `merge_from` for local sides that are plain string lists (final
+    /// `Trace`s in the diff/merge path, which no longer carry tables).
+    pub fn merge_strings(&mut self, local: &[String]) -> Vec<u32> {
+        local.iter().map(|s| self.intern_str(s)).collect()
+    }
+
+    fn insert_entry(&mut self, hash: u64, s: String) -> u32 {
+        let id = self.strings.len() as u32;
+        self.strings.push(s);
+        self.hashes.push(hash);
+        self.place(hash, id as u64);
+        self.maybe_grow();
+        id
+    }
+
+    fn maybe_grow(&mut self) {
+        if self.strings.len() * 4 > self.slots.len() * 3 {
+            self.slots = vec![0; self.slots.len() * 2];
+            self.mask = self.slots.len() - 1;
+            for id in 0..self.hashes.len() {
+                let h = self.hashes[id];
+                self.place(h, id as u64);
+            }
+        }
+    }
+
+    /// Drop `hash -> id` into the first free probe slot. Caller guarantees
+    /// one exists (load factor is capped at 75%).
+    fn place(&mut self, hash: u64, id: u64) {
+        let mut slot = (hash as usize) & self.mask;
+        while self.slots[slot] != 0 { slot = (slot + 1) & self.mask; }
+        self.slots[slot] = (hash & 0xffff_ffff_0000_0000) | (id + 1);
+    }
+
+    fn lookup(&self, hash: u64) -> Option<u32> {
+        let mut slot = (hash as usize) & self.mask;
+        loop {
+            let v = self.slots[slot];
+            if v == 0 { return None; }
+            let id = (v & 0xffff_ffff) as usize - 1;
+            if v >> 32 == hash >> 32 && self.hashes[id] == hash {
+                return Some(id as u32);
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+}
+
+impl Default for InternTable {
+    fn default() -> Self { Self::new() }
+}
 
 /// Find `"key": <integer>` at/after `start` in a JSON blob (works through
 /// nested objects, since `find_key` is a plain byte search). Returns None if
@@ -224,8 +342,7 @@ pub fn parse_f64(bytes: &[u8]) -> f64 {
 
 pub fn parse_args_flat(
     blob: &[u8],
-    strs: &mut Vec<String>,
-    idx: &mut FnvMap<u32>,
+    strs: &mut InternTable,
     pairs: &mut Vec<[u32; 2]>,
 ) {
     if blob.is_empty() || blob[0] != b'{' { return; }
@@ -243,24 +360,11 @@ pub fn parse_args_flat(
         p = skip_ws(blob, p);
         let vs = p;
         p = skip_value(blob, p);
-        let ki = intern(&blob[ks..ke], strs, idx);
+        let ki = strs.intern(&blob[ks..ke]);
         let val_bytes = if blob[vs] == b'"' { &blob[vs + 1..p - 1] } else { &blob[vs..p] };
-        let vi = intern(val_bytes, strs, idx);
+        let vi = strs.intern(val_bytes);
         pairs.push([ki, vi]);
     }
-}
-
-pub fn intern(bytes: &[u8], table: &mut Vec<String>, index: &mut FnvMap<u32>) -> u32 {
-    let hash = fnv1a(bytes);
-    if let Some(&idx) = index.get(&hash) { return idx; }
-    let idx = table.len() as u32;
-    let s = match String::from_utf8(bytes.to_vec()) {
-        Ok(s) => s,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    };
-    table.push(s);
-    index.insert(hash, idx);
-    idx
 }
 
 pub fn fnv1a(bytes: &[u8]) -> u64 {

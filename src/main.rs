@@ -33,7 +33,7 @@ mod ktz;
 #[cfg(target_os = "macos")]
 mod dock_menu;
 
-use parse::{skip_value, parse_args_flat, FnvMap};
+use parse::{skip_value, parse_args_flat, InternTable};
 use types::*;
 #[cfg(not(target_arch = "wasm32"))]
 use renderer::MetalRenderer as PlatformRenderer;
@@ -166,16 +166,15 @@ fn set_reload_dir(pane: &mut Pane, dir: Option<&str>) {
 /// defensive bound, not because args actually nest that deep in practice.
 fn format_arg_value(buf: &mut String, val: &str, depth: usize) {
     if depth < 4 && val.starts_with('{') && val.ends_with('}') {
-        let mut strs = Vec::new();
-        let mut idx = FnvMap::default();
+        let mut strs = InternTable::new();
         let mut pairs = Vec::new();
-        parse_args_flat(val.as_bytes(), &mut strs, &mut idx, &mut pairs);
+        parse_args_flat(val.as_bytes(), &mut strs, &mut pairs);
         if !pairs.is_empty() {
             for &[k, v] in &pairs {
                 buf.push('\n');
                 for _ in 0..=depth { buf.push_str("  "); }
-                write!(buf, "{}: ", strs[k as usize]).unwrap();
-                format_arg_value(buf, &strs[v as usize], depth + 1);
+                write!(buf, "{}: ", strs.str(k)).unwrap();
+                format_arg_value(buf, strs.str(v), depth + 1);
             }
             return;
         }
@@ -2239,15 +2238,14 @@ impl App {
                                     let off = ev.args_off as usize;
                                     if off < raw.len() {
                                         let end = skip_value(raw, off);
-                                        let mut strs = Vec::new();
-                                        let mut idx = FnvMap::default();
+                                        let mut strs = InternTable::new();
                                         let mut pairs = Vec::new();
-                                        parse_args_flat(&raw[off..end], &mut strs, &mut idx, &mut pairs);
+                                        parse_args_flat(&raw[off..end], &mut strs, &mut pairs);
                                         if !pairs.is_empty() {
                                             state.buf.detail_buf.push('\n');
                                             for &[k, v] in &pairs {
-                                                write!(state.buf.detail_buf, "\n{}: ", strs[k as usize]).unwrap();
-                                                format_arg_value(&mut state.buf.detail_buf, &strs[v as usize], 0);
+                                                write!(state.buf.detail_buf, "\n{}: ", strs.str(k)).unwrap();
+                                                format_arg_value(&mut state.buf.detail_buf, strs.str(v), 0);
                                             }
                                         }
                                     }

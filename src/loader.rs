@@ -41,10 +41,8 @@ impl RawData {
 }
 
 struct ChunkState {
-    names: Vec<String>,
-    name_idx: FnvMap<u32>,
-    cats: Vec<String>,
-    cat_idx: FnvMap<u32>,
+    names: InternTable,
+    cats: InternTable,
     events: Vec<(u64, u64, Event)>,
     thread_names: HashMap<(u64, u64), String>,
     flows: Vec<(u64, u64, u64, f64, bool)>,
@@ -56,15 +54,11 @@ struct ChunkState {
 
 impl ChunkState {
     fn new() -> Self {
-        let mut name_idx = FnvMap::default();
-        name_idx.insert(0, 0);
-        let mut cat_idx = FnvMap::default();
-        cat_idx.insert(0, 0);
+        // InternTable::new() pre-interns "" at id 0 — the seed the old
+        // name_idx/cat_idx `insert(0, 0)` calls used to set up.
         Self {
-            names: vec![String::new()],
-            name_idx,
-            cats: vec![String::new()],
-            cat_idx,
+            names: InternTable::new(),
+            cats: InternTable::new(),
             events: Vec::new(),
             thread_names: HashMap::new(),
             flows: Vec::new(),
@@ -179,7 +173,7 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
                         if pos < raw.len() && raw[pos] == b'"' {
                             let s = pos + 1;
                             pos = skip_string(raw, pos);
-                            cat = intern(&raw[s..pos - 1], &mut state.cats, &mut state.cat_idx);
+                            cat = state.cats.intern(&raw[s..pos - 1]);
                         } else { pos = skip_value(raw, pos); }
                     }
                     _ => { pos = skip_value(raw, pos); }
@@ -193,7 +187,7 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
                         if pos < raw.len() && raw[pos] == b'"' {
                             let s = pos + 1;
                             pos = skip_string(raw, pos);
-                            name = intern(&raw[s..pos - 1], &mut state.names, &mut state.name_idx);
+                            name = state.names.intern(&raw[s..pos - 1]);
                         } else { pos = skip_value(raw, pos); }
                     }
                     [b'a', b'r'] => {
@@ -220,17 +214,16 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
             state.total_events += 1;
             counter.fetch_add(1, Ordering::Relaxed);
         } else if ph == b'M' {
-            let name_str = &state.names[name as usize];
+            let name_str = state.names.str(name);
             if name_str == "thread_name" && args_off > 0 {
                 let end = skip_value(raw, args_off as usize);
-                let mut tmp_strs = Vec::new();
-                let mut tmp_idx = FnvMap::default();
+                let mut tmp_strs = InternTable::new();
                 let mut tmp_pairs = Vec::new();
-                parse_args_flat(&raw[args_off as usize..end], &mut tmp_strs, &mut tmp_idx, &mut tmp_pairs);
+                parse_args_flat(&raw[args_off as usize..end], &mut tmp_strs, &mut tmp_pairs);
                 for &[k, v] in &tmp_pairs {
-                    if tmp_strs.get(k as usize).map_or(false, |s| s == "name") {
-                        if let Some(s) = tmp_strs.get(v as usize) {
-                            state.thread_names.insert((pid, tid), s.clone());
+                    if (k as usize) < tmp_strs.len() && tmp_strs.str(k) == "name" {
+                        if (v as usize) < tmp_strs.len() {
+                            state.thread_names.insert((pid, tid), tmp_strs.str(v).to_string());
                         }
                         break;
                     }
@@ -240,26 +233,6 @@ fn parse_chunk(raw: &[u8], start: usize, chunk_end: usize, state: &mut ChunkStat
             state.flows.push((flow_id, pid, tid, ts, ph == b's'));
         }
     }
-}
-
-fn merge_intern_table(
-    global: &mut Vec<String>,
-    global_idx: &mut FnvMap<u32>,
-    local: &[String],
-    local_idx: &FnvMap<u32>,
-) -> Vec<u32> {
-    let mut remap = vec![0u32; local.len()];
-    for (&hash, &local_i) in local_idx {
-        if let Some(&global_i) = global_idx.get(&hash) {
-            remap[local_i as usize] = global_i;
-        } else {
-            let global_i = global.len() as u32;
-            global.push(local[local_i as usize].clone());
-            global_idx.insert(hash, global_i);
-            remap[local_i as usize] = global_i;
-        }
-    }
-    remap
 }
 
 fn calc_n_threads(data_len: usize, max_parse_threads: usize) -> usize {
@@ -319,7 +292,7 @@ fn decompress_parse_seq(
         // progress; restart the count so the parse phase reports fresh
         counter.store(0, Ordering::Relaxed);
     }
-    tlog!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
+    tlog!("  read: {:.3}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
 
     let te = find_key(&raw, b"traceEvents").ok_or("no traceEvents found")?;
     let mut pos = te + "\"traceEvents\"".len();
@@ -376,7 +349,7 @@ fn decompress_parse_streaming(
     };
 
     if let Some(buf) = try_libdeflate(&compressed, estimated) {
-        tlog!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), buf.len() / 1024 / 1024);
+        tlog!("  read: {:.3}s ({}MB)", t0.elapsed().as_secs_f64(), buf.len() / 1024 / 1024);
         let raw = RawData::Vec(buf);
         let te = find_key(&raw, b"traceEvents").ok_or("no traceEvents found")?;
         let mut pos = te + "\"traceEvents\"".len();
@@ -397,7 +370,7 @@ fn decompress_parse_streaming(
             parse_chunk(&raw, start, end, &mut state, &counter);
             state
         });
-        tlog!("  scan: {:.2}s ({} events, {}x parallel)",
+        tlog!("  scan: {:.3}s ({} events, {}x parallel)",
             t0.elapsed().as_secs_f64(), chunks.iter().map(|c| c.total_events).sum::<usize>(), n_chunks);
         return Ok((raw, chunks));
     }
@@ -546,7 +519,7 @@ fn decompress_parse_streaming(
             }));
         }
 
-        tlog!("  stream: {:.2}s ({}MB, {} chunks)",
+        tlog!("  stream: {:.3}s ({}MB, {} chunks)",
             t0.elapsed().as_secs_f64(), final_len / 1024 / 1024, handles.len());
 
         Ok(collect_chunks(handles))
@@ -555,7 +528,7 @@ fn decompress_parse_streaming(
     let chunks = result?;
     let final_len = write_pos.load(Ordering::Acquire);
     unsafe { backing.set_len(final_len); }
-    tlog!("  scan: {:.2}s ({} events, streaming)",
+    tlog!("  scan: {:.3}s ({} events, streaming)",
         t0.elapsed().as_secs_f64(), chunks.iter().map(|c| c.total_events).sum::<usize>());
     Ok((RawData::Vec(backing), chunks))
     }
@@ -599,10 +572,8 @@ pub(crate) fn compute_kernel_stats(tracks: &[Track]) -> Vec<KernelStats> {
 /// chunk per frame slice (`WasmParsePlan`) while native runs the same
 /// merge in a tight loop. Field-for-field the locals of the old loop.
 pub(crate) struct TraceScan {
-    names: Vec<String>,
-    name_idx: FnvMap<u32>,
-    cats: Vec<String>,
-    cat_idx: FnvMap<u32>,
+    names: InternTable,
+    cats: InternTable,
     track_map: HashMap<(u64, u64), Vec<Event>>,
     thread_names: HashMap<(u64, u64), String>,
     flow_events: Vec<(u64, u64, u64, f64, bool)>,
@@ -614,13 +585,9 @@ pub(crate) struct TraceScan {
 
 impl TraceScan {
     fn new() -> Self {
-        let mut name_idx = FnvMap::default();
-        name_idx.insert(0, 0);
-        let mut cat_idx = FnvMap::default();
-        cat_idx.insert(0, 0);
         Self {
-            names: vec![String::new()], name_idx,
-            cats: vec![String::new()], cat_idx,
+            names: InternTable::new(),
+            cats: InternTable::new(),
             track_map: HashMap::new(),
             thread_names: HashMap::new(),
             flow_events: Vec::new(),
@@ -631,8 +598,8 @@ impl TraceScan {
 
     /// Fold one parsed chunk into the shared tables/lists.
     fn merge_chunk(&mut self, chunk: ChunkState) {
-        let name_remap = merge_intern_table(&mut self.names, &mut self.name_idx, &chunk.names, &chunk.name_idx);
-        let cat_remap = merge_intern_table(&mut self.cats, &mut self.cat_idx, &chunk.cats, &chunk.cat_idx);
+        let name_remap = self.names.merge_from(&chunk.names);
+        let cat_remap = self.cats.merge_from(&chunk.cats);
 
         for (pid, tid, mut ev) in chunk.events {
             ev.name = name_remap[ev.name as usize];
@@ -670,7 +637,7 @@ fn assemble_track(
     tid: u64,
     mut evs: Vec<Event>,
     min_ts: f64,
-    cats: &[String],
+    cats: &InternTable,
     thread_names: &HashMap<(u64, u64), String>,
 ) -> Track {
     // Verbatim from the old closure, with cat_ref/tn_ref renamed to the
@@ -719,7 +686,7 @@ fn assemble_track(
         prefix_max_dur.push(running_max);
     }
     let gpu_count = evs.iter().filter(|e| {
-        let c = &cats[e.cat as usize];
+        let c = cats.str(e.cat);
         c == "kernel" || c.starts_with("gpu_")
     }).count();
     let gpu = gpu_count > evs.len() / 2;
@@ -739,7 +706,9 @@ fn finish_trace(
     n_chunks: usize,
     t0: &Instant,
 ) -> Result<Trace, String> {
-    let TraceScan { mut names, name_idx: _, mut cats, cat_idx: _, track_map: _, thread_names: _, mut flow_events, min_ts, mut max_ts, total_events, scan_count } = scan;
+    let TraceScan { names, cats, track_map: _, thread_names: _, mut flow_events, min_ts, mut max_ts, total_events, scan_count } = scan;
+    let mut names = names.into_strings();
+    let mut cats = cats.into_strings();
 
     let mut device = String::new();
     if let Some(dp) = find_key(&raw, b"deviceProperties") {
@@ -781,7 +750,7 @@ fn finish_trace(
         if let Some(r) = find_int_field(&raw, di, b"rank") { dist_rank = r as i32; }
         if let Some(w) = find_int_field(&raw, di, b"world_size") { dist_world = w as i32; }
     }
-    tlog!("  scan: {:.2}s ({} objects, {} events, {} names, {}x parallel)",
+    tlog!("  scan: {:.3}s ({} objects, {} events, {} names, {}x parallel)",
         t0.elapsed().as_secs_f64(), scan_count, total_events, names.len(), n_chunks);
 
     // Zero-copy on .json: a mapped file keeps pointing at its own pages
@@ -847,7 +816,7 @@ fn finish_trace(
     names.shrink_to_fit();
     cats.shrink_to_fit();
 
-    tlog!("  lanes: {:.2}s ({} tracks, {} flow_pairs)", t2.elapsed().as_secs_f64(), tracks.len(), flow_pairs.len());
+    tlog!("  lanes: {:.3}s ({} tracks, {} flow_pairs)", t2.elapsed().as_secs_f64(), tracks.len(), flow_pairs.len());
     Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, vllm_version, dist_rank, dist_world, flow_pairs, rank_paths: Vec::new() })
 }
 
@@ -2313,23 +2282,23 @@ fn load_trace_inner(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: u
     #[cfg(not(target_arch = "wasm32"))]
     if path.ends_with(".tvcache.xz") {
         return load_cache_xz(path)
-            .inspect(|t| tlog!("  cache (xz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
+            .inspect(|t| tlog!("  cache (xz): {:.3}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
             .map(|t| (t, true));
     }
     #[cfg(not(target_arch = "wasm32"))]
     if path.ends_with(".tvcache.gz") {
         return load_cache_gz(path)
-            .inspect(|t| tlog!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
+            .inspect(|t| tlog!("  cache (gz): {:.3}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
             .map(|t| (t, true));
     }
     if path.ends_with(".tvcache") {
         return load_cache_direct(path)
-            .inspect(|t| tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
+            .inspect(|t| tlog!("  cache: {:.3}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
             .map(|t| (t, true));
     }
 
     if let Some(trace) = load_cache(path, cache_dir) {
-        tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+        tlog!("  cache: {:.3}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
         return Ok((trace, true));
     }
 
@@ -2370,7 +2339,7 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
     tlog!("  memory: events={}MB strings={}MB args={}MB total={}MB",
         event_bytes / 1024 / 1024, str_bytes / 1024 / 1024, args_bytes / 1024 / 1024,
         (event_bytes + str_bytes + args_bytes) / 1024 / 1024);
-    tlog!("  total: {:.2}s", t0.elapsed().as_secs_f64());
+    tlog!("  total: {:.3}s", t0.elapsed().as_secs_f64());
     Ok(trace)
 }
 
@@ -2394,13 +2363,13 @@ fn clone_trace(t: &Trace) -> Trace {
 }
 
 fn send_progressive(trace: Trace, tx: &std::sync::mpsc::Sender<Result<Trace, String>>, t0: &Instant, _source_path: &str, _cache_dir: Option<&str>) {
-    tlog!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
+    tlog!("  ready: {:.3}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
     let mut compact_trace = clone_trace(&trace);
     let _ = tx.send(Ok(trace));
 
     compact_args(&mut compact_trace);
     let args_bytes: usize = compact_trace.raw_bufs.iter().map(|b| b.len()).sum();
-    tlog!("  compact: {:.2}s (args={}MB)", t0.elapsed().as_secs_f64(), args_bytes / 1024 / 1024);
+    tlog!("  compact: {:.3}s (args={}MB)", t0.elapsed().as_secs_f64(), args_bytes / 1024 / 1024);
     let _ = tx.send(Ok(compact_trace));
 }
 
@@ -2415,7 +2384,7 @@ pub fn load_trace_progressive(
     if path.ends_with(".tvcache.xz") {
         match load_cache_xz(path) {
             Ok(trace) => {
-                tlog!("  cache (xz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  cache (xz): {:.3}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
             }
             Err(e) => { let _ = tx.send(Err(e)); }
@@ -2426,7 +2395,7 @@ pub fn load_trace_progressive(
     if path.ends_with(".tvcache.gz") {
         match load_cache_gz(path) {
             Ok(trace) => {
-                tlog!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  cache (gz): {:.3}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
             }
             Err(e) => { let _ = tx.send(Err(e)); }
@@ -2436,7 +2405,7 @@ pub fn load_trace_progressive(
     if path.ends_with(".tvcache") {
         match load_cache_direct(path) {
             Ok(trace) => {
-                tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  cache: {:.3}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
             }
             Err(e) => { let _ = tx.send(Err(e)); }
@@ -2445,7 +2414,7 @@ pub fn load_trace_progressive(
     }
 
     if let Some(trace) = load_cache(path, cache_dir) {
-        tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+        tlog!("  cache: {:.3}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
         let _ = tx.send(Ok(trace));
         return;
     }
@@ -2594,39 +2563,11 @@ pub fn detect_rank_groups(paths: &[String]) -> (Vec<(Vec<(usize, String)>, Optio
     (rank_groups, standalone)
 }
 
-fn merge_intern_direct(
-    global: &mut Vec<String>,
-    global_idx: &mut FnvMap<u32>,
-    local: &[String],
-) -> Vec<u32> {
-    let mut remap = vec![0u32; local.len()];
-    for (i, s) in local.iter().enumerate() {
-        let hash = crate::parse::fnv1a(s.as_bytes());
-        let gi = *global_idx.entry(hash).or_insert_with(|| {
-            let id = global.len() as u32;
-            global.push(s.clone());
-            id
-        });
-        remap[i] = gi;
-    }
-    remap
-}
-
 pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     let global_min = traces.iter().map(|(_, t)| t.min_ts).fold(f64::MAX, f64::min);
 
-    let mut names: Vec<String> = vec![String::new()];
-    let mut name_idx: FnvMap<u32> = FnvMap::with_capacity_and_hasher(
-        traces.iter().map(|(_, t)| t.names.len()).max().unwrap_or(0) * 2,
-        Default::default(),
-    );
-    name_idx.insert(0, 0);
-    let mut cats: Vec<String> = vec![String::new()];
-    let mut cat_idx: FnvMap<u32> = FnvMap::with_capacity_and_hasher(
-        traces.iter().map(|(_, t)| t.cats.len()).max().unwrap_or(0) * 2,
-        Default::default(),
-    );
-    cat_idx.insert(0, 0);
+    let mut names = InternTable::new();
+    let mut cats = InternTable::new();
     let mut device = String::new();
     let mut vllm_version = String::new();
     // A merged trace spans many ranks, so there's no single rank id; keep the
@@ -2639,8 +2580,8 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     for (_, trace) in &traces {
         let time_offset = trace.min_ts - global_min;
 
-        let name_remap = merge_intern_direct(&mut names, &mut name_idx, &trace.names);
-        let cat_remap = merge_intern_direct(&mut cats, &mut cat_idx, &trace.cats);
+        let name_remap = names.merge_strings(&trace.names);
+        let cat_remap = cats.merge_strings(&trace.cats);
 
         if device.is_empty() && !trace.device.is_empty() {
             device = trace.device.clone();
@@ -2737,6 +2678,8 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
 
     let stats = kernel_stats_from_dur_map(dur_map);
 
+    let mut names = names.into_strings();
+    let mut cats = cats.into_strings();
     names.shrink_to_fit();
     cats.shrink_to_fit();
 
@@ -2929,7 +2872,7 @@ pub fn load_multi_progressive(
     if !bypass_cache {
         if let Some(cd) = cache_dir {
             if let Some(trace) = load_merged_cache(cd) {
-                tlog!("  merged cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  merged cache: {:.3}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
                 return;
             }
@@ -2971,7 +2914,7 @@ pub fn load_multi_progressive(
         rank_paths.into_iter().filter(|(r, _)| succeeded.contains(r)).collect();
     let mut trace = merge_traces(traces);
     trace.rank_paths = merged_rank_paths;
-    tlog!("  merged: {:.2}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
+    tlog!("  merged: {:.3}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
     let _ = tx.send(Ok(trace));
 }
 
@@ -3135,7 +3078,7 @@ pub fn load_trace_from_bytes_progressive(
         Ok((mut trace, from_cache)) => {
             if !from_cache {
                 compact_args(&mut trace);
-                tlog!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
+                tlog!("  ready: {:.3}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
             }
             let _ = tx.send(Ok(trace));
         }
@@ -3158,7 +3101,7 @@ fn load_trace_from_bytes_inner(
         let mut buf = Vec::new();
         return match decoder.read_to_end(&mut buf).ok().and_then(|_| load_cache_from_bytes(&buf)) {
             Some(trace) => {
-                tlog!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  cache (gz): {:.3}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 Ok((trace, true))
             }
             None => Err(format!("{name}: {}", cache_load_error(&buf))),
@@ -3184,7 +3127,7 @@ fn load_trace_from_bytes_inner(
         };
         return match load_cache_from_bytes(&decompressed) {
             Some(trace) => {
-                tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  cache: {:.3}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 Ok((trace, true))
             }
             None => Err(format!("{name}: {}", cache_load_error(&decompressed))),
@@ -3200,7 +3143,7 @@ fn load_trace_from_bytes_inner(
         // progress; restart the count so the parse phase reports fresh
         counter.store(0, Ordering::Relaxed);
     }
-    tlog!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
+    tlog!("  read: {:.3}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
 
     let te = match find_key(&raw, b"traceEvents") {
         Some(v) => v,
@@ -3296,7 +3239,7 @@ pub fn load_multi_from_bytes_progressive(
         return;
     }
     let trace = merge_traces(traces);
-    tlog!("  merged: {:.2}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
+    tlog!("  merged: {:.3}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
     let _ = tx.send(Ok(trace));
 }
 
@@ -3443,7 +3386,7 @@ impl SteppedParse {
             SteppedParse::Single(mut p) => {
                 if let Some(r) = p.take_result() {
                     if let Ok(t) = &r {
-                        tlog!("  ready: {:.2}s ({} tracks)", p.t0.elapsed().as_secs_f64(), t.tracks.len());
+                        tlog!("  ready: {:.3}s ({} tracks)", p.t0.elapsed().as_secs_f64(), t.tracks.len());
                     }
                     let _ = tx.send(r);
                 }
@@ -3468,7 +3411,7 @@ impl WasmParsePlan {
             let mut buf = Vec::new();
             return match decoder.read_to_end(&mut buf).ok().and_then(|_| load_cache_from_bytes(&buf)) {
                 Some(trace) => {
-                    tlog!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                    tlog!("  cache (gz): {:.3}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                     Prepared::Done(Ok(trace))
                 }
                 None => Prepared::Done(Err(format!("{name}: {}", cache_load_error(&buf)))),
@@ -3489,7 +3432,7 @@ impl WasmParsePlan {
             };
             return match load_cache_from_bytes(&decompressed) {
                 Some(trace) => {
-                    tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                    tlog!("  cache: {:.3}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                     Prepared::Done(Ok(trace))
                 }
                 None => Prepared::Done(Err(format!("{name}: {}", cache_load_error(&decompressed)))),
@@ -3532,7 +3475,7 @@ impl WasmParsePlan {
             // restart so the parse phase reports fresh.
             counter.store(0, Ordering::Relaxed);
         }
-        tlog!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
+        tlog!("  read: {:.3}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
         let mut plan = WasmParsePlan {
             phase: PlanPhase::Parse,
             gz: None,
@@ -3634,7 +3577,7 @@ impl WasmParsePlan {
             return true;
         }
         self.raw = RawData::Vec(std::mem::take(&mut gz.out));
-        tlog!("  read: {:.2}s ({}MB)", self.t0.elapsed().as_secs_f64(), self.raw.len() / 1024 / 1024);
+        tlog!("  read: {:.3}s ({}MB)", self.t0.elapsed().as_secs_f64(), self.raw.len() / 1024 / 1024);
         if self.begin_parse() {
             self.phase = PlanPhase::Parse;
         } else {
@@ -3870,7 +3813,7 @@ impl WasmMultiParsePlan {
             }
             // Every rank was a cache hit — nothing to step, merge now.
             let trace = merge_traces(done);
-            tlog!("  merged: {:.2}s ({} events, {} flow_pairs)",
+            tlog!("  merged: {:.3}s ({} events, {} flow_pairs)",
                 t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
             return Prepared::Done(Ok(trace));
         }
@@ -3939,7 +3882,7 @@ impl WasmMultiParsePlan {
             return;
         }
         let trace = merge_traces(traces);
-        tlog!("  merged: {:.2}s ({} events, {} flow_pairs)",
+        tlog!("  merged: {:.3}s ({} events, {} flow_pairs)",
             self.t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
         let _ = tx.send(Ok(trace));
     }

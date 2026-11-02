@@ -229,14 +229,62 @@ fn test_fnv1a_empty() {
 
 #[test]
 fn test_intern_dedup() {
-    let mut table = Vec::new();
-    let mut index = FnvMap::default();
-    let a = intern(b"kernel_a", &mut table, &mut index);
-    let b = intern(b"kernel_b", &mut table, &mut index);
-    let a2 = intern(b"kernel_a", &mut table, &mut index);
+    let mut t = InternTable::new();
+    let a = t.intern(b"kernel_a");
+    let b = t.intern(b"kernel_b");
+    let a2 = t.intern(b"kernel_a");
     assert_eq!(a, a2);
     assert_ne!(a, b);
-    assert_eq!(table.len(), 2);
+    assert_eq!(t.str(a), "kernel_a");
+    assert_eq!(t.len(), 3); // "" seed + two names
+}
+
+// The empty-string seed: id 0 is always "", the old `insert(0, 0)` of the
+// FnvMap tables, so events that never saw a name/cat field read "".
+#[test]
+fn test_intern_empty_seed() {
+    let t = InternTable::new();
+    assert_eq!(t.str(0), "");
+    assert_eq!(t.len(), 1);
+}
+
+// Insert enough strings to cross several grow/rehash boundaries (the table
+// starts at 64 slots and doubles at 75% load) and confirm every id still
+// resolves back to the right string — the slot packing (tag in the upper
+// 32 bits, id+1 in the lower) must survive rehashing.
+#[test]
+fn test_intern_grows_and_lookup_survives_rehash() {
+    let mut t = InternTable::new();
+    let ids: Vec<u32> = (0..2000).map(|i| t.intern(format!("name_{i}").as_bytes())).collect();
+    for (i, &id) in ids.iter().enumerate() {
+        assert_eq!(t.str(id), format!("name_{i}"));
+    }
+    // Re-interning after growth still dedups to the same ids.
+    for (i, &id) in ids.iter().enumerate() {
+        assert_eq!(t.intern(format!("name_{i}").as_bytes()), id);
+    }
+}
+
+// merge_from must remap local ids to global ones and intern unseen strings
+// exactly once, matching the old merge_intern_table semantics.
+#[test]
+fn test_intern_merge_from() {
+    let mut a = InternTable::new();
+    let ka = a.intern(b"shared");
+    let kb = a.intern(b"only_a");
+
+    let mut b = InternTable::new();
+    let b1 = b.intern(b"only_b");
+    let b2 = b.intern(b"shared");
+    let b3 = b.intern(b"only_b2");
+
+    let remap = a.merge_from(&b);
+    assert_eq!(a.str(remap[b1 as usize]), "only_b", "unseen strings intern and remap to their new global id");
+    assert_eq!(remap[b2 as usize], ka, "already-interned string remaps to the global id");
+    assert_eq!(a.str(remap[b3 as usize]), "only_b2");
+    // "" seed, shared, only_a, only_b, only_b2
+    assert_eq!(a.len(), 5);
+    assert_ne!(remap[b2 as usize], kb);
 }
 
 // --- Time formatting ---
@@ -1213,26 +1261,24 @@ fn test_load_trace_truncated_gz() {
 #[test]
 fn test_parse_args_flat() {
     let blob = br#"{"key1": "val1", "key2": 42}"#;
-    let mut strs = Vec::new();
-    let mut idx = FnvMap::default();
+    let mut strs = InternTable::new();
     let mut pairs = Vec::new();
-    parse_args_flat(blob, &mut strs, &mut idx, &mut pairs);
+    parse_args_flat(blob, &mut strs, &mut pairs);
 
     assert_eq!(pairs.len(), 2);
-    assert_eq!(strs[pairs[0][0] as usize], "key1");
-    assert_eq!(strs[pairs[0][1] as usize], "val1");
-    assert_eq!(strs[pairs[1][0] as usize], "key2");
-    assert_eq!(strs[pairs[1][1] as usize], "42");
+    assert_eq!(strs.str(pairs[0][0]), "key1");
+    assert_eq!(strs.str(pairs[0][1]), "val1");
+    assert_eq!(strs.str(pairs[1][0]), "key2");
+    assert_eq!(strs.str(pairs[1][1]), "42");
 }
 
 #[test]
 fn test_parse_args_flat_empty() {
-    let mut strs = Vec::new();
-    let mut idx = FnvMap::default();
+    let mut strs = InternTable::new();
     let mut pairs = Vec::new();
-    parse_args_flat(b"{}", &mut strs, &mut idx, &mut pairs);
+    parse_args_flat(b"{}", &mut strs, &mut pairs);
     assert!(pairs.is_empty());
-    parse_args_flat(b"", &mut strs, &mut idx, &mut pairs);
+    parse_args_flat(b"", &mut strs, &mut pairs);
     assert!(pairs.is_empty());
 }
 
