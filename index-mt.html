@@ -13,7 +13,9 @@
 
     /* See index.html: shown by web/initializer.mjs while the wasm binary
        downloads, styled to match so there's no visible seam handing off to
-       the real canvas. */
+       the real canvas. For a share-link open the Rust side keeps this
+       overlay up as the single load screen (see update_boot_overlay in
+       main.rs). */
     #tv-loading {
       position: fixed;
       inset: 0;
@@ -25,6 +27,9 @@
       background: #161616;
       font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: #ccc;
+    }
+    #tv-loading svg {
+      display: block;
     }
     .tv-loading-bar-track {
       width: 220px;

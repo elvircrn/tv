@@ -3427,6 +3427,15 @@ impl SteppedParse {
         }
     }
 
+    /// 0..1 progress through the plan (see `WasmParsePlan::progress`), for
+    /// the boot overlay's parse slice.
+    pub fn progress(&self) -> f32 {
+        match self {
+            SteppedParse::Single(p) => p.progress(),
+            SteppedParse::Multi(p) => p.progress(),
+        }
+    }
+
     /// Send the completed result down the channel (merge first for
     /// multi-rank). Only call once `step` reported true.
     pub fn finish(self, tx: &std::sync::mpsc::Sender<Result<Trace, String>>) {
@@ -3772,6 +3781,40 @@ impl WasmParsePlan {
             PlanPhase::Done => None,
         }
     }
+
+    /// Coarse 0..1 progress through the plan's phases, for the boot
+    /// overlay's parse slice (update_boot_overlay in main.rs). The
+    /// within-phase position is real (compressed bytes consumed, chunks
+    /// merged, tracks built); the phase boundaries are fixed weights, so a
+    /// phase that runs heavier than its weight only makes the bar slow,
+    /// never wrong. Phases a given input never reaches are skipped by the
+    /// transition itself (e.g. a .tvcache never leaves Done).
+    pub fn progress(&self) -> f32 {
+        let frac = |a: usize, b: usize| if b == 0 { 1.0 } else { a.min(b) as f32 / b as f32 };
+        match self.phase {
+            PlanPhase::Decompress => 0.25 * match self.gz.as_ref() {
+                // Cursor position = compressed bytes consumed so far.
+                Some(g) => frac(
+                    g.decoder.get_ref().position() as usize,
+                    g.decoder.get_ref().get_ref().len(),
+                ),
+                None => 1.0,
+            },
+            // split_points has n+1 entries for n chunks; the last chunk is
+            // counted by leaving Parse for Merge.
+            PlanPhase::Parse => 0.25 + 0.40 * frac(self.next_chunk, self.split_points.len().saturating_sub(1)),
+            PlanPhase::Merge => 0.65 + 0.10 * frac(self.next_merge, self.chunks.len()),
+            PlanPhase::Assemble => 0.75 + 0.15 * frac(
+                self.keyed_tracks.len(),
+                self.keyed_tracks.len() + self.track_entries.len(),
+            ),
+            PlanPhase::Compact => 0.90 + 0.10 * match self.compact_state.as_ref() {
+                Some(c) => frac(c.next, c.total),
+                None => 1.0,
+            },
+            PlanPhase::Done => 1.0,
+        }
+    }
 }
 
 /// Locate the byte just past the `[` opening the traceEvents array (the
@@ -3867,6 +3910,16 @@ impl WasmMultiParsePlan {
             }
         }
         Some("Merging ranks...".to_string())
+    }
+
+    /// Mean of the member plans' progress (done ranks count as 1.0 via
+    /// `done`), so the bar advances evenly across ranks instead of rank by
+    /// rank. See `WasmParsePlan::progress`.
+    pub fn progress(&self) -> f32 {
+        let sum: f32 = self.plans.iter().map(|(_, p)| p.progress()).sum::<f32>()
+            + self.done.len() as f32;
+        let n = self.plans.len() + self.done.len();
+        if n == 0 { 1.0 } else { sum / n as f32 }
     }
 
     /// Collect each rank's result, merge, and send. `merge_traces` is the

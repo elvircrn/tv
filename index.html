@@ -16,7 +16,11 @@
     /* Shown by web/initializer.mjs while the wasm binary downloads — there's
        nothing from the Rust side to draw yet at this point, so this is
        plain HTML/CSS, styled to match the app's dark theme and accent color
-       so there's no visible seam when it hands off to the real canvas. */
+       so there's no visible seam when it hands off to the real canvas. For
+       a share-link open (?src=/?gist=) the Rust side keeps this overlay up
+       as the single load screen through the trace download and parse, so
+       the whole load reads as one bar (see update_boot_overlay in
+       main.rs). */
     #tv-loading {
       position: fixed;
       inset: 0;
@@ -28,6 +32,9 @@
       background: #161616;
       font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: #ccc;
+    }
+    #tv-loading svg {
+      display: block;
     }
     .tv-loading-bar-track {
       width: 220px;

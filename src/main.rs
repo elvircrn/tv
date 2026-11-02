@@ -449,14 +449,24 @@ fn download_progress_text(p: &DownloadProgress) -> String {
 
 /// Bytes received so far and, if the server sent `Content-Length`, the
 /// total — the total is `None` for chunked/unknown-length responses, in
-/// which case the UI shows a byte count instead of a percentage. Plain
-/// data (no cfg): the splash's bar-drawing code is compiled on every
-/// target and reads these fields, gated at runtime on the value being
-/// `None` off-web.
+/// which case the UI shows a byte count instead of a percentage.
 #[derive(Clone, Copy)]
 pub struct DownloadProgress {
     pub received: u64,
     pub total: Option<u64>,
+}
+
+/// How the web boot overlay's single bar (web/initializer.mjs) splits the
+/// whole link-to-timeline load into phases, in percent. The initializer
+/// owns the first slice while the wasm binary downloads; `update_boot_overlay`
+/// continues the same bar through the trace download and parse, and removes
+/// the overlay when nothing is left in flight. Must stay in sync with
+/// WASM_SHARE in web/initializer.mjs.
+#[cfg(target_arch = "wasm32")]
+mod boot_weights {
+    pub const WASM: f32 = 25.0;
+    pub const DOWNLOAD: f32 = 50.0;
+    pub const PARSE: f32 = 25.0;
 }
 
 /// Fetches `url` and returns its response body as bytes — used for the
@@ -1182,6 +1192,95 @@ impl App {
         Some(((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt())
     }
 
+    /// Drives the HTML boot overlay (web/initializer.mjs) that a share-link
+    /// open (?src=/?gist=) keeps alive across the whole load, so the user
+    /// sees ONE bar from link to timeline instead of an app bar that resets
+    /// when the trace download begins. The initializer owns the wasm slice
+    /// (0-25%); this continues the same bar through the trace download
+    /// (25-75%, by Content-Length) and the parse (75-100%, by the stepped
+    /// plan's phase progress), and removes the overlay once nothing is in
+    /// flight — the frame that removes it is the frame the timeline (or the
+    /// error splash, drawn by the canvas) first composits. Called every
+    /// frame from render_frame; a plain app open has no overlay left to
+    /// find and this is a no-op. A free function (not a method) so
+    /// render_frame's live `imgui` field borrow still splits. Weights:
+    /// `boot_weights` (must match the initializer's WASM_SHARE).
+    #[cfg(target_arch = "wasm32")]
+    fn update_boot_overlay(
+        state: &AppState,
+        pending_dl: &std::rc::Rc<std::cell::RefCell<Option<DownloadProgress>>>,
+        pending_files: &std::rc::Rc<std::cell::RefCell<Vec<(String, Vec<u8>)>>>,
+    ) {
+        use wasm_bindgen::JsCast;
+        let doc = match web_sys::window().and_then(|w| w.document()) {
+            Some(d) => d,
+            None => return,
+        };
+        let overlay = match doc.get_element_by_id("tv-loading") {
+            Some(e) => e,
+            None => return,
+        };
+
+        // What's still in flight, in bar order: the download itself, the
+        // staging gap between fetch completion and the file landing in a
+        // pane (hold at the download boundary), then any pane's parse/load.
+        let dl = *pending_dl.borrow();
+        let parse = if dl.is_some() {
+            None
+        } else if !pending_files.borrow().is_empty() {
+            // Files staged, user_event hasn't routed them into a pane yet.
+            Some(None)
+        } else {
+            state.panes.iter().filter_map(|p| p.boot_parse_progress()).next()
+        };
+
+        let (pct, label, indeterminate) = if let Some(p) = dl {
+            match p.total.filter(|t| *t > 0) {
+                Some(total) => (
+                    boot_weights::WASM + boot_weights::DOWNLOAD
+                        * (p.received as f32 / total as f32).min(1.0),
+                    None,
+                    false,
+                ),
+                // 0 bytes and no total yet = gist resolution / response
+                // headers still pending — hold where the wasm slice ended.
+                None if p.received == 0 => (boot_weights::WASM, None, false),
+                None => (boot_weights::WASM, Some(format!(
+                    "Loading trace... {:.1} MB", p.received as f64 / (1024.0 * 1024.0),
+                )), true),
+            }
+        } else if let Some(progress) = parse {
+            match progress {
+                Some(f) => (
+                    (boot_weights::WASM + boot_weights::DOWNLOAD + boot_weights::PARSE * f)
+                        .min(99.0),
+                    None,
+                    false,
+                ),
+                None => (boot_weights::WASM + boot_weights::DOWNLOAD, None, false),
+            }
+        } else {
+            // Nothing in flight: whatever final state exists (trace, error)
+            // is already behind the overlay — hand the screen over.
+            if let Some(parent) = overlay.parent_node() {
+                let _ = parent.remove_child(&overlay);
+            }
+            return;
+        };
+
+        let label = label.unwrap_or_else(|| format!("Loading trace... {:.0}%", pct));
+        if let Some(el) = doc.get_element_by_id("tv-boot-fill") {
+            // class_list is Element's; style needs the HtmlElement cast.
+            let _ = el.class_list().toggle_with_force("indeterminate", indeterminate);
+            if let Some(he) = el.dyn_ref::<web_sys::HtmlElement>() {
+                let _ = he.style().set_property("width", &format!("{:.0}%", pct));
+            }
+        }
+        if let Some(el) = doc.get_element_by_id("tv-boot-label") {
+            el.set_text_content(Some(&label));
+        }
+    }
+
     fn render_frame(&mut self) {
         let imgui = match self.imgui.as_mut() {
             Some(ctx) => ctx,
@@ -1232,6 +1331,14 @@ impl App {
             #[cfg(not(target_arch = "wasm32"))]
             p.poll_share_upload();
         }
+
+        // Before any UI builds: a share-link open's boot overlay comes off
+        // in the same frame the trace (or its error) lands, so the first
+        // thing composited without it is the timeline itself. A free
+        // function taking the fields (not a &self method) so the borrow
+        // splits around the live `imgui` field borrow above.
+        #[cfg(target_arch = "wasm32")]
+        Self::update_boot_overlay(&self.state, &self.pending_download_progress, &self.pending_web_files);
 
         let scroll = self.scroll_accum;
         self.scroll_accum = [0.0; 2];
@@ -2263,17 +2370,14 @@ impl App {
                 let tl_top = content_top;
                 let tl_h = display[1] - content_top;
                 // What the active pane is waiting on, drawn centered under
-                // the logo: a ?src=/?gist= download (web, with a real
-                // progress bar — the download is the one multi-second phase
-                // of a share-link open, and a static logo for that stretch
-                // reads as a hang), a staged parse (single-threaded wasm),
-                // or a running load's event count.
+                // the logo: a ?src=/?gist= download (web — normally hidden
+                // behind the boot overlay, which owns the download's
+                // progress bar; this text is the fallback if the overlay
+                // isn't there), a staged parse (single-threaded wasm), or a
+                // running load's event count.
                 #[cfg(target_arch = "wasm32")]
-                let dl_progress = self.pending_download_progress.borrow().as_ref().copied();
-                #[cfg(not(target_arch = "wasm32"))]
-                let dl_progress: Option<DownloadProgress> = None;
-                #[cfg(target_arch = "wasm32")]
-                let dl_status = dl_progress.map(|p| download_progress_text(&p));
+                let dl_status = self.pending_download_progress.borrow().as_ref()
+                    .map(download_progress_text);
                 #[cfg(not(target_arch = "wasm32"))]
                 let dl_status: Option<String> = None;
                 #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
@@ -2317,27 +2421,6 @@ impl App {
                             cy -= 30.0;
                         }
                         draw_vllm_logo(&dl, cx, cy, logo_scale);
-                        // Download progress bar, same visual language as the
-                        // HTML initializer's pre-wasm bar (#2a2a2a track,
-                        // #30A2FF fill, 220x6, rounded). Event-driven (one
-                        // update per received chunk), not an animation.
-                        // Drawn while `dl` is alive, before the text below.
-                        let mut bar_h = 0.0;
-                        if let Some(p) = dl_progress {
-                            if let Some(total) = p.total.filter(|t| *t > 0) {
-                                const BAR_W: f32 = 220.0;
-                                bar_h = 6.0;
-                                let bx = cx + (logo_w - BAR_W) * 0.5;
-                                let by = cy + logo_h + 16.0;
-                                dl.add_rect([bx, by], [bx + BAR_W, by + bar_h], col32(42, 42, 42, 255))
-                                    .filled(true).rounding(3.0).build();
-                                let fill_w = BAR_W * (p.received as f32 / total as f32).min(1.0);
-                                if fill_w > 0.0 {
-                                    dl.add_rect([bx, by], [bx + fill_w, by + bar_h], col32(48, 162, 255, 255))
-                                        .filled(true).rounding(3.0).build();
-                                }
-                            }
-                        }
                         drop(dl);
                         if let Some(e) = &state.panes[ai].error {
                             let wrap_w = (avail[0] * 0.8).min(600.0);
@@ -2351,9 +2434,7 @@ impl App {
                         } else if let Some(status) = &splash_status {
                             let sz = ui.calc_text_size(status);
                             let tx = (avail[0] - sz[0]) * 0.5;
-                            // Below the bar when one is showing, else
-                            // directly below the logo.
-                            let ty = cy - win_pos[1] + logo_h + 16.0 + bar_h + if bar_h > 0.0 { 8.0 } else { 0.0 };
+                            let ty = cy - win_pos[1] + logo_h + 16.0;
                             ui.set_cursor_pos([tx, ty]);
                             ui.text_colored([0.65, 0.65, 0.65, 1.0], status);
                         }

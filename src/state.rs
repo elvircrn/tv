@@ -1481,6 +1481,20 @@ impl Pane {
         )
     }
 
+    /// Load-in-flight status for the web boot overlay (update_boot_overlay
+    /// in main.rs): `None` when this pane isn't loading, `Some(None)` when
+    /// it is but no fraction is known (staged-not-yet-stepping, or the mt
+    /// build's pool-side parse), `Some(Some(f))` while a stepped parse can
+    /// report its phase progress.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn boot_parse_progress(&self) -> Option<Option<f32>> {
+        #[cfg(not(feature = "mt"))]
+        if let Some(PendingParse::Stepping { plan, .. }) = &self.pending_parse {
+            return Some(Some(plan.progress()));
+        }
+        if self.loading.is_some() { Some(None) } else { None }
+    }
+
     pub fn open_multi(&mut self, rank_paths: Vec<(usize, String)>) {
         let (tx, rx) = mpsc::channel();
         let n = rank_paths.len();
