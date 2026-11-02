@@ -1,3 +1,21 @@
+/// eprintln! that survives the web build: wasm32-unknown-unknown's std
+/// stdio is a hard no-op (see sys/pal's unsupported stdio — writes succeed
+/// into a void), so on wasm this forwards to the browser console instead.
+/// Same call sites either way: loader phase timings, slow-frame marks.
+#[macro_export]
+macro_rules! tlog {
+    ($($arg:tt)*) => {{
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!($($arg)*)));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            eprintln!($($arg)*);
+        }
+    }};
+}
+
 mod parse;
 mod types;
 #[cfg(not(target_arch = "wasm32"))]
@@ -29,6 +47,7 @@ use std::fmt::Write as FmtWrite;
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::Write as IoWrite;
 use crate::time::Instant;
+
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -420,14 +439,21 @@ fn download_progress_text(p: &DownloadProgress) -> String {
             "Downloading: {:.1} MB / {:.1} MB ({:.0}%)",
             mb(p.received), mb(total), 100.0 * p.received as f64 / total as f64,
         ),
+        // 0 bytes and no total yet = the fetch/gist-resolution phase
+        // before the first chunk arrives (DNS/TLS/headers can take a
+        // second on a cold connection) — "0.0 MB" would read as broken.
+        _ if p.received == 0 => "Downloading trace...".to_string(),
         _ => format!("Downloading: {:.1} MB", mb(p.received)),
     }
 }
 
 /// Bytes received so far and, if the server sent `Content-Length`, the
 /// total — the total is `None` for chunked/unknown-length responses, in
-/// which case the UI shows a byte count instead of a percentage.
-#[cfg(target_arch = "wasm32")]
+/// which case the UI shows a byte count instead of a percentage. Plain
+/// data (no cfg): the splash's bar-drawing code is compiled on every
+/// target and reads these fields, gated at runtime on the value being
+/// `None` off-web.
+#[derive(Clone, Copy)]
 pub struct DownloadProgress {
     pub received: u64,
     pub total: Option<u64>,
@@ -770,6 +796,14 @@ impl ApplicationHandler for App {
                     let pending = self.pending_web_files.clone();
                     let pending_err = self.pending_src_error.clone();
                     let pending_progress = self.pending_download_progress.clone();
+                    // Announce the download before the first byte moves: the
+                    // fetch's own progress ticks only fire once response
+                    // chunks arrive (~1s of DNS/TLS/header time on a cold
+                    // connection), and the gist API resolution before it is
+                    // its own network round-trip — without this the splash
+                    // is a bare, silent logo for that whole stretch, which
+                    // reads as a hang.
+                    *pending_progress.borrow_mut() = Some(DownloadProgress { received: 0, total: None });
                     wasm_bindgen_futures::spawn_local(async move {
                         let url_result = match (src, gist) {
                             (Some(url), _) => Ok(url),
@@ -1233,7 +1267,7 @@ impl App {
         macro_rules! mark {
             ($name:expr, $t:expr) => {
                 let e = $t.elapsed().as_secs_f64() * 1000.0;
-                if e > 20.0 { eprintln!("  {}:{:.0} ", $name, e); }
+                if e > 20.0 { tlog!("  {}:{:.0} ", $name, e); }
                 $t = Instant::now();
             }
         }
@@ -1841,7 +1875,7 @@ impl App {
                                 let t_hist = Instant::now();
                                 draw_selection_histogram(&ui, pane.trace.as_ref().unwrap(), &pane.selection_stats, pane.sel_aggregate, &mut state.buf);
                                 let hist_ms = t_hist.elapsed().as_secs_f64() * 1000.0;
-                                if hist_ms > 10.0 { eprintln!("  histogram:{:.0} ({} entries)", hist_ms, pane.selection_stats.iter().map(|s| s.durations.len()).sum::<usize>()); }
+                                if hist_ms > 10.0 { tlog!("  histogram:{:.0} ({} entries)", hist_ms, pane.selection_stats.iter().map(|s| s.durations.len()).sum::<usize>()); }
                                 ui.separator();
                                 let t_tbl = Instant::now();
                                 if pane.sel_aggregate {
@@ -1858,7 +1892,7 @@ impl App {
                                 }
                                 let tbl_ms = t_tbl.elapsed().as_secs_f64() * 1000.0;
                                 let tbl_rows = if pane.sel_aggregate { pane.sel_agg_stats.len() } else { pane.sel_individual.len() };
-                                if tbl_ms > 10.0 { eprintln!("  stats_table:{:.0} ({} rows, aggregate={})", tbl_ms, tbl_rows, pane.sel_aggregate); }
+                                if tbl_ms > 10.0 { tlog!("  stats_table:{:.0} ({} rows, aggregate={})", tbl_ms, tbl_rows, pane.sel_aggregate); }
                             } else {
                                 // Big centered hint: with nothing selected the
                                 // tab is a blank rectangle, which reads as
@@ -2229,13 +2263,17 @@ impl App {
                 let tl_top = content_top;
                 let tl_h = display[1] - content_top;
                 // What the active pane is waiting on, drawn centered under
-                // the logo: a ?src=/?gist= download (web), a staged parse
-                // (single-threaded wasm), or a running load's event count.
-                // The toolbar carries the same text at 13px in the corner;
-                // without this, the splash is a static logo for the whole
-                // load, which reads as a hang.
+                // the logo: a ?src=/?gist= download (web, with a real
+                // progress bar — the download is the one multi-second phase
+                // of a share-link open, and a static logo for that stretch
+                // reads as a hang), a staged parse (single-threaded wasm),
+                // or a running load's event count.
                 #[cfg(target_arch = "wasm32")]
-                let dl_status = self.pending_download_progress.borrow().as_ref().map(download_progress_text);
+                let dl_progress = self.pending_download_progress.borrow().as_ref().copied();
+                #[cfg(not(target_arch = "wasm32"))]
+                let dl_progress: Option<DownloadProgress> = None;
+                #[cfg(target_arch = "wasm32")]
+                let dl_status = dl_progress.map(|p| download_progress_text(&p));
                 #[cfg(not(target_arch = "wasm32"))]
                 let dl_status: Option<String> = None;
                 #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
@@ -2279,6 +2317,27 @@ impl App {
                             cy -= 30.0;
                         }
                         draw_vllm_logo(&dl, cx, cy, logo_scale);
+                        // Download progress bar, same visual language as the
+                        // HTML initializer's pre-wasm bar (#2a2a2a track,
+                        // #30A2FF fill, 220x6, rounded). Event-driven (one
+                        // update per received chunk), not an animation.
+                        // Drawn while `dl` is alive, before the text below.
+                        let mut bar_h = 0.0;
+                        if let Some(p) = dl_progress {
+                            if let Some(total) = p.total.filter(|t| *t > 0) {
+                                const BAR_W: f32 = 220.0;
+                                bar_h = 6.0;
+                                let bx = cx + (logo_w - BAR_W) * 0.5;
+                                let by = cy + logo_h + 16.0;
+                                dl.add_rect([bx, by], [bx + BAR_W, by + bar_h], col32(42, 42, 42, 255))
+                                    .filled(true).rounding(3.0).build();
+                                let fill_w = BAR_W * (p.received as f32 / total as f32).min(1.0);
+                                if fill_w > 0.0 {
+                                    dl.add_rect([bx, by], [bx + fill_w, by + bar_h], col32(48, 162, 255, 255))
+                                        .filled(true).rounding(3.0).build();
+                                }
+                            }
+                        }
                         drop(dl);
                         if let Some(e) = &state.panes[ai].error {
                             let wrap_w = (avail[0] * 0.8).min(600.0);
@@ -2292,7 +2351,9 @@ impl App {
                         } else if let Some(status) = &splash_status {
                             let sz = ui.calc_text_size(status);
                             let tx = (avail[0] - sz[0]) * 0.5;
-                            let ty = cy - win_pos[1] + logo_h + 16.0;
+                            // Below the bar when one is showing, else
+                            // directly below the logo.
+                            let ty = cy - win_pos[1] + logo_h + 16.0 + bar_h + if bar_h > 0.0 { 8.0 } else { 0.0 };
                             ui.set_cursor_pos([tx, ty]);
                             ui.text_colored([0.65, 0.65, 0.65, 1.0], status);
                         }
@@ -2678,7 +2739,7 @@ impl App {
         let _ = t_section;
         let frame_ms = now.elapsed().as_secs_f64() * 1000.0;
         if frame_ms > 50.0 {
-            eprintln!("\nSLOW FRAME: {:.0}ms", frame_ms);
+            tlog!("\nSLOW FRAME: {:.0}ms", frame_ms);
         }
     }
 }

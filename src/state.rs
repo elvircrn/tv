@@ -1379,6 +1379,7 @@ impl Pane {
         });
         #[cfg(not(feature = "mt"))]
         {
+            crate::tlog!("staged: {name} ({} bytes)", bytes.len());
             self.pending_parse = Some(PendingParse::Single { name, bytes, counter, tx });
             self.pending_parse_painted = false;
         }
@@ -1544,6 +1545,7 @@ impl Pane {
         };
         match rx.try_recv() {
             Ok(Ok(trace)) => {
+                crate::tlog!("arrived: {} tracks, {} events", trace.tracks.len(), trace.total_events);
                 let is_reload = self.trace.is_some();
                 // Heat-map bounds are a function of the trace's durations;
                 // a new (or reloaded, possibly changed) trace invalidates

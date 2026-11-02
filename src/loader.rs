@@ -280,7 +280,7 @@ fn collect_chunks(handles: Vec<std::thread::ScopedJoinHandle<'_, ChunkState>>) -
             let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
                 .or_else(|| e.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_string());
-            eprintln!("  parse thread panicked: {msg}");
+            tlog!("  parse thread panicked: {msg}");
             None
         }
     }).collect()
@@ -303,7 +303,7 @@ where
                 let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
                     .or_else(|| e.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "unknown panic".to_string());
-                eprintln!("  parse thread panicked: {msg}");
+                tlog!("  parse thread panicked: {msg}");
                 None
             }
         })
@@ -319,7 +319,7 @@ fn decompress_parse_seq(
         // progress; restart the count so the parse phase reports fresh
         counter.store(0, Ordering::Relaxed);
     }
-    eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
+    tlog!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
 
     let te = find_key(&raw, b"traceEvents").ok_or("no traceEvents found")?;
     let mut pos = te + "\"traceEvents\"".len();
@@ -376,7 +376,7 @@ fn decompress_parse_streaming(
     };
 
     if let Some(buf) = try_libdeflate(&compressed, estimated) {
-        eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), buf.len() / 1024 / 1024);
+        tlog!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), buf.len() / 1024 / 1024);
         let raw = RawData::Vec(buf);
         let te = find_key(&raw, b"traceEvents").ok_or("no traceEvents found")?;
         let mut pos = te + "\"traceEvents\"".len();
@@ -397,7 +397,7 @@ fn decompress_parse_streaming(
             parse_chunk(&raw, start, end, &mut state, &counter);
             state
         });
-        eprintln!("  scan: {:.2}s ({} events, {}x parallel)",
+        tlog!("  scan: {:.2}s ({} events, {}x parallel)",
             t0.elapsed().as_secs_f64(), chunks.iter().map(|c| c.total_events).sum::<usize>(), n_chunks);
         return Ok((raw, chunks));
     }
@@ -465,7 +465,7 @@ fn decompress_parse_streaming(
                     }
                     Err(e) => {
                         if pos == 0 { ov.store(true, Ordering::Release); }
-                        else { eprintln!("  truncated gz: {e}"); }
+                        else { tlog!("  truncated gz: {e}"); }
                         break;
                     }
                 }
@@ -546,7 +546,7 @@ fn decompress_parse_streaming(
             }));
         }
 
-        eprintln!("  stream: {:.2}s ({}MB, {} chunks)",
+        tlog!("  stream: {:.2}s ({}MB, {} chunks)",
             t0.elapsed().as_secs_f64(), final_len / 1024 / 1024, handles.len());
 
         Ok(collect_chunks(handles))
@@ -555,7 +555,7 @@ fn decompress_parse_streaming(
     let chunks = result?;
     let final_len = write_pos.load(Ordering::Acquire);
     unsafe { backing.set_len(final_len); }
-    eprintln!("  scan: {:.2}s ({} events, streaming)",
+    tlog!("  scan: {:.2}s ({} events, streaming)",
         t0.elapsed().as_secs_f64(), chunks.iter().map(|c| c.total_events).sum::<usize>());
     Ok((RawData::Vec(backing), chunks))
     }
@@ -781,7 +781,7 @@ fn finish_trace(
         if let Some(r) = find_int_field(&raw, di, b"rank") { dist_rank = r as i32; }
         if let Some(w) = find_int_field(&raw, di, b"world_size") { dist_world = w as i32; }
     }
-    eprintln!("  scan: {:.2}s ({} objects, {} events, {} names, {}x parallel)",
+    tlog!("  scan: {:.2}s ({} objects, {} events, {} names, {}x parallel)",
         t0.elapsed().as_secs_f64(), scan_count, total_events, names.len(), n_chunks);
 
     // Zero-copy on .json: a mapped file keeps pointing at its own pages
@@ -847,7 +847,7 @@ fn finish_trace(
     names.shrink_to_fit();
     cats.shrink_to_fit();
 
-    eprintln!("  lanes: {:.2}s ({} tracks, {} flow_pairs)", t2.elapsed().as_secs_f64(), tracks.len(), flow_pairs.len());
+    tlog!("  lanes: {:.2}s ({} tracks, {} flow_pairs)", t2.elapsed().as_secs_f64(), tracks.len(), flow_pairs.len());
     Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, vllm_version, dist_rank, dist_world, flow_pairs, rank_paths: Vec::new() })
 }
 
@@ -2313,23 +2313,23 @@ fn load_trace_inner(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: u
     #[cfg(not(target_arch = "wasm32"))]
     if path.ends_with(".tvcache.xz") {
         return load_cache_xz(path)
-            .inspect(|t| eprintln!("  cache (xz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
+            .inspect(|t| tlog!("  cache (xz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
             .map(|t| (t, true));
     }
     #[cfg(not(target_arch = "wasm32"))]
     if path.ends_with(".tvcache.gz") {
         return load_cache_gz(path)
-            .inspect(|t| eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
+            .inspect(|t| tlog!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
             .map(|t| (t, true));
     }
     if path.ends_with(".tvcache") {
         return load_cache_direct(path)
-            .inspect(|t| eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
+            .inspect(|t| tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), t.total_events))
             .map(|t| (t, true));
     }
 
     if let Some(trace) = load_cache(path, cache_dir) {
-        eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+        tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
         return Ok((trace, true));
     }
 
@@ -2367,10 +2367,10 @@ pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usi
     let event_bytes: usize = trace.tracks.iter().map(|t| t.events.len() * std::mem::size_of::<Event>()).sum();
     let str_bytes: usize = trace.names.iter().chain(trace.cats.iter()).map(|s| s.len() + std::mem::size_of::<String>()).sum();
     let args_bytes: usize = trace.raw_bufs.iter().map(|b| b.len()).sum();
-    eprintln!("  memory: events={}MB strings={}MB args={}MB total={}MB",
+    tlog!("  memory: events={}MB strings={}MB args={}MB total={}MB",
         event_bytes / 1024 / 1024, str_bytes / 1024 / 1024, args_bytes / 1024 / 1024,
         (event_bytes + str_bytes + args_bytes) / 1024 / 1024);
-    eprintln!("  total: {:.2}s", t0.elapsed().as_secs_f64());
+    tlog!("  total: {:.2}s", t0.elapsed().as_secs_f64());
     Ok(trace)
 }
 
@@ -2394,13 +2394,13 @@ fn clone_trace(t: &Trace) -> Trace {
 }
 
 fn send_progressive(trace: Trace, tx: &std::sync::mpsc::Sender<Result<Trace, String>>, t0: &Instant, _source_path: &str, _cache_dir: Option<&str>) {
-    eprintln!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
+    tlog!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
     let mut compact_trace = clone_trace(&trace);
     let _ = tx.send(Ok(trace));
 
     compact_args(&mut compact_trace);
     let args_bytes: usize = compact_trace.raw_bufs.iter().map(|b| b.len()).sum();
-    eprintln!("  compact: {:.2}s (args={}MB)", t0.elapsed().as_secs_f64(), args_bytes / 1024 / 1024);
+    tlog!("  compact: {:.2}s (args={}MB)", t0.elapsed().as_secs_f64(), args_bytes / 1024 / 1024);
     let _ = tx.send(Ok(compact_trace));
 }
 
@@ -2415,7 +2415,7 @@ pub fn load_trace_progressive(
     if path.ends_with(".tvcache.xz") {
         match load_cache_xz(path) {
             Ok(trace) => {
-                eprintln!("  cache (xz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  cache (xz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
             }
             Err(e) => { let _ = tx.send(Err(e)); }
@@ -2426,7 +2426,7 @@ pub fn load_trace_progressive(
     if path.ends_with(".tvcache.gz") {
         match load_cache_gz(path) {
             Ok(trace) => {
-                eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
             }
             Err(e) => { let _ = tx.send(Err(e)); }
@@ -2436,7 +2436,7 @@ pub fn load_trace_progressive(
     if path.ends_with(".tvcache") {
         match load_cache_direct(path) {
             Ok(trace) => {
-                eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
             }
             Err(e) => { let _ = tx.send(Err(e)); }
@@ -2445,7 +2445,7 @@ pub fn load_trace_progressive(
     }
 
     if let Some(trace) = load_cache(path, cache_dir) {
-        eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+        tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
         let _ = tx.send(Ok(trace));
         return;
     }
@@ -2929,7 +2929,7 @@ pub fn load_multi_progressive(
     if !bypass_cache {
         if let Some(cd) = cache_dir {
             if let Some(trace) = load_merged_cache(cd) {
-                eprintln!("  merged cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  merged cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 let _ = tx.send(Ok(trace));
                 return;
             }
@@ -2950,7 +2950,7 @@ pub fn load_multi_progressive(
                 let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
                     .or_else(|| e.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "unknown panic".to_string());
-                eprintln!("  rank {r} load thread panicked: {msg}");
+                tlog!("  rank {r} load thread panicked: {msg}");
                 None
             }
         }
@@ -2959,7 +2959,7 @@ pub fn load_multi_progressive(
     for (rank, result) in results {
         match result {
             Ok(t) => traces.push((rank, t)),
-            Err(e) => { eprintln!("  rank {rank}: {e}"); }
+            Err(e) => { tlog!("  rank {rank}: {e}"); }
         }
     }
     if traces.is_empty() {
@@ -2971,7 +2971,7 @@ pub fn load_multi_progressive(
         rank_paths.into_iter().filter(|(r, _)| succeeded.contains(r)).collect();
     let mut trace = merge_traces(traces);
     trace.rank_paths = merged_rank_paths;
-    eprintln!("  merged: {:.2}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
+    tlog!("  merged: {:.2}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
     let _ = tx.send(Ok(trace));
 }
 
@@ -3017,7 +3017,7 @@ fn read_gz_tolerant<R: std::io::Read>(reader: R) -> Result<Vec<u8>, String> {
             Ok(n) => buf.extend_from_slice(&tmp[..n]),
             Err(e) if buf.is_empty() => return Err(format!("decompress: {e}")),
             Err(e) => {
-                eprintln!("  truncated gz stream after {} bytes: {e}", buf.len());
+                tlog!("  truncated gz stream after {} bytes: {e}", buf.len());
                 break;
             }
         }
@@ -3042,16 +3042,16 @@ pub fn read_bytes(path: &str, counter: &AtomicUsize) -> Result<RawData, String> 
             if name.ends_with(".json.gz") {
                 let buf = read_gz_tolerant(&mut entry)
                     .map_err(|e| format!("{name}: {e}"))?;
-                eprintln!("  extracted: {name}");
+                tlog!("  extracted: {name}");
                 return Ok(RawData::Vec(buf));
             } else if name.ends_with(".json") {
                 let mut buf = Vec::new();
                 match entry.read_to_end(&mut buf) {
                     Ok(_) => {}
                     Err(e) if buf.is_empty() => return Err(format!("read {name}: {e}")),
-                    Err(e) => eprintln!("  truncated tar entry after {} bytes: {e}", buf.len()),
+                    Err(e) => tlog!("  truncated tar entry after {} bytes: {e}", buf.len()),
                 }
-                eprintln!("  extracted: {name}");
+                tlog!("  extracted: {name}");
                 return Ok(RawData::Vec(buf));
             }
         }
@@ -3096,16 +3096,16 @@ fn read_bytes_named(name: &str, raw: Vec<u8>, counter: &AtomicUsize) -> Result<R
             let ename = entry.path().map_err(|e| format!("tar path: {e}"))?.to_string_lossy().to_string();
             if ename.ends_with(".json.gz") {
                 let buf = read_gz_tolerant(&mut entry).map_err(|e| format!("{ename}: {e}"))?;
-                eprintln!("  extracted: {ename}");
+                tlog!("  extracted: {ename}");
                 return Ok(RawData::Vec(buf));
             } else if ename.ends_with(".json") {
                 let mut buf = Vec::new();
                 match entry.read_to_end(&mut buf) {
                     Ok(_) => {}
                     Err(e) if buf.is_empty() => return Err(format!("read {ename}: {e}")),
-                    Err(e) => eprintln!("  truncated tar entry after {} bytes: {e}", buf.len()),
+                    Err(e) => tlog!("  truncated tar entry after {} bytes: {e}", buf.len()),
                 }
-                eprintln!("  extracted: {ename}");
+                tlog!("  extracted: {ename}");
                 return Ok(RawData::Vec(buf));
             }
         }
@@ -3135,7 +3135,7 @@ pub fn load_trace_from_bytes_progressive(
         Ok((mut trace, from_cache)) => {
             if !from_cache {
                 compact_args(&mut trace);
-                eprintln!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
+                tlog!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
             }
             let _ = tx.send(Ok(trace));
         }
@@ -3158,7 +3158,7 @@ fn load_trace_from_bytes_inner(
         let mut buf = Vec::new();
         return match decoder.read_to_end(&mut buf).ok().and_then(|_| load_cache_from_bytes(&buf)) {
             Some(trace) => {
-                eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 Ok((trace, true))
             }
             None => Err(format!("{name}: {}", cache_load_error(&buf))),
@@ -3184,7 +3184,7 @@ fn load_trace_from_bytes_inner(
         };
         return match load_cache_from_bytes(&decompressed) {
             Some(trace) => {
-                eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                 Ok((trace, true))
             }
             None => Err(format!("{name}: {}", cache_load_error(&decompressed))),
@@ -3200,7 +3200,7 @@ fn load_trace_from_bytes_inner(
         // progress; restart the count so the parse phase reports fresh
         counter.store(0, Ordering::Relaxed);
     }
-    eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
+    tlog!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
 
     let te = match find_key(&raw, b"traceEvents") {
         Some(v) => v,
@@ -3288,7 +3288,7 @@ pub fn load_multi_from_bytes_progressive(
     for (rank, result) in results {
         match result {
             Ok(t) => traces.push((rank, t)),
-            Err(e) => eprintln!("  rank {rank}: {e}"),
+            Err(e) => tlog!("  rank {rank}: {e}"),
         }
     }
     if traces.is_empty() {
@@ -3296,7 +3296,7 @@ pub fn load_multi_from_bytes_progressive(
         return;
     }
     let trace = merge_traces(traces);
-    eprintln!("  merged: {:.2}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
+    tlog!("  merged: {:.2}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
     let _ = tx.send(Ok(trace));
 }
 
@@ -3434,7 +3434,7 @@ impl SteppedParse {
             SteppedParse::Single(mut p) => {
                 if let Some(r) = p.take_result() {
                     if let Ok(t) = &r {
-                        eprintln!("  ready: {:.2}s ({} tracks)", p.t0.elapsed().as_secs_f64(), t.tracks.len());
+                        tlog!("  ready: {:.2}s ({} tracks)", p.t0.elapsed().as_secs_f64(), t.tracks.len());
                     }
                     let _ = tx.send(r);
                 }
@@ -3459,7 +3459,7 @@ impl WasmParsePlan {
             let mut buf = Vec::new();
             return match decoder.read_to_end(&mut buf).ok().and_then(|_| load_cache_from_bytes(&buf)) {
                 Some(trace) => {
-                    eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                    tlog!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                     Prepared::Done(Ok(trace))
                 }
                 None => Prepared::Done(Err(format!("{name}: {}", cache_load_error(&buf)))),
@@ -3480,7 +3480,7 @@ impl WasmParsePlan {
             };
             return match load_cache_from_bytes(&decompressed) {
                 Some(trace) => {
-                    eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                    tlog!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
                     Prepared::Done(Ok(trace))
                 }
                 None => Prepared::Done(Err(format!("{name}: {}", cache_load_error(&decompressed)))),
@@ -3523,7 +3523,7 @@ impl WasmParsePlan {
             // restart so the parse phase reports fresh.
             counter.store(0, Ordering::Relaxed);
         }
-        eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
+        tlog!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
         let mut plan = WasmParsePlan {
             phase: PlanPhase::Parse,
             gz: None,
@@ -3616,7 +3616,7 @@ impl WasmParsePlan {
             }
             Err(e) => {
                 // Truncated tail: keep what decompressed.
-                eprintln!("  truncated gz stream after {} bytes: {e}", gz.out.len());
+                tlog!("  truncated gz stream after {} bytes: {e}", gz.out.len());
                 true
             }
         };
@@ -3625,7 +3625,7 @@ impl WasmParsePlan {
             return true;
         }
         self.raw = RawData::Vec(std::mem::take(&mut gz.out));
-        eprintln!("  read: {:.2}s ({}MB)", self.t0.elapsed().as_secs_f64(), self.raw.len() / 1024 / 1024);
+        tlog!("  read: {:.2}s ({}MB)", self.t0.elapsed().as_secs_f64(), self.raw.len() / 1024 / 1024);
         if self.begin_parse() {
             self.phase = PlanPhase::Parse;
         } else {
@@ -3657,7 +3657,7 @@ impl WasmParsePlan {
                 let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
                     .or_else(|| e.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "unknown panic".to_string());
-                eprintln!("  parse chunk panicked: {msg}");
+                tlog!("  parse chunk panicked: {msg}");
             }
         }
         self.next_chunk += 1;
@@ -3818,7 +3818,7 @@ impl WasmMultiParsePlan {
                 Prepared::Plan(SteppedParse::Single(p)) => plans.push((rank, p)),
                 Prepared::Plan(SteppedParse::Multi(_)) => unreachable!("single prepare cannot return a multi plan"),
                 Prepared::Done(Ok(t)) => done.push((rank, t)),
-                Prepared::Done(Err(e)) => eprintln!("  rank {rank}: {e}"),
+                Prepared::Done(Err(e)) => tlog!("  rank {rank}: {e}"),
             }
         }
         if plans.is_empty() {
@@ -3827,7 +3827,7 @@ impl WasmMultiParsePlan {
             }
             // Every rank was a cache hit — nothing to step, merge now.
             let trace = merge_traces(done);
-            eprintln!("  merged: {:.2}s ({} events, {} flow_pairs)",
+            tlog!("  merged: {:.2}s ({} events, {} flow_pairs)",
                 t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
             return Prepared::Done(Ok(trace));
         }
@@ -3877,8 +3877,8 @@ impl WasmMultiParsePlan {
         for (rank, mut plan) in self.plans {
             match plan.take_result() {
                 Some(Ok(t)) => traces.push((rank, t)),
-                Some(Err(e)) => eprintln!("  rank {rank}: {e}"),
-                None => eprintln!("  rank {rank}: no result"),
+                Some(Err(e)) => tlog!("  rank {rank}: {e}"),
+                None => tlog!("  rank {rank}: no result"),
             }
         }
         if traces.is_empty() {
@@ -3886,7 +3886,7 @@ impl WasmMultiParsePlan {
             return;
         }
         let trace = merge_traces(traces);
-        eprintln!("  merged: {:.2}s ({} events, {} flow_pairs)",
+        tlog!("  merged: {:.2}s ({} events, {} flow_pairs)",
             self.t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
         let _ = tx.send(Ok(trace));
     }
