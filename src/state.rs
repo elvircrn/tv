@@ -708,6 +708,12 @@ pub struct Pane {
     /// empty when nothing is selected.
     pub sel_scopes: Vec<usize>,
     pub pending_tab: Option<BottomTab>,
+    /// Which bottom-panel tab is currently active, mirrored from the imgui
+    /// tab bar each frame (the TabItem body that runs is the active one).
+    /// Lets event handlers decide whether to switch tabs — e.g. a finished
+    /// selection switches away from Detail (which has nothing to show for
+    /// it) but never steals focus from Gaps/Steps.
+    pub bottom_tab: BottomTab,
     /// Track index whose row draw_timeline should scroll into view as part of an
     /// in-flight search zoom. Consumed (cleared) on the next timeline draw.
     pub pending_focus: Option<u32>,
@@ -850,6 +856,7 @@ impl Pane {
             gap_filter: GapFilter::default(),
             sel_scopes: Vec::new(),
             pending_tab: Some(BottomTab::Selection),
+            bottom_tab: BottomTab::Selection,
             pending_focus: None,
             sort_col: 2,
             sort_asc: false,

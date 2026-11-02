@@ -1778,87 +1778,18 @@ impl App {
                 )
                 .build(|| {
                     let pane = &mut state.panes[ai];
-                    let trace = pane.trace.as_ref().unwrap();
+                    // No panel-wide `trace` binding: Detail (its main
+                    // consumer) is the LAST tab now, and a borrow live
+                    // across the later whole-pane &mut calls
+                    // (ensure_sel_overlap_totals, ensure_gaps) no longer
+                    // ends before them. Each tab re-borrows locally.
                     if let Some(_tab_bar) = ui.tab_bar("##bottomtabs") {
                         let pending = pane.pending_tab.take();
-                        let detail_flags = if pending == Some(BottomTab::Detail) {
-                            imgui::TabItemFlags::SET_SELECTED
-                        } else { imgui::TabItemFlags::empty() };
-                        if let Some(_t) = imgui::TabItem::new("Detail").flags(detail_flags).begin(&ui) {
-                            // Resolve the selection defensively: after a reload/merge
-                            // the trace can have fewer tracks/events than when the
-                            // EventRef was captured, so a stale index must not panic.
-                            let sel_ev = pane.selected.and_then(|sel| {
-                                trace.tracks.get(sel.track_idx as usize).and_then(|t| {
-                                    t.events.get(sel.event_idx as usize).map(|ev| (t, ev))
-                                })
-                            });
-                            if let Some((track, ev)) = sel_ev {
-                                let name = &trace.names[ev.name as usize];
-                                let is_hidden = pane.hidden_names.get(ev.name as usize).copied().unwrap_or(false);
-                                state.buf.fmt.clear();
-                                if is_hidden {
-                                    write!(state.buf.fmt, "Show##hideev").unwrap();
-                                } else {
-                                    write!(state.buf.fmt, "Hide##hideev").unwrap();
-                                }
-                                if ui.small_button(&state.buf.fmt) {
-                                    if (ev.name as usize) < pane.hidden_names.len() {
-                                        pane.hidden_names[ev.name as usize] = !is_hidden;
-                                    }
-                                }
-                                state.buf.detail_buf.clear();
-                                write!(state.buf.detail_buf, "{}\n", name).unwrap();
-                                state.buf.detail_buf.push_str("Dur: ");
-                                write_time(&mut state.buf.detail_buf, ev.dur);
-                                state.buf.detail_buf.push_str("  |  Start: +");
-                                write_time(&mut state.buf.detail_buf, ev.ts);
-                                write!(state.buf.detail_buf, "\nCat: {}  |  Track: {}", trace.cats[ev.cat as usize], track.label).unwrap();
-                                if ev.args_off > 0 {
-                                    let raw = &trace.raw_bufs[track.raw_buf_idx as usize];
-                                    let off = ev.args_off as usize;
-                                    if off < raw.len() {
-                                        let end = skip_value(raw, off);
-                                        let mut strs = Vec::new();
-                                        let mut idx = FnvMap::default();
-                                        let mut pairs = Vec::new();
-                                        parse_args_flat(&raw[off..end], &mut strs, &mut idx, &mut pairs);
-                                        if !pairs.is_empty() {
-                                            state.buf.detail_buf.push('\n');
-                                            for &[k, v] in &pairs {
-                                                write!(state.buf.detail_buf, "\n{}: ", strs[k as usize]).unwrap();
-                                                format_arg_value(&mut state.buf.detail_buf, &strs[v as usize], 0);
-                                            }
-                                        }
-                                    }
-                                }
-                                let avail = ui.content_region_avail();
-                                let mut text_h = avail[1];
-                                if track.gpu {
-                                    let drew = draw_duration_histogram(
-                                        &ui, trace, pane.show_cpu, ev.name, ev.dur,
-                                        &mut pane.detail_hist_key, &mut pane.detail_hist_bins,
-                                        &mut pane.detail_hist_min, &mut pane.detail_hist_max,
-                                        &mut pane.detail_hist_mean, &mut pane.detail_hist_median,
-                                        &mut state.buf, DETAIL_HIST_H,
-                                    );
-                                    if drew {
-                                        ui.spacing();
-                                        text_h = ui.content_region_avail()[1];
-                                    }
-                                }
-                                ui.input_text_multiline("##detail_text", &mut state.buf.detail_buf, [avail[0], text_h])
-                                    .flags(imgui::InputTextFlags::READ_ONLY)
-                                    .build();
-                            } else {
-                                ui.text_colored([0.5, 0.5, 0.5, 1.0], "Click an event to see details");
-                            }
-                        }
-
                         let sel_flags = if pending == Some(BottomTab::Selection) {
                             imgui::TabItemFlags::SET_SELECTED
                         } else { imgui::TabItemFlags::empty() };
                         if let Some(_t) = imgui::TabItem::new("Selection").flags(sel_flags).begin(&ui) {
+                            pane.bottom_tab = BottomTab::Selection;
                             if !pane.selection_stats.is_empty() {
                                 ui.checkbox("Aggregate", &mut pane.sel_aggregate);
                                 ui.same_line();
@@ -1902,7 +1833,7 @@ impl App {
                                 // mark! bucket) so a slow Selection tab shows exactly
                                 // which piece is responsible instead of one lump sum.
                                 let t_hist = Instant::now();
-                                draw_selection_histogram(&ui, trace, &pane.selection_stats, pane.sel_aggregate, &mut state.buf);
+                                draw_selection_histogram(&ui, pane.trace.as_ref().unwrap(), &pane.selection_stats, pane.sel_aggregate, &mut state.buf);
                                 let hist_ms = t_hist.elapsed().as_secs_f64() * 1000.0;
                                 if hist_ms > 10.0 { eprintln!("  histogram:{:.0} ({} entries)", hist_ms, pane.selection_stats.iter().map(|s| s.durations.len()).sum::<usize>()); }
                                 ui.separator();
@@ -1937,6 +1868,7 @@ impl App {
                                 imgui::TabItemFlags::SET_SELECTED
                             } else { imgui::TabItemFlags::empty() };
                             if let Some(_t) = imgui::TabItem::new("Steps").flags(steps_flags).begin(&ui) {
+                            pane.bottom_tab = BottomTab::Steps;
                                 // Summary line first: totals over all steps,
                                 // plus the DP-group count when the trace's
                                 // batches are per-group (each DP group runs
@@ -1978,6 +1910,7 @@ impl App {
                                 imgui::TabItemFlags::SET_SELECTED
                             } else { imgui::TabItemFlags::empty() };
                             if let Some(_t) = imgui::TabItem::new("Gaps").flags(gaps_flags).begin(&ui) {
+                            pane.bottom_tab = BottomTab::Gaps;
                                 // Filter row: real traces carry seconds-long
                                 // profiler-artifact gaps that fill the whole
                                 // top-N list. Zoom into the known-good region
@@ -2098,6 +2031,82 @@ impl App {
                                     ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
                                 }
                                 draw_gaps_table(&ui, pane.trace.as_ref().unwrap(), gaps, pane.focused_gap, &mut state.buf, &mut gap_clicked);
+                            }
+                        }
+
+                        let detail_flags = if pending == Some(BottomTab::Detail) {
+                            imgui::TabItemFlags::SET_SELECTED
+                        } else { imgui::TabItemFlags::empty() };
+                        if let Some(_t) = imgui::TabItem::new("Detail").flags(detail_flags).begin(&ui) {
+                            pane.bottom_tab = BottomTab::Detail;
+                            let trace = pane.trace.as_ref().unwrap();
+                            // Resolve the selection defensively: after a reload/merge
+                            // the trace can have fewer tracks/events than when the
+                            // EventRef was captured, so a stale index must not panic.
+                            let sel_ev = pane.selected.and_then(|sel| {
+                                trace.tracks.get(sel.track_idx as usize).and_then(|t| {
+                                    t.events.get(sel.event_idx as usize).map(|ev| (t, ev))
+                                })
+                            });
+                            if let Some((track, ev)) = sel_ev {
+                                let name = &trace.names[ev.name as usize];
+                                let is_hidden = pane.hidden_names.get(ev.name as usize).copied().unwrap_or(false);
+                                state.buf.fmt.clear();
+                                if is_hidden {
+                                    write!(state.buf.fmt, "Show##hideev").unwrap();
+                                } else {
+                                    write!(state.buf.fmt, "Hide##hideev").unwrap();
+                                }
+                                if ui.small_button(&state.buf.fmt) {
+                                    if (ev.name as usize) < pane.hidden_names.len() {
+                                        pane.hidden_names[ev.name as usize] = !is_hidden;
+                                    }
+                                }
+                                state.buf.detail_buf.clear();
+                                write!(state.buf.detail_buf, "{}\n", name).unwrap();
+                                state.buf.detail_buf.push_str("Dur: ");
+                                write_time(&mut state.buf.detail_buf, ev.dur);
+                                state.buf.detail_buf.push_str("  |  Start: +");
+                                write_time(&mut state.buf.detail_buf, ev.ts);
+                                write!(state.buf.detail_buf, "\nCat: {}  |  Track: {}", trace.cats[ev.cat as usize], track.label).unwrap();
+                                if ev.args_off > 0 {
+                                    let raw = &trace.raw_bufs[track.raw_buf_idx as usize];
+                                    let off = ev.args_off as usize;
+                                    if off < raw.len() {
+                                        let end = skip_value(raw, off);
+                                        let mut strs = Vec::new();
+                                        let mut idx = FnvMap::default();
+                                        let mut pairs = Vec::new();
+                                        parse_args_flat(&raw[off..end], &mut strs, &mut idx, &mut pairs);
+                                        if !pairs.is_empty() {
+                                            state.buf.detail_buf.push('\n');
+                                            for &[k, v] in &pairs {
+                                                write!(state.buf.detail_buf, "\n{}: ", strs[k as usize]).unwrap();
+                                                format_arg_value(&mut state.buf.detail_buf, &strs[v as usize], 0);
+                                            }
+                                        }
+                                    }
+                                }
+                                let avail = ui.content_region_avail();
+                                let mut text_h = avail[1];
+                                if track.gpu {
+                                    let drew = draw_duration_histogram(
+                                        &ui, trace, pane.show_cpu, ev.name, ev.dur,
+                                        &mut pane.detail_hist_key, &mut pane.detail_hist_bins,
+                                        &mut pane.detail_hist_min, &mut pane.detail_hist_max,
+                                        &mut pane.detail_hist_mean, &mut pane.detail_hist_median,
+                                        &mut state.buf, DETAIL_HIST_H,
+                                    );
+                                    if drew {
+                                        ui.spacing();
+                                        text_h = ui.content_region_avail()[1];
+                                    }
+                                }
+                                ui.input_text_multiline("##detail_text", &mut state.buf.detail_buf, [avail[0], text_h])
+                                    .flags(imgui::InputTextFlags::READ_ONLY)
+                                    .build();
+                            } else {
+                                ui.text_colored([0.5, 0.5, 0.5, 1.0], "Click an event to see details");
                             }
                         }
                     }
@@ -2406,10 +2415,15 @@ impl App {
             }
 
             if state.panes[ai].selection_dirty && !ui.io().mouse_down[0] {
-                // No pending_tab here on purpose: auto-switching to the
-                // Selection tab on every drag yanks the user off whatever
-                // tab they're working in (Gaps especially, which reacts to
-                // the selection itself). The Selection tab is a click away.
+                // Auto-switch to Selection only from Detail — that tab shows
+                // the single clicked event, which a region selection just
+                // cleared, so without the switch it looks like nothing
+                // happened. Gaps/Steps/Selection are left alone: yanking the
+                // user off a tab they're working in (Gaps especially, which
+                // reacts to the selection itself) is its own annoyance.
+                if state.panes[ai].bottom_tab == BottomTab::Detail {
+                    state.panes[ai].pending_tab = Some(BottomTab::Selection);
+                }
                 state.panes[ai].finish_selection(&mut state.buf);
                 state.panes[ai].selection_dirty = false;
             }
