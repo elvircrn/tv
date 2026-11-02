@@ -1,5 +1,7 @@
 use crate::loader::{load_trace_progressive, load_multi_progressive};
 use crate::types::*;
+#[cfg(all(target_arch = "wasm32", feature = "mt"))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -12,24 +14,58 @@ use std::sync::{mpsc, Arc};
 /// asynchronously in the background exactly like the `std::thread::spawn` it
 /// replaces.
 ///
-/// wasm32: NOT `rayon::spawn`. Confirmed empirically (a throwaway
-/// wasm-bindgen + Node harness) that on wasm's no-real-threads fallback, a
-/// bare `rayon::spawn` job is never picked up — not synchronously, and not
-/// even as a side effect of later, unrelated rayon calls — because nothing
-/// ever runs a worker-thread loop to service the global queue there (unlike
-/// `join`/`scope`/`par_iter`, where the *calling* thread itself executes the
-/// work as part of the blocking call). Shipping `rayon::spawn` verbatim here
-/// would silently hang every wasm trace load forever (the channel never
-/// receives anything, so `poll_loading` waits indefinitely). Until real wasm
-/// threading lands (a later phase — wasm-bindgen-rayon + an atomics build),
-/// there's no way to background this on wasm at all, so run it synchronously
-/// inline instead: blocks the tab for the load's duration, but at least
-/// completes and reports a result instead of hanging.
+/// wasm32 + `mt`: same `rayon::spawn`, onto the wasm-bindgen-rayon Worker
+/// pool `main` initialized before the event loop started (see main.rs) —
+/// the load runs on a Worker and the main thread keeps rendering, so
+/// `poll_loading` animates the event counter like it does natively. Gated
+/// on `MT_POOL_READY` because a bare `rayon::spawn` with no live pool is
+/// never picked up on wasm (confirmed empirically — nothing services the
+/// global queue), which would hang the load forever; if pool init failed,
+/// fall back to the synchronous inline run instead.
+///
+/// wasm32 without `mt`: no real threads exist at all, so run synchronously
+/// inline. The job blocks the main thread for its whole duration; the
+/// one-frame `pending_parse` deferral (see `Pane::run_pending_parse`) at
+/// least gets a "Parsing trace..." splash painted before the freeze.
 fn spawn_load_job(job: impl FnOnce() + Send + 'static) {
     #[cfg(not(target_arch = "wasm32"))]
     rayon::spawn(job);
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "mt"))]
+    if MT_POOL_READY.load(Ordering::Relaxed) {
+        rayon::spawn(job);
+    } else {
+        job();
+    }
+    #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
     job();
+}
+
+/// Whether wasm-bindgen-rayon's Worker pool initialized successfully (mt
+/// build only). Set by `main` after `init_thread_pool` resolves; read by
+/// `spawn_load_job` to decide between a real background spawn and the
+/// synchronous fallback.
+#[cfg(all(target_arch = "wasm32", feature = "mt"))]
+pub static MT_POOL_READY: AtomicBool = AtomicBool::new(false);
+
+/// Single-threaded wasm build only: the inputs of a load that has been
+/// announced (`loading` is `Some`) but whose parse hasn't started. There are
+/// no threads to run it on, so the parse blocks the main thread for its
+/// whole duration — staging it for one frame lets a "Parsing trace..."
+/// splash paint first instead of the tab freezing on the bare logo with no
+/// hint that anything is happening.
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+pub(crate) enum PendingParse {
+    Single {
+        name: String,
+        bytes: Vec<u8>,
+        counter: Arc<AtomicUsize>,
+        tx: mpsc::Sender<Result<Trace, String>>,
+    },
+    Multi {
+        rank_named_bytes: Vec<(usize, String, Vec<u8>)>,
+        counter: Arc<AtomicUsize>,
+        tx: mpsc::Sender<Result<Trace, String>>,
+    },
 }
 
 /// Interned name indices matching vLLM's per-generation execute wrapper span.
@@ -714,6 +750,17 @@ pub struct Pane {
     /// selection switches away from Detail (which has nothing to show for
     /// it) but never steals focus from Gaps/Steps.
     pub bottom_tab: BottomTab,
+    /// Single-threaded wasm build only: a load whose parse hasn't run yet.
+    /// `open_from_bytes`/`open_multi_from_bytes` stage the job here instead
+    /// of running it (no threads exist to background it with); `run_pending_parse`
+    /// executes it a frame later. See `PendingParse` for why the delay.
+    #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+    pub(crate) pending_parse: Option<PendingParse>,
+    /// Whether a frame has rendered since `pending_parse` was staged. The
+    /// staging frame only announces (splash shows "Parsing trace...");
+    /// the frame after that runs the parse, once the announcement painted.
+    #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+    pending_parse_painted: bool,
     /// Track index whose row draw_timeline should scroll into view as part of an
     /// in-flight search zoom. Consumed (cleared) on the next timeline draw.
     pub pending_focus: Option<u32>,
@@ -857,6 +904,10 @@ impl Pane {
             sel_scopes: Vec::new(),
             pending_tab: Some(BottomTab::Selection),
             bottom_tab: BottomTab::Selection,
+            #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+            pending_parse: None,
+            #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+            pending_parse_painted: false,
             pending_focus: None,
             sort_col: 2,
             sort_asc: false,
@@ -1294,9 +1345,19 @@ impl Pane {
         self.trace_path = name.clone();
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
+        // mt: spawn_load_job puts the parse on the rayon Worker pool, so it
+        // can start immediately. Single-threaded: it would run inline right
+        // here, before any frame could paint a "Parsing trace..." splash —
+        // stage it for `run_pending_parse` instead (one frame later).
+        #[cfg(feature = "mt")]
         spawn_load_job(move || {
             crate::loader::load_trace_from_bytes_progressive(&name, bytes, &counter, &tx);
         });
+        #[cfg(not(feature = "mt"))]
+        {
+            self.pending_parse = Some(PendingParse::Single { name, bytes, counter, tx });
+            self.pending_parse_painted = false;
+        }
     }
 
     /// wasm equivalent of `open_multi`: each rank's bytes are already in
@@ -1316,9 +1377,42 @@ impl Pane {
         self.error = None;
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
+        // Same mt-vs-single-threaded split as `open_from_bytes`.
+        #[cfg(feature = "mt")]
         spawn_load_job(move || {
             crate::loader::load_multi_from_bytes_progressive(rank_named_bytes, &counter, &tx);
         });
+        #[cfg(not(feature = "mt"))]
+        {
+            self.pending_parse = Some(PendingParse::Multi { rank_named_bytes, counter, tx });
+            self.pending_parse_painted = false;
+        }
+    }
+
+    /// Single-threaded wasm build: execute a staged parse (see
+    /// `PendingParse`). The first frame after staging only sets
+    /// `pending_parse_painted`, so its splash ("Parsing trace...") gets
+    /// painted before the main thread blocks; the parse then runs at the
+    /// top of the next frame. It completes inline, so `poll_loading` —
+    /// which render_frame calls right after this — picks up the result in
+    /// the same frame and the trace appears without a wasted frame between.
+    #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+    pub(crate) fn run_pending_parse(&mut self) {
+        if self.pending_parse.is_none() {
+            return;
+        }
+        if !self.pending_parse_painted {
+            self.pending_parse_painted = true;
+            return;
+        }
+        match self.pending_parse.take().unwrap() {
+            PendingParse::Single { name, bytes, counter, tx } => {
+                crate::loader::load_trace_from_bytes_progressive(&name, bytes, &counter, &tx);
+            }
+            PendingParse::Multi { rank_named_bytes, counter, tx } => {
+                crate::loader::load_multi_from_bytes_progressive(rank_named_bytes, &counter, &tx);
+            }
+        }
     }
 
     pub fn open_multi(&mut self, rank_paths: Vec<(usize, String)>) {

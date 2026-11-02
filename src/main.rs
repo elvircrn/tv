@@ -1189,6 +1189,11 @@ impl App {
         }
 
         for p in &mut self.state.panes {
+            // Single-threaded wasm: run a staged parse now, one frame after
+            // it was staged (see Pane::run_pending_parse) — before
+            // poll_loading, so the result lands in this same frame.
+            #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+            p.run_pending_parse();
             p.poll_loading();
             #[cfg(not(target_arch = "wasm32"))]
             p.poll_share_upload();
@@ -2223,6 +2228,32 @@ impl App {
             if !state.panes[ai].has_trace() {
                 let tl_top = content_top;
                 let tl_h = display[1] - content_top;
+                // What the active pane is waiting on, drawn centered under
+                // the logo: a ?src=/?gist= download (web), a staged parse
+                // (single-threaded wasm), or a running load's event count.
+                // The toolbar carries the same text at 13px in the corner;
+                // without this, the splash is a static logo for the whole
+                // load, which reads as a hang.
+                #[cfg(target_arch = "wasm32")]
+                let dl_status = self.pending_download_progress.borrow().as_ref().map(download_progress_text);
+                #[cfg(not(target_arch = "wasm32"))]
+                let dl_status: Option<String> = None;
+                #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+                let parse_staged = state.panes[ai].pending_parse.is_some();
+                #[cfg(not(all(target_arch = "wasm32", not(feature = "mt"))))]
+                let parse_staged = false;
+                let splash_status = dl_status.or_else(|| {
+                    let pane = &state.panes[ai];
+                    if pane.error.is_some() {
+                        None
+                    } else if parse_staged {
+                        Some("Parsing trace...".to_string())
+                    } else if pane.loading.is_some() {
+                        Some(pane.loading_progress_text())
+                    } else {
+                        None
+                    }
+                });
                 let _pad = ui.push_style_var(StyleVar::WindowPadding([0.0, 0.0]));
                 ui.window("##splash")
                     .position([0.0, tl_top], Condition::Always)
@@ -2258,6 +2289,12 @@ impl App {
                             let _c = ui.push_style_color(StyleColor::Text, [1.0, 0.4, 0.4, 1.0]);
                             let _wrap = ui.push_text_wrap_pos_with_pos(ui.cursor_pos()[0] + wrap_w);
                             ui.text_wrapped(e);
+                        } else if let Some(status) = &splash_status {
+                            let sz = ui.calc_text_size(status);
+                            let tx = (avail[0] - sz[0]) * 0.5;
+                            let ty = cy - win_pos[1] + logo_h + 16.0;
+                            ui.set_cursor_pos([tx, ty]);
+                            ui.text_colored([0.65, 0.65, 0.65, 1.0], status);
                         }
                     });
             } else {
@@ -2792,8 +2829,13 @@ fn main() {
             // Not fatal: every rayon call site on wasm32 already tolerates
             // running sequentially (that was the *only* mode before this
             // phase) — worst case without a working pool is the old
-            // single-threaded behavior, not a crash.
+            // single-threaded behavior, not a crash. That fallback is why
+            // MT_POOL_READY stays false here: `rayon::spawn` with no live
+            // pool would never be picked up (see spawn_load_job), so trace
+            // loads fall back to running inline instead of hanging.
             web_sys::console::error_1(&e);
+        } else {
+            crate::state::MT_POOL_READY.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         build_and_run_app();
     });
