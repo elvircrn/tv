@@ -3062,7 +3062,7 @@ fn read_bytes_named(name: &str, raw: Vec<u8>, counter: &AtomicUsize) -> Result<R
 /// send (there's no real background thread on wasm yet — see
 /// `state::spawn_load_job` — so the job already runs to completion before
 /// `poll_loading` gets a chance to observe an intermediate state).
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "mt"))]
 pub fn load_trace_from_bytes_progressive(
     name: &str, raw_input: Vec<u8>, counter: &Arc<AtomicUsize>,
     tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
@@ -3086,7 +3086,7 @@ pub fn load_trace_from_bytes_progressive(
 /// straight into `merge_traces` (`load_multi_from_bytes_progressive`),
 /// which compacts the merged trace once at the end instead of once per
 /// rank and once merged.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "mt"))]
 fn load_trace_from_bytes_inner(
     name: &str, raw_input: Vec<u8>, counter: &Arc<AtomicUsize>, t0: &Instant,
 ) -> Result<(Trace, bool), String> {
@@ -3206,7 +3206,7 @@ pub fn group_by_rank_bytes(
 /// Each rank loads uncompacted via `load_trace_from_bytes_inner` —
 /// `merge_traces` compacts the merged trace once at the end, so a per-rank
 /// compact would only add a second copy round (see `load_trace_for_merge`).
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "mt"))]
 pub fn load_multi_from_bytes_progressive(
     rank_named_bytes: Vec<(usize, String, Vec<u8>)>,
     counter: &Arc<AtomicUsize>,
@@ -3235,4 +3235,273 @@ pub fn load_multi_from_bytes_progressive(
     let trace = merge_traces(traces);
     eprintln!("  merged: {:.2}s ({} events, {} flow_pairs)", t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
     let _ = tx.send(Ok(trace));
+}
+
+/// Chunk count for the stepped parse below: enough splits that one step is
+/// a few MB of JSON (tens of ms), so the event counter visibly moves at
+/// requestAnimationFrame cadence. `calc_n_threads` picks 2 on
+/// single-threaded wasm (available_parallelism is 1 there), far too coarse
+/// to animate.
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+fn plan_chunk_count(len: usize) -> usize {
+    (len / (4 * 1024 * 1024)).clamp(1, 64)
+}
+
+/// What `WasmParsePlan::prepare` / `WasmMultiParsePlan::prepare` hand back:
+/// either a plan to step through, or a finished result (cache hit, or a
+/// prepare failure) that the caller sends down the channel as-is.
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+pub enum Prepared {
+    Plan(SteppedParse),
+    Done(Result<Trace, String>),
+}
+
+/// `load_trace_from_bytes_progressive` split into resumable phases for the
+/// single-threaded wasm build (driven by `Pane::run_pending_parse`): the
+/// same helpers in the same order — prepare (decompress + split points),
+/// step (one `parse_chunk` call), finish (build_trace + compact + send) —
+/// so results are identical to the monolithic version and only the pacing
+/// differs. One chunk per frame keeps the event counter moving; without
+/// this there is no thread to background the parse on, so the count sits
+/// still for the whole load. The mt build doesn't need it (the whole job
+/// runs on the rayon Worker pool).
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+pub struct WasmParsePlan {
+    raw: RawData,
+    split_points: Vec<usize>,
+    next_chunk: usize,
+    chunks: Vec<ChunkState>,
+    counter: Arc<AtomicUsize>,
+    t0: Instant,
+}
+
+/// The single- and multi-rank plans behind one `step`/`finish` interface.
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+pub enum SteppedParse {
+    Single(WasmParsePlan),
+    Multi(WasmMultiParsePlan),
+}
+
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+impl SteppedParse {
+    /// Parse the next chunk. Returns true when every chunk of every rank is
+    /// parsed and `finish` can run.
+    pub fn step(&mut self) -> bool {
+        match self {
+            SteppedParse::Single(p) => p.step(),
+            SteppedParse::Multi(p) => p.step(),
+        }
+    }
+
+    /// build_trace (+ merge/compact for multi-rank) and send the result.
+    /// Still one synchronous block: the merge phase has no counter to
+    /// animate, so slicing it buys nothing.
+    pub fn finish(self, tx: &std::sync::mpsc::Sender<Result<Trace, String>>) {
+        match self {
+            SteppedParse::Single(p) => p.finish(tx),
+            SteppedParse::Multi(p) => p.finish(tx),
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+impl WasmParsePlan {
+    /// Everything `load_trace_from_bytes_inner` does up to (but not
+    /// including) the chunk-parse loop. Cache formats (.tvcache) resolve
+    /// entirely in here and come back as `Prepared::Done`.
+    pub fn prepare(name: &str, raw_input: Vec<u8>, counter: &Arc<AtomicUsize>) -> Prepared {
+        let t0 = Instant::now();
+        if name.ends_with(".tvcache.gz") {
+            let mut decoder = flate2::read::GzDecoder::new(&raw_input[..]);
+            let mut buf = Vec::new();
+            return match decoder.read_to_end(&mut buf).ok().and_then(|_| load_cache_from_bytes(&buf)) {
+                Some(trace) => {
+                    eprintln!("  cache (gz): {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                    Prepared::Done(Ok(trace))
+                }
+                None => Prepared::Done(Err(format!("{name}: {}", cache_load_error(&buf)))),
+            };
+        }
+        if name.ends_with(".tvcache") {
+            let decompressed = if raw_input.len() >= 4 && raw_input[0..4] == ZSTD_FRAME_MAGIC {
+                let mut out = Vec::new();
+                match ruzstd::decoding::StreamingDecoder::new(&raw_input[..])
+                    .ok()
+                    .and_then(|mut d| d.read_to_end(&mut out).ok())
+                {
+                    Some(_) => out,
+                    None => return Prepared::Done(Err(format!("{name}: corrupt zstd-compressed .tvcache file"))),
+                }
+            } else {
+                raw_input
+            };
+            return match load_cache_from_bytes(&decompressed) {
+                Some(trace) => {
+                    eprintln!("  cache: {:.2}s ({} events)", t0.elapsed().as_secs_f64(), trace.total_events);
+                    Prepared::Done(Ok(trace))
+                }
+                None => Prepared::Done(Err(format!("{name}: {}", cache_load_error(&decompressed)))),
+            };
+        }
+
+        let raw = match read_bytes_named(name, raw_input, counter) {
+            Ok(r) => r,
+            Err(e) => return Prepared::Done(Err(e)),
+        };
+        if name.ends_with(".ktz") {
+            // ktz decode already counted rendered events into the counter;
+            // restart so the parse phase reports fresh.
+            counter.store(0, Ordering::Relaxed);
+        }
+        eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
+
+        let te = match find_key(&raw, b"traceEvents") {
+            Some(v) => v,
+            None => return Prepared::Done(Err(format!("{name}: no traceEvents found"))),
+        };
+        let mut pos = te + "\"traceEvents\"".len();
+        pos = skip_ws(&raw, pos);
+        if pos < raw.len() && raw[pos] == b':' { pos += 1; }
+        pos = skip_ws(&raw, pos);
+        if pos >= raw.len() || raw[pos] != b'[' {
+            return Prepared::Done(Err(format!("{name}: malformed traceEvents")));
+        }
+        let array_start = pos + 1;
+        let split_points = find_split_points(&raw, array_start, plan_chunk_count(raw.len()));
+        Prepared::Plan(SteppedParse::Single(WasmParsePlan {
+            raw, split_points, next_chunk: 0, chunks: Vec::new(),
+            counter: counter.clone(), t0,
+        }))
+    }
+
+    fn is_done(&self) -> bool {
+        self.next_chunk + 1 >= self.split_points.len()
+    }
+
+    /// Parse the next chunk. Returns true when all chunks are parsed.
+    pub fn step(&mut self) -> bool {
+        if self.is_done() {
+            return true;
+        }
+        let i = self.next_chunk;
+        let start = self.split_points[i];
+        let end = self.split_points[i + 1];
+        // A chunk that panics is dropped with a message, matching
+        // `parse_chunks_parallel`'s catch_unwind handling.
+        let counter = &self.counter;
+        let raw = &self.raw;
+        let state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut state = ChunkState::new();
+            parse_chunk(raw, start, end, &mut state, counter);
+            state
+        }));
+        match state {
+            Ok(s) => self.chunks.push(s),
+            Err(e) => {
+                let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                eprintln!("  parse chunk panicked: {msg}");
+            }
+        }
+        self.next_chunk += 1;
+        self.is_done()
+    }
+
+    /// build_trace without compact/send — the rank input for `merge_traces`
+    /// (mirrors `load_trace_from_bytes_inner`'s uncompacted return; the
+    /// merged trace is compacted once, in the multi-rank finish).
+    fn build(self) -> Result<Trace, String> {
+        let n_chunks = self.split_points.len() - 1;
+        build_trace(self.raw, self.chunks, n_chunks, &self.t0)
+    }
+
+    fn finish(self, tx: &std::sync::mpsc::Sender<Result<Trace, String>>) {
+        let t0 = self.t0;
+        match self.build() {
+            Ok(mut trace) => {
+                compact_args(&mut trace);
+                eprintln!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
+                let _ = tx.send(Ok(trace));
+            }
+            Err(e) => { let _ = tx.send(Err(e)); }
+        }
+    }
+}
+
+/// Multi-rank stepped parse: per-rank `WasmParsePlan`s round-robin stepped
+/// so the shared counter grows across all ranks instead of one rank
+/// finishing before the next starts. Mirrors
+/// `load_multi_from_bytes_progressive` phase for phase.
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+pub struct WasmMultiParsePlan {
+    plans: Vec<(usize, WasmParsePlan)>,
+    /// Ranks that resolved fully during prepare (a dropped .tvcache rank
+    /// file) — carried straight to the merge, nothing to step.
+    done: Vec<(usize, Trace)>,
+    next: usize,
+    t0: Instant,
+}
+
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+impl WasmMultiParsePlan {
+    pub fn prepare(
+        rank_named_bytes: Vec<(usize, String, Vec<u8>)>, counter: &Arc<AtomicUsize>,
+    ) -> Prepared {
+        let t0 = Instant::now();
+        let mut plans = Vec::new();
+        let mut done = Vec::new();
+        for (rank, name, bytes) in rank_named_bytes {
+            match WasmParsePlan::prepare(&name, bytes, counter) {
+                Prepared::Plan(SteppedParse::Single(p)) => plans.push((rank, p)),
+                Prepared::Plan(SteppedParse::Multi(_)) => unreachable!("single prepare cannot return a multi plan"),
+                Prepared::Done(Ok(t)) => done.push((rank, t)),
+                Prepared::Done(Err(e)) => eprintln!("  rank {rank}: {e}"),
+            }
+        }
+        if plans.is_empty() {
+            if done.is_empty() {
+                return Prepared::Done(Err("all ranks failed to load".into()));
+            }
+            // Every rank was a cache hit — nothing to step, merge now.
+            let trace = merge_traces(done);
+            eprintln!("  merged: {:.2}s ({} events, {} flow_pairs)",
+                t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
+            return Prepared::Done(Ok(trace));
+        }
+        Prepared::Plan(SteppedParse::Multi(WasmMultiParsePlan { plans, done, next: 0, t0 }))
+    }
+
+    /// Parse one chunk of one rank (round-robin over ranks that still have
+    /// chunks left). Returns true when every rank is fully parsed.
+    pub fn step(&mut self) -> bool {
+        let n = self.plans.len();
+        for k in 0..n {
+            let i = (self.next + k) % n;
+            if !self.plans[i].1.is_done() {
+                self.next = i + 1;
+                self.plans[i].1.step();
+                break;
+            }
+        }
+        self.plans.iter().all(|(_, p)| p.is_done())
+    }
+
+    fn finish(self, tx: &std::sync::mpsc::Sender<Result<Trace, String>>) {
+        let mut traces = self.done;
+        for (rank, plan) in self.plans {
+            match plan.build() {
+                Ok(t) => traces.push((rank, t)),
+                Err(e) => eprintln!("  rank {rank}: {e}"),
+            }
+        }
+        if traces.is_empty() {
+            let _ = tx.send(Err("all ranks failed to load".into()));
+            return;
+        }
+        let trace = merge_traces(traces);
+        eprintln!("  merged: {:.2}s ({} events, {} flow_pairs)",
+            self.t0.elapsed().as_secs_f64(), trace.total_events, trace.flow_pairs.len());
+        let _ = tx.send(Ok(trace));
+    }
 }

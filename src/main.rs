@@ -2239,7 +2239,7 @@ impl App {
                 #[cfg(not(target_arch = "wasm32"))]
                 let dl_status: Option<String> = None;
                 #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
-                let parse_staged = state.panes[ai].pending_parse.is_some();
+                let parse_staged = state.panes[ai].parse_announced();
                 #[cfg(not(all(target_arch = "wasm32", not(feature = "mt"))))]
                 let parse_staged = false;
                 let splash_status = dl_status.or_else(|| {
