@@ -1,6 +1,7 @@
 use crate::parse::fnv1a;
 use crate::time::Instant;
 use crate::types::*;
+use smallvec::SmallVec;
 use imgui::{ImColor32, StyleColor, StyleVar, WindowFlags};
 use std::fmt::Write;
 use std::os::raw::c_char;
@@ -956,32 +957,37 @@ pub(crate) fn build_merged_group_events(
     // either, so the cursor only ever moves forward — and the event's
     // interval is free at that depth iff the cursor is exhausted or points
     // at an interval starting at/after the event's end. The resulting
-    // free_at masks then answer the lo/hi walks stretch_bounds does, at
+    // free_at grid then answers the lo/hi walks stretch_bounds does, at
     // O(events × depths) sequential steps instead of O(events × depths ×
     // log events) random ones.
     let d_total = max_depth as usize;
+    let n_ev = ev_list.len();
     let mut per_depth: Vec<Vec<(f64, f64)>> = vec![Vec::new(); d_total];
     for (i, &(ts, dur, _, _)) in ev_list.iter().enumerate() {
         per_depth[depths[i] as usize].push((ts, ts + dur));
     }
-    let mut free_at: Vec<BitSet> = vec![BitSet::new(); d_total];
+    // One flat bit grid, row per depth — a single allocation instead of one
+    // heap list per depth. Row `d` occupies `[d * n_ev, (d + 1) * n_ev)`.
+    let mut free_at = BitSet::with_len(d_total * n_ev);
     for d_prime in 0..d_total {
         let slots = &per_depth[d_prime];
-        let mask = &mut free_at[d_prime];
+        let row = d_prime * n_ev;
         let mut cur = 0usize;
-        for &(ts, dur, _, _) in ev_list.iter() {
+        for (i, &(ts, dur, _, _)) in ev_list.iter().enumerate() {
             let end = ts + dur;
             while cur < slots.len() && slots[cur].1 <= ts { cur += 1; }
-            mask.push(cur == slots.len() || slots[cur].0 >= end);
+            if cur == slots.len() || slots[cur].0 >= end {
+                free_at.set(row + i, true);
+            }
         }
     }
     let mut stretch: Vec<(u16, u16)> = Vec::with_capacity(ev_list.len());
     for (i, _) in ev_list.iter().enumerate() {
         let d = depths[i] as usize;
         let mut lo = d;
-        while lo > 0 && free_at[lo - 1][i] { lo -= 1; }
+        while lo > 0 && free_at[(lo - 1) * n_ev + i] { lo -= 1; }
         let mut hi = d;
-        while hi + 1 < d_total && free_at[hi + 1][i] { hi += 1; }
+        while hi + 1 < d_total && free_at[(hi + 1) * n_ev + i] { hi += 1; }
         stretch.push((lo as u16, hi as u16));
     }
 
@@ -1119,7 +1125,7 @@ pub fn draw_timeline(
     let mut cumulative = 0.0f32;
 
     // Pre-group GPU tracks by rank when merging (simple Vec, no BTreeMap)
-    let mut rank_group_idxs: Vec<(Option<usize>, usize)> = Vec::new(); // (rank, group_slot)
+    let mut rank_group_idxs: SmallVec<[(Option<usize>, usize); 16]> = SmallVec::new(); // (rank, group_slot)
     let mut group_slot = 0usize;
     if merge_gpu {
         for &i in track_order.iter() {
@@ -1507,12 +1513,11 @@ pub fn draw_timeline(
     let name_dim_colors: Vec<ImColor32> = trace.names.iter().map(|n| dim_color(n)).collect();
     // Heat-mode LUT: 256 quantized (base, dim) color pairs over the pane's
     // log10 duration bounds, so the hot loops below pay one log10 + one
-    // table read per event instead of the colormap interpolation.
-    let heat_lut: Vec<(ImColor32, ImColor32)> = if color_by_dur {
-        (0..=255u32).map(|i| { let c = heat_color(i as f32 / 255.0); (c, heat_dim(c)) }).collect()
-    } else {
-        Vec::new()
-    };
+    // table read per event instead of the colormap interpolation. A plain
+    // stack array, not a Vec: the size is constant and it's rebuilt every
+    // frame while By Duration coloring is on.
+    let heat_lut: [(ImColor32, ImColor32); 256] =
+        std::array::from_fn(|i| { let c = heat_color(i as f32 / 255.0); (c, heat_dim(c)) });
     // Event color picker shared by all four render paths: name-hash palette,
     // or the duration heat map; `matches == false` means the event is
     // currently filtered out (active search/selection) and gets the dim
@@ -2859,7 +2864,7 @@ fn draw_diff_bars(
     let bar_w = width.max(1.0);
 
     struct Segment { start: usize, end: usize, dur_a: f64, dur_b: f64 }
-    let mut segments: Vec<Segment> = Vec::new();
+    let mut segments: SmallVec<[Segment; 32]> = SmallVec::new();
     let mut i = 0;
     let lines = &diff.lines;
     while i < lines.len() {

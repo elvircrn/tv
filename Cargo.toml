@@ -18,6 +18,7 @@ raw-window-handle = "0.6"
 memchr = "2"
 tar = "0.4"
 rayon = "1"
+smallvec = "1.16.4"
 
 # Enabled only by scripts/build-wasm-mt.sh / serve-wasm-mt.sh, the
 # atomics/bulk-memory nightly build that gets real Web Worker parallelism —
