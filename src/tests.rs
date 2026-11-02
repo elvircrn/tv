@@ -2121,6 +2121,30 @@ fn bench_merge_filter() {
     }
 }
 
+// Times the app's real load path (load_trace_progressive), not the bench
+// shortcut: the first receive is what gates the first interactive frame, and
+// the second (compacted) copy replaces it shortly after. Run with:
+//   TV_BENCH_TRACE=<trace> cargo test --release bench_progressive_load -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_progressive_load() {
+    use crate::loader::load_trace_progressive;
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<trace> to run this bench"); return; }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let counter = test_counter();
+    let t0 = std::time::Instant::now();
+    load_trace_progressive(&path, &counter, 0, &tx, None);
+    let mut n = 0;
+    while let Ok(Ok(t)) = rx.try_recv() {
+        n += 1;
+        eprintln!("  receive {n}: +{:.2}s ({} tracks, {} events)",
+            t0.elapsed().as_secs_f64(), t.tracks.len(), t.total_events);
+    }
+}
+
 // Measures a *full* draw_timeline call (real imgui context, no renderer
 // backend needed — draw lists are plain in-memory data) at several zoom
 // levels, to see where the frame budget actually goes beyond the

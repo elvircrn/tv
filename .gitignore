@@ -12,3 +12,4 @@ CLAUDE.md
 .claude/
 .idea/
 TraceViewer.app
+target-cov/
