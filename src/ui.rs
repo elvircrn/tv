@@ -553,6 +553,12 @@ pub fn draw_stats_table(
         | TableFlags::BORDERS_INNER_V
         | TableFlags::BORDERS_OUTER
         | TableFlags::SCROLL_Y
+        // SCROLL_X lets the table extend past the panel, so resizing a
+        // column pushes the columns right of it along (spreadsheet-style).
+        // Without it imgui keeps the table at panel width and steals the
+        // delta from the right neighbor, dead-ending the drag once that
+        // neighbor bottoms out at its minimum width.
+        | TableFlags::SCROLL_X
         | TableFlags::NO_SAVED_SETTINGS
         | TableFlags::SIZING_FIXED_FIT;
 
@@ -564,18 +570,25 @@ pub fn draw_stats_table(
     let num_w = ui
         .calc_text_size("0000.00 ms")[0]
         .max(ui.calc_text_size("Median")[0] + 22.0);
-    // "WARPS|BLOCKS" is the widest realistic limiting-factor combo.
-    let occ_w = ui.calc_text_size("WARPS|BLOCKS")[0] + 12.0;
     let cols: [TableColumnSetup<&str>; 9] = std::array::from_fn(|i| {
         let mut c = TableColumnSetup::new(STATS_HEADERS[i]);
         if i == 0 {
-            // The name is textual and usually long, so let it stretch to absorb
-            // all the slack. The numeric columns fit their (short) content and
-            // get pushed to the right. Name can't be hidden (it's the key).
-            c.flags |= TableColumnFlags::WIDTH_STRETCH | TableColumnFlags::NO_HIDE;
+            // Name can't be hidden (it's the key). Fixed at a generous width
+            // rather than stretch — see the comment on the trailing column.
+            c.flags |= TableColumnFlags::WIDTH_FIXED | TableColumnFlags::NO_HIDE;
+            c.init_width_or_weight = (avail[0] * 0.45).max(240.0);
+        } else if i == 8 {
+            // The ONLY stretch column, and it must be the last one: imgui
+            // does a spreadsheet-style offsetting resize (grow this column,
+            // push everything right of it along, extend the table) only when
+            // no stretch column sits left of the dragged border — otherwise
+            // it steals the width from the right neighbor, which dead-ends
+            // at that column's minimum. A trailing stretch absorbs the
+            // panel slack so the table still fills the panel width.
+            c.flags |= TableColumnFlags::WIDTH_STRETCH;
         } else {
             c.flags |= TableColumnFlags::WIDTH_FIXED;
-            c.init_width_or_weight = if i == 8 { occ_w } else { num_w };
+            c.init_width_or_weight = num_w;
         }
         if i == *sort_col {
             c.flags |= TableColumnFlags::DEFAULT_SORT;
@@ -2306,11 +2319,14 @@ pub fn draw_steps_table(
     // batch out of its span name; otherwise every row would read "0".
     let has_batch = steps.iter()
         .any(|s| s.batch.map_or(false, |b| b.total_tokens > 0 || b.n_ctx > 0 || b.n_gen > 0));
+    // SCROLL_X: see draw_stats_table — resizing must extend the table
+    // (pushing the columns to the right along), not steal from a neighbor.
     let flags = TableFlags::RESIZABLE
         | TableFlags::ROW_BG
         | TableFlags::BORDERS_INNER_V
         | TableFlags::BORDERS_OUTER
         | TableFlags::SCROLL_Y
+        | TableFlags::SCROLL_X
         | TableFlags::NO_SAVED_SETTINGS
         | TableFlags::SIZING_FIXED_FIT;
 
@@ -2319,11 +2335,23 @@ pub fn draw_steps_table(
         .max(ui.calc_text_size("Idle before")[0] + 12.0);
     let mk_col = |i: usize| {
         let mut c = TableColumnSetup::new(HEADERS[i]);
-        if i == 0 {
-            c.flags |= TableColumnFlags::WIDTH_STRETCH | TableColumnFlags::NO_HIDE;
+        // Trailing-stretch layout (see draw_stats_table): the LAST column
+        // ("Kernels", i == 9 in both the full and batch-less column sets) is
+        // the only stretch one, so every border left of it resizes
+        // spreadsheet-style. The step index stays a narrow fixed column.
+        if i == 9 {
+            c.flags |= TableColumnFlags::WIDTH_STRETCH;
         } else {
             c.flags |= TableColumnFlags::WIDTH_FIXED;
-            c.init_width_or_weight = num_w;
+            c.init_width_or_weight = if i == 0 {
+                ui.calc_text_size("Step")[0] + 24.0
+            } else {
+                num_w
+            };
+            if i == 0 {
+                // The step index is the row key/click target.
+                c.flags |= TableColumnFlags::NO_HIDE;
+            }
         }
         c
     };
@@ -2491,11 +2519,14 @@ pub fn draw_gaps_table(
         "Rank", "Start", "Length", "CPU busy", "Runtime", "Why",
         "CPU was doing", "After", "Resumes",
     ];
+    // SCROLL_X: see draw_stats_table — resizing must extend the table
+    // (pushing the columns to the right along), not steal from a neighbor.
     let flags = TableFlags::RESIZABLE
         | TableFlags::ROW_BG
         | TableFlags::BORDERS_INNER_V
         | TableFlags::BORDERS_OUTER
         | TableFlags::SCROLL_Y
+        | TableFlags::SCROLL_X
         | TableFlags::NO_SAVED_SETTINGS
         | TableFlags::SIZING_FIXED_FIT;
 
@@ -2509,7 +2540,10 @@ pub fn draw_gaps_table(
     let pct_w = ui.calc_text_size("Runtime")[0] + 18.0;
     let mk_col = |i: usize| {
         let mut c = TableColumnSetup::new(HEADERS[i]);
-        if i == 6 {
+        // Trailing-stretch layout (see draw_stats_table): the last column
+        // ("Resumes", a kernel name) is the only stretch one, so resizing
+        // any border left of it pushes the rest along spreadsheet-style.
+        if i == 8 {
             c.flags |= TableColumnFlags::WIDTH_STRETCH;
         } else {
             c.flags |= TableColumnFlags::WIDTH_FIXED;
