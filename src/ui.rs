@@ -776,13 +776,12 @@ pub fn draw_stats_table(
                 if ui.is_item_hovered() {
                     if suspect {
                         ui.tooltip_text(
-                            "Likely a calculator artifact.\n\n\
-                            This kernel requests shared memory above CUDA's default\n\
-                            48KB static limit (common for GEMM/attention/NCCL\n\
-                            kernels). CUPTI's occupancy calculator checks against\n\
-                            that default instead of the larger opt-in limit the\n\
-                            kernel actually used.\n\n\
-                            Real occupancy is probably higher than this implies.",
+                            "Likely a calculator artifact: this kernel requests more\n\
+                            than CUDA's default 48KB of static shared memory (common\n\
+                            for GEMM/attention/NCCL kernels), and CUPTI's occupancy\n\
+                            calculator checks against that default, not the opt-in\n\
+                            limit the kernel actually used. Real occupancy is\n\
+                            probably higher.",
                         );
                     } else {
                         ui.tooltip_text(

@@ -1266,9 +1266,9 @@ impl App {
             if near_icon {
                 ui.set_mouse_cursor(Some(imgui::MouseCursor::Hand));
                 let tip = if state.panes[ai].even_spacing {
-                    "Tracks are fit to the visible height - click to go back to their normal (scrollable) sizes."
+                    "Tracks fill the visible height. Click to restore scrollable track sizes."
                 } else {
-                    "Fit all tracks to evenly fill the space down to this divider - handy for the merged view, where a few rank rows otherwise leave a lot of dead space. Double-clicking the divider does the same thing."
+                    "Fit all tracks between the timeline and this divider. Double-clicking the divider toggles it too."
                 };
                 ui.tooltip_text(tip);
             }
@@ -1385,11 +1385,11 @@ impl App {
                                         }
                                         if ui.is_item_hovered() {
                                             let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "GPU-only timings (no args)" };
-                                            ui.tooltip_text(&format!("Export {what}, then upload it to a new secret GitHub gist via your locally logged-in `gh` CLI, and show a copyable ?gist= link - no browser login or pasted token, but it does need `gh auth login` already done on this machine"));
+                                            ui.tooltip_text(&format!("Export {what} to a new secret GitHub gist via the local `gh` CLI and show a copyable ?gist= link. Requires `gh auth login` on this machine."));
                                         }
                                         ui.menu_item_config("Include CPU data##sharecpu").build_with_ref(&mut pane.share_include_cpu);
                                         if ui.is_item_hovered() {
-                                            ui.tooltip_text("Upload the whole trace (all CPU and GPU tracks, args left intact, not stripped) instead of just GPU-only timings - much larger, but complete");
+                                            ui.tooltip_text("Upload the whole trace (CPU and GPU tracks, args intact) instead of GPU-only timings. Much larger.");
                                         }
                                         match &pane.share_link_result {
                                             Some((true, link)) if link.starts_with("https://") => {
@@ -1420,7 +1420,7 @@ impl App {
                                         });
                                     }
                                     if ui.is_item_hovered() {
-                                        ui.tooltip_text("Write this trace to the fast on-disk cache (<folder>.tvcache/_merged.tvcache for a folder open, a sibling <file>.tvcache for a single file) so re-opening it loads instantly. Opening a trace never writes these automatically - this menu item is the only way they get created.");
+                                        ui.tooltip_text("Write this trace to the on-disk cache (<folder>.tvcache/_merged.tvcache for a folder, a sibling <file>.tvcache for a single file) so re-opening it loads instantly. Opening a trace never writes a cache; this menu item is the only way one gets created.");
                                     }
                                     if let Some((ok, msg)) = &pane.export_message {
                                         let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
@@ -1463,7 +1463,7 @@ impl App {
                                         pane.color_by_dur = true;
                                     }
                                     if ui.is_item_hovered() {
-                                        ui.tooltip_text("Heat-map events by duration (blue = short, red = long) instead of by name.\nThe scale is fixed per trace at the 5th-95th percentile of GPU-event durations,\nso slow kernels stand out even at zoom levels where labels don't fit.\nA legend with the actual durations sits at the bottom-right of the timeline.");
+                                        ui.tooltip_text("Heat-map events by duration (blue = short, red = long) instead of by name.\nThe scale is the 5th-95th percentile of GPU-event durations, fixed per trace.\nThe legend at the bottom-right of the timeline shows the actual durations.");
                                     }
                                 });
                                 if multi_rank {
@@ -1475,7 +1475,7 @@ impl App {
                                         });
                                     }
                                     if ui.is_item_hovered() {
-                                        ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) - aligns each DP group's first DeepEP combine kernel, matching sync_traces.py");
+                                        ui.tooltip_text("Correct inter-node clock skew across DP groups (in memory only) by aligning each DP group's first DeepEP combine kernel. Same alignment as sync_traces.py.");
                                     }
                                     if let Some((ok, msg)) = &pane.sync_message {
                                         let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
@@ -1803,14 +1803,13 @@ impl App {
                                 ui.checkbox("Overlap aware", &mut pane.sel_overlap);
                                 if ui.is_item_hovered() {
                                     ui.tooltip_text(
-                                        "Total splits every instant of wall time\n\
-                                        equally among the selected kernels running\n\
-                                        it, per rank: a kernel always alongside one\n\
-                                        other is worth half its sum, a solo kernel\n\
-                                        keeps it all. Totals sum to the selection's\n\
-                                        busy wall time — concurrency is never\n\
-                                        double-counted. Mean/Median/Max/Min stay\n\
-                                        per-launch.",
+                                        "Total splits every instant of wall time equally\n\
+                                        among the selected kernels running it, per rank:\n\
+                                        a kernel always alongside one other is worth half\n\
+                                        its sum, a solo kernel keeps it all. Totals sum\n\
+                                        to the selection's busy wall time, so concurrency\n\
+                                        is never double-counted. Mean/Median/Max/Min\n\
+                                        stay per-launch.",
                                     );
                                 }
                                 drop(_dis);
@@ -1977,7 +1976,7 @@ impl App {
                                     }
                                     if ui.is_item_hovered() {
                                         ui.tooltip_text(
-                                            "Only look for gaps inside the time range currently visible in the timeline. Zoom into the good region first.");
+                                            "Look for gaps only inside the visible time range.");
                                     }
                                 }
                                 // Selection-scoped idle, per rank: when a range
