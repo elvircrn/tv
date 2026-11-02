@@ -468,8 +468,8 @@ pub(crate) fn kernel_occ_limit(trace: &Trace, track_idx: u32, event_idx: u32) ->
 /// on the current row after `spacing` px. Draws nothing when nothing is hidden.
 /// Lives beside the Selection table's "Hide Selected" so all hide/unhide
 /// controls sit together instead of being scattered into the toolbar.
-pub fn draw_hidden_clear(ui: &imgui::Ui, spacing: f32, hidden_names: &mut [bool], fmt: &mut String) {
-    let n_hidden = hidden_names.iter().filter(|&&h| h).count();
+pub fn draw_hidden_clear(ui: &imgui::Ui, spacing: f32, hidden_names: &mut BitSet, fmt: &mut String) {
+    let n_hidden = hidden_names.count_ones();
     if n_hidden == 0 {
         return;
     }
@@ -482,9 +482,7 @@ pub fn draw_hidden_clear(ui: &imgui::Ui, spacing: f32, hidden_names: &mut [bool]
     ui.text_colored([1.0, 0.7, 0.3, 1.0], fmt);
     ui.same_line_with_spacing(0.0, 4.0);
     if ui.small_button("Clear##unhide") {
-        for h in hidden_names.iter_mut() {
-            *h = false;
-        }
+        hidden_names.fill(false);
     }
 }
 
@@ -852,7 +850,7 @@ pub(crate) fn collect_merged_track_events(
     ti: usize,
     view_t0: f64,
     view_t1: f64,
-    hidden_names: &[bool],
+    hidden_names: &BitSet,
     out: &mut Vec<(f64, f64, u32, u32)>,
 ) {
     let start = bisect_overlap(&gt.events, &gt.prefix_max_dur, view_t0);
@@ -867,7 +865,7 @@ pub(crate) fn collect_merged_track_events(
         // whether each one individually overlaps the current window. Skip
         // those explicitly instead of treating "start..end" as "overlapping".
         if ev.ts + ev.dur < view_t0 { continue; }
-        if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+        if hidden_names.get(ev.name as usize).unwrap_or(false) { continue; }
         let has_grandchild = gt.events[ei + 1..].iter()
             .take_while(|e2| e2.ts <= ev.ts + ev.dur)
             .any(|e2| e2.depth > ev.depth + 1);
@@ -887,7 +885,7 @@ pub(crate) fn collect_merged_track_events(
 pub(crate) fn build_merged_group_events(
     trace: &Trace,
     group_tracks: &[usize],
-    hidden_names: &[bool],
+    hidden_names: &BitSet,
 ) -> MergedPack {
     let mut ev_list: Vec<(f64, f64, u32, u32)> = Vec::new();
     // Each track contributes one contiguous ts-sorted run to ev_list (tracks
@@ -966,7 +964,7 @@ pub(crate) fn build_merged_group_events(
     for (i, &(ts, dur, _, _)) in ev_list.iter().enumerate() {
         per_depth[depths[i] as usize].push((ts, ts + dur));
     }
-    let mut free_at: Vec<Vec<bool>> = vec![Vec::new(); d_total];
+    let mut free_at: Vec<BitSet> = vec![BitSet::new(); d_total];
     for d_prime in 0..d_total {
         let slots = &per_depth[d_prime];
         let mask = &mut free_at[d_prime];
@@ -1018,11 +1016,11 @@ pub(crate) fn build_merged_group_events(
 /// of splitting it uniformly with dozens of blank rank rows. Falls back to
 /// a plain uniform split if every row (or no row) has content, since
 /// there's nothing to collapse into.
-pub(crate) fn even_spacing_heights(has_content: &[bool], avail: f32) -> Vec<f32> {
+pub(crate) fn even_spacing_heights(has_content: &BitSet, avail: f32) -> Vec<f32> {
     let n = has_content.len();
     if n == 0 { return Vec::new(); }
     const EMPTY_ROW_H: f32 = 6.0;
-    let n_empty = has_content.iter().filter(|&&c| !c).count();
+    let n_empty = n - has_content.count_ones();
     let n_content = n - n_empty;
     let empty_h = EMPTY_ROW_H.min(avail / n as f32);
     let content_h = if n_content > 0 {
@@ -1030,7 +1028,7 @@ pub(crate) fn even_spacing_heights(has_content: &[bool], avail: f32) -> Vec<f32>
     } else {
         avail / n as f32
     };
-    has_content.iter().map(|&c| if n_content > 0 && !c { empty_h } else { content_h }).collect()
+    has_content.iter().map(|c| if n_content > 0 && !c { empty_h } else { content_h }).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1051,7 +1049,7 @@ pub fn draw_timeline(
     pinch: f32,
     ctrl: bool,
     shift: bool,
-    search_mask: &[bool],
+    search_mask: &BitSet,
     selection: Option<[f64; 4]>,
     // The frozen (track_idx, event_idx) set a finished region-selection
     // refers to (see `Pane::capture_sel_events`, `Pane::finished_sel`). Used
@@ -1060,11 +1058,10 @@ pub fn draw_timeline(
     // highlight to different tracks after Show CPU toggles, track
     // reordering, or height changes.
     finished_sel_events: &std::collections::HashSet<(u32, u32)>,
-    collapsed: &mut Vec<bool>,
-    hidden_names: &[bool],
+    collapsed: &mut BitSet,
+    hidden_names: &BitSet,
     selected: Option<EventRef>,
     multi_select_name: Option<u32>,
-    sel_mask: &[bool],
     label_w: f32,
     track_scales: &mut Vec<f32>,
     even_spacing: &mut bool,
@@ -1074,7 +1071,7 @@ pub fn draw_timeline(
     merge_gpu: bool,
     dt: f32,
     focus: &mut Option<u32>,
-    merge_cache_key: &mut Option<(Vec<bool>, Vec<usize>)>,
+    merge_cache_key: &mut Option<(BitSet, Vec<usize>)>,
     merged_gpu_groups: &mut Vec<MergedGpuGroup>,
     // vLLM scheduler steps for the ruler bands; empty slice is a no-op.
     steps: &[StepInfo],
@@ -1176,7 +1173,7 @@ pub fn draw_timeline(
     // shared cache would compare against whichever *other* pane last
     // rendered.
     let merge_cache_valid = if merge_gpu {
-        let key = (hidden_names.to_vec(), track_order.clone());
+        let key = (hidden_names.clone(), track_order.clone());
         let valid = merge_cache_key.as_ref() == Some(&key);
         if !valid { *merge_cache_key = Some(key); }
         valid
@@ -1213,15 +1210,15 @@ pub fn draw_timeline(
     // view, where ranks are rarely in perfect lockstep, so zooming in tight
     // enough often leaves only one rank's row with anything visible while
     // the rest sit empty.
-    let mut has_content: Vec<bool> = Vec::new();
-    let mut emitted_ranks: Vec<bool> = vec![false; rank_group_idxs.len()];
+    let mut has_content: BitSet = BitSet::new();
+    let mut emitted_ranks: BitSet = BitSet::with_len(rank_group_idxs.len());
     for &i in track_order.iter() {
         let t = &trace.tracks[i];
         if merge_gpu && t.gpu {
             let rank = crate::state::parse_rank(&t.label);
             if let Some(ri) = rank_group_idxs.iter().position(|(r, _)| *r == rank) {
                 if emitted_ranks[ri] { continue; }
-                emitted_ranks[ri] = true;
+                emitted_ranks.set(ri, true);
                 let gi = rank_group_idxs[ri].1;
                 let g = &mut merged_gpu_groups[gi];
                 let first = g.tracks[0];
@@ -1250,7 +1247,7 @@ pub fn draw_timeline(
         buf.visible.push(i);
         let h = track_height(
             t.max_depth,
-            collapsed.get(i).copied().unwrap_or(false),
+            collapsed.get(i).unwrap_or(false),
             track_scales.get(i).copied().unwrap_or(1.0),
         );
         buf.heights.push(h);
@@ -1474,9 +1471,8 @@ pub fn draw_timeline(
     let mut hover_result: Option<EventRef> = None;
     let mut click_result: Option<EventRef> = None;
     let hover_in_timeline = hovered && mouse_pos[1] > tracks_top;
-    let searching = search_mask.iter().any(|&m| m);
-    let has_sel_mask = !sel_mask.is_empty() && sel_mask.iter().any(|&m| m);
-    let filtering = searching || has_sel_mask;
+    let searching = search_mask.any();
+    let filtering = searching;
 
     let active_sel = sel_change.unwrap_or(selection);
     // A LIVE drag tests events against raw pixel Y — the layout can't
@@ -1598,8 +1594,7 @@ pub fn draw_timeline(
                     let stretched_h = (hi - lo + 1) as f32 * sub_h - LANE_GAP;
 
                     let matches = !filtering
-                        || (searching && (ev.name as usize) < search_mask.len() && search_mask[ev.name as usize])
-                        || (has_sel_mask && sel_mask.get(ev.name as usize).copied().unwrap_or(false));
+                        || (searching && search_mask.get(ev.name as usize).unwrap_or(false));
 
                     if w < MIN_EV_PX {
                         // Pixel quantization: at wide zoom millions of events
@@ -1655,9 +1650,7 @@ pub fn draw_timeline(
                         _ => (ev_track_y, stretched_h),
                     };
                     let is_selected = is_selected(ti32, ei as u32, sel_y, sel_h, ev.ts, ev.dur);
-                    let is_sel_mask = !sel_mask.is_empty() && sel_mask.get(ev.name as usize).copied().unwrap_or(false);
-
-                    let fill = if is_hovered { brighten(color, 30) } else if is_selected || is_sel_mask { brighten(color, 20) } else { color };
+                    let fill = if is_hovered { brighten(color, 30) } else if is_selected { brighten(color, 20) } else { color };
                     dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], fill)
                         .filled(true).rounding(EV_ROUNDING).build();
 
@@ -1667,7 +1660,7 @@ pub fn draw_timeline(
                     } else if is_hovered {
                         dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 255, 255, 255))
                             .rounding(EV_ROUNDING).build();
-                    } else if is_selected || is_sel_mask {
+                    } else if is_selected {
                         dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], ACCENT_SOFT)
                             .rounding(EV_ROUNDING).build();
                     } else if is_multi {
@@ -1701,7 +1694,7 @@ pub fn draw_timeline(
             } else {
                 let orig_ti = buf.visible[vi];
                 let track = &trace.tracks[orig_ti];
-                let is_collapsed = collapsed.get(orig_ti).copied().unwrap_or(false);
+                let is_collapsed = collapsed.get(orig_ti).unwrap_or(false);
                 // A collapsed row is a single lane showing only depth-0
                 // events across its full height — not max_depth lanes
                 // squeezed into one SUB_LANE_H (which made each bar
@@ -1717,14 +1710,13 @@ pub fn draw_timeline(
                 for ei in start..end {
                     let ev = &track.events[ei];
                     if is_collapsed && ev.depth > 0 { continue; }
-                    if hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                    if hidden_names.get(ev.name as usize).unwrap_or(false) { continue; }
                     let x0 = t2x(ev.ts, view.t0, px_per_us, tl_left).max(tl_left);
                     let x1 = t2x(ev.ts + ev.dur, view.t0, px_per_us, tl_left).min(rect[2]);
                     let w = x1 - x0;
 
                     let matches = !filtering
-                        || (searching && (ev.name as usize) < search_mask.len() && search_mask[ev.name as usize])
-                        || (has_sel_mask && sel_mask.get(ev.name as usize).copied().unwrap_or(false));
+                        || (searching && search_mask.get(ev.name as usize).unwrap_or(false));
 
                     if w < MIN_EV_PX {
                         let px = x0 as i32;
@@ -1749,9 +1741,7 @@ pub fn draw_timeline(
                     let is_multi = multi_select_name.map_or(false, |n| ev.name == n);
                     let ev_track_y = buf.y_offsets[vi] + ev.depth as f32 * sub_h;
                     let is_selected = is_selected(orig_ti as u32, ei as u32, ev_track_y, sub_h, ev.ts, ev.dur);
-                    let is_sel_mask = !sel_mask.is_empty() && sel_mask.get(ev.name as usize).copied().unwrap_or(false);
-
-                    let fill = if is_hovered { brighten(color, 30) } else if is_selected || is_sel_mask { brighten(color, 20) } else { color };
+                    let fill = if is_hovered { brighten(color, 30) } else if is_selected { brighten(color, 20) } else { color };
                     dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], fill)
                         .filled(true).rounding(EV_ROUNDING).build();
 
@@ -1761,7 +1751,7 @@ pub fn draw_timeline(
                     } else if is_hovered {
                         dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], col32(255, 255, 255, 255))
                             .rounding(EV_ROUNDING).build();
-                    } else if is_selected || is_sel_mask {
+                    } else if is_selected {
                         dl.add_rect([ev_rect[0], ev_rect[1]], [ev_rect[2], ev_rect[3]], ACCENT_SOFT)
                             .rounding(EV_ROUNDING).build();
                     } else if is_multi {
@@ -2123,8 +2113,9 @@ pub fn draw_timeline(
             let y = tracks_top + buf.y_offsets[vi] - view.scroll_y;
             if mouse_pos[1] >= y && mouse_pos[1] < y + track_h {
                 if trace.tracks[orig_ti].max_depth > 1 {
-                    if let Some(c) = collapsed.get_mut(orig_ti) {
-                        *c = !*c;
+                    if orig_ti < collapsed.len() {
+                        let c = collapsed[orig_ti];
+                        collapsed.set(orig_ti, !c);
                     }
                 }
                 break;

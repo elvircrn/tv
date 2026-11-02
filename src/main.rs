@@ -1444,11 +1444,11 @@ impl App {
                                 // in `poll_loading`, not recomputed every toolbar frame).
                                 if !pane.exec_context_names.is_empty() {
                                     let all_hidden = pane.exec_context_names.iter()
-                                        .all(|&i| pane.hidden_names.get(i).copied().unwrap_or(false));
+                                        .all(|&i| pane.hidden_names.get(i).unwrap_or(false));
                                     let label = if all_hidden { "Show Execute Context" } else { "Hide Execute Context" };
                                     if ui.menu_item(label) {
                                         for &i in &pane.exec_context_names {
-                                            if let Some(h) = pane.hidden_names.get_mut(i) { *h = !all_hidden; }
+                                            pane.hidden_names.set(i, !all_hidden);
                                         }
                                         if !pane.search.is_empty() { pane.rebuild_search(); }
                                     }
@@ -1587,7 +1587,7 @@ impl App {
                                 pane.zoom_to_search();
                                 pane.pending_tab = Some(BottomTab::Selection);
                             }
-                            let search_active = pane.search_mask.iter().any(|&m| m);
+                            let search_active = pane.search_mask.any();
                             if search_active {
                                 let has_matches = !pane.search_nav.is_empty();
                                 ui.same_line_with_spacing(0.0, 6.0);
@@ -1821,7 +1821,7 @@ impl App {
                                 ui.same_line();
                                 if ui.button("Hide Selected") {
                                     for se in &pane.selection_stats {
-                                        if let Some(h) = pane.hidden_names.get_mut(se.name as usize) { *h = true; }
+                                        pane.hidden_names.set(se.name as usize, true);
                                     }
                                 }
                                 draw_hidden_clear(&ui, 10.0, &mut pane.hidden_names, &mut state.buf.fmt);
@@ -2074,7 +2074,7 @@ impl App {
                             });
                             if let Some((track, ev)) = sel_ev {
                                 let name = &trace.names[ev.name as usize];
-                                let is_hidden = pane.hidden_names.get(ev.name as usize).copied().unwrap_or(false);
+                                let is_hidden = pane.hidden_names.get(ev.name as usize).unwrap_or(false);
                                 state.buf.fmt.clear();
                                 if is_hidden {
                                     write!(state.buf.fmt, "Show##hideev").unwrap();
@@ -2083,7 +2083,7 @@ impl App {
                                 }
                                 if ui.small_button(&state.buf.fmt) {
                                     if (ev.name as usize) < pane.hidden_names.len() {
-                                        pane.hidden_names[ev.name as usize] = !is_hidden;
+                                        pane.hidden_names.set(ev.name as usize, !is_hidden);
                                     }
                                 }
                                 state.buf.detail_buf.clear();
@@ -2356,7 +2356,6 @@ impl App {
                         &pane.hidden_names,
                         pane.selected,
                         pane.multi_select_name,
-                        &pane.sel_mask,
                         pane.label_w,
                         &mut pane.track_scales,
                         &mut pane.even_spacing,
@@ -2443,7 +2442,6 @@ impl App {
                     // Selection tab's data itself, but not this highlight).
                     pane.selection = None;
                     pane.finished_sel = None;
-                    pane.sel_mask.clear();
                     // Double-click selects every event of this name: populate the
                     // Selection tab with that kernel's aggregate + distribution.
                     pane.rebuild_multi_select_stats();
@@ -2462,7 +2460,7 @@ impl App {
                     pane.selection_dirty = true;
                     // A region shift-drag supersedes an active search: clear the
                     // search box and its highlight (once, at drag start).
-                    if !pane.search.is_empty() || pane.search_mask.iter().any(|&m| m) {
+                    if !pane.search.is_empty() || pane.search_mask.any() {
                         pane.clear_search();
                     }
                 } else {

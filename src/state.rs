@@ -403,11 +403,11 @@ pub(crate) fn is_gpu_work_cat(c: &str) -> bool {
 /// length, and rank scoping, all BEFORE the top-N cut, so profiler-artifact
 /// gaps don't consume list slots (see `GapFilter`'s doc).
 pub(crate) fn compute_gaps_in(trace: &Trace, f: GapFilter) -> Vec<GapInfo> {
-    let mut is_work = vec![false; trace.cats.len()];
+    let mut is_work = BitSet::with_len(trace.cats.len());
     let mut any_work = false;
     for (i, c) in trace.cats.iter().enumerate() {
         if is_gpu_work_cat(c) {
-            is_work[i] = true;
+            is_work.set(i, true);
             any_work = true;
         }
     }
@@ -671,7 +671,7 @@ pub struct Pane {
     pub search: String,
     pub search_focus: bool,
     pub select_all_pending: bool,
-    pub search_mask: Vec<bool>,
+    pub search_mask: BitSet,
     pub search_nav: Vec<(f64, u32, u32)>,
     pub search_cursor: usize,
     pub prev_search: String,
@@ -694,12 +694,11 @@ pub struct Pane {
     /// `rebuild_selection_stats`.
     pub sel_gpu: Vec<SelGpuSummary>,
     pub selection_dirty: bool,
-    pub sel_mask: Vec<bool>,
-    pub collapsed: Vec<bool>,
+    pub collapsed: BitSet,
     pub track_scales: Vec<f32>,
     pub even_spacing: bool,
     pub geom: PaneGeom,
-    pub hidden_names: Vec<bool>,
+    pub hidden_names: BitSet,
     /// Cache key for `merged_gpu_groups` below. The pack is VIEW-INDEPENDENT
     /// (whole-span packing, see `MergedPack`), so the key is only
     /// (hidden_names, track_order) — panning and zooming must NOT rebuild
@@ -707,7 +706,7 @@ pub struct Pane {
     /// edge visibly re-lane frame after frame during a pan (off-screen
     /// influencers dropping out of the collect window) and cost a full
     /// repack on every view-change frame.
-    pub merge_cache_key: Option<(Vec<bool>, Vec<usize>)>,
+    pub merge_cache_key: Option<(BitSet, Vec<usize>)>,
     /// The merged multi-rank view's per-rank-group row data (packed events +
     /// max depth), validated against `merge_cache_key` above. This must live
     /// here, not on the shared `DrawBuf` (where it lived before it was
@@ -884,7 +883,7 @@ impl Pane {
             search: String::with_capacity(256),
             search_focus: false,
             select_all_pending: false,
-            search_mask: Vec::new(),
+            search_mask: BitSet::new(),
             search_nav: Vec::new(),
             search_cursor: 0,
             prev_search: String::new(),
@@ -894,12 +893,11 @@ impl Pane {
             selection_stats: Vec::new(),
             sel_gpu: Vec::new(),
             selection_dirty: false,
-            sel_mask: Vec::new(),
-            collapsed: Vec::new(),
+            collapsed: BitSet::new(),
             track_scales: Vec::new(),
             even_spacing: false,
             geom: PaneGeom::default(),
-            hidden_names: Vec::new(),
+            hidden_names: BitSet::new(),
             merge_cache_key: None,
             merged_gpu_groups: Vec::new(),
             exec_context_names: Vec::new(),
@@ -1158,7 +1156,6 @@ impl Pane {
         // back to the manual filter, so the cached list is stale.
         self.gaps = None;
         self.focused_gap = None;
-        self.sel_mask.clear();
         self.sel_median = 0.0;
         self.sel_agg_stats.clear();
         self.sel_individual.clear();
@@ -1184,7 +1181,6 @@ impl Pane {
         self.focused_gap = None;
         self.selection = None;
         self.rebuild_selection_stats(buf);
-        self.sel_mask.clear();
     }
 
     /// Resolve a raw pixel-space selection rectangle into the concrete set of
@@ -1263,12 +1259,12 @@ impl Pane {
                 // Mirror the renderer exactly: a collapsed row is ONE lane
                 // showing only depth-0 events across its full height, so
                 // deeper events are invisible and must not be captured.
-                let is_collapsed = self.collapsed.get(ti).copied().unwrap_or(false);
+                let is_collapsed = self.collapsed.get(ti).unwrap_or(false);
                 let sub_h = track_h / if is_collapsed { 1 } else { track.max_depth.max(1) } as f32;
                 let start = bisect_overlap(&track.events, &track.prefix_max_dur, s0);
                 let end = track.events.partition_point(|e| e.ts <= s1).max(start);
                 for (local_i, ev) in track.events[start..end].iter().enumerate() {
-                    if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                    if self.hidden_names.get(ev.name as usize).unwrap_or(false) { continue; }
                     if is_collapsed && ev.depth > 0 { continue; }
                     let ev_top = track_top + ev.depth as f32 * sub_h;
                     let ev_bot = ev_top + sub_h;
@@ -1538,12 +1534,12 @@ impl Pane {
                 if is_reload {
                     let n_tracks = trace.tracks.len();
                     let n_names = trace.names.len();
-                    self.collapsed.resize(n_tracks, false);
+                    self.collapsed.resize(n_tracks);
                     self.track_scales.resize(n_tracks, 1.0);
                     if self.track_order.len() != n_tracks {
                         self.track_order = default_track_order(&trace.tracks);
                     }
-                    self.hidden_names.resize(n_names, false);
+                    self.hidden_names.resize(n_names);
                     self.search_mask.clear();
                     self.search_nav.clear();
                     self.search_cursor = 0;
@@ -1573,10 +1569,10 @@ impl Pane {
                     self.view.t0 = -pad;
                     self.view.t1 = trace.max_ts + pad;
                     self.view.scroll_y = 0.0;
-                    self.collapsed = vec![false; trace.tracks.len()];
+                    self.collapsed = BitSet::with_len(trace.tracks.len());
                     self.track_scales = vec![1.0; trace.tracks.len()];
                     self.track_order = default_track_order(&trace.tracks);
-                    self.hidden_names = vec![false; trace.names.len()];
+                    self.hidden_names = BitSet::with_len(trace.names.len());
                     self.trace = Some(trace);
                 }
                 // Computed once per load instead of every toolbar frame — the
@@ -1605,7 +1601,7 @@ impl Pane {
         };
         let q = self.search.trim().to_ascii_lowercase();
         self.search_mask.clear();
-        self.search_mask.resize(trace.names.len(), false);
+        self.search_mask.resize(trace.names.len());
         self.search_nav.clear();
         self.search_cursor = 0;
 
@@ -1613,7 +1609,7 @@ impl Pane {
 
         for (i, name) in trace.names.iter().enumerate() {
             if name.to_ascii_lowercase().contains(&q) {
-                self.search_mask[i] = true;
+                self.search_mask.set(i, true);
             }
         }
 
@@ -1736,13 +1732,12 @@ impl Pane {
             Some(t) => t,
             None => return,
         };
-        if !self.search_mask.iter().any(|&m| m) { return; }
+        if !self.search_mask.any() { return; }
 
         self.selected = None;
         self.multi_select_name = None;
         self.selection = None;
         self.selection_stats.clear();
-        self.sel_mask.clear();
 
         let map = &mut buf.sel_map;
         for v in map.values_mut() { v.0 = 0; v.1 = 0.0; v.2.clear(); v.3.clear(); }
@@ -1750,7 +1745,7 @@ impl Pane {
         for (ti, track) in trace.tracks.iter().enumerate() {
             if !self.show_cpu && !track.gpu { continue; }
             for (ei, ev) in track.events.iter().enumerate() {
-                if self.hidden_names.get(ev.name as usize).copied().unwrap_or(false) { continue; }
+                if self.hidden_names.get(ev.name as usize).unwrap_or(false) { continue; }
                 if self.search_mask[ev.name as usize] {
                     let e = map.entry(ev.name).or_insert((0, 0.0, Vec::new(), Vec::new()));
                     e.0 += 1;
@@ -1820,7 +1815,7 @@ impl Pane {
         let track = match trace.tracks.get(ti as usize) { Some(t) => t, None => return false };
         if !self.show_cpu && !track.gpu { return false; }
         match track.events.get(ei as usize) {
-            Some(ev) => !self.hidden_names.get(ev.name as usize).copied().unwrap_or(false),
+            Some(ev) => !self.hidden_names.get(ev.name as usize).unwrap_or(false),
             None => false,
         }
     }

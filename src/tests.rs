@@ -103,8 +103,8 @@ fn make_merged_pack(entries: &[(f64, f64, u32, u32, u16, u16, u16)]) -> MergedPa
 }
 
 fn make_state(trace: Trace) -> AppState {
-    let hidden_names = vec![false; trace.names.len()];
-    let collapsed = vec![false; trace.tracks.len()];
+    let hidden_names = BitSet::with_len(trace.names.len());
+    let collapsed = BitSet::with_len(trace.tracks.len());
     let mut buf = DrawBuf::default();
     let mut cum = 0.0f32;
     for (i, t) in trace.tracks.iter().enumerate() {
@@ -419,7 +419,7 @@ fn test_reload_resets_merge_cache_key() {
     let trace1 = make_trace(vec!["", "k"], vec![("GPU 0", true, vec![ev(0.0, 1.0, 1, 0)])]);
     let mut pane = Pane::new();
     pane.trace = Some(trace1);
-    pane.merge_cache_key = Some((vec![false], vec![0]));
+    pane.merge_cache_key = Some((BitSet::with_len(1), vec![0]));
 
     let trace2 = make_trace(vec!["", "k"], vec![("GPU 0", true, vec![ev(0.0, 1.0, 1, 0)])]);
     let (tx, rx) = std::sync::mpsc::channel();
@@ -450,7 +450,7 @@ fn test_merged_pack_is_view_independent_at_left_edge() {
         ("GPU 0", true, vec![ev(0.0, 50.0, 0, 0)]),
         ("GPU 1", true, vec![ev(10.0, 10.0, 0, 0), ev(30.0, 10.0, 0, 0)]),
     ]);
-    let hidden = vec![false; trace.names.len()];
+    let hidden = BitSet::with_len(trace.names.len());
 
     let pack = crate::ui::build_merged_group_events(&trace, &[0, 1], &hidden);
 
@@ -523,7 +523,7 @@ fn test_selection_stats_respects_hidden() {
     let trace = make_trace(names, vec![("GPU 0", true, events)]);
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
-    p.hidden_names[1] = true;
+    p.hidden_names.set(1, true);
     p.selection = Some([0.0, 30.0, 0.0, 1e9]);
     p.finish_selection(&mut state.buf);
 
@@ -607,7 +607,9 @@ fn test_collapsed_track_selection_matches_rendered_lanes() {
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
     p.show_cpu = true;
-    p.collapsed = vec![true];
+    let mut c = BitSet::with_len(1);
+    c.set(0, true);
+    p.collapsed = c;
     // Mirror what draw_timeline's layout does for a collapsed track: the row
     // is one SUB_LANE_H lane regardless of max_depth.
     p.geom.heights[0] = track_height(3, true, 1.0);
@@ -763,7 +765,7 @@ fn test_rebuild_search_empty() {
     p.search = "  ".to_string();
     p.rebuild_search();
 
-    assert!(p.search_mask.iter().all(|&m| !m));
+    assert!(p.search_mask.iter().all(|m| !m));
 }
 
 // --- Trace loading (file-based) ---
@@ -969,7 +971,8 @@ fn test_rank_paths_trailer_absent_is_empty() {
 
 #[test]
 fn test_even_spacing_heights_all_content_is_uniform() {
-    let has_content = vec![true; 4];
+    let mut has_content = BitSet::with_len(4);
+    has_content.fill(true);
     let heights = crate::ui::even_spacing_heights(&has_content, 100.0);
     assert_eq!(heights, vec![25.0; 4]);
 }
@@ -978,7 +981,7 @@ fn test_even_spacing_heights_all_content_is_uniform() {
 fn test_even_spacing_heights_all_empty_is_uniform() {
     // Nothing to expand into the freed space, so this must not collapse
     // every row to the empty-strip height and lose the rest of the viewport.
-    let has_content = vec![false; 4];
+    let has_content = BitSet::with_len(4);
     let heights = crate::ui::even_spacing_heights(&has_content, 100.0);
     assert_eq!(heights, vec![25.0; 4]);
 }
@@ -987,8 +990,8 @@ fn test_even_spacing_heights_all_empty_is_uniform() {
 fn test_even_spacing_heights_one_of_many_fills_the_rest() {
     // The scenario the merged multi-rank view actually hits: 8 rank rows,
     // only one has an event in the current (zoomed-in) view window.
-    let mut has_content = vec![false; 8];
-    has_content[3] = true;
+    let mut has_content = BitSet::with_len(8);
+    has_content.set(3, true);
     let heights = crate::ui::even_spacing_heights(&has_content, 100.0);
     for (i, &h) in heights.iter().enumerate() {
         if i == 3 {
@@ -1003,7 +1006,7 @@ fn test_even_spacing_heights_one_of_many_fills_the_rest() {
 fn test_even_spacing_heights_empty_strip_never_exceeds_uniform_share() {
     // A tiny viewport with many rows: EMPTY_ROW_H (6.0) alone would exceed
     // an equal per-row share, which must clamp instead of overflowing avail.
-    let has_content = vec![false, true, false, false, false, false, false, false, false, false];
+    let has_content: BitSet = [false, true, false, false, false, false, false, false, false, false].into_iter().collect();
     let heights = crate::ui::even_spacing_heights(&has_content, 10.0);
     let total: f32 = heights.iter().sum();
     assert!(total <= 10.0 + 1e-4, "collapsed rows must not overflow the available height: {total}");
@@ -1011,7 +1014,7 @@ fn test_even_spacing_heights_empty_strip_never_exceeds_uniform_share() {
 
 #[test]
 fn test_even_spacing_heights_empty_input() {
-    assert!(crate::ui::even_spacing_heights(&[], 100.0).is_empty());
+    assert!(crate::ui::even_spacing_heights(&BitSet::new(), 100.0).is_empty());
 }
 
 #[test]
@@ -1308,7 +1311,7 @@ fn test_select_from_search_respects_hidden() {
     );
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
-    p.hidden_names[1] = true;
+    p.hidden_names.set(1, true);
 
     p.search = "a".to_string();
     p.rebuild_search();
@@ -1529,7 +1532,7 @@ fn test_diff_extract_selection_respects_hidden() {
     );
     let mut state = make_state(trace);
     let p = &mut state.panes[0];
-    p.hidden_names[1] = true;
+    p.hidden_names.set(1, true);
     p.finished_sel = Some([0.0, 20.0, 0.0, 100.0]);
     p.finished_sel_events = p.capture_sel_events(p.finished_sel.unwrap()).into_iter().collect();
     let events = p.extract_selection_events();
@@ -2163,8 +2166,8 @@ fn bench_draw_timeline() {
     let mut pane = Pane::new();
     pane.merge_gpu = true;
     pane.track_order = default_track_order(&trace.tracks);
-    pane.hidden_names = vec![false; trace.names.len()];
-    pane.collapsed = vec![false; trace.tracks.len()];
+    pane.hidden_names = BitSet::with_len(trace.names.len());
+    pane.collapsed = BitSet::with_len(trace.tracks.len());
     pane.track_scales = vec![1.0; trace.tracks.len()];
     let max_ts = trace.max_ts;
     pane.trace = Some(trace);
@@ -2196,7 +2199,7 @@ fn bench_draw_timeline() {
                     [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0, false, false,
                     &pane.search_mask, pane.selection, &pane.finished_sel_events,
                     &mut pane.collapsed, &pane.hidden_names, pane.selected, pane.multi_select_name,
-                    &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
+                    pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
                     &pane.steps, pane.step_cursor, false, None, None,
@@ -2225,7 +2228,7 @@ fn bench_draw_timeline() {
                     [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0, false, false,
                     &pane.search_mask, pane.selection, &pane.finished_sel_events,
                     &mut pane.collapsed, &pane.hidden_names, pane.selected, pane.multi_select_name,
-                    &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
+                    pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
                     &pane.steps, pane.step_cursor, false, None, None,
@@ -2254,7 +2257,7 @@ fn bench_draw_timeline() {
                     [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0, false, false,
                     &pane.search_mask, pane.selection, &pane.finished_sel_events,
                     &mut pane.collapsed, &pane.hidden_names, pane.selected, pane.multi_select_name,
-                    &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
+                    pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                     &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                     &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
                     &pane.steps, pane.step_cursor, false, None, None,
@@ -2771,7 +2774,7 @@ fn test_collect_merged_track_events_excludes_events_before_view_t0() {
         ev(100.0, 1.0, 1, 0),   // B: ends at 101, long over by the window below
     ];
     let trace = make_trace(names, vec![("GPU 0", true, events)]);
-    let hidden = vec![false; trace.names.len()];
+    let hidden = BitSet::with_len(trace.names.len());
     let mut out = Vec::new();
     crate::ui::collect_merged_track_events(&trace.tracks[0], 0, 4500.0, 4600.0, &hidden, &mut out);
     assert_eq!(out.len(), 1, "only A should overlap [4500, 4600], not B: {out:?}");
@@ -2789,7 +2792,7 @@ fn test_build_merged_group_events_stretch_matches_naive_recompute() {
         ("GPU 0", true, vec![ev(0.0, 10.0, 0, 0), ev(100.0, 10.0, 0, 0)]),
         ("GPU 1", true, vec![ev(0.0, 10.0, 0, 0)]),
     ]);
-    let hidden = vec![false; trace.names.len()];
+    let hidden = BitSet::with_len(trace.names.len());
     let pack = crate::ui::build_merged_group_events(&trace, &[0, 1], &hidden);
     assert_eq!(pack.max_depth, 2);
     assert_eq!(pack.depth.len(), 3);
@@ -2836,10 +2839,9 @@ fn bench_merge_gpu_collect_cost() {
         .collect();
     eprintln!("names matching execute_context: {}", exec_names.len());
 
-    let mut hidden_none = vec![false; trace.names.len()];
-    let mut hidden_exec = vec![false; trace.names.len()];
-    for &n in &exec_names { hidden_exec[n as usize] = true; }
-    let _ = &mut hidden_none;
+    let hidden_none = BitSet::with_len(trace.names.len());
+    let mut hidden_exec = BitSet::with_len(trace.names.len());
+    for &n in &exec_names { hidden_exec.set(n as usize, true); }
 
     for (ti, track) in trace.tracks.iter().enumerate() {
         if !track.gpu || track.events.len() < 1000 { continue; }
@@ -2964,7 +2966,7 @@ fn bench_merge_phases() {
     }
     eprintln!("{} rank groups", groups.len());
 
-    let hidden: Vec<bool> = Vec::new();
+    let hidden = BitSet::new();
     let iters = 10;
 
     // One-time pack build per group (view-independent — no zoom loop).
@@ -4833,10 +4835,10 @@ fn draw_timeline_heat_mode_renders() {
     );
     let mut pane = Pane::new();
     pane.trace = Some(trace);
-    pane.collapsed = vec![false; 2];
+    pane.collapsed = BitSet::with_len(2);
     pane.track_scales = vec![1.0; 2];
     pane.track_order = vec![0, 1];
-    pane.hidden_names = vec![false; 2];
+    pane.hidden_names = BitSet::with_len(2);
     pane.show_cpu = true;
     pane.view.t0 = 0.0;
     pane.view.t1 = 60.0;
@@ -4858,7 +4860,7 @@ fn draw_timeline_heat_mode_renders() {
                 [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], 0.0, false, false,
                 &pane.search_mask, pane.selection, &pane.finished_sel_events,
                 &mut pane.collapsed, &pane.hidden_names, pane.selected, pane.multi_select_name,
-                &pane.sel_mask, pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
+                pane.label_w, &mut pane.track_scales, &mut pane.even_spacing,
                 &mut pane.geom, &mut pane.track_order, &mut drag, pane.merge_gpu, 0.016,
                 &mut pane.pending_focus, &mut pane.merge_cache_key, &mut pane.merged_gpu_groups,
                 &pane.steps, pane.step_cursor, pane.color_by_dur, pane.heat_bounds, None,

@@ -83,6 +83,110 @@ pub const DETAIL_HIST_H: f32 = 90.0;
 /// outright — a label peeking into its neighbor reads better than a blank row.
 pub const MIN_TEXT_PX: f32 = 6.0;
 
+/// A packed bit set over `len` indexed slots — one bit per slot in `u64`
+/// words instead of one byte per slot. Reads go through `get` or `Index`;
+/// writes through `set`/`push`/`fill` (there is no `&mut bool` into packed
+/// bits). Bits at index `>= len` are kept clear, so equality, `iter`, and
+/// `count_ones` see exactly the live slots.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct BitSet {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl BitSet {
+    pub fn new() -> Self {
+        Self { words: Vec::new(), len: 0 }
+    }
+
+    /// An all-clear set with `n` slots.
+    pub fn with_len(n: usize) -> Self {
+        Self { words: vec![0u64; n.div_ceil(64)], len: n }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Drops every slot (`len` becomes 0), like `Vec::clear`.
+    pub fn clear(&mut self) {
+        self.words.clear();
+        self.len = 0;
+    }
+
+    /// Grows or shrinks to `n` slots. Bits below `n` keep their value; new
+    /// slots start clear.
+    pub fn resize(&mut self, n: usize) {
+        self.words.resize(n.div_ceil(64), 0);
+        let rem = n % 64;
+        if rem != 0 {
+            if let Some(w) = self.words.last_mut() { *w &= (1u64 << rem) - 1; }
+        }
+        self.len = n;
+    }
+
+    pub fn get(&self, i: usize) -> Option<bool> {
+        if i < self.len { Some(self[i]) } else { None }
+    }
+
+    pub fn set(&mut self, i: usize, v: bool) {
+        assert!(i < self.len, "BitSet set at {i} but len is {}", self.len);
+        let w = &mut self.words[i / 64];
+        let bit = 1u64 << (i % 64);
+        if v { *w |= bit; } else { *w &= !bit; }
+    }
+
+    /// Appends one slot, like `Vec::push`.
+    pub fn push(&mut self, v: bool) {
+        if self.len % 64 == 0 { self.words.push(0); }
+        if v {
+            let i = self.len;
+            self.words[i / 64] |= 1u64 << (i % 64);
+        }
+        self.len += 1;
+    }
+
+    /// Sets every slot to `v`.
+    pub fn fill(&mut self, v: bool) {
+        let all = if v { !0u64 } else { 0 };
+        for w in &mut self.words { *w = all; }
+        let rem = self.len % 64;
+        if rem != 0 {
+            if let Some(w) = self.words.last_mut() { *w &= (1u64 << rem) - 1; }
+        }
+    }
+
+    /// Whether any slot is set.
+    pub fn any(&self) -> bool {
+        self.words.iter().any(|&w| w != 0)
+    }
+
+    /// How many slots are set.
+    pub fn count_ones(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
+        (0..self.len).map(move |i| self.words[i / 64] & (1u64 << (i % 64)) != 0)
+    }
+}
+
+impl FromIterator<bool> for BitSet {
+    fn from_iter<I: IntoIterator<Item = bool>>(iter: I) -> Self {
+        let mut bs = BitSet::new();
+        for v in iter { bs.push(v); }
+        bs
+    }
+}
+
+impl std::ops::Index<usize> for BitSet {
+    type Output = bool;
+    fn index(&self, i: usize) -> &bool {
+        assert!(i < self.len, "BitSet index {i} but len is {}", self.len);
+        if self.words[i / 64] & (1u64 << (i % 64)) != 0 { &true } else { &false }
+    }
+}
+
 pub fn track_height(max_depth: u16, collapsed: bool, scale: f32) -> f32 {
     let base = if collapsed { SUB_LANE_H } else { max_depth.max(1) as f32 * SUB_LANE_H };
     base * scale
