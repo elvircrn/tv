@@ -16,7 +16,11 @@
     /* Shown by web/initializer.mjs while the wasm binary downloads — there's
        nothing from the Rust side to draw yet at this point, so this is
        plain HTML/CSS, styled to match the app's dark theme and accent color
-       so there's no visible seam when it hands off to the real canvas. */
+       so there's no visible seam when it hands off to the real canvas. For
+       a share-link open (?src=/?gist=) the Rust side keeps this overlay up
+       as the single load screen through the trace download and parse, so
+       the whole load reads as one bar (see update_boot_overlay in
+       main.rs). */
     #tv-loading {
       position: fixed;
       inset: 0;
@@ -28,6 +32,9 @@
       background: #161616;
       font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: #ccc;
+    }
+    #tv-loading svg {
+      display: block;
     }
     .tv-loading-bar-track {
       width: 220px;
@@ -138,10 +145,10 @@ async function __trunkInitializer(init, source, sourceSize, initializer, initWit
 }
 
 
-import init, * as bindings from '/tv/tv-d264783403c6bccf.js';
-import initializer from '/tv/a7c029aecc6fb532-initializer.mjs';
+import init, * as bindings from '/tv/tv-b42642b893700bc.js';
+import initializer from '/tv/586feaa3f8cb8f52-initializer.mjs';
 
-const wasm = await __trunkInitializer(init, '/tv/tv-d264783403c6bccf_bg.wasm', 2219572, initializer(), true);
+const wasm = await __trunkInitializer(init, '/tv/tv-b42642b893700bc_bg.wasm', 2221302, initializer(), true);
 
 
 window.wasmBindings = bindings;
@@ -150,6 +157,6 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-<link rel="modulepreload" href="/tv/tv-d264783403c6bccf.js" crossorigin="anonymous" integrity="sha384-EkmdIwiUFaRKB3Pdb9NEBkUv1oXdzNfGwtBltc1TL65x3Y33tR4DfrxwlinXhzig"><link rel="modulepreload" href="/tv/a7c029aecc6fb532-initializer.mjs" crossorigin="anonymous" integrity="sha384-k4F05y7zWjHL6t12SxBNSNSUxKRwUptimkqP9AHHYuc12+IIz8maTbH9pJWTuAOV"></head>
+<link rel="modulepreload" href="/tv/tv-b42642b893700bc.js" crossorigin="anonymous" integrity="sha384-iSHRzSON95FAQqZR8Pitdo099iCtp2M9DRcWi3d0h5TGY53wyslqbsBz0jdECa62"><link rel="modulepreload" href="/tv/586feaa3f8cb8f52-initializer.mjs" crossorigin="anonymous" integrity="sha384-SKC7CN56JvcRkCZMUvLE1lJIJf0VLHgfE9JviPqnl7NbpxXYygF+ErYCNE39FcyU"></head>
 <body></body>
 </html>
