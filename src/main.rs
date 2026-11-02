@@ -1156,6 +1156,8 @@ impl App {
         let window = self.window.as_ref().unwrap();
         let phys = window.inner_size();
         let s = self.scale_factor as f32;
+        // The 2x-size atlas font (see renderer.rs), for oversized labels.
+        let big_font = self.renderer.as_ref().map(|r| r.big_font);
 
         let io = imgui.io_mut();
         io.display_size = [phys.width as f32 / s, phys.height as f32 / s];
@@ -1854,7 +1856,25 @@ impl App {
                                 let tbl_rows = if pane.sel_aggregate { pane.sel_agg_stats.len() } else { pane.sel_individual.len() };
                                 if tbl_ms > 10.0 { eprintln!("  stats_table:{:.0} ({} rows, aggregate={})", tbl_ms, tbl_rows, pane.sel_aggregate); }
                             } else {
-                                ui.text_colored([0.5, 0.5, 0.5, 1.0], "Shift+drag to select a time range");
+                                // Big centered hint: with nothing selected the
+                                // tab is a blank rectangle, which reads as
+                                // broken. Falls back to plain text if the 2x
+                                // atlas font isn't available (no renderer yet).
+                                let avail = ui.content_region_avail();
+                                let cur = ui.cursor_pos();
+                                let label = "Shift+drag to select events";
+                                if let Some(f) = big_font {
+                                    let _t = ui.push_font(f);
+                                    let sz = ui.calc_text_size(label);
+                                    ui.set_cursor_pos([
+                                        cur[0] + ((avail[0] - sz[0]) * 0.5).max(0.0),
+                                        cur[1] + ((avail[1] - sz[1]) * 0.5).max(0.0),
+                                    ]);
+                                    ui.text_colored([0.5, 0.5, 0.5, 1.0], label);
+                                } else {
+                                    ui.text_colored([0.5, 0.5, 0.5, 1.0], label);
+                                }
+                                ui.set_cursor_pos(cur);
                                 draw_hidden_clear(&ui, 16.0, &mut pane.hidden_names, &mut state.buf.fmt);
                             }
                         }

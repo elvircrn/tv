@@ -41,6 +41,8 @@ pub struct WebGl2Renderer {
     // mirroring MetalRenderer's single contiguous vtx/idx upload.
     vtx_scratch: Vec<u8>,
     idx_scratch: Vec<u8>,
+    /// The 2x-size atlas font, for oversized labels (push_font).
+    pub big_font: imgui::FontId,
 }
 
 fn compile_shader(gl: &Gl, kind: u32, src: &str) -> web_sys::WebGlShader {
@@ -102,6 +104,18 @@ impl WebGl2Renderer {
                 ..Default::default()
             }),
         }]);
+        // Second 2x-size build for oversized labels — see renderer.rs.
+        let big_font = imgui.fonts().add_font(&[FontSource::TtfData {
+            data: FONT_TTF,
+            size_pixels: hidpi_size * 2.0,
+            config: Some(imgui::FontConfig {
+                oversample_h: 3,
+                oversample_v: 1,
+                pixel_snap_h: true,
+                rasterizer_multiply: 1.5,
+                ..Default::default()
+            }),
+        }]);
         let atlas = imgui.fonts().build_rgba32_texture();
         let (aw, ah) = (atlas.width, atlas.height);
         let mut atlas_px = atlas.data.to_vec();
@@ -138,7 +152,7 @@ impl WebGl2Renderer {
 
         Self {
             gl, canvas, program, u_proj, font_tex, vtx_buf, idx_buf,
-            vtx_scratch: Vec::new(), idx_scratch: Vec::new(),
+            vtx_scratch: Vec::new(), idx_scratch: Vec::new(), big_font,
         }
     }
 

@@ -52,6 +52,8 @@ pub struct MetalRenderer {
     vtx_cap: usize,
     idx_cap: usize,
     raw_layer: raw_window_metal::Layer,
+    /// The 2x-size atlas font, for oversized labels (push_font).
+    pub big_font: imgui::FontId,
 }
 
 impl MetalRenderer {
@@ -134,6 +136,30 @@ impl MetalRenderer {
                 }),
             }]);
         }
+        // A second, 2x-size build of the same face for oversized labels
+        // (the Selection tab's empty-state hint). The only way to address
+        // a font from the UI is the FontId, and rasterizing at 2x keeps it
+        // crisp instead of upscaling the 1x atlas bitmap.
+        let big_font = if let Some(ref data) = system_font {
+            fonts.add_font(&[FontSource::TtfData {
+                data,
+                size_pixels: hidpi_size * 2.0,
+                config: Some(imgui::FontConfig {
+                    oversample_h: 3,
+                    oversample_v: 1,
+                    pixel_snap_h: true,
+                    rasterizer_multiply: 1.5,
+                    ..Default::default()
+                }),
+            }])
+        } else {
+            fonts.add_font(&[FontSource::DefaultFontData {
+                config: Some(imgui::FontConfig {
+                    size_pixels: hidpi_size * 2.0,
+                    ..Default::default()
+                }),
+            }])
+        };
         let atlas = fonts.build_rgba32_texture();
         let (aw, ah) = (atlas.width, atlas.height);
         // SF Mono is a light-weight face; on the dark theme its anti-aliased
@@ -169,7 +195,7 @@ impl MetalRenderer {
 
         Self {
             device, queue, pipeline, font_tex, vtx_buf, idx_buf, proj_buf,
-            vtx_cap: INITIAL_BUF, idx_cap: INITIAL_BUF, raw_layer,
+            vtx_cap: INITIAL_BUF, idx_cap: INITIAL_BUF, raw_layer, big_font,
         }
     }
 
