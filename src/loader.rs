@@ -594,43 +594,152 @@ pub(crate) fn compute_kernel_stats(tracks: &[Track]) -> Vec<KernelStats> {
     kernel_stats_from_dur_map(dur_map)
 }
 
-fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Instant) -> Result<Trace, String> {
-    let mut names: Vec<String> = vec![String::new()];
-    let mut name_idx: FnvMap<u32> = FnvMap::default();
-    name_idx.insert(0, 0);
-    let mut cats: Vec<String> = vec![String::new()];
-    let mut cat_idx: FnvMap<u32> = FnvMap::default();
-    cat_idx.insert(0, 0);
+/// The chunk-merge half of `build_trace` (its `for chunk in chunks` loop)
+/// held out as a struct so the single-threaded wasm build can fold one
+/// chunk per frame slice (`WasmParsePlan`) while native runs the same
+/// merge in a tight loop. Field-for-field the locals of the old loop.
+pub(crate) struct TraceScan {
+    names: Vec<String>,
+    name_idx: FnvMap<u32>,
+    cats: Vec<String>,
+    cat_idx: FnvMap<u32>,
+    track_map: HashMap<(u64, u64), Vec<Event>>,
+    thread_names: HashMap<(u64, u64), String>,
+    flow_events: Vec<(u64, u64, u64, f64, bool)>,
+    min_ts: f64,
+    max_ts: f64,
+    total_events: usize,
+    scan_count: u64,
+}
 
-    let mut track_map: HashMap<(u64, u64), Vec<Event>> = HashMap::new();
-    let mut thread_names: HashMap<(u64, u64), String> = HashMap::new();
-    let mut flow_events: Vec<(u64, u64, u64, f64, bool)> = Vec::new();
-    let mut min_ts = f64::MAX;
-    let mut max_ts = f64::MIN;
-    let mut total_events: usize = 0;
-    let mut scan_count: u64 = 0;
+impl TraceScan {
+    fn new() -> Self {
+        let mut name_idx = FnvMap::default();
+        name_idx.insert(0, 0);
+        let mut cat_idx = FnvMap::default();
+        cat_idx.insert(0, 0);
+        Self {
+            names: vec![String::new()], name_idx,
+            cats: vec![String::new()], cat_idx,
+            track_map: HashMap::new(),
+            thread_names: HashMap::new(),
+            flow_events: Vec::new(),
+            min_ts: f64::MAX, max_ts: f64::MIN,
+            total_events: 0, scan_count: 0,
+        }
+    }
 
-    for chunk in chunks {
-        let name_remap = merge_intern_table(&mut names, &mut name_idx, &chunk.names, &chunk.name_idx);
-        let cat_remap = merge_intern_table(&mut cats, &mut cat_idx, &chunk.cats, &chunk.cat_idx);
+    /// Fold one parsed chunk into the shared tables/lists.
+    fn merge_chunk(&mut self, chunk: ChunkState) {
+        let name_remap = merge_intern_table(&mut self.names, &mut self.name_idx, &chunk.names, &chunk.name_idx);
+        let cat_remap = merge_intern_table(&mut self.cats, &mut self.cat_idx, &chunk.cats, &chunk.cat_idx);
 
         for (pid, tid, mut ev) in chunk.events {
             ev.name = name_remap[ev.name as usize];
             ev.cat = cat_remap[ev.cat as usize];
-            track_map.entry((pid, tid)).or_default().push(ev);
+            self.track_map.entry((pid, tid)).or_default().push(ev);
         }
 
         for (key, value) in chunk.thread_names {
-            thread_names.entry(key).or_insert(value);
+            self.thread_names.entry(key).or_insert(value);
         }
 
-        flow_events.extend(chunk.flows.iter().copied());
+        self.flow_events.extend(chunk.flows.iter().copied());
 
-        min_ts = min_ts.min(chunk.min_ts);
-        max_ts = max_ts.max(chunk.max_ts);
-        total_events += chunk.total_events;
-        scan_count += chunk.scan_count;
+        self.min_ts = self.min_ts.min(chunk.min_ts);
+        self.max_ts = self.max_ts.max(chunk.max_ts);
+        self.total_events += chunk.total_events;
+        self.scan_count += chunk.scan_count;
     }
+
+    /// Drain the per-(pid,tid) event lists for track assembly, into a Vec
+    /// so both the native par_iter and the wasm one-track-per-slice loop
+    /// walk the same entries.
+    fn take_track_entries(&mut self) -> Vec<((u64, u64), Vec<Event>)> {
+        self.track_map.drain().collect()
+    }
+}
+
+/// One track's assembly from its raw event list — the body of the per-track
+/// loop the old `build_trace` ran inline: normalize timestamps to the trace
+/// min, sort (exploiting the mostly-sorted input), Tetris-pack depths,
+/// prefix-max durations, classify CPU vs GPU. A pure function of its inputs
+/// so it runs per-track on rayon natively and once per frame slice on wasm.
+fn assemble_track(
+    pid: u64,
+    tid: u64,
+    mut evs: Vec<Event>,
+    min_ts: f64,
+    cats: &[String],
+    thread_names: &HashMap<(u64, u64), String>,
+) -> Track {
+    // Verbatim from the old closure, with cat_ref/tn_ref renamed to the
+    // parameters.
+    for ev in evs.iter_mut() { ev.ts -= min_ts; }
+    let mut sorted_end = evs.len();
+    for i in 1..evs.len() {
+        if evs[i].ts < evs[i - 1].ts {
+            sorted_end = i;
+            break;
+        }
+    }
+    if sorted_end < evs.len() {
+        if evs.len() - sorted_end < evs.len() / 100 {
+            let mut tail = evs.split_off(sorted_end);
+            tail.sort_unstable_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+            let prefix = std::mem::take(&mut evs);
+            evs.reserve(prefix.len() + tail.len());
+            let (mut i, mut j) = (0, 0);
+            while i < prefix.len() && j < tail.len() {
+                if prefix[i].ts <= tail[j].ts {
+                    evs.push(prefix[i]); i += 1;
+                } else {
+                    evs.push(tail[j]); j += 1;
+                }
+            }
+            if i < prefix.len() { evs.extend_from_slice(&prefix[i..]); }
+            if j < tail.len() { evs.extend_from_slice(&tail[j..]); }
+        } else {
+            evs.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
+        }
+    }
+    let mut lanes: Vec<f64> = Vec::new();
+    let mut max_depth: u16 = 1;
+    for ev in evs.iter_mut() {
+        let d = lanes.iter().position(|&end| end <= ev.ts)
+            .unwrap_or_else(|| { lanes.push(0.0); lanes.len() - 1 });
+        lanes[d] = ev.ts + ev.dur;
+        ev.depth = d as u16;
+        max_depth = max_depth.max(d as u16 + 1);
+    }
+    let mut prefix_max_dur = Vec::with_capacity(evs.len());
+    let mut running_max = 0.0f64;
+    for ev in &evs {
+        running_max = running_max.max(ev.dur);
+        prefix_max_dur.push(running_max);
+    }
+    let gpu_count = evs.iter().filter(|e| {
+        let c = &cats[e.cat as usize];
+        c == "kernel" || c.starts_with("gpu_")
+    }).count();
+    let gpu = gpu_count > evs.len() / 2;
+    let label = thread_names.get(&(pid, tid)).cloned().unwrap_or_else(|| {
+        if gpu { format!("GPU {tid}") } else { format!("Thread {tid}") }
+    });    evs.shrink_to_fit();
+    Track { label, gpu, events: evs, max_depth, prefix_max_dur, raw_buf_idx: 0 }
+}
+
+/// Everything `build_trace` does once every track is assembled: metadata
+/// scans, track ordering, flow pairing, kernel stats, and the `Trace`
+/// itself. Shared by the native path and the wasm plan's assemble phase.
+fn finish_trace(
+    raw: RawData,
+    scan: TraceScan,
+    keyed_tracks: Vec<((u64, u64), Track)>,
+    n_chunks: usize,
+    t0: &Instant,
+) -> Result<Trace, String> {
+    let TraceScan { mut names, name_idx: _, mut cats, cat_idx: _, track_map: _, thread_names: _, mut flow_events, min_ts, mut max_ts, total_events, scan_count } = scan;
 
     let mut device = String::new();
     if let Some(dp) = find_key(&raw, b"deviceProperties") {
@@ -672,11 +781,8 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
         if let Some(r) = find_int_field(&raw, di, b"rank") { dist_rank = r as i32; }
         if let Some(w) = find_int_field(&raw, di, b"world_size") { dist_world = w as i32; }
     }
-
     eprintln!("  scan: {:.2}s ({} objects, {} events, {} names, {}x parallel)",
         t0.elapsed().as_secs_f64(), scan_count, total_events, names.len(), n_chunks);
-    drop(name_idx);
-    drop(cat_idx);
 
     // Zero-copy on .json: a mapped file keeps pointing at its own pages
     // instead of being memcpy'd to a heap buffer first (measured 0.36s /
@@ -689,70 +795,7 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
     }
 
     let t2 = Instant::now();
-
-    let mut keyed_tracks: Vec<((u64, u64), Track)> = {
-        let cat_ref = &cats;
-        let tn_ref = &thread_names;
-        track_map
-            .into_par_iter()
-            .map(|((pid, tid), mut evs)| {
-                for ev in evs.iter_mut() { ev.ts -= min_ts; }
-                let mut sorted_end = evs.len();
-                for i in 1..evs.len() {
-                    if evs[i].ts < evs[i - 1].ts {
-                        sorted_end = i;
-                        break;
-                    }
-                }
-                if sorted_end < evs.len() {
-                    if evs.len() - sorted_end < evs.len() / 100 {
-                        let mut tail = evs.split_off(sorted_end);
-                        tail.sort_unstable_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
-                        let prefix = std::mem::take(&mut evs);
-                        evs.reserve(prefix.len() + tail.len());
-                        let (mut i, mut j) = (0, 0);
-                        while i < prefix.len() && j < tail.len() {
-                            if prefix[i].ts <= tail[j].ts {
-                                evs.push(prefix[i]); i += 1;
-                            } else {
-                                evs.push(tail[j]); j += 1;
-                            }
-                        }
-                        if i < prefix.len() { evs.extend_from_slice(&prefix[i..]); }
-                        if j < tail.len() { evs.extend_from_slice(&tail[j..]); }
-                    } else {
-                        evs.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap());
-                    }
-                }
-                let mut lanes: Vec<f64> = Vec::new();
-                let mut max_depth: u16 = 1;
-                for ev in evs.iter_mut() {
-                    let d = lanes.iter().position(|&end| end <= ev.ts)
-                        .unwrap_or_else(|| { lanes.push(0.0); lanes.len() - 1 });
-                    lanes[d] = ev.ts + ev.dur;
-                    ev.depth = d as u16;
-                    max_depth = max_depth.max(d as u16 + 1);
-                }
-                let mut prefix_max_dur = Vec::with_capacity(evs.len());
-                let mut running_max = 0.0f64;
-                for ev in &evs {
-                    running_max = running_max.max(ev.dur);
-                    prefix_max_dur.push(running_max);
-                }
-                let gpu_count = evs.iter().filter(|e| {
-                    let c = &cat_ref[e.cat as usize];
-                    c == "kernel" || c.starts_with("gpu_")
-                }).count();
-                let gpu = gpu_count > evs.len() / 2;
-                let label = tn_ref.get(&(pid, tid)).cloned().unwrap_or_else(|| {
-                    if gpu { format!("GPU {tid}") } else { format!("Thread {tid}") }
-                });
-                evs.shrink_to_fit();
-                let track = Track { label, gpu, events: evs, max_depth, prefix_max_dur, raw_buf_idx: 0 };
-                ((pid, tid), track)
-            })
-            .collect()
-    };
+    let mut keyed_tracks = keyed_tracks;
 
     keyed_tracks.sort_by(|a, b| b.1.gpu.cmp(&a.1.gpu).then_with(|| b.1.events.len().cmp(&a.1.events.len())));
 
@@ -806,6 +849,20 @@ fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Inst
 
     eprintln!("  lanes: {:.2}s ({} tracks, {} flow_pairs)", t2.elapsed().as_secs_f64(), tracks.len(), flow_pairs.len());
     Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, vllm_version, dist_rank, dist_world, flow_pairs, rank_paths: Vec::new() })
+}
+
+fn build_trace(raw: RawData, chunks: Vec<ChunkState>, n_chunks: usize, t0: &Instant) -> Result<Trace, String> {
+    let mut scan = TraceScan::new();
+    for chunk in chunks { scan.merge_chunk(chunk); }
+    let min_ts = scan.min_ts;
+    let entries = scan.take_track_entries();
+    let cats = &scan.cats;
+    let thread_names = &scan.thread_names;
+    let keyed_tracks: Vec<((u64, u64), Track)> = entries
+        .into_par_iter()
+        .map(|((pid, tid), evs)| ((pid, tid), assemble_track(pid, tid, evs, min_ts, cats, thread_names)))
+        .collect();
+    finish_trace(raw, scan, keyed_tracks, n_chunks, t0)
 }
 
 const CACHE_MAGIC: &[u8; 4] = b"TRV2";
@@ -2918,27 +2975,33 @@ pub fn load_multi_progressive(
     let _ = tx.send(Ok(trace));
 }
 
+/// One track's slice of `compact_args` — extracted so the single-threaded
+/// wasm build can compact one track per frame slice (`WasmParsePlan`).
+fn compact_track(track: &mut Track, raw_bufs: &[Arc<ArgsBuf>], compact: &mut Vec<u8>) {
+    let raw = &raw_bufs[track.raw_buf_idx as usize];
+    for ev in &mut track.events {
+        if ev.args_off > 0 {
+            let off = ev.args_off as usize;
+            let len = if ev.args_len > 0 {
+                ev.args_len as usize
+            } else {
+                skip_value(raw, off) - off
+            };
+            let new_off = compact.len();
+            compact.extend_from_slice(&raw[off..off + len]);
+            ev.args_off = new_off as u32;
+            ev.args_len = len.min(u16::MAX as usize) as u16;
+        }
+    }
+    track.raw_buf_idx = 0;
+}
+
 fn compact_args(trace: &mut Trace) {
     if trace.raw_bufs.is_empty() { return; }
     let mut compact = vec![0u8];
     let raw_bufs: Vec<_> = trace.raw_bufs.iter().cloned().collect();
     for track in &mut trace.tracks {
-        let raw = &raw_bufs[track.raw_buf_idx as usize];
-        for ev in &mut track.events {
-            if ev.args_off > 0 {
-                let off = ev.args_off as usize;
-                let len = if ev.args_len > 0 {
-                    ev.args_len as usize
-                } else {
-                    skip_value(raw, off) - off
-                };
-                let new_off = compact.len();
-                compact.extend_from_slice(&raw[off..off + len]);
-                ev.args_off = new_off as u32;
-                ev.args_len = len.min(u16::MAX as usize) as u16;
-            }
-        }
-        track.raw_buf_idx = 0;
+        compact_track(track, &raw_bufs, &mut compact);
     }
     compact.shrink_to_fit();
     trace.raw_bufs = vec![Arc::new(ArgsBuf::Heap(compact))];
@@ -3237,15 +3300,24 @@ pub fn load_multi_from_bytes_progressive(
     let _ = tx.send(Ok(trace));
 }
 
-/// Chunk count for the stepped parse below: enough splits that one step is
-/// a few MB of JSON (tens of ms), so the event counter visibly moves at
+/// Chunk count for the stepped parse below: enough splits that one work
+/// unit is a fraction of a megabyte of JSON, so several chunks fit inside
+/// a frame's step budget and the event counter visibly moves at
 /// requestAnimationFrame cadence. `calc_n_threads` picks 2 on
 /// single-threaded wasm (available_parallelism is 1 there), far too coarse
 /// to animate.
 #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
 fn plan_chunk_count(len: usize) -> usize {
-    (len / (4 * 1024 * 1024)).clamp(1, 64)
+    (len / (512 * 1024)).clamp(1, 512)
 }
+
+/// Per-call work budget for `WasmParsePlan::step`: loop work units until
+/// this much time elapses (at least one unit always runs, so progress is
+/// guaranteed), then hand the main thread back to the browser so it can
+/// render the splash. 10ms leaves room for that render inside a 60fps
+/// frame.
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+const STEP_BUDGET_MS: u64 = 10;
 
 /// What `WasmParsePlan::prepare` / `WasmMultiParsePlan::prepare` hand back:
 /// either a plan to step through, or a finished result (cache hit, or a
@@ -3257,22 +3329,75 @@ pub enum Prepared {
 }
 
 /// `load_trace_from_bytes_progressive` split into resumable phases for the
-/// single-threaded wasm build (driven by `Pane::run_pending_parse`): the
-/// same helpers in the same order — prepare (decompress + split points),
-/// step (one `parse_chunk` call), finish (build_trace + compact + send) —
-/// so results are identical to the monolithic version and only the pacing
-/// differs. One chunk per frame keeps the event counter moving; without
-/// this there is no thread to background the parse on, so the count sits
-/// still for the whole load. The mt build doesn't need it (the whole job
-/// runs on the rayon Worker pool).
+/// single-threaded wasm build (driven by `Pane::run_pending_parse`). Every
+/// phase runs the same helpers the monolithic version runs, in the same
+/// order — results are identical, only the pacing differs. `step` returns
+/// to the caller every STEP_BUDGET_MS so the browser keeps compositing
+/// frames (a frozen splash reads as a hang); without this there is no
+/// thread to background the load on. The mt build doesn't need it (the
+/// whole job runs on the rayon Worker pool).
+///
+/// Phases: Decompress (a .gz input gunzipped a slice at a time instead of
+/// one blocking call), Parse (chunks), Merge (`TraceScan::merge_chunk`),
+/// Assemble (`assemble_track` per track, then `finish_trace`), and — for a
+/// single-rank load — Compact (`compact_track` per track). Multi-rank
+/// member plans stop after Assemble: `merge_traces` concatenates the ranks
+/// and compacts the merged args itself (mirrors
+/// `load_multi_from_bytes_progressive`).
 #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
 pub struct WasmParsePlan {
+    phase: PlanPhase,
+    /// Decompress-phase state; Some only while `phase == Decompress`. The
+    /// decoder owns the compressed bytes (wrapped in a Cursor) so it
+    /// survives across step calls without borrowing the plan.
+    gz: Option<GzState>,
+    /// The JSON being parsed (set by prepare for non-gz inputs, by the
+    /// Decompress phase otherwise).
     raw: RawData,
+    /// Input name, for error messages and phase logging.
+    name: String,
     split_points: Vec<usize>,
     next_chunk: usize,
     chunks: Vec<ChunkState>,
+    /// Merge-phase cursor into `chunks`.
+    next_merge: usize,
+    scan: TraceScan,
+    /// Assemble-phase input/output.
+    track_entries: Vec<((u64, u64), Vec<Event>)>,
+    keyed_tracks: Vec<((u64, u64), Track)>,
+    /// Compact-phase state; Some only while `phase == Compact`.
+    compact_state: Option<CompactState>,
+    /// The plan's answer, set when the last phase (or an error) resolves.
+    result: Option<Result<Trace, String>>,
+    /// Whether this plan runs the Compact phase itself. True for a
+    /// single-rank load; multi-rank member plans skip it (see struct doc).
+    compact_when_done: bool,
     counter: Arc<AtomicUsize>,
     t0: Instant,
+}
+
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+#[derive(PartialEq)]
+enum PlanPhase { Decompress, Parse, Merge, Assemble, Compact, Done }
+
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+struct GzState {
+    decoder: flate2::read::GzDecoder<std::io::Cursor<Vec<u8>>>,
+    out: Vec<u8>,
+    /// Whether any byte has decompressed yet — distinguishes a hard gzip
+    /// error (nothing out -> fail) from a truncated tail (keep the partial
+    /// output), matching `read_gz_tolerant`.
+    got_any: bool,
+}
+
+/// Compact-phase state: `compact_track` over the trace held in
+/// `WasmParsePlan::result`, one track per work unit.
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+struct CompactState {
+    next: usize,
+    total: usize,
+    compact: Vec<u8>,
+    raw_snapshot: Vec<Arc<ArgsBuf>>,
 }
 
 /// The single- and multi-rank plans behind one `step`/`finish` interface.
@@ -3284,8 +3409,8 @@ pub enum SteppedParse {
 
 #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
 impl SteppedParse {
-    /// Parse the next chunk. Returns true when every chunk of every rank is
-    /// parsed and `finish` can run.
+    /// Advance by up to one frame's worth of work. Returns true when the
+    /// load is complete and `finish` can run.
     pub fn step(&mut self) -> bool {
         match self {
             SteppedParse::Single(p) => p.step(),
@@ -3293,12 +3418,27 @@ impl SteppedParse {
         }
     }
 
-    /// build_trace (+ merge/compact for multi-rank) and send the result.
-    /// Still one synchronous block: the merge phase has no counter to
-    /// animate, so slicing it buys nothing.
+    /// Splash text for the phases the event counter can't describe; None
+    /// means "use the event counter text" (the Parse phase).
+    pub fn status(&self) -> Option<String> {
+        match self {
+            SteppedParse::Single(p) => p.status(),
+            SteppedParse::Multi(p) => p.status(),
+        }
+    }
+
+    /// Send the completed result down the channel (merge first for
+    /// multi-rank). Only call once `step` reported true.
     pub fn finish(self, tx: &std::sync::mpsc::Sender<Result<Trace, String>>) {
         match self {
-            SteppedParse::Single(p) => p.finish(tx),
+            SteppedParse::Single(mut p) => {
+                if let Some(r) = p.take_result() {
+                    if let Ok(t) = &r {
+                        eprintln!("  ready: {:.2}s ({} tracks)", p.t0.elapsed().as_secs_f64(), t.tracks.len());
+                    }
+                    let _ = tx.send(r);
+                }
+            }
             SteppedParse::Multi(p) => p.finish(tx),
         }
     }
@@ -3308,8 +3448,11 @@ impl SteppedParse {
 impl WasmParsePlan {
     /// Everything `load_trace_from_bytes_inner` does up to (but not
     /// including) the chunk-parse loop. Cache formats (.tvcache) resolve
-    /// entirely in here and come back as `Prepared::Done`.
-    pub fn prepare(name: &str, raw_input: Vec<u8>, counter: &Arc<AtomicUsize>) -> Prepared {
+    /// entirely in here and come back as `Prepared::Done`. A plain .gz
+    /// input comes back as a Decompress-phase plan instead of blocking on
+    /// one whole-file gunzip; .ktz/.tar.gz/plain JSON take their one-shot
+    /// `read_bytes_named` path (a stepped .gz is the common web case).
+    pub fn prepare(name: &str, raw_input: Vec<u8>, counter: &Arc<AtomicUsize>, compact_when_done: bool) -> Prepared {
         let t0 = Instant::now();
         if name.ends_with(".tvcache.gz") {
             let mut decoder = flate2::read::GzDecoder::new(&raw_input[..]);
@@ -3344,6 +3487,33 @@ impl WasmParsePlan {
             };
         }
 
+        let stepped_gz = name.ends_with(".gz")
+            && !name.ends_with(".tar.gz")
+            && !name.ends_with(".tgz");
+        if stepped_gz {
+            return Prepared::Plan(SteppedParse::Single(WasmParsePlan {
+                phase: PlanPhase::Decompress,
+                gz: Some(GzState {
+                    decoder: flate2::read::GzDecoder::new(std::io::Cursor::new(raw_input)),
+                    out: Vec::new(),
+                    got_any: false,
+                }),
+                raw: RawData::Vec(Vec::new()),
+                name: name.to_string(),
+                split_points: Vec::new(),
+                next_chunk: 0,
+                chunks: Vec::new(),
+                next_merge: 0,
+                scan: TraceScan::new(),
+                track_entries: Vec::new(),
+                keyed_tracks: Vec::new(),
+                compact_state: None,
+                result: None,
+                compact_when_done,
+                counter: counter.clone(),
+                t0,
+            }));
+        }
         let raw = match read_bytes_named(name, raw_input, counter) {
             Ok(r) => r,
             Err(e) => return Prepared::Done(Err(e)),
@@ -3354,40 +3524,126 @@ impl WasmParsePlan {
             counter.store(0, Ordering::Relaxed);
         }
         eprintln!("  read: {:.2}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
-
-        let te = match find_key(&raw, b"traceEvents") {
-            Some(v) => v,
-            None => return Prepared::Done(Err(format!("{name}: no traceEvents found"))),
+        let mut plan = WasmParsePlan {
+            phase: PlanPhase::Parse,
+            gz: None,
+            raw,
+            name: name.to_string(),
+            split_points: Vec::new(),
+            next_chunk: 0,
+            chunks: Vec::new(),
+            next_merge: 0,
+            scan: TraceScan::new(),
+            track_entries: Vec::new(),
+            keyed_tracks: Vec::new(),
+            compact_state: None,
+            result: None,
+            compact_when_done,
+            counter: counter.clone(),
+            t0,
         };
-        let mut pos = te + "\"traceEvents\"".len();
-        pos = skip_ws(&raw, pos);
-        if pos < raw.len() && raw[pos] == b':' { pos += 1; }
-        pos = skip_ws(&raw, pos);
-        if pos >= raw.len() || raw[pos] != b'[' {
-            return Prepared::Done(Err(format!("{name}: malformed traceEvents")));
+        if !plan.begin_parse() {
+            // begin_parse set `result` with the error.
+            return match plan.result.take() {
+                Some(r) => Prepared::Done(r),
+                None => Prepared::Done(Err(format!("{name}: malformed traceEvents"))),
+            };
         }
-        let array_start = pos + 1;
-        let split_points = find_split_points(&raw, array_start, plan_chunk_count(raw.len()));
-        Prepared::Plan(SteppedParse::Single(WasmParsePlan {
-            raw, split_points, next_chunk: 0, chunks: Vec::new(),
-            counter: counter.clone(), t0,
-        }))
+        Prepared::Plan(SteppedParse::Single(plan))
     }
 
-    fn is_done(&self) -> bool {
-        self.next_chunk + 1 >= self.split_points.len()
+    /// Find traceEvents and the chunk split points — the tail of the old
+    /// prepare. On failure sets `result` and returns false.
+    fn begin_parse(&mut self) -> bool {
+        let array_start = match find_trace_events(&self.raw) {
+            Ok(a) => a,
+            Err(e) => { self.result = Some(Err(format!("{}: {e}", self.name))); return false; }
+        };
+        let n = plan_chunk_count(self.raw.len());
+        self.split_points = find_split_points(&self.raw, array_start, n);
+        true
     }
 
-    /// Parse the next chunk. Returns true when all chunks are parsed.
+    pub fn is_done(&self) -> bool {
+        self.phase == PlanPhase::Done
+    }
+
+    /// Advance by up to one frame's worth of work: loop work units until
+    /// STEP_BUDGET_MS elapses (a single unit may overshoot — progress is
+    /// guaranteed regardless). Returns true when the plan is complete and
+    /// `take_result` holds the answer.
     pub fn step(&mut self) -> bool {
-        if self.is_done() {
+        let start = Instant::now();
+        loop {
+            if !self.step_unit() {
+                return true;
+            }
+            if start.elapsed().as_millis() as u64 >= STEP_BUDGET_MS {
+                return false;
+            }
+        }
+    }
+
+    /// One unit of the current phase. Returns false only when Done.
+    /// pub(crate) so the multi-rank plan can interleave rank units inside
+    /// its own budget.
+    pub(crate) fn step_unit(&mut self) -> bool {
+        match self.phase {
+            PlanPhase::Done => false,
+            PlanPhase::Decompress => self.step_decompress(),
+            PlanPhase::Parse => self.step_parse(),
+            PlanPhase::Merge => self.step_merge(),
+            PlanPhase::Assemble => self.step_assemble(),
+            PlanPhase::Compact => self.step_compact(),
+        }
+    }
+
+    /// Gunzip one 64KB slice (read_gz_tolerant's tolerance, sliced). On
+    /// completion, moves the output into `raw` and runs begin_parse.
+    fn step_decompress(&mut self) -> bool {
+        let mut gz = match self.gz.take() {
+            Some(g) => g,
+            None => { self.phase = PlanPhase::Parse; return true; }
+        };
+        let mut tmp = [0u8; 64 * 1024];
+        let eof = match gz.decoder.read(&mut tmp) {
+            Ok(0) => true,
+            Ok(n) => { gz.out.extend_from_slice(&tmp[..n]); gz.got_any = true; false }
+            Err(e) if !gz.got_any => {
+                self.result = Some(Err(format!("decompress: {e}")));
+                self.phase = PlanPhase::Done;
+                return true;
+            }
+            Err(e) => {
+                // Truncated tail: keep what decompressed.
+                eprintln!("  truncated gz stream after {} bytes: {e}", gz.out.len());
+                true
+            }
+        };
+        if !eof {
+            self.gz = Some(gz);
+            return true;
+        }
+        self.raw = RawData::Vec(std::mem::take(&mut gz.out));
+        eprintln!("  read: {:.2}s ({}MB)", self.t0.elapsed().as_secs_f64(), self.raw.len() / 1024 / 1024);
+        if self.begin_parse() {
+            self.phase = PlanPhase::Parse;
+        } else {
+            self.phase = PlanPhase::Done;
+        }
+        true
+    }
+
+    /// Parse one chunk. A chunk that panics is dropped with a message,
+    /// matching `parse_chunks_parallel`'s catch_unwind handling.
+    fn step_parse(&mut self) -> bool {
+        if self.next_chunk + 1 >= self.split_points.len() {
+            self.phase = PlanPhase::Merge;
             return true;
         }
         let i = self.next_chunk;
         let start = self.split_points[i];
         let end = self.split_points[i + 1];
-        // A chunk that panics is dropped with a message, matching
-        // `parse_chunks_parallel`'s catch_unwind handling.
         let counter = &self.counter;
         let raw = &self.raw;
         let state = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3405,28 +3661,132 @@ impl WasmParsePlan {
             }
         }
         self.next_chunk += 1;
-        self.is_done()
+        if self.next_chunk + 1 >= self.split_points.len() {
+            self.phase = PlanPhase::Merge;
+        }
+        true
     }
 
-    /// build_trace without compact/send — the rank input for `merge_traces`
-    /// (mirrors `load_trace_from_bytes_inner`'s uncompacted return; the
-    /// merged trace is compacted once, in the multi-rank finish).
-    fn build(self) -> Result<Trace, String> {
-        let n_chunks = self.split_points.len() - 1;
-        build_trace(self.raw, self.chunks, n_chunks, &self.t0)
+    /// Merge one parsed chunk into the TraceScan — the slice of
+    /// build_trace's merge loop, so the parsed chunks' buffers free as they
+    /// merge instead of all at once at the end.
+    fn step_merge(&mut self) -> bool {
+        if self.next_merge < self.chunks.len() {
+            let chunk = std::mem::replace(&mut self.chunks[self.next_merge], ChunkState::new());
+            self.scan.merge_chunk(chunk);
+            self.next_merge += 1;
+        } else {
+            self.track_entries = self.scan.take_track_entries();
+            self.phase = PlanPhase::Assemble;
+        }
+        true
     }
 
-    fn finish(self, tx: &std::sync::mpsc::Sender<Result<Trace, String>>) {
-        let t0 = self.t0;
-        match self.build() {
-            Ok(mut trace) => {
-                compact_args(&mut trace);
-                eprintln!("  ready: {:.2}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
-                let _ = tx.send(Ok(trace));
+    /// Assemble one track per unit. The unit after the last runs
+    /// finish_trace (metadata scans, flow pairing, stats — the glue that
+    /// needs every track present).
+    fn step_assemble(&mut self) -> bool {
+        if let Some(((pid, tid), evs)) = self.track_entries.pop() {
+            let track = assemble_track(
+                pid, tid, evs, self.scan.min_ts, &self.scan.cats, &self.scan.thread_names,
+            );
+            self.keyed_tracks.push(((pid, tid), track));
+            return true;
+        }
+        let scan = std::mem::replace(&mut self.scan, TraceScan::new());
+        let raw = std::mem::replace(&mut self.raw, RawData::Vec(Vec::new()));
+        let keyed_tracks = std::mem::take(&mut self.keyed_tracks);
+        let n_chunks = self.split_points.len().saturating_sub(1);
+        self.result = Some(finish_trace(raw, scan, keyed_tracks, n_chunks, &self.t0));
+        if !self.compact_when_done {
+            self.phase = PlanPhase::Done;
+        } else if let Some(Ok(trace)) = &self.result {
+            if trace.raw_bufs.is_empty() {
+                // Nothing to compact — matches compact_args' early return.
+                self.phase = PlanPhase::Done;
+            } else {
+                let raw_snapshot: Vec<_> = trace.raw_bufs.iter().cloned().collect();
+                let total = trace.tracks.len();
+                self.compact_state = Some(CompactState { next: 0, total, compact: vec![0u8], raw_snapshot });
+                self.phase = PlanPhase::Compact;
             }
-            Err(e) => { let _ = tx.send(Err(e)); }
+        } else {
+            self.phase = PlanPhase::Done;
+        }
+        true
+    }
+
+    /// compact_track over one track per unit — the slice of compact_args
+    /// that used to run as a single blocking call.
+    fn step_compact(&mut self) -> bool {
+        let mut cs = match self.compact_state.take() {
+            Some(c) => c,
+            None => { self.phase = PlanPhase::Done; return true; }
+        };
+        let done = {
+            let trace = match self.result.as_mut() {
+                Some(Ok(t)) => t,
+                _ => { self.phase = PlanPhase::Done; return true; }
+            };
+            if cs.next < cs.total {
+                compact_track(&mut trace.tracks[cs.next], &cs.raw_snapshot, &mut cs.compact);
+                cs.next += 1;
+                false
+            } else {
+                cs.compact.shrink_to_fit();
+                trace.raw_bufs = vec![Arc::new(ArgsBuf::Heap(std::mem::take(&mut cs.compact)))];
+                true
+            }
+        };
+        if done {
+            self.phase = PlanPhase::Done;
+        } else {
+            self.compact_state = Some(cs);
+        }
+        true
+    }
+
+    /// The plan's answer once `step` reports done.
+    pub fn take_result(&mut self) -> Option<Result<Trace, String>> {
+        self.result.take()
+    }
+
+    /// Splash text for the phases the event counter can't describe; None
+    /// during Parse (the counter covers it) and Done.
+    pub fn status(&self) -> Option<String> {
+        match self.phase {
+            PlanPhase::Decompress => self.gz.as_ref()
+                .map(|g| format!("Decompressing... {}MB", g.out.len() / 1024 / 1024)),
+            PlanPhase::Parse => None,
+            PlanPhase::Merge => Some(format!(
+                "Merging chunks... {}/{}",
+                self.next_merge.min(self.chunks.len()), self.chunks.len(),
+            )),
+            PlanPhase::Assemble => Some(format!(
+                "Building tracks... {}/{}",
+                self.keyed_tracks.len(),
+                self.keyed_tracks.len() + self.track_entries.len(),
+            )),
+            PlanPhase::Compact => self.compact_state.as_ref()
+                .map(|c| format!("Compacting... {}/{}", c.next, c.total)),
+            PlanPhase::Done => None,
         }
     }
+}
+
+/// Locate the byte just past the `[` opening the traceEvents array (the
+/// parse chunks' common start offset).
+#[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+fn find_trace_events(raw: &[u8]) -> Result<usize, String> {
+    let te = find_key(raw, b"traceEvents").ok_or_else(|| "no traceEvents found".to_string())?;
+    let mut pos = te + "\"traceEvents\"".len();
+    pos = skip_ws(raw, pos);
+    if pos < raw.len() && raw[pos] == b':' { pos += 1; }
+    pos = skip_ws(raw, pos);
+    if pos >= raw.len() || raw[pos] != b'[' {
+        return Err("malformed traceEvents".to_string());
+    }
+    Ok(pos + 1)
 }
 
 /// Multi-rank stepped parse: per-rank `WasmParsePlan`s round-robin stepped
@@ -3452,7 +3812,9 @@ impl WasmMultiParsePlan {
         let mut plans = Vec::new();
         let mut done = Vec::new();
         for (rank, name, bytes) in rank_named_bytes {
-            match WasmParsePlan::prepare(&name, bytes, counter) {
+            // Member plans skip their own Compact phase: merge_traces
+            // concatenates the ranks and compacts the merged args once.
+            match WasmParsePlan::prepare(&name, bytes, counter, false) {
                 Prepared::Plan(SteppedParse::Single(p)) => plans.push((rank, p)),
                 Prepared::Plan(SteppedParse::Multi(_)) => unreachable!("single prepare cannot return a multi plan"),
                 Prepared::Done(Ok(t)) => done.push((rank, t)),
@@ -3472,27 +3834,51 @@ impl WasmMultiParsePlan {
         Prepared::Plan(SteppedParse::Multi(WasmMultiParsePlan { plans, done, next: 0, t0 }))
     }
 
-    /// Parse one chunk of one rank (round-robin over ranks that still have
-    /// chunks left). Returns true when every rank is fully parsed.
+    /// Step work units from the ranks round-robin, one frame's budget
+    /// shared across ranks (so the counter grows across all ranks instead
+    /// of one rank finishing before the next starts). Returns true when
+    /// every rank is fully done.
     pub fn step(&mut self) -> bool {
-        let n = self.plans.len();
-        for k in 0..n {
-            let i = (self.next + k) % n;
-            if !self.plans[i].1.is_done() {
-                self.next = i + 1;
-                self.plans[i].1.step();
-                break;
+        let start = Instant::now();
+        loop {
+            if self.plans.iter().all(|(_, p)| p.is_done()) {
+                return true;
+            }
+            let n = self.plans.len();
+            for k in 0..n {
+                let i = (self.next + k) % n;
+                if !self.plans[i].1.is_done() {
+                    self.next = i + 1;
+                    self.plans[i].1.step_unit();
+                    break;
+                }
+            }
+            if start.elapsed().as_millis() as u64 >= STEP_BUDGET_MS {
+                return false;
             }
         }
-        self.plans.iter().all(|(_, p)| p.is_done())
     }
 
+    /// Splash text: the next rank's phase, or the merge once all are done.
+    pub fn status(&self) -> Option<String> {
+        for (_, p) in &self.plans {
+            if !p.is_done() {
+                return p.status();
+            }
+        }
+        Some("Merging ranks...".to_string())
+    }
+
+    /// Collect each rank's result, merge, and send. `merge_traces` is the
+    /// one deliberately-blocking call left: it has no counter to animate,
+    /// so slicing it buys nothing.
     fn finish(self, tx: &std::sync::mpsc::Sender<Result<Trace, String>>) {
         let mut traces = self.done;
-        for (rank, plan) in self.plans {
-            match plan.build() {
-                Ok(t) => traces.push((rank, t)),
-                Err(e) => eprintln!("  rank {rank}: {e}"),
+        for (rank, mut plan) in self.plans {
+            match plan.take_result() {
+                Some(Ok(t)) => traces.push((rank, t)),
+                Some(Err(e)) => eprintln!("  rank {rank}: {e}"),
+                None => eprintln!("  rank {rank}: no result"),
             }
         }
         if traces.is_empty() {

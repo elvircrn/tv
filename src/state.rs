@@ -51,9 +51,10 @@ pub static MT_POOL_READY: AtomicBool = AtomicBool::new(false);
 /// (`loading` is `Some`) but hasn't completed. There are no threads to run
 /// it on, so `run_pending_parse` drives it across frames: staged for one
 /// frame first (so a "Parsing trace..." splash paints before the main
-/// thread does any blocking work), then stepped one parse chunk per frame
-/// (see `SteppedParse` in loader.rs) so the event counter visibly grows
-/// instead of sitting still for the whole load.
+/// thread does any blocking work), then stepped a time-budgeted slice of
+/// the load per frame (see `SteppedParse` in loader.rs) so the splash
+/// keeps animating — the event counter during the parse phase, phase text
+/// otherwise — instead of freezing for the whole load.
 #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
 pub(crate) enum PendingParse {
     /// Inputs not yet prepared (decompress + split points).
@@ -68,7 +69,8 @@ pub(crate) enum PendingParse {
         counter: Arc<AtomicUsize>,
         tx: mpsc::Sender<Result<Trace, String>>,
     },
-    /// Prepared; one chunk parses per frame until `step` reports done.
+    /// Prepared; stepped a time-budgeted slice per frame until `step`
+    /// reports done.
     Stepping {
         plan: crate::loader::SteppedParse,
         tx: mpsc::Sender<Result<Trace, String>>,
@@ -1133,6 +1135,9 @@ impl Pane {
     }
 
     pub fn loading_progress_text(&self) -> String {
+        if let Some(text) = self.stepped_status() {
+            return text;
+        }
         let n = self.loading_events.load(Ordering::Relaxed);
         if n == 0 {
             "Loading: reading file...".to_string()
@@ -1143,6 +1148,22 @@ impl Pane {
         } else {
             format!("Loading: {:.2}M events...", n as f64 / 1_000_000.0)
         }
+    }
+
+    /// The stepped wasm load's phase text (decompress/merge/assemble/
+    /// compact), which the event counter can't describe. None during the
+    /// parse phase — the counter animates that one.
+    #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
+    fn stepped_status(&self) -> Option<String> {
+        match &self.pending_parse {
+            Some(PendingParse::Stepping { plan, .. }) => plan.status(),
+            _ => None,
+        }
+    }
+
+    #[cfg(any(not(target_arch = "wasm32"), feature = "mt"))]
+    fn stepped_status(&self) -> Option<String> {
+        None
     }
 
     pub fn clear_selection(&mut self) {
@@ -1396,10 +1417,11 @@ impl Pane {
     /// worth of work (see `PendingParse`). The first frame after staging
     /// only sets `pending_parse_painted`, so its splash ("Parsing
     /// trace...") paints before the main thread does any blocking work.
-    /// After that: prepare the plan, then parse one chunk per frame (the
-    /// event counter animates), then finish — which sends through the
-    /// channel, so `poll_loading` (called right after this in
-    /// render_frame) picks the result up in the same frame.
+    /// After that: prepare the plan, then step a time-budgeted slice of it
+    /// per frame (the event counter animates during the parse phase), then
+    /// finish — which sends through the channel, so `poll_loading` (called
+    /// right after this in render_frame) picks the result up in the same
+    /// frame.
     #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
     pub(crate) fn run_pending_parse(&mut self) {
         if self.pending_parse.is_none() {
@@ -1415,7 +1437,7 @@ impl Pane {
         };
         self.pending_parse = match job {
             PendingParse::Single { name, bytes, counter, tx } => {
-                match crate::loader::WasmParsePlan::prepare(&name, bytes, &counter) {
+                match crate::loader::WasmParsePlan::prepare(&name, bytes, &counter, true) {
                     crate::loader::Prepared::Done(result) => {
                         let _ = tx.send(result);
                         None
