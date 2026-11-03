@@ -287,11 +287,15 @@ fn decompress_parse_seq(
     path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, t0: &Instant,
 ) -> Result<(RawData, Vec<ChunkState>, usize), String> {
     let raw = read_bytes(path, counter)?;
-    if path.ends_with(".ktz") {
-        // ktz decode already counted rendered events into the loader
-        // progress; restart the count so the parse phase reports fresh
-        counter.store(0, Ordering::Relaxed);
-    }
+    // ktz decode already counted every rendered event into `counter`, and
+    // the parse below re-derives those same events from the rendered JSON —
+    // so it counts into a throwaway instead: one event, one bump, and the
+    // loader progress only ever climbs. (This used to store(0) and re-count,
+    // which read as the splash number resetting mid-load — and with several
+    // ranks loading in parallel, one rank's reset zeroed the shared counter
+    // out from under all the others.)
+    let parse_counter = Arc::new(AtomicUsize::new(0));
+    let counter: &Arc<AtomicUsize> = if path.ends_with(".ktz") { &parse_counter } else { counter };
     tlog!("  read: {:.3}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
 
     let te = find_key(&raw, b"traceEvents").ok_or("no traceEvents found")?;
@@ -3138,11 +3142,10 @@ fn load_trace_from_bytes_inner(
         Ok(r) => r,
         Err(e) => return Err(e),
     };
-    if name.ends_with(".ktz") {
-        // ktz decode already counted rendered events into the loader
-        // progress; restart the count so the parse phase reports fresh
-        counter.store(0, Ordering::Relaxed);
-    }
+    // See decompress_parse_seq: ktz decode already counted the events, so
+    // its re-parse counts into a throwaway — progress stays monotonic.
+    let parse_counter = Arc::new(AtomicUsize::new(0));
+    let counter: &Arc<AtomicUsize> = if name.ends_with(".ktz") { &parse_counter } else { counter };
     tlog!("  read: {:.3}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
 
     let te = match find_key(&raw, b"traceEvents") {
@@ -3470,11 +3473,14 @@ impl WasmParsePlan {
             Ok(r) => r,
             Err(e) => return Prepared::Done(Err(e)),
         };
-        if name.ends_with(".ktz") {
-            // ktz decode already counted rendered events into the counter;
-            // restart so the parse phase reports fresh.
-            counter.store(0, Ordering::Relaxed);
-        }
+        // See decompress_parse_seq: a ktz's render already counted its
+        // events into the shared counter, so the plan's parse steps count
+        // into a private throwaway — the splash number never resets.
+        let plan_counter = if name.ends_with(".ktz") {
+            Arc::new(AtomicUsize::new(0))
+        } else {
+            counter.clone()
+        };
         tlog!("  read: {:.3}s ({}MB)", t0.elapsed().as_secs_f64(), raw.len() / 1024 / 1024);
         let mut plan = WasmParsePlan {
             phase: PlanPhase::Parse,
@@ -3491,7 +3497,7 @@ impl WasmParsePlan {
             compact_state: None,
             result: None,
             compact_when_done,
-            counter: counter.clone(),
+            counter: plan_counter,
             t0,
         };
         if !plan.begin_parse() {

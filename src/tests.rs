@@ -4157,6 +4157,99 @@ fn ktz_v4_range_resets() {
     assert_eq!(std::str::from_utf8(&got).unwrap(), expected);
 }
 
+/// A KTZ4 file of `n` complete-X events (same column/stream layout as
+/// ktz_v4_range_resets, minus the blob machinery): ph/pid/tid/name/cat
+/// columns, ts stepping 1us per event, constant 100ns dur, one int-arg
+/// stream. Decodes to a trace the loader can parse end to end.
+fn ktz_all_x_events(n: u64) -> Vec<u8> {
+    let syms: Vec<&[u8]> = vec![b"", b"\"X\"", b"1234", b"7", b"\"Op\"", b"\"a\""];
+    let mut col_a = Vec::new();
+    for i in 0..n {
+        ktz_varint(&mut col_a, ktz_zz(if i == 0 { 0 } else { 1 }));
+    }
+    let mut stream = Vec::new();
+    ktz_varint(&mut stream, 1);          // nKeys
+    stream.push(1);                      // wrap
+    ktz_varint(&mut stream, 5); stream.push(0); // key "a", kind int
+    ktz_varint(&mut stream, col_a.len() as u64); stream.extend_from_slice(&col_a);
+    ktz_varint(&mut stream, n);          // nFlags
+    for _ in 0..n { ktz_varint(&mut stream, 1); } // every event flag-1
+    ktz_varint(&mut stream, 0);          // no blobs
+
+    let mut payload = Vec::new();
+    let mut rep = |vals: &dyn Fn(u64) -> u64| {
+        let mut sec = Vec::new();
+        for i in 0..n { ktz_varint(&mut sec, vals(i)); }
+        ktz_section(&mut payload, &sec);
+    };
+    rep(&|_| 1);                                        // ph "X"
+    rep(&|_| 2);                                        // pid 1234
+    rep(&|_| 3);                                        // tid 7
+    rep(&|_| 4);                                        // name "Op"
+    rep(&|_| 0);                                        // cat absent
+    rep(&|i| if i == 0 { ktz_zz1(0) } else { ktz_zz1(1000) }); // ts: i us
+    rep(&|_| ktz_zz1(100));                             // dur: 100ns, every event
+    ktz_varint(&mut payload, 1); // nStreams
+    ktz_varint(&mut payload, 4); // nid = name sym 4
+    ktz_section(&mut payload, &stream);
+    ktz_section(&mut payload, &ktz_symtab(&syms));
+    ktz_section(&mut payload, &ktz_head_foot(b"{\"traceEvents\": [\n", b"]\n}\n"));
+    ktz_framed(b"KTZ4", n, &payload)
+}
+
+// The loader's event counter drives the "Loading: N events..." splash. It
+// must be monotonic across a whole load — including .ktz files, whose decode
+// counts rendered events and whose parse phase used to store(0) and re-count
+// (zeroing the shared counter mid-load, once per rank, while the other ranks
+// were still counting: the splash number visibly bounced). Each event is now
+// counted exactly once, at render time; the re-parse counts into a private
+// throwaway. This pins both halves: no decrease ever observed by a sampler
+// racing the load, and the final count is exactly the rendered total.
+#[test]
+fn multi_ktz_load_progress_is_monotonic() {
+    const N: u64 = 20_000;
+    const RANKS: u64 = 4;
+    let file = ktz_all_x_events(N);
+
+    let dir = std::env::temp_dir().join(format!("tv-ktz-mono-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut rank_paths: Vec<(usize, String)> = Vec::new();
+    for r in 0..RANKS {
+        let p = dir.join(format!("rank{r}.pt.trace.json.ktz"));
+        std::fs::write(&p, &file).unwrap();
+        rank_paths.push((r as usize, p.to_str().unwrap().to_string()));
+    }
+
+    let counter = test_counter();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let ctr = counter.clone();
+    let handle = std::thread::spawn(move || {
+        crate::loader::load_multi_progressive(rank_paths, &ctr, 0, &tx, None, true);
+        drop(tx);
+    });
+
+    let mut prev = 0usize;
+    while !handle.is_finished() {
+        let n = counter.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(n >= prev, "loader event count went backwards: {prev} -> {n}");
+        prev = n;
+    }
+    handle.join().unwrap();
+    let mut last = None;
+    while let Ok(t) = rx.try_recv() {
+        last = Some(t.expect("multi-rank ktz load"));
+    }
+    assert!(last.is_some(), "no trace received");
+    assert!(last.unwrap().total_events > 0);
+
+    // Exactly once per event: 4 ranks x N rendered events, no re-count, no
+    // reset. (The old double-counting design ends at 2x this; the old
+    // store(0) design dips to 0 mid-load, caught by the sampler above.)
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), (N * RANKS) as usize);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn ktz_v3_synthetic() {
     // KTZ3: framed like KTZ4 but per-name streams are blens+blobs sections.
