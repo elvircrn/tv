@@ -1077,14 +1077,19 @@ impl ApplicationHandler for App {
 
             WindowEvent::DroppedFile(path) => {
                 // A dropped directory is not a trace: treat it as the source
-                // checkout for the Source tab (drag a vllm checkout onto the
-                // window to use it). Files go through the trace pipeline.
+                // checkout for the Source cross-reference (drag a vllm
+                // checkout onto the window to use it). Files go through the
+                // trace pipeline.
                 #[cfg(not(target_arch = "wasm32"))]
                 if path.is_dir() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if name == "vllm" || path.join("vllm").is_dir() {
                             self.state.src_path = path.to_string_lossy().into_owned();
                             self.state.src_idx = Some(Box::new(source::SourceIndex::new(path)));
+                            if let Some(pane) = self.state.panes.get_mut(self.state.active) {
+                                pane.src_msg = Some((SrcNote::Ok,
+                                    format!("source checkout: {}", self.state.src_path)));
+                            }
                             return;
                         }
                     }
@@ -2130,10 +2135,10 @@ impl App {
                                 state.buf.detail_buf.push_str("  |  Start: +");
                                 write_time(&mut state.buf.detail_buf, ev.ts);
                                 write!(state.buf.detail_buf, "\nCat: {}  |  Track: {}", trace.cats[ev.cat as usize], track.label).unwrap();
-                                // CallFrom (kineto with_stack) is the exact
-                                // python file:line this frame was called from
-                                // — captured here for the View Source button.
-                                let mut callfrom: Option<String> = None;
+                                // Args include CallFrom (kineto with_stack):
+                                // the exact python file:line a frame was
+                                // called from. Rendered here, consumed by the
+                                // right-click View Source resolution.
                                 if ev.args_off > 0 {
                                     let raw = &trace.raw_bufs[track.raw_buf_idx as usize];
                                     let off = ev.args_off as usize;
@@ -2145,47 +2150,9 @@ impl App {
                                         if !pairs.is_empty() {
                                             state.buf.detail_buf.push('\n');
                                             for &[k, v] in &pairs {
-                                                if callfrom.is_none() && strs.str(k) == "CallFrom" {
-                                                    callfrom = Some(strs.str(v).to_string());
-                                                }
                                                 write!(state.buf.detail_buf, "\n{}: ", strs.str(k)).unwrap();
                                                 format_arg_value(&mut state.buf.detail_buf, strs.str(v), 0);
                                             }
-                                        }
-                                    }
-                                }
-                                // View Source: exact jump for python frames
-                                // (CallFrom), kernel-name resolution for GPU
-                                // ops. Shown even before a checkout is
-                                // indexed — clicking then routes to the
-                                // Source tab to set one up.
-                                #[cfg(not(target_arch = "wasm32"))]
-                                if callfrom.is_some() || track.gpu || trace.cats[ev.cat as usize] == "cpu_op" {
-                                    if ui.small_button("View Source") {
-                                        if let Some(r) = pane.selected {
-                                            let (act, warn) = resolve_event_source(&mut state.src_idx, pane, r);
-                                            apply_src_action(
-                                                &mut pane.src_msg, &mut pane.src_hits,
-                                                &mut pane.pending_tab, &state.src_editor, act, warn);
-                                        }
-                                    }
-                                    if ui.is_item_hovered() {
-                                        ui.tooltip_text(if callfrom.is_some() {
-                                            "Open the exact file:line this python frame was called from"
-                                        } else {
-                                            "Resolve this name to source (def for triton/tilelang, csrc for vllm:: kernels and ops)"
-                                        });
-                                    }
-                                    // The last attempt's outcome, right where the
-                                    // click happened: a failed editor launch or
-                                    // an unresolvable name must not look like
-                                    // the button did nothing.
-                                    if let Some((is_err, e)) = &pane.src_msg {
-                                        ui.same_line();
-                                        let color = if *is_err { [0.9, 0.4, 0.4, 1.0] } else { [0.9, 0.75, 0.3, 1.0] };
-                                        ui.text_colored(color, e.lines().next().unwrap_or(e));
-                                        if ui.is_item_hovered() && e.contains('\n') {
-                                            ui.tooltip_text(e);
                                         }
                                     }
                                 }
@@ -2209,107 +2176,6 @@ impl App {
                                     .build();
                             } else {
                                 ui.text_colored([0.5, 0.5, 0.5, 1.0], "Click an event to see details");
-                            }
-                        }
-
-                        // Source cross-reference. No in-app viewer: tv's job
-                        // ends at resolving an event to a file:line, the
-                        // user's editor renders it (see source.rs for why).
-                        // The wasm build has no checkout to walk, so the tab
-                        // doesn't exist there.
-                        #[cfg(not(target_arch = "wasm32"))]
-                        {
-                            let src_flags = if pending == Some(BottomTab::Source) {
-                                imgui::TabItemFlags::SET_SELECTED
-                            } else { imgui::TabItemFlags::empty() };
-                            if let Some(_t) = imgui::TabItem::new("Source").flags(src_flags).begin(&ui) {
-                                pane.bottom_tab = BottomTab::Source;
-                                // Row 1: checkout path + Set button. Applying is
-                                // free — nothing is indexed until a jump, so
-                                // switching checkouts (or branches) is instant
-                                // and always current.
-                                let mut go = false;
-                                ui.set_next_item_width((ui.content_region_avail()[0] - 140.0).max(120.0));
-                                if ui.input_text("##srcpath", &mut state.src_path)
-                                    .hint("/path/to/vllm")
-                                    .build() { go = true; }
-                                ui.same_line();
-                                if ui.button("Set") { go = true; }
-                                if go {
-                                    let p = std::path::PathBuf::from(&state.src_path);
-                                    if p.is_dir() {
-                                        state.src_idx = Some(Box::new(source::SourceIndex::new(p)));
-                                    } else {
-                                        pane.src_msg = Some((true, format!("not a directory: {}", state.src_path)));
-                                    }
-                                }
-                                if let Some(idx) = state.src_idx.as_mut() {
-                                    // Version banner: the trace's build commit
-                                    // vs the checkout's git describe. A mismatch
-                                    // means line numbers can drift — the one way
-                                    // this feature silently lies otherwise.
-                                    let trace_ver = pane.trace.as_ref()
-                                        .map(|t| t.vllm_version.clone())
-                                        .unwrap_or_default();
-                                    let git_desc = idx.git_desc();
-                                    if !trace_ver.is_empty() {
-                                        state.buf.fmt.clear();
-                                        match (source::trace_build_commit(&trace_ver), git_desc.as_deref()) {
-                                            (Some(build), Some(desc)) if desc.contains(build) => {
-                                                write!(state.buf.fmt, "checkout matches trace build {}", &build[..7]).unwrap();
-                                                ui.text_colored([0.4, 0.8, 0.5, 1.0], &state.buf.fmt);
-                                            }
-                                            (Some(build), Some(desc)) => {
-                                                write!(state.buf.fmt, "trace built at {} but checkout is at {} - line numbers may drift", &build[..build.len().min(12)], desc).unwrap();
-                                                ui.text_colored([0.9, 0.7, 0.3, 1.0], &state.buf.fmt);
-                                            }
-                                            _ => {
-                                                write!(state.buf.fmt, "trace vllm_version: {}", trace_ver).unwrap();
-                                                ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
-                                            }
-                                        }
-                                    }
-                                    // Row 2: the editor the jump buttons launch.
-                                    // No kernel-name search here — that's what
-                                    // the IDE is for; this tab is setup and
-                                    // the landing spot for multi-hit jumps.
-                                    ui.set_next_item_width(90.0);
-                                    ui.input_text("##srceditor", &mut state.src_editor)
-                                        .hint("editor")
-                                        .build();
-                                    ui.same_line();
-                                    ui.text_colored([0.5, 0.5, 0.5, 1.0], "editor command (code, cursor, zed)");
-                                    // Hit rows from a multi-hit event jump:
-                                    // click to open file:line.
-                                    if !pane.src_hits.is_empty() {
-                                        ui.separator();
-                                        let hits = std::mem::take(&mut pane.src_hits);
-                                        for h in &hits {
-                                            state.buf.fmt.clear();
-                                            write!(state.buf.fmt, "{}:{}", h.rel, h.line).unwrap();
-                                            if ui.selectable(&state.buf.fmt) {
-                                                if let Err(e) = source::open_in_editor(&state.src_editor, h) {
-                                                    pane.src_msg = Some((true, e));
-                                                }
-                                            }
-                                        }
-                                        pane.src_hits = hits;
-                                    }
-                                } else {
-                                    ui.text_colored([0.5, 0.5, 0.5, 1.0],
-                                        "Point tv at a vLLM checkout to cross-reference kernels\n\
-                                        and python frames with source. CallFrom args jump to the\n\
-                                        exact line; kernel names resolve via def/class indexing.");
-                                }
-                                if pane.src_msg.is_some() {
-                                    let clear = ui.small_button("x##srcclear");
-                                    ui.same_line();
-                                    if let Some((is_err, e)) = &pane.src_msg {
-                                        let color = if *is_err { [0.9, 0.45, 0.45, 1.0] } else { [0.9, 0.75, 0.3, 1.0] };
-                                        ui.text_colored(color, e);
-                                    }
-                                    if clear { pane.src_msg = None; }
-                                }
                             }
                         }
                     }
@@ -2369,14 +2235,19 @@ impl App {
                         write!(state.buf.fmt, "{} | {} | {} events | {} tracks | {:.1}ms", fname, ranks, t.total_events, t.tracks.len(), dt * 1000.0).unwrap();
                     }
                     dl.add_text([win_pos[0] + 8.0, cy], col32(153, 153, 153, 255), &state.buf.fmt);
-                    // A source-jump outcome rides the status bar's left side:
-                    // it's the only place a right-click "View Source" that
-                    // didn't land (or landed on drifted lines) would
-                    // otherwise be visible from.
-                    if let Some((is_err, e)) = &pane.src_msg {
+                    // A source-jump outcome rides the status bar's left side —
+                    // the one feedback place for the right-click View Source
+                    // gesture: green where it landed, yellow when the
+                    // checkout drifts from the trace's build, red why it
+                    // didn't land at all.
+                    if let Some((note, e)) = &pane.src_msg {
                         let left_w = ui.calc_text_size(&state.buf.fmt)[0];
                         let msg = e.lines().next().unwrap_or(e);
-                        let c = if *is_err { col32(220, 90, 90, 255) } else { col32(225, 185, 80, 255) };
+                        let c = match note {
+                            SrcNote::Ok => col32(140, 200, 150, 255),
+                            SrcNote::Warn => col32(225, 185, 80, 255),
+                            SrcNote::Err => col32(220, 90, 90, 255),
+                        };
                         dl.add_text([win_pos[0] + 8.0 + left_w + 14.0, cy], c, msg);
                     }
 
@@ -2395,9 +2266,23 @@ impl App {
                     }
                     // vLLM version/commit, when the trace carries it, sits just
                     // right of the logo: `[logo] 0.26.1rc1.dev528+g...  on  Device`.
+                    // Clicking it opens the source-setup popup — the version
+                    // is what the setup exists to match, so the affordance
+                    // lives there instead of another toolbar button.
                     if !t.vllm_version.is_empty() {
                         let ver_size = ui.calc_text_size(&t.vllm_version);
                         right_x -= ver_size[0];
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            ui.set_cursor_screen_pos([right_x, cy]);
+                            ui.invisible_button("##srcver", ver_size);
+                            if ui.is_item_clicked() {
+                                ui.open_popup("##src_setup");
+                            }
+                            if ui.is_item_hovered() {
+                                ui.tooltip_text("source cross-reference setup");
+                            }
+                        }
                         dl.add_text([right_x, cy], col32(120, 120, 120, 255), &t.vllm_version);
                         right_x -= 6.0;
                     }
@@ -2407,6 +2292,94 @@ impl App {
         }
 
         mark!("status", t_section);
+        // ---- Source cross-reference popups ----
+        // No Source tab and no per-event button: the one gesture is
+        // right-click -> View Source, the one feedback place is the status
+        // bar. These popups exist only when a jump needs them (or the
+        // status-bar version text was clicked).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            ui.popup("##src_setup", || {
+                ui.text("Source cross-reference");
+                ui.separator();
+                // Version banner, computed before the input widgets take
+                // their &mut borrows: the trace's build commit vs the
+                // checkout's git describe. A mismatch means line numbers
+                // can drift — the one way this feature silently lies.
+                let trace_ver = state.panes[ai].trace.as_ref()
+                    .map(|t| t.vllm_version.clone()).unwrap_or_default();
+                let git_desc = state.src_idx.as_mut().and_then(|i| i.git_desc());
+                if !trace_ver.is_empty() {
+                    state.buf.fmt.clear();
+                    match (source::trace_build_commit(&trace_ver), git_desc.as_deref()) {
+                        (Some(build), Some(desc)) if desc.contains(build) => {
+                            write!(state.buf.fmt, "checkout matches trace build {}", &build[..7]).unwrap();
+                            ui.text_colored([0.4, 0.8, 0.5, 1.0], &state.buf.fmt);
+                        }
+                        (Some(build), Some(desc)) => {
+                            write!(state.buf.fmt, "trace built at {} but checkout is at {} - line numbers may drift",
+                                &build[..build.len().min(12)], desc).unwrap();
+                            ui.text_colored([0.9, 0.7, 0.3, 1.0], &state.buf.fmt);
+                        }
+                        _ => {
+                            write!(state.buf.fmt, "trace vllm_version: {}", trace_ver).unwrap();
+                            ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
+                        }
+                    }
+                }
+                // Applying is free — nothing is indexed until a jump, so
+                // switching checkouts (or branches) is instant and always
+                // current.
+                let mut go = false;
+                ui.set_next_item_width(320.0);
+                if ui.input_text("##srcpath", &mut state.src_path)
+                    .hint("/path/to/vllm (or drop the folder on the window)")
+                    .build() { go = true; }
+                ui.same_line();
+                if ui.button("Set") { go = true; }
+                if go {
+                    let p = std::path::PathBuf::from(&state.src_path);
+                    if p.is_dir() {
+                        state.src_idx = Some(Box::new(source::SourceIndex::new(p)));
+                        state.panes[ai].src_msg =
+                            Some((SrcNote::Ok, format!("source checkout: {}", state.src_path)));
+                        ui.close_current_popup();
+                    } else {
+                        state.panes[ai].src_msg =
+                            Some((SrcNote::Err, format!("not a directory: {}", state.src_path)));
+                    }
+                }
+                ui.set_next_item_width(90.0);
+                ui.input_text("##srceditor", &mut state.src_editor)
+                    .hint("editor")
+                    .build();
+                ui.same_line();
+                ui.text_disabled("editor command (code, cursor, zed)");
+            });
+            // Multi-hit picker: a name that resolved to more than one
+            // definition lists them; click a row to open file:line.
+            ui.popup("##src_hits", || {
+                ui.text_disabled("multiple definitions - pick one");
+                ui.separator();
+                let mut picked: Option<source::SourceHit> = None;
+                let hits = std::mem::take(&mut state.panes[ai].src_hits);
+                for h in &hits {
+                    state.buf.fmt.clear();
+                    write!(state.buf.fmt, "{}:{}", h.rel, h.line).unwrap();
+                    if ui.selectable(&state.buf.fmt) { picked = Some(h.clone()); }
+                }
+                state.panes[ai].src_hits = hits;
+                if let Some(h) = picked {
+                    state.panes[ai].src_hits.clear();
+                    ui.close_current_popup();
+                    match source::open_in_editor(&state.src_editor, &h) {
+                        Err(e) => state.panes[ai].src_msg = Some((SrcNote::Err, e)),
+                        Ok(()) => state.panes[ai].src_msg =
+                            Some((SrcNote::Ok, format!("opened {}:{}", h.rel, h.line))),
+                    }
+                }
+            });
+        }
         // ---- Timeline (active pane) ----
         let mut hover_result: Option<EventRef> = None;
         let mut click_result: Option<EventRef> = None;
@@ -2601,16 +2574,19 @@ impl App {
                                         Err(e) => (false, format!("Sync failed: {e}")),
                                     });
                                 }
-                                // Right-click -> source in one interaction: no
-                                // selecting, no tab hop through Detail.
+                                // Right-click -> source: the one gesture for
+                                // the whole feature. Setup (no checkout yet)
+                                // and multi-hit picks are popups, outcomes
+                                // land in the status bar.
                                 #[cfg(not(target_arch = "wasm32"))]
                                 if ui.menu_item("View Source") {
                                     let (act, warn) = resolve_event_source(
                                         &mut state.src_idx, &state.panes[ai], r);
                                     let pane = &mut state.panes[ai];
                                     apply_src_action(
+                                        ui,
                                         &mut pane.src_msg, &mut pane.src_hits,
-                                        &mut pane.pending_tab, &state.src_editor, act, warn);
+                                        &state.src_editor, act, warn);
                                 }
                             });
                         }
@@ -2979,35 +2955,38 @@ fn resolve_event_source(
     (act, warn)
 }
 
-/// Apply a resolution: open the editor, fill the Source tab's hit list,
-/// or park the message in `src_msg` (shown inline and in the status bar).
-/// Takes the affected Pane fields individually, not `&mut Pane` — the
-/// Detail tab calls this while holding a shared borrow of `pane.trace`
-/// across it (the duration histogram below uses it too).
+/// Apply a resolution: open the editor, open the multi-hit picker popup,
+/// open the setup popup (no checkout yet), or park the outcome in
+/// `src_msg` for the status bar. Takes the affected Pane fields
+/// individually, not `&mut Pane` — the context-menu call site holds a
+/// shared borrow of the pane's trace across it.
 #[cfg(not(target_arch = "wasm32"))]
 fn apply_src_action(
-    msg: &mut Option<(bool, String)>,
+    ui: &imgui::Ui,
+    msg: &mut Option<(SrcNote, String)>,
     hits: &mut Vec<source::SourceHit>,
-    pending_tab: &mut Option<BottomTab>,
     editor: &str,
     act: SrcAction,
     warn: Option<String>,
 ) {
     match act {
-        SrcAction::Error(e) => *msg = Some((true, e)),
+        SrcAction::Error(e) => *msg = Some((SrcNote::Err, e)),
         SrcAction::Open(h) => match source::open_in_editor(editor, &h) {
-            Err(e) => *msg = Some((true, e)),
-            // A clean open clears any stale message; a drift warning
-            // replaces it (yellow, not red — the jump did happen).
-            Ok(()) => *msg = warn.map(|w| (false, w)),
+            Err(e) => *msg = Some((SrcNote::Err, e)),
+            // Where the jump landed, or the drift warning when the
+            // checkout isn't the trace's build (the jump did happen).
+            Ok(()) => *msg = Some(match warn {
+                Some(w) => (SrcNote::Warn, w),
+                None => (SrcNote::Ok, format!("opened {}:{}", h.rel, h.line)),
+            }),
         },
         SrcAction::List(hs) => {
             *hits = hs;
-            *pending_tab = Some(BottomTab::Source);
-            *msg = warn.map(|w| (false, w));
+            ui.open_popup("##src_hits");
+            *msg = warn.map(|w| (SrcNote::Warn, w));
         }
-        // No checkout yet: the Source tab is where one gets set up.
-        SrcAction::NeedCheckout => *pending_tab = Some(BottomTab::Source),
+        // No checkout yet: the setup popup is where one gets set up.
+        SrcAction::NeedCheckout => ui.open_popup("##src_setup"),
     }
 }
 

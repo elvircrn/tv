@@ -866,16 +866,15 @@ pub struct Pane {
     /// include whole-step wrappers that would otherwise dominate the top
     /// of the range and flatten the kernel scale.
     pub heat_bounds: Option<(f64, f64)>,
-    /// Source tab: hits from the last multi-hit event resolution, listed as
-    /// clickable rows that open the editor. Per-pane so each tab keeps its
-    /// results.
+    /// Source cross-reference: hits from the last multi-hit resolution,
+    /// listed in the ##src_hits popup as clickable rows that open the
+    /// editor. Per-pane so each tab keeps its results.
     pub src_hits: Vec<crate::source::SourceHit>,
-    /// Last source-jump outcome: (is_error, text). Errors are red (launch
-    /// failure, unresolvable name), warnings yellow — chiefly "checkout is
-    /// not the trace's build commit, line numbers may be off", which is the
-    /// only way a jump that lands in the right file can still be wrong.
-    /// Shown inline in the Detail tab and the status bar until replaced.
-    pub src_msg: Option<(bool, String)>,
+    /// Last source-jump outcome, shown in the status bar until replaced:
+    /// Ok = where it landed, Warn = checkout drift (right file, wrong
+    /// lines — the only way a jump can still be wrong), Err = why it
+    /// didn't land at all.
+    pub src_msg: Option<(SrcNote, String)>,
 }
 
 impl Pane {

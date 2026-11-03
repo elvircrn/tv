@@ -528,7 +528,13 @@ pub struct DiffResult {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum BottomTab { Detail, Selection, Steps, Gaps, Source }
+pub enum BottomTab { Detail, Selection, Steps, Gaps }
+
+/// Severity of a source-jump note shown in the status bar: where the jump
+/// landed (Ok), a checkout-drift warning (Warn), or why it didn't land
+/// (Err). Green / yellow / red.
+#[derive(Clone, Copy, PartialEq)]
+pub enum SrcNote { Ok, Warn, Err }
 
 /// One GPU idle gap ("bubble"): a wall-time interval where a rank's GPU was
 /// doing no work at all, plus the CPU-side annotation that explains it.
