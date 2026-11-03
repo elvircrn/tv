@@ -6366,3 +6366,4 @@ fn bench_top_gpu_events() {
         eprintln!("slowest cat=kernel event: {:.1} us  {}", dur, name);
     }
 }
+

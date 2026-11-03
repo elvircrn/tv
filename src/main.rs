@@ -247,7 +247,7 @@ struct App {
     // settles — same Rc<RefCell> + proxy-wake hop as `pending_paste`.
     #[cfg(target_arch = "wasm32")]
     pending_src_error: std::rc::Rc<std::cell::RefCell<Option<String>>>,
-    // Populated during a `?src=`/`?gist=` download (see `fetch_bytes_with_progress`)
+    // Populated during a `?src=` download (see `fetch_bytes_with_progress`)
     // so the empty-pane placeholder can show a live "Downloading: X / Y" line
     // instead of the page looking frozen for as long as the fetch takes.
     // Cleared once the fetch settles either way (bytes land in
@@ -435,7 +435,7 @@ fn download_progress_text(p: &DownloadProgress) -> String {
             "Downloading: {:.1} MB / {:.1} MB ({:.0}%)",
             mb(p.received), mb(total), 100.0 * p.received as f64 / total as f64,
         ),
-        // 0 bytes and no total yet = the fetch/gist-resolution phase
+        // 0 bytes and no total yet = the fetch-headers phase
         // before the first chunk arrives (DNS/TLS/headers can take a
         // second on a cold connection) — "0.0 MB" would read as broken.
         _ if p.received == 0 => "Downloading trace...".to_string(),
@@ -466,10 +466,10 @@ mod boot_weights {
 }
 
 /// Fetches `url` and returns its response body as bytes — used for the
-/// `?src=<url>`/`?gist=<id>` shareable-link feature (see `resumed()`).
+/// `?src=<url>` shareable-link feature (see `resumed()`).
 /// `url` must serve permissive CORS headers (`Access-Control-Allow-Origin`)
 /// since this is a cross-origin `fetch()` from the page's own JS context; a
-/// gist raw URL or a repo's `raw.githubusercontent.com` file both do this
+/// repo's `raw.githubusercontent.com` file does this
 /// by default. Reads the response body incrementally via its
 /// `ReadableStream` rather than waiting for the whole thing to land in one
 /// `array_buffer()` Promise, so `on_progress` can report bytes-received as
@@ -516,45 +516,6 @@ async fn fetch_bytes_with_progress(
         }
     }
     Ok(bytes)
-}
-
-/// Resolves a bare gist ID (from `?gist=<id>`) to its one file's raw URL via
-/// GitHub's gist API, which serves permissive CORS and — unlike the raw
-/// content host — knows the filename without it being spelled out in the
-/// link. Lets a shareable link be the short `?gist=<id>` instead of a fully
-/// spelled-out, percent-encoded `?src=<raw-url>`. Picks the first file if a
-/// gist somehow has more than one (this app always creates single-file
-/// gists via "Export GPU (web)").
-#[cfg(target_arch = "wasm32")]
-async fn resolve_gist_raw_url(win: &web_sys::Window, gist_id: &str) -> Result<String, String> {
-    use wasm_bindgen::JsCast;
-    let api_url = format!("https://api.github.com/gists/{gist_id}");
-    let resp_value = wasm_bindgen_futures::JsFuture::from(win.fetch_with_str(&api_url))
-        .await
-        .map_err(|_| "gist lookup failed (network or bad gist id)".to_string())?;
-    let resp: web_sys::Response = resp_value.unchecked_into();
-    if !resp.ok() {
-        return Err(format!("gist lookup returned HTTP {} (check the gist id)", resp.status()));
-    }
-    let text_promise = resp.text().map_err(|_| "gist response has no body".to_string())?;
-    let text_value = wasm_bindgen_futures::JsFuture::from(text_promise)
-        .await
-        .map_err(|_| "failed reading gist response body".to_string())?;
-    let text = text_value.as_string().ok_or_else(|| "gist response wasn't text".to_string())?;
-    let json = js_sys::JSON::parse(&text).map_err(|_| "gist response wasn't valid JSON".to_string())?;
-    let files = js_sys::Reflect::get(&json, &"files".into())
-        .map_err(|_| "gist response missing 'files'".to_string())?;
-    let keys = js_sys::Object::keys(files.unchecked_ref::<js_sys::Object>());
-    let first_key = keys.get(0);
-    if first_key.is_undefined() {
-        return Err("gist has no files".to_string());
-    }
-    let file_info = js_sys::Reflect::get(&files, &first_key)
-        .map_err(|_| "gist file entry missing".to_string())?;
-    js_sys::Reflect::get(&file_info, &"raw_url".into())
-        .ok()
-        .and_then(|v| v.as_string())
-        .ok_or_else(|| "gist file entry missing raw_url".to_string())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -777,53 +738,40 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Shareable-link loading: either a `?src=<url>` query param (e.g. a
-        // repo raw-file URL — anything serving permissive CORS headers) or
-        // the shorter `?gist=<id>` (resolved to its raw file URL via
-        // resolve_gist_raw_url first) is fetched once at startup and
-        // dropped into the same `pending_web_files` queue a real file drop
-        // would use, so it's routed into a pane by the exact same code in
-        // `user_event` below. A failed fetch (bad URL/id, 404, CORS
-        // rejection) has no bytes to hand that queue, so it reports through
-        // `pending_src_error` instead.
+        // Shareable-link loading: a `?src=<url>` query param (e.g. a repo
+        // raw-file URL — anything serving permissive CORS headers) is
+        // fetched once at startup and dropped into the same
+        // `pending_web_files` queue a real file drop would use, so it's
+        // routed into a pane by the exact same code in `user_event` below.
+        // A failed fetch (bad URL, 404, CORS rejection) has no bytes to
+        // hand that queue, so it reports through `pending_src_error`
+        // instead.
         #[cfg(target_arch = "wasm32")]
         if let Some(proxy) = self.event_loop_proxy.clone() {
             if let Some(win) = web_sys::window() {
                 let search = win.location().search().unwrap_or_default();
                 let params = web_sys::UrlSearchParams::new_with_str(&search).ok();
                 let src = params.as_ref().and_then(|p| p.get("src"));
-                let gist = params.as_ref().and_then(|p| p.get("gist"));
-                if src.is_some() || gist.is_some() {
+                if let Some(url) = src {
                     let pending = self.pending_web_files.clone();
                     let pending_err = self.pending_src_error.clone();
                     let pending_progress = self.pending_download_progress.clone();
                     // Announce the download before the first byte moves: the
                     // fetch's own progress ticks only fire once response
                     // chunks arrive (~1s of DNS/TLS/header time on a cold
-                    // connection), and the gist API resolution before it is
-                    // its own network round-trip — without this the splash
-                    // is a bare, silent logo for that whole stretch, which
-                    // reads as a hang.
+                    // connection) — without this the splash is a bare,
+                    // silent logo for that whole stretch, which reads as a
+                    // hang.
                     *pending_progress.borrow_mut() = Some(DownloadProgress { received: 0, total: None });
                     wasm_bindgen_futures::spawn_local(async move {
-                        let url_result = match (src, gist) {
-                            (Some(url), _) => Ok(url),
-                            (None, Some(id)) => resolve_gist_raw_url(&win, &id).await,
-                            (None, None) => unreachable!(),
+                        let progress_proxy = proxy.clone();
+                        let progress_slot = pending_progress.clone();
+                        let on_progress = move |p: DownloadProgress| {
+                            *progress_slot.borrow_mut() = Some(p);
+                            let _ = progress_proxy.send_event(());
                         };
-                        let result = match url_result {
-                            Ok(url) => {
-                                let progress_proxy = proxy.clone();
-                                let progress_slot = pending_progress.clone();
-                                let on_progress = move |p: DownloadProgress| {
-                                    *progress_slot.borrow_mut() = Some(p);
-                                    let _ = progress_proxy.send_event(());
-                                };
-                                fetch_bytes_with_progress(&win, &url, Some(&on_progress)).await
-                                    .map(|bytes| (url, bytes))
-                            }
-                            Err(e) => Err(e),
-                        };
+                        let result = fetch_bytes_with_progress(&win, &url, Some(&on_progress))
+                            .await.map(|bytes| (url, bytes));
                         *pending_progress.borrow_mut() = None;
                         match result {
                             Ok((url, bytes)) => {
@@ -877,9 +825,10 @@ impl ApplicationHandler for App {
         if !files.is_empty() {
             // A dropped folder's files land here as one flat batch (see
             // walk_dropped_entry) — group same-run rank files (e.g.
-            // "...-rank-0.json.gz", "...-rank-1.json.gz") into a single
-            // merged multi-rank pane instead of opening each rank as its
-            // own separate trace, matching native's drag-drop behavior.
+            // "...-rank-0.pt.trace.json.ktz", "...-rank-1.pt.trace.json.ktz")
+            // into a single merged multi-rank pane instead of opening each
+            // rank as its own separate trace, matching native's drag-drop
+            // behavior.
             let (rank_groups, standalone) = crate::loader::group_by_rank_bytes(files);
             for group in rank_groups {
                 let empty = self.state.panes.iter().position(|p| !p.has_trace() && p.loading.is_none());
@@ -1184,7 +1133,7 @@ impl App {
     }
 
     /// Drives the HTML boot overlay (web/initializer.mjs) that a share-link
-    /// open (?src=/?gist=) keeps alive across the whole load, so the user
+    /// open (?src=) keeps alive across the whole load, so the user
     /// sees ONE bar from link to timeline instead of an app bar that resets
     /// when the trace download begins. The initializer owns the wasm slice
     /// (0-25%); this continues the same bar through the trace download
@@ -1233,8 +1182,8 @@ impl App {
                     None,
                     false,
                 ),
-                // 0 bytes and no total yet = gist resolution / response
-                // headers still pending — hold where the wasm slice ended.
+                // 0 bytes and no total yet = response headers
+                // still pending — hold where the wasm slice ended.
                 None if p.received == 0 => (boot_weights::WASM, None, false),
                 None => (boot_weights::WASM, Some(format!(
                     "Loading trace... {:.1} MB", p.received as f64 / (1024.0 * 1024.0),
@@ -2285,7 +2234,7 @@ impl App {
                 let tl_top = content_top;
                 let tl_h = display[1] - content_top;
                 // What the active pane is waiting on, drawn centered under
-                // the logo: a ?src=/?gist= download (web — normally hidden
+                // the logo: a ?src= download (web — normally hidden
                 // behind the boot overlay, which owns the download's
                 // progress bar; this text is the fallback if the overlay
                 // isn't there), a staged parse (single-threaded wasm), or a

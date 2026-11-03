@@ -5,7 +5,7 @@
 // (vLLM mark + progress bar + label) over the otherwise-blank page while
 // the (multi-MB) wasm binary downloads.
 //
-// For a share-link open (?src=/?gist=) this overlay IS the whole load
+// For a share-link open (?src=) this overlay IS the whole load
 // screen: it stays up after the wasm boots, and the Rust side drives the
 // same bar/label on through the trace download and the parse
 // (update_boot_overlay in main.rs), removing the overlay only when the
@@ -37,7 +37,7 @@ export default function trunkInitializer() {
   // Rust side takes the bar over and removes it); a plain app open has
   // nothing left to load once the wasm is here.
   const params = new URLSearchParams(location.search);
-  const share = params.has("src") || params.has("gist");
+  const share = params.has("src");
   // How much of the whole link-to-timeline load this phase owns. The rest
   // (50% trace download, 25% parse) is driven from Rust — see
   // boot_weights in main.rs.
