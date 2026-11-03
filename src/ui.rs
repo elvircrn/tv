@@ -1166,11 +1166,25 @@ pub fn draw_timeline(
     if let DragKind::TrackResize(pi, ti) = *drag {
         if pi == pane_idx {
             if ui.io().mouse_down[0] {
-                let base_h = track_height(trace.tracks[ti].max_depth, false, 1.0);
-                if base_h > 0.0 {
-                    let delta_scale = mouse_delta[1] / base_h;
-                    if let Some(s) = track_scales.get_mut(ti) {
-                        *s = (*s + delta_scale).clamp(TRACK_SCALE_MIN, TRACK_SCALE_MAX);
+                // The scale step must move the row's on-screen border 1:1
+                // with the cursor, so it's dy over the row's UNSCALED
+                // height — which is not always the dragged track's own
+                // base: a merged rank row draws at the pack's max depth
+                // (the dragged track is just one lane of many), and a
+                // collapsed row draws a single lane. Deriving it from the
+                // row's actual drawn height (last frame's layout over the
+                // current scale; `buf` still holds it above) keeps the
+                // drag honest in every mode. Scaling by the track's own
+                // base made merged rows resize pack-depth-times too fast.
+                let vi = buf.visible.iter().position(|&v| v == ti);
+                if let (Some(vi), Some(&s)) = (vi, track_scales.get(ti)) {
+                    if let Some(&h) = buf.heights.get(vi) {
+                        let unscaled = h / s;
+                        if s > 0.0 && unscaled > 0.0 {
+                            *track_scales.get_mut(ti).unwrap() =
+                                (s + mouse_delta[1] / unscaled)
+                                    .clamp(TRACK_SCALE_MIN, TRACK_SCALE_MAX);
+                        }
                     }
                 }
             } else {
