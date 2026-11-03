@@ -57,9 +57,12 @@ fn make_trace(names: Vec<&str>, tracks: Vec<(&str, bool, Vec<Event>)>) -> Trace 
         total_events += events.len();
         trs.push(Track { label: label.to_string(), gpu, events, max_depth, prefix_max_dur, raw_buf_idx: 0 });
     }
+    // Same per-name stats every real load path computes, so tests see what
+    // the toolbar's live search-match count reads.
+    let stats = crate::loader::compute_kernel_stats(&trs);
     Trace {
         tracks: trs, names: name_strs, cats: vec![String::new()],
-        raw_bufs: Vec::new(), stats: Vec::new(),
+        raw_bufs: Vec::new(), stats,
         max_ts, min_ts: 0.0, total_events, device: String::new(),
         vllm_version: String::new(),
         dist_rank: -1, dist_world: 0,
@@ -787,7 +790,70 @@ fn test_rebuild_search() {
     assert!(p.search_mask[1]);
     assert!(p.search_mask[2]);
     assert!(!p.search_mask[3]);
+    // The nav index is lazy: a keystroke rebuild builds the mask only, and
+    // the toolbar count comes from the per-name stats.
+    assert!(p.search_nav.is_empty(), "keystroke rebuild must not build the nav index");
+    assert_eq!(p.search_match_count(), 2);
+    p.ensure_search_nav();
     assert_eq!(p.search_nav.len(), 2);
+}
+
+#[test]
+fn test_search_nav_built_lazily_and_invalidated() {
+    let trace = make_trace(
+        vec!["", "alpha", "beta"],
+        vec![("GPU", true, vec![
+            ev(30.0, 5.0, 1, 0),
+            ev(10.0, 5.0, 2, 0),
+            ev(0.0, 5.0, 1, 0),
+        ])],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+
+    // Typing "alpha" per character: two keystrokes, neither builds nav.
+    p.search = "a".to_string();
+    p.rebuild_search();
+    assert!(p.search_nav.is_empty());
+    p.search = "alpha".to_string();
+    p.rebuild_search();
+    assert!(p.search_nav.is_empty());
+    assert_eq!(p.search_match_count(), 2);
+
+    // First navigation use builds it, sorted by timestamp: the "alpha"
+    // events are track-indices 0 (ts 30) and 2 (ts 0), so [0] is event 2.
+    p.nav_search(true);
+    assert_eq!(p.search_nav.len(), 2);
+    assert_eq!(p.search_nav[0].0, 0.0, "nav must be sorted by ts");
+    assert_eq!(p.search_nav[0].2, 2, "earliest alpha event is index 2 (ts 0)");
+    assert_eq!(p.search_nav_query.as_deref(), Some("alpha"));
+
+    // Retyping invalidates without rebuilding; the next use rebuilds for
+    // the new query only.
+    p.search = "beta".to_string();
+    p.rebuild_search();
+    assert_eq!(p.search_nav_query.as_deref(), Some("alpha"), "stale nav kept, marked by query");
+    p.nav_search(true);
+    assert_eq!(p.search_nav.len(), 1);
+    assert_eq!(p.search_nav_query.as_deref(), Some("beta"));
+}
+
+#[test]
+fn test_clear_search_invalidates_nav() {
+    let trace = make_trace(
+        vec!["", "alpha"],
+        vec![("GPU", true, vec![ev(0.0, 5.0, 1, 0)])],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    p.search = "alpha".to_string();
+    p.rebuild_search();
+    p.ensure_search_nav();
+    assert_eq!(p.search_nav.len(), 1);
+
+    p.clear_search();
+    assert!(p.search_nav.is_empty());
+    assert!(p.search_nav_query.is_none());
 }
 
 #[test]
@@ -2054,6 +2120,54 @@ fn test_default_track_order_fixes_bad_stored_order() {
     assert_eq!(visible_ranks, vec![0, 1, 2, 10, 11], "view should show ranks in numeric order regardless of storage order");
 }
 
+// Measures the search box's two costs separately, as they're now paid:
+// `rebuild_search` (the name mask) runs in-frame on every keystroke, while
+// `ensure_search_nav` (the event scan + sort behind next/prev navigation)
+// is deferred to the first Enter/N/arrow use. Run with:
+//   TV_BENCH_TRACE=<trace> cargo test --release bench_search_rebuild -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_search_rebuild() {
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache or a directory> to run this bench"); return; }
+    };
+    let trace = if std::path::Path::new(&path).is_dir() {
+        let (rank_groups, standalone) = detect_rank_groups(&[path.clone()]);
+        let mut all_paths: Vec<(usize, String)> = Vec::new();
+        for (group, _) in &rank_groups { all_paths.extend(group.clone()); }
+        for (i, (p, _)) in standalone.iter().enumerate() { all_paths.push((all_paths.len() + i, p.clone())); }
+        let counter = test_counter();
+        use rayon::prelude::*;
+        let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len().max(1)).max(2);
+        let traces: Vec<(usize, Trace)> = all_paths.par_iter().filter_map(|(rank, p)| {
+            load_trace(p, &counter, tpf, None).ok().map(|t| (*rank, t))
+        }).collect();
+        merge_traces(traces)
+    } else {
+        let counter = test_counter();
+        load_trace(&path, &counter, 8, None).expect("load trace")
+    };
+    eprintln!("loaded: {} tracks, {} events, {} names",
+        trace.tracks.len(), trace.total_events, trace.names.len());
+
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    // Queries of varying selectivity, as typed one character at a time: the
+    // first char of a common word (worst case for hit count), a mid-length
+    // fragment, a full op name, and a miss.
+    for q in ["e", "ke", "kernel", "nccl", "no-such-name"] {
+        pane.search = q.to_string();
+        let t0 = std::time::Instant::now();
+        pane.rebuild_search();
+        let mask_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        pane.ensure_search_nav();
+        eprintln!("q={q:?}: mask {:.1}ms (per keystroke), nav {:.1}ms (deferred, {} hits)",
+            mask_ms, t1.elapsed().as_secs_f64() * 1000.0, pane.search_nav.len());
+    }
+}
+
 // Measures the per-frame cost of the merged-GPU buffer build for two depth
 // filters: leaf-only (delta=0, current) vs. keep-one-parent-level (delta=1,
 // the 047226a design that un-hides parent blocks). Run with:
@@ -2496,6 +2610,7 @@ fn test_nav_search_wraps_and_frames_each_match() {
     pane.view.t1 = 1000.0;
     pane.search.push_str("foo");
     pane.rebuild_search();
+    pane.ensure_search_nav();
     assert_eq!(pane.search_nav.len(), 3);
     assert_eq!(pane.search_cursor, 0);
 
@@ -2704,6 +2819,7 @@ fn test_nav_search_skips_hidden_cpu_matches() {
     pane.view.t1 = 1000.0;
     pane.search.push_str("foo");
     pane.rebuild_search();
+    pane.ensure_search_nav();
     assert_eq!(pane.search_nav.len(), 3);
 
     // Enter frames the first *visible* match (GPU ts=50) and syncs the cursor.

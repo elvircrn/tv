@@ -676,6 +676,14 @@ pub struct Pane {
     pub search_mask: BitSet,
     pub search_nav: Vec<(f64, u32, u32)>,
     pub search_cursor: usize,
+    /// The (trimmed) query `search_nav` was built for, or None when stale —
+    /// the search text changed or the trace was swapped since. The nav index
+    /// costs a full event scan + sort (measured 15-500ms on a 17.5M-event
+    /// merged trace), so it's built lazily by `ensure_search_nav` on the
+    /// first navigation use (Enter, N/Shift-N, the toolbar arrows) instead
+    /// of on every keystroke; the live mask and match count the toolbar
+    /// shows while typing never need it.
+    pub search_nav_query: Option<String>,
     pub prev_search: String,
     pub selection: Option<[f64; 4]>,
     pub finished_sel: Option<[f64; 4]>,
@@ -894,6 +902,7 @@ impl Pane {
             search_mask: BitSet::new(),
             search_nav: Vec::new(),
             search_cursor: 0,
+            search_nav_query: None,
             prev_search: String::new(),
             selection: None,
             finished_sel: None,
@@ -1196,6 +1205,10 @@ impl Pane {
         self.prev_search.clear();
         self.search_mask.clear();
         self.search_nav.clear();
+        // The nav index (if any was built) refers to the cleared query and,
+        // via (track, event) indices, to this trace — drop its marker so the
+        // next navigation use rebuilds it.
+        self.search_nav_query = None;
         self.search_cursor = 0;
     }
 
@@ -1588,6 +1601,9 @@ impl Pane {
                     self.hidden_names.resize(n_names);
                     self.search_mask.clear();
                     self.search_nav.clear();
+                    // (track_idx, event_idx) pairs in the nav index pointed
+                    // into the OLD trace — force a rebuild on next use.
+                    self.search_nav_query = None;
                     self.search_cursor = 0;
                     // The reloaded trace may have fewer events; a retained
                     // EventRef would index out of bounds in the Detail panel,
@@ -1640,6 +1656,11 @@ impl Pane {
         }
     }
 
+    /// Refresh the live name mask for the current search text. This is the
+    /// per-keystroke path, so it only scans `names` (O(distinct names), a
+    /// few thousand) — the event scan + sort that `search_nav` needs is
+    /// deferred to `ensure_search_nav`, paid once by the first navigation
+    /// action (Enter, N, arrows) instead of by every typed character.
     pub fn rebuild_search(&mut self) {
         let trace = match &self.trace {
             Some(t) => t,
@@ -1648,7 +1669,6 @@ impl Pane {
         let q = self.search.trim().to_ascii_lowercase();
         self.search_mask.clear();
         self.search_mask.resize(trace.names.len());
-        self.search_nav.clear();
         self.search_cursor = 0;
 
         if q.is_empty() { return; }
@@ -1658,7 +1678,21 @@ impl Pane {
                 self.search_mask.set(i, true);
             }
         }
+    }
 
+    /// Build `search_nav` (every matching event, sorted by timestamp) if the
+    /// one cached in `search_nav_query` is stale. Called by the navigation
+    /// entry points (`zoom_to_search`, `nav_search`) — the only consumers
+    /// that need the per-event index at all.
+    pub(crate) fn ensure_search_nav(&mut self) {
+        if self.search_nav_query.as_deref() == Some(self.search.trim()) { return; }
+        if self.trace.is_none() { return; }
+        // Refresh the mask this index is built from — idempotent, and guards
+        // against a caller navigating with text that changed since the last
+        // `rebuild_search`.
+        self.rebuild_search();
+        let trace = self.trace.as_ref().unwrap();
+        self.search_nav.clear();
         for (ti, track) in trace.tracks.iter().enumerate() {
             for (ei, ev) in track.events.iter().enumerate() {
                 if self.search_mask[ev.name as usize] {
@@ -1667,6 +1701,23 @@ impl Pane {
             }
         }
         self.search_nav.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        self.search_nav_query = Some(self.search.trim().to_string());
+    }
+
+    /// How many events the current search matches — summed from the
+    /// load-time per-name counts in `trace.stats`, so the toolbar's live
+    /// "N matches" text costs O(distinct names), not the event scan the nav
+    /// index needs. Same total the old per-keystroke `search_nav.len()`
+    /// showed (both count matching events across all tracks).
+    pub fn search_match_count(&self) -> usize {
+        let trace = match &self.trace {
+            Some(t) => t,
+            None => return 0,
+        };
+        trace.stats.iter()
+            .filter(|s| self.search_mask.get(s.name as usize).unwrap_or(false))
+            .map(|s| s.count as usize)
+            .sum()
     }
 
     pub fn rebuild_selection_stats(&mut self, buf: &mut DrawBuf) {
@@ -1871,6 +1922,7 @@ impl Pane {
     /// stale cursor (which could step into a hidden CPU match and appear to do
     /// nothing).
     pub fn zoom_to_search(&mut self) {
+        self.ensure_search_nav();
         let idx = self.search_nav.iter()
             .position(|&(_, ti, ei)| self.nav_match_visible(ti, ei));
         if let Some(idx) = idx {
@@ -2004,6 +2056,7 @@ impl Pane {
     /// `forward` advances, `!forward` goes back; both wrap around. Selects the
     /// event and switches the bottom panel to the Detail tab.
     pub fn nav_search(&mut self, forward: bool) {
+        self.ensure_search_nav();
         let n = self.search_nav.len();
         if n == 0 { return; }
         // Step to the next/previous *visible* match, skipping hidden CPU-track

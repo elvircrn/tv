@@ -1729,21 +1729,24 @@ impl App {
                             }
                             let search_active = pane.search_mask.any();
                             if search_active {
-                                let has_matches = !pane.search_nav.is_empty();
+                                // Live count from the load-time per-name
+                                // stats — the nav index itself is built
+                                // lazily on the first Enter/N/arrow use.
+                                let n_matches = pane.search_match_count();
                                 ui.same_line_with_spacing(0.0, 6.0);
-                                ui.enabled(has_matches, || {
+                                ui.enabled(n_matches > 0, || {
                                     if ui.small_button("<##prevmatch") { pane.nav_search(false); }
                                 });
                                 if ui.is_item_hovered() { ui.tooltip_text("Previous match (Shift+N)"); }
                                 ui.same_line_with_spacing(0.0, 2.0);
-                                ui.enabled(has_matches, || {
+                                ui.enabled(n_matches > 0, || {
                                     if ui.small_button(">##nextmatch") { pane.nav_search(true); }
                                 });
                                 if ui.is_item_hovered() { ui.tooltip_text("Next match (N)"); }
                                 ui.same_line_with_spacing(0.0, 6.0);
                                 ui.align_text_to_frame_padding();
                                 state.buf.fmt.clear();
-                                write!(state.buf.fmt, "{} matches", pane.search_nav.len()).unwrap();
+                                write!(state.buf.fmt, "{} matches", n_matches).unwrap();
                                 ui.text_colored([0.6, 0.8, 1.0, 1.0], &state.buf.fmt);
                             }
                         }
