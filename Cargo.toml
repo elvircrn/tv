@@ -16,7 +16,6 @@ imgui = { version = "0.12", features = ["tables-api"] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 raw-window-handle = "0.6"
 memchr = "2"
-tar = "0.4"
 rayon = "1"
 smallvec = "1.16.4"
 
@@ -40,23 +39,7 @@ imgui-sys = { version = "0.12", features = ["freetype"] }
 metal = "0.33"
 raw-window-metal = "1"
 core-graphics-types = "0.2"
-flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
-libdeflater = "1"
-memmap2 = "0.9"
-# Decode-only since the native "Export GPU" writer went away with its
-# button: `load_cache_xz` still opens previously exported .tvcache.xz
-# files (xz was chosen over gzip for ~265x vs ~65x on a real 87MB args
-# blob; the writer's full measurements live in git history).
-xz2 = "0.1"
-# Wraps the main .tvcache/_merged.tvcache cache (save_cache/save_merged_cache/
-# load_cache*) — unlike the one-shot xz export format, this needs to compress AND
-# decompress fast enough to stay invisible on every trace load/save, not
-# just an occasional export. Measured directly on a real 234MB (post synth-
-# args-encoding) cache: zstd level 3 compresses in ~0.1s and decompresses in
-# ~0.1s, for a 9.4x additional reduction (234MB -> 25MB) — xz/gzip get a
-# similar ratio only at 10-70x the compress time, and zstd's decompress side
-# is competitive with gzip's regardless of level, so there's no ratio/speed
-# tradeoff to make on the read side, only on how hard to compress on write.
+# .ktz container's zstd frames (the real C library via zstd-sys).
 zstd = "0.13"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -64,13 +47,11 @@ zstd = "0.13"
 # C toolchain/sysroot for the target, and wasm doesn't read the SF Mono font
 # from disk anyway (see renderer_web.rs: DefaultFontData).
 imgui-sys = "0.12"
-flate2 = { version = "1", features = ["rust_backend"], default-features = false }
 # Decode-only counterpart to native's `zstd` (which wraps the real C library
 # via zstd-sys — needs a C toolchain to cross-compile to wasm32, unlike this).
-# The web build only ever needs to *read* a zstd-compressed .tvcache/
-# _merged.tvcache — compression only happens when the native app saves one —
-# and a pure-Rust decoder is all that needs. Verified directly: decodes a
-# real cache file produced by the native `zstd` crate byte-for-byte.
+# The web build only ever needs to *read* .ktz zstd frames, and a pure-Rust
+# decoder is all that needs. Verified directly: decodes a real frame produced
+# by the native `zstd` crate byte-for-byte.
 # 0.9 for its 128MiB default window limit: .ktz files use windowLog-27
 # (128MiB) zstd frames, which 0.7's 100MB hard cap rejected.
 ruzstd = "0.9"

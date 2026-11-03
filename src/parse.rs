@@ -238,48 +238,8 @@ fn skip_container(raw: &[u8], pos: usize) -> usize {
     i
 }
 
-pub fn skip_to_closing(raw: &[u8], pos: usize) -> usize {
-    let mut depth = 1u32;
-    let mut i = pos;
-    while depth > 0 && i < raw.len() {
-        match memchr::memchr3(b'"', b'{', b'}', &raw[i..]) {
-            Some(off) => {
-                for j in i..i + off {
-                    match raw[j] {
-                        b'[' => depth += 1,
-                        b']' => { depth -= 1; if depth == 0 { return j + 1; } }
-                        _ => {}
-                    }
-                }
-                i += off;
-                match raw[i] {
-                    b'"' => i = skip_string(raw, i),
-                    b'{' => { depth += 1; i += 1; }
-                    b'}' => { depth -= 1; i += 1; }
-                    _ => unreachable!(),
-                }
-            }
-            None => return raw.len(),
-        }
-    }
-    i
-}
-
-pub fn skip_number(raw: &[u8], pos: usize) -> usize {
-    let mut i = pos;
-    while i < raw.len()
-        && (raw[i].is_ascii_digit() || matches!(raw[i], b'.' | b'-' | b'+' | b'e' | b'E'))
-    { i += 1; }
-    i
-}
-
 pub fn skip_ws(raw: &[u8], mut pos: usize) -> usize {
     while pos < raw.len() && matches!(raw[pos], b' ' | b'\n' | b'\r' | b'\t') { pos += 1; }
-    pos
-}
-
-pub fn skip_ws_comma(raw: &[u8], mut pos: usize) -> usize {
-    while pos < raw.len() && matches!(raw[pos], b' ' | b'\n' | b'\r' | b'\t' | b',') { pos += 1; }
     pos
 }
 
@@ -374,48 +334,6 @@ pub fn fnv1a(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100000001b3);
     }
     h
-}
-
-pub fn find_event_start(raw: &[u8], near: usize, limit: usize) -> Option<usize> {
-    let finder = memchr::memmem::Finder::new(b"\"ph\"");
-    let limit = limit.min(raw.len());
-    let mut pos = near;
-    while pos < limit {
-        match finder.find(&raw[pos..limit]) {
-            Some(off) => {
-                let ph_pos = pos + off;
-                let mut p = ph_pos;
-                while p > 0 && raw[p] != b'{' { p -= 1; }
-                if raw[p] == b'{' {
-                    if p == 0 { return Some(p); }
-                    let mut q = p - 1;
-                    while q > 0 && matches!(raw[q], b' ' | b'\t' | b'\r' | b'\n') { q -= 1; }
-                    if matches!(raw[q], b',' | b'[') {
-                        return Some(p);
-                    }
-                }
-                pos = ph_pos + 4;
-            }
-            None => break,
-        }
-    }
-    None
-}
-
-pub fn find_split_points(raw: &[u8], start: usize, n: usize) -> Vec<usize> {
-    if n <= 1 { return vec![start, raw.len()]; }
-    let remaining = raw.len().saturating_sub(start);
-    let chunk_size = remaining / n;
-    let mut points = vec![start];
-    for t in 1..n {
-        let target = start + t * chunk_size;
-        let limit = raw.len().min(target + chunk_size);
-        if let Some(p) = find_event_start(raw, target, limit) {
-            points.push(p);
-        }
-    }
-    points.push(raw.len());
-    points
 }
 
 pub fn json_unescape(s: &str) -> String {

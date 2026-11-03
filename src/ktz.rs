@@ -198,6 +198,40 @@ pub fn event_count_hint(path: &str) -> Option<u64> {
     c.varint().ok()
 }
 
+/// Total decompressed section payload of a KTZ3/KTZ4 file, summed straight
+/// from the frame table (magic + nEvents + nFrames + per-frame
+/// {payloadLen, compLen} varints) without decompressing anything — the
+/// exact transient-heap figure for one rank's load, used by the multi-rank
+/// wave sizing. None for KTZ2 (its payload lives inside the zstd frame) or
+/// any file whose table can't be read/validated from the head. Mirrors
+/// framed_payload's table walk and validation; never allocates.
+pub fn payload_size_hint(path: &str) -> Option<u64> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = vec![0u8; 4096];
+    let n = f.read(&mut head).ok()?;
+    head.truncate(n);
+    if head.len() < 4 || (&head[..4] != b"KTZ3" && &head[..4] != b"KTZ4") { return None; }
+    let mut c = Cur { d: &head, p: 4 };
+    c.varint().ok()?; // nEvents (skip)
+    let n_frames = c.varint().ok()?;
+    if n_frames > head.len() as u64 { return None; }
+    let mut total_pay: u64 = 0;
+    let mut total_comp: u64 = 0;
+    for _ in 0..n_frames {
+        let pay = c.varint().ok()?;
+        let comp = c.varint().ok()?;
+        if pay > MAX_FRAME_PAYLOAD as u64 { return None; }
+        total_pay = total_pay.checked_add(pay)?;
+        total_comp = total_comp.checked_add(comp)?;
+    }
+    // Same table-overrun check framed_payload applies against the file, but
+    // against the head we managed to read — a table that walks past it (or
+    // past the file) is either corrupt or a huge frame count we can't size.
+    if total_comp > (head.len() - c.p) as u64 { return None; }
+    Some(total_pay)
+}
+
 impl<'a> Cur<'a> {
     fn new(d: &'a [u8]) -> Self {
         Cur { d, p: 0 }
@@ -924,7 +958,7 @@ impl KtzDecoder {
     /// Parse the container (zstd frames + section table + symtab). Does not
     /// decode events yet — call `step` until it returns true.
     pub fn new(data: &[u8]) -> Result<Self, String> {
-        let (mut payload, n_events, is_v4) = if data.len() >= 4
+        let (payload, n_events, is_v4) = if data.len() >= 4
             && (&data[..4] == b"KTZ3" || &data[..4] == b"KTZ4")
         {
             framed_payload(data)?

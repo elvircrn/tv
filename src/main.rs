@@ -142,15 +142,12 @@ pub(crate) fn should_show_tab_strip(panes: &[Pane]) -> bool {
     panes.len() > 1 || !panes[0].trace_path.is_empty()
 }
 
-/// Wires up a freshly-opened pane's `reload_dir`/`cache_dir` when its files
-/// came from a directory argument (CLI or drop) — `dir` is `None` for bare
-/// file arguments, which have nothing to watch/cache against.
+/// Wires up a freshly-opened pane's `reload_dir` when its files came from a
+/// directory argument (CLI or drop) — `dir` is `None` for bare file
+/// arguments, which have nothing to watch.
 fn set_reload_dir(pane: &mut Pane, dir: Option<&str>) {
     if let Some(dir) = dir {
-        if !dir.ends_with(".tvcache") {
-            pane.reload_dir = Some(dir.to_string());
-            pane.cache_dir = Some(crate::loader::cache_dir_for_folder(dir));
-        }
+        pane.reload_dir = Some(dir.to_string());
     }
 }
 
@@ -575,10 +572,7 @@ async fn file_from_entry(entry: &web_sys::FileSystemFileEntry) -> Option<web_sys
 
 /// Recursively walks a dropped `FileSystemEntry` (a file, or a folder that
 /// may itself contain rank files and/or subfolders), collecting (name,
-/// bytes) for every trace-like file found. `.tvcache` *directories* are
-/// skipped (native's disk-cache dirs — meaningless on wasm, see
-/// `loader::load_cache`'s stub, and not real trace data); a `.tvcache`
-/// *file* is still accepted, same as `loader::is_trace_file`.
+/// bytes) for every trace-like (.ktz) file found.
 /// Boxed because async fns can't recurse directly — the resulting future's
 /// size would depend on its own size.
 #[cfg(target_arch = "wasm32")]
@@ -593,8 +587,6 @@ fn walk_dropped_entry(entry: web_sys::FileSystemEntry) -> std::pin::Pin<Box<dyn 
             let Ok(buf) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await else { return Vec::new() };
             vec![(name, js_sys::Uint8Array::new(&buf).to_vec())]
         } else if entry.is_directory() {
-            let name = entry.name();
-            if name.ends_with(".tvcache") { return Vec::new(); }
             let dir_entry: web_sys::FileSystemDirectoryEntry = entry.unchecked_into();
             let reader = dir_entry.create_reader();
             let mut out = Vec::new();
@@ -1327,8 +1319,6 @@ impl App {
             #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
             p.run_pending_parse();
             p.poll_loading();
-            #[cfg(not(target_arch = "wasm32"))]
-            p.poll_share_upload();
         }
 
         // Before any UI builds: a share-link open's boot overlay comes off
@@ -1495,84 +1485,8 @@ impl App {
                     let pane = &mut state.panes[ai];
                     if pane.trace.is_some() {
                         if let Some(_mb) = ui.begin_menu_bar() {
-                            // ---- File menu: export/share/sync. Export/Share
-                            // are native-only (no filesystem, no `gh` CLI on
-                            // wasm); Sync Clocks works everywhere — sources
-                            // rank/filename pairs from either reload_paths
-                            // (native directory opens) or the trace's own
-                            // persisted rank_paths (works after loading an
-                            // already-merged .tvcache, native or web — see
-                            // loader::sync_multi_rank_clocks).
-                            #[cfg(not(target_arch = "wasm32"))]
-                            let has_export_share = !pane.reload_paths.is_empty()
-                                && pane.trace.as_ref().is_some_and(|t| t.tracks.iter().any(|tr| tr.gpu));
-                            // Export Merged TV Cache needs somewhere to write:
-                            // the folder a directory-open came from, or the one
-                            // source file of a bare file open. Mirrors the
-                            // gating in `Pane::export_tv_cache`.
-                            #[cfg(not(target_arch = "wasm32"))]
-                            let can_export_cache = pane.cache_dir.is_some()
-                                || (pane.reload_paths.len() == 1
-                                    && !pane.reload_paths[0].1.ends_with(".tvcache")
-                                    && !pane.reload_paths[0].1.ends_with(".tvcache.xz")
-                                    && !pane.reload_paths[0].1.ends_with(".tvcache.gz"));
                             let multi_rank = pane.reload_paths.len() >= 2
                                 || pane.trace.as_ref().is_some_and(|t| t.rank_paths.len() >= 2);
-                            #[cfg(not(target_arch = "wasm32"))]
-                            if has_export_share || can_export_cache {
-                                ui.menu("File", || {
-                                    #[cfg(not(target_arch = "wasm32"))]
-                                    if has_export_share {
-                                        let uploading = pane.share_link_job.is_some();
-                                        let include_cpu = pane.share_include_cpu;
-                                        if ui.menu_item_config("Share via Gist").enabled(!uploading).build() {
-                                            pane.start_share_upload(include_cpu);
-                                        }
-                                        if ui.is_item_hovered() {
-                                            let what = if include_cpu { "the whole trace (CPU and GPU, args intact)" } else { "GPU-only timings (no args)" };
-                                            ui.tooltip_text(&format!("Export {what} to a new secret GitHub gist via the local `gh` CLI and show a copyable ?gist= link. Requires `gh auth login` on this machine."));
-                                        }
-                                        ui.menu_item_config("Include CPU data##sharecpu").build_with_ref(&mut pane.share_include_cpu);
-                                        if ui.is_item_hovered() {
-                                            ui.tooltip_text("Upload the whole trace (CPU and GPU tracks, args intact) instead of GPU-only timings. Much larger.");
-                                        }
-                                        match &pane.share_link_result {
-                                            Some((true, link)) if link.starts_with("https://") => {
-                                                // Align with the Copy button on the same line.
-                                                ui.align_text_to_frame_padding();
-                                                ui.text_colored([0.4, 0.85, 0.4, 1.0], link);
-                                                ui.same_line();
-                                                if ui.small_button("Copy##sharelink") {
-                                                    #[cfg(not(target_arch = "wasm32"))]
-                                                    MacClipboard.set(link);
-                                                }
-                                            }
-                                            Some((ok, msg)) => {
-                                                let color = if *ok { [0.8, 0.8, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
-                                                ui.text_colored(color, msg);
-                                            }
-                                            None => {}
-                                        }
-                                        ui.separator();
-                                    }
-                                    // Opening a trace no longer writes cache files
-                                    // next to the user's data — this is the only
-                                    // thing that does, and only on purpose.
-                                    if ui.menu_item("Export Merged TV Cache") {
-                                        pane.export_message = Some(match pane.export_tv_cache() {
-                                            Ok(p) => (true, format!("Wrote {p}")),
-                                            Err(e) => (false, e),
-                                        });
-                                    }
-                                    if ui.is_item_hovered() {
-                                        ui.tooltip_text("Write this trace to the on-disk cache (<folder>.tvcache/_merged.tvcache for a folder, a sibling <file>.tvcache for a single file) so re-opening it loads instantly. Opening a trace never writes a cache; this menu item is the only way one gets created.");
-                                    }
-                                    if let Some((ok, msg)) = &pane.export_message {
-                                        let color = if *ok { [0.4, 0.85, 0.4, 1.0] } else { [0.9, 0.4, 0.4, 1.0] };
-                                        ui.text_colored(color, msg);
-                                    }
-                                });
-                            }
 
                             // ---- View menu: display toggles + cross-pane actions.
                             ui.menu("View", || {
@@ -1758,9 +1672,9 @@ impl App {
                         #[cfg(target_arch = "wasm32")]
                         let placeholder = self.pending_download_progress.borrow().as_ref()
                             .map(download_progress_text)
-                            .unwrap_or_else(|| "Drop a trace file here, or: tv <file.json[.gz]>".to_string());
+                            .unwrap_or_else(|| "Drop a trace file here, or: tv <file.ktz>".to_string());
                         #[cfg(not(target_arch = "wasm32"))]
-                        let placeholder = "Drop a trace file here, or: tv <file.json[.gz]>".to_string();
+                        let placeholder = "Drop a trace file here, or: tv <file.ktz>".to_string();
                         ui.text(&placeholder);
                     }
                     if let Some(e) = &pane.error {
@@ -2843,7 +2757,7 @@ fn main() {
         if rank_groups.is_empty() && standalone.len() <= 1 {
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let path = standalone.first().map(|(s, _)| s.as_str()).unwrap_or(&bench_args[0]);
-            match loader::load_trace(path, &counter, 0, None) {
+            match loader::load_trace(path, &counter) {
                 Ok(t) => eprintln!("  ok: {} events, {} tracks, {:.2}s", t.total_events, t.tracks.len(), t0.elapsed().as_secs_f64()),
                 Err(e) => eprintln!("  err: {e}"),
             }
@@ -2853,8 +2767,6 @@ fn main() {
             for (group, _) in &rank_groups { all_paths.extend(group.clone()); }
             for (i, (p, _)) in standalone.iter().enumerate() { all_paths.push((all_paths.len() + i, p.clone())); }
 
-            let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len()).max(2);
-            eprintln!("bench: {} threads per file", tpf);
             let t_load = Instant::now();
             use rayon::prelude::*;
             let results: Vec<_> = all_paths.par_iter().filter_map(|(rank, path)| {
@@ -2862,7 +2774,7 @@ fn main() {
                 let ctr = counter.clone();
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let t = Instant::now();
-                    let res = loader::load_trace_for_merge(path, &ctr, tpf, None, &t);
+                    let res = loader::load_trace(path, &ctr);
                     (res, t.elapsed().as_secs_f64())
                 })) {
                     Ok((res, elapsed)) => Some((r, res, elapsed)),

@@ -57,7 +57,7 @@ pub static MT_POOL_READY: AtomicBool = AtomicBool::new(false);
 /// otherwise — instead of freezing for the whole load.
 #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
 pub(crate) enum PendingParse {
-    /// Inputs not yet prepared (decompress + split points).
+    /// Inputs not yet prepared (ktz header parse still to run).
     Single {
         name: String,
         bytes: Vec<u8>,
@@ -648,10 +648,7 @@ pub(crate) fn parse_rank(label: &str) -> Option<usize> {
 /// `parse_rank`), not by track index or label text. Deliberately computed
 /// here rather than relying on `merge_traces` writing tracks in the right
 /// order to begin with — this way the *view* is always correct regardless
-/// of how the underlying `Trace` was produced, including a `.tvcache`
-/// export that was itself built and saved before a rank-ordering fix
-/// existed (the label text it stored still has the numeric rank in it;
-/// only the on-disk *track order* predates the fix). A trace with no
+/// of how the underlying `Trace` was produced. A trace with no
 /// "Rank N" labels at all (not a multi-rank merge) gets the same `None`
 /// key for every track, so the stable sort leaves it in its original order.
 pub(crate) fn default_track_order(tracks: &[Track]) -> Vec<usize> {
@@ -847,26 +844,7 @@ pub struct Pane {
     pub auto_reload: bool,
     pub reload_paths: Vec<(usize, String)>,
     pub reload_dir: Option<String>,
-    pub cache_dir: Option<String>,
     pub loading_events: Arc<AtomicUsize>,
-    /// Result of the last "Export GPU" click (success message, or an
-    /// error) — shown next to the button until the next click replaces it.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub export_message: Option<(bool, String)>,
-    /// Background `gh`/`git`-based gist upload started by "Share via Gist"
-    /// (see `start_share_upload`) — `None` once no upload is in flight.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub share_link_job: Option<mpsc::Receiver<Result<String, String>>>,
-    /// Result of the last "Share via Gist" click (the finished `?gist=`
-    /// link, or an error) — shown next to the button until replaced.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub share_link_result: Option<(bool, String)>,
-    /// "Include CPU data" checkbox next to "Share via Gist" — persisted
-    /// across frames like any other UI toggle. When set, uploads the whole
-    /// trace (`export_full_web`) instead of the GPU-only, args-stripped
-    /// default (`export_gpu_only_web`).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub share_include_cpu: bool,
     /// Result of the last "Sync Clocks" click (success summary, or an
     /// error) — shown next to the button until the next click replaces it.
     pub sync_message: Option<(bool, String)>,
@@ -962,16 +940,7 @@ impl Pane {
             auto_reload: false,
             reload_paths: Vec::new(),
             reload_dir: None,
-            cache_dir: None,
             loading_events: Arc::new(AtomicUsize::new(0)),
-            #[cfg(not(target_arch = "wasm32"))]
-            export_message: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            share_link_job: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            share_link_result: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            share_include_cpu: false,
             sync_message: None,
             color_by_dur: false,
             heat_bounds: None,
@@ -979,82 +948,6 @@ impl Pane {
     }
 
     pub fn has_trace(&self) -> bool { self.trace.is_some() }
-
-    /// "File > Export Merged TV Cache": writes this pane's trace to the
-    /// on-disk cache that opening a trace used to build automatically (it
-    /// no longer does — see `loader::cache_dir_for_folder`). For a
-    /// folder-opened pane that's `<folder>.tvcache/_merged.tvcache`; for a
-    /// bare single-file open it's a sibling `<file>.tvcache` (same format,
-    /// read back by `load_cache`). Already-cached sources (.tvcache family)
-    /// have nothing to export.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn export_tv_cache(&self) -> Result<String, String> {
-        let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;
-        if let Some(cd) = &self.cache_dir {
-            crate::loader::export_merged_cache(trace, cd)
-        } else if self.reload_paths.len() == 1 {
-            let path = &self.reload_paths[0].1;
-            if path.ends_with(".tvcache") || path.ends_with(".tvcache.xz") || path.ends_with(".tvcache.gz") {
-                Err("this trace was loaded from a cache file - nothing to export".to_string())
-            } else {
-                crate::loader::export_single_cache(trace, path)
-            }
-        } else {
-            Err("no folder or single source file to export a cache for".to_string())
-        }
-    }
-
-    /// Sibling-folder naming shared by `export_gpu_only_web`/`export_full_web`:
-    /// derived from the source path (or the merge directory's own name for a
-    /// multi-rank trace, since `reload_paths` for those points at individual
-    /// rank files, not the folder the user actually opened).
-    #[cfg(not(target_arch = "wasm32"))]
-    fn export_web_paths(&self) -> Result<(std::path::PathBuf, String), String> {
-        let sample_path = self.reload_paths.first().map(|(_, p)| p.as_str())
-            .ok_or_else(|| "no source file path available for this trace".to_string())?;
-        let base = std::path::Path::new(sample_path);
-        let parent = base.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf();
-
-        let stem = match &self.reload_dir {
-            Some(dir) => std::path::Path::new(dir).file_name()
-                .and_then(|s| s.to_str()).unwrap_or("trace").to_string(),
-            None => {
-                let s = base.file_stem().and_then(|s| s.to_str()).unwrap_or("trace");
-                s.strip_suffix(".json").or_else(|| s.strip_suffix(".tar")).unwrap_or(s).to_string()
-            }
-        };
-        Ok((parent, stem))
-    }
-
-    /// Exports this pane's GPU tracks (timings only, args stripped) via
-    /// `loader::export_gpu_only_web` (plain layout, gzip instead of xz) so
-    /// the result can be uploaded somewhere with permissive CORS and opened
-    /// through the web build's `?src=<url>` shareable-link loader, which has
-    /// no LZMA decoder and can't reverse the xz format's columnar/kernel-
-    /// grouped encoding.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn export_gpu_only_web(&self) -> Result<String, String> {
-        let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;
-        let (parent, stem) = self.export_web_paths()?;
-        let out_path = parent.join(format!("{stem}-gpu-only")).join("gpu-only-web.tvcache.gz");
-        let out_str = out_path.to_str().ok_or_else(|| "non-UTF-8 destination path".to_string())?;
-        crate::loader::export_gpu_only_web(trace, out_str)?;
-        Ok(out_path.to_string_lossy().into_owned())
-    }
-
-    /// Exports the whole trace (CPU and GPU tracks, args left intact — see
-    /// `loader::export_full_web`) rather than `export_gpu_only_web`'s
-    /// deliberately stripped-down version. Much larger, but complete —
-    /// for when you want to share the actual trace, not just GPU timings.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn export_full_web(&self) -> Result<String, String> {
-        let trace = self.trace.as_ref().ok_or_else(|| "no trace loaded".to_string())?;
-        let (parent, stem) = self.export_web_paths()?;
-        let out_path = parent.join(format!("{stem}-full-export")).join("full-trace.tvcache");
-        let out_str = out_path.to_str().ok_or_else(|| "non-UTF-8 destination path".to_string())?;
-        crate::loader::export_full_web(trace, out_str)?;
-        Ok(out_path.to_string_lossy().into_owned())
-    }
 
     /// Corrects inter-node clock skew across this pane's merged multi-rank
     /// trace — see `loader::sync_multi_rank_clocks` for the full algorithm
@@ -1068,13 +961,10 @@ impl Pane {
     ///
     /// Prefers `reload_paths` (the live per-rank source files, when this
     /// pane was opened as a directory/rank list) but falls back to the
-    /// merged trace's own `rank_paths` — the same rank/filename pairs,
-    /// persisted into the `.tvcache` format at export time — so this still
-    /// works after reopening an already-merged cache file directly, when
-    /// there's no directory of per-rank JSON to re-derive them from — the
-    /// latter is the only path available on wasm (`reload_paths` is always
-    /// empty there), but it's enough: any `.tvcache` merged natively and
-    /// then opened in the browser carries its `rank_paths` with it.
+    /// merged trace's own `rank_paths` — the same rank/filename pairs the
+    /// merge recorded. The latter is the only path available on wasm
+    /// (`reload_paths` is always empty there), but it's enough: any
+    /// multi-rank merge carries its `rank_paths` with it.
     pub fn sync_clocks(&mut self) -> Result<String, String> {
         self.sync_clocks_on(crate::loader::DEFAULT_SYNC_MARKER)
     }
@@ -1112,50 +1002,6 @@ impl Pane {
         result
     }
 
-    /// Exports (via `export_gpu_only_web`, or `export_full_web` when
-    /// `include_cpu` is set) and, on a background thread, uploads the
-    /// result to a new secret GitHub gist through the locally authenticated
-    /// `gh` CLI — no browser OAuth flow or pasted token involved, since
-    /// this only runs on native where `gh`'s own stored credentials are
-    /// already available. The export itself is fast (local disk only) and
-    /// stays synchronous; only the network upload (`loader::upload_gist`)
-    /// is backgrounded, since that can take a few seconds and shouldn't
-    /// freeze the UI.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn start_share_upload(&mut self, include_cpu: bool) {
-        if self.share_link_job.is_some() { return; }
-        let path = match if include_cpu { self.export_full_web() } else { self.export_gpu_only_web() } {
-            Ok(p) => p,
-            Err(e) => { self.share_link_result = Some((false, e)); return; }
-        };
-        let (tx, rx) = mpsc::channel();
-        self.share_link_job = Some(rx);
-        self.share_link_result = Some((true, "Uploading to gist...".to_string()));
-        rayon::spawn(move || {
-            let _ = tx.send(crate::loader::upload_gist(&path));
-        });
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn poll_share_upload(&mut self) {
-        let rx = match &self.share_link_job {
-            Some(rx) => rx,
-            None => return,
-        };
-        match rx.try_recv() {
-            Ok(Ok(link)) => {
-                self.share_link_result = Some((true, link));
-                self.share_link_job = None;
-            }
-            Ok(Err(e)) => {
-                self.share_link_result = Some((false, e));
-                self.share_link_job = None;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => { self.share_link_job = None; }
-        }
-    }
-
     pub fn loading_progress_text(&self) -> String {
         if let Some(text) = self.stepped_status() {
             return text;
@@ -1172,9 +1018,9 @@ impl Pane {
         }
     }
 
-    /// The stepped wasm load's phase text (decompress/merge/assemble/
-    /// compact), which the event counter can't describe. None during the
-    /// parse phase — the counter animates that one.
+    /// The stepped wasm load's phase text (track assembly/rank merge),
+    /// which the event counter can't describe. None during the decode
+    /// phase — the counter animates that one.
     #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
     fn stepped_status(&self) -> Option<String> {
         match &self.pending_parse {
@@ -1376,9 +1222,8 @@ impl Pane {
         self.reload_paths = vec![(0, path.clone())];
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
-        let cd = self.cache_dir.clone();
         spawn_load_job(move || {
-            load_trace_progressive(&path, &counter, 0, &tx, cd.as_deref());
+            load_trace_progressive(&path, &counter, &tx);
         });
     }
 
@@ -1386,8 +1231,8 @@ impl Pane {
     /// via the browser's drag-and-drop/file-picker File API) instead of a
     /// filesystem path — there's no mmap/filesystem on wasm32 to open a path
     /// against. `name` is the dropped/picked file's name (e.g.
-    /// `File::name()`), used only to sniff the format (.tvcache/.tar.gz/.gz
-    /// vs plain JSON), same role a real path's suffix plays natively.
+    /// `File::name()`), used only to sniff the format, same role a real
+    /// path's suffix plays natively.
     #[cfg(target_arch = "wasm32")]
     pub fn open_from_bytes(&mut self, name: String, bytes: Vec<u8>) {
         let (tx, rx) = mpsc::channel();
@@ -1465,7 +1310,7 @@ impl Pane {
         };
         self.pending_parse = match job {
             PendingParse::Single { name, bytes, counter, tx } => {
-                match crate::loader::WasmParsePlan::prepare(&name, bytes, &counter, true) {
+                match crate::loader::WasmParsePlan::prepare(&name, bytes, &counter) {
                     crate::loader::Prepared::Done(result) => {
                         let _ = tx.send(result);
                         None
@@ -1537,10 +1382,8 @@ impl Pane {
         self.error = None;
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
-        let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / n).max(2);
-        let cd = self.cache_dir.clone();
         spawn_load_job(move || {
-            load_multi_progressive(rank_paths, &counter, tpf, &tx, cd.as_deref(), false);
+            load_multi_progressive(rank_paths, &counter, &tx);
         });
     }
 
@@ -1565,16 +1408,14 @@ impl Pane {
         self.loading_events = Arc::new(AtomicUsize::new(0));
         let counter = self.loading_events.clone();
         let paths = self.reload_paths.clone();
-        let cd = self.cache_dir.clone();
         if paths.len() == 1 {
             let path = paths[0].1.clone();
             spawn_load_job(move || {
-                load_trace_progressive(&path, &counter, 0, &tx, cd.as_deref());
+                load_trace_progressive(&path, &counter, &tx);
             });
         } else {
-            let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / paths.len()).max(1);
             spawn_load_job(move || {
-                load_multi_progressive(paths, &counter, tpf, &tx, cd.as_deref(), true);
+                load_multi_progressive(paths, &counter, &tx);
             });
         }
     }

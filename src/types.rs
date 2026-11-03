@@ -2,28 +2,17 @@ use imgui::ImColor32;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub enum ArgsBuf {
-    Heap(Vec<u8>),
-    /// The mmap'd source .json itself, kept alive zero-copy. `into_vec`-ing a
-    /// mapped file cost a full-file heap copy on every plain .json load
-    /// (0.36s and ~1.6GB of anon RSS on a 1.6GB file) that `compact_args`
-    /// then paid for a second time when it copied the args ranges out — so
-    /// events now hold `args_off` straight into the file's pages. The mapping
-    /// is file-backed (clean, reclaimable under pressure) and short-lived:
-    /// `compact_args` swaps in one Heap buffer and every live `Arc<ArgsBuf>`
-    /// to the mapping drops. Native-only, mirroring `RawData::Mmap`.
-    #[cfg(not(target_arch = "wasm32"))]
-    Mmap(memmap2::Mmap),
-}
+/// The single args-text buffer a loaded trace's events point into
+/// (`Event::args_off`/`args_len`), written directly by the ktz decoder —
+/// only the ranges events actually use, contiguously, with byte 0 reserved
+/// so `args_off == 0` means "no args". A multi-rank merge keeps one per
+/// .ktz file (`raw_bufs`).
+pub struct ArgsBuf(pub Vec<u8>);
 
 impl std::ops::Deref for ArgsBuf {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        match self {
-            ArgsBuf::Heap(v) => v,
-            #[cfg(not(target_arch = "wasm32"))]
-            ArgsBuf::Mmap(m) => m,
-        }
+        &self.0
     }
 }
 
@@ -281,11 +270,10 @@ pub struct Trace {
     pub dist_world: i32,
     pub flow_pairs: Vec<FlowPair>,
     /// `(rank, source file path/name)` for each rank folded into this trace
-    /// by `merge_traces` — empty for a single-rank trace. Persisted in the
-    /// on-disk/exported cache format so `Pane::sync_clocks` can still group
-    /// ranks by DP/TP (parsed from these filenames) after reopening a
-    /// `.tvcache` directly, when `Pane::reload_paths` no longer has the
-    /// original per-rank paths (e.g. it points at just the one cache file).
+    /// by `merge_traces` — empty for a single-rank trace. Kept so
+    /// `Pane::sync_clocks` can group ranks by DP/TP (parsed from these
+    /// filenames) even when `Pane::reload_paths` no longer holds the
+    /// original per-rank paths.
     pub rank_paths: Vec<(usize, String)>,
 }
 

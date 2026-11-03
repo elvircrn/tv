@@ -1,6 +1,6 @@
 use super::*;
 use crate::parse::*;
-use crate::loader::{load_trace, detect_rank_groups, merge_traces, resolve_tool_in};
+use crate::loader::{load_trace, detect_rank_groups, merge_traces};
 use crate::state::{parse_rank, find_exec_context_names, default_track_order, compute_steps, compute_gaps_in, selection_gpu_summary, Pane};
 /// Test-local shorthand for the unfiltered sweep (production code always
 /// goes through compute_gaps_in with a real GapFilter).
@@ -170,22 +170,9 @@ fn test_skip_string() {
 }
 
 #[test]
-fn test_skip_number() {
-    assert_eq!(skip_number(b"123.45,", 0), 6);
-    assert_eq!(skip_number(b"-1.5e10}", 0), 7);
-    assert_eq!(skip_number(b"0 ", 0), 1);
-}
-
-#[test]
 fn test_skip_value_nested() {
     let raw = br#"{"a": [1, 2]}, next"#;
     assert_eq!(skip_value(raw, 0), 13);
-}
-
-#[test]
-fn test_skip_ws_comma() {
-    assert_eq!(skip_ws_comma(b"  , , x", 0), 6);
-    assert_eq!(skip_ws_comma(b"abc", 0), 0);
 }
 
 #[test]
@@ -885,19 +872,19 @@ fn test_rebuild_search_empty() {
 // --- Trace loading (file-based) ---
 
 #[test]
-fn test_load_trace_json() {
-    let json = r#"{"traceEvents": [
-        {"ph":"X","ts":100,"dur":50,"pid":1,"tid":1,"name":"kern_a","cat":"kernel","args":{"op":"matmul"}},
-        {"ph":"X","ts":200,"dur":30,"pid":1,"tid":1,"name":"kern_b","cat":"kernel"},
-        {"ph":"X","ts":300,"dur":40,"pid":1,"tid":2,"name":"cpu_fn","cat":"cpu_op"},
-        {"ph":"M","ts":0,"pid":1,"tid":1,"name":"thread_name","args":{"name":"GPU Stream 0"}}
-    ]}"#;
+fn test_load_trace_ktz() {
+    let events = vec![
+        kx(1, 1, "kern_a", "kernel", 100.0, 50.0),
+        kx(1, 1, "kern_b", "kernel", 200.0, 30.0),
+        kx(1, 2, "cpu_fn", "cpu_op", 300.0, 40.0),
+        kthread_name(1, 1, "GPU Stream 0"),
+    ];
     let dir = std::env::temp_dir().join("tv_test_load");
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("test.json");
-    std::fs::write(&path, json).unwrap();
+    let path = dir.join("test.ktz");
+    std::fs::write(&path, ktz_trace_file(&events, "{\"traceEvents\": [", "]}")).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
     assert_eq!(trace.tracks.len(), 2);
     assert!(trace.names.contains(&"kern_a".to_string()));
     assert!(trace.names.contains(&"kern_b".to_string()));
@@ -913,60 +900,58 @@ fn test_load_trace_json() {
 }
 
 #[test]
-fn test_load_trace_gz() {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-
-    let json = br#"{"traceEvents": [
-        {"ph":"X","ts":0,"dur":100,"pid":1,"tid":1,"name":"k","cat":"kernel"}
-    ]}"#;
-    let dir = std::env::temp_dir().join("tv_test_gz");
+fn test_load_trace_args() {
+    // Args text rides along in the trace's single args buffer, addressed by
+    // each event's args_off/args_len.
+    let mut e0 = kx(1, 1, "kern_a", "kernel", 100.0, 50.0);
+    e0.args = r#"{"op":"matmul"}"#.to_string();
+    let dir = std::env::temp_dir().join("tv_test_load_args");
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("test.json.gz");
-    let file = std::fs::File::create(&path).unwrap();
-    let mut gz = GzEncoder::new(file, Compression::fast());
-    std::io::Write::write_all(&mut gz, json).unwrap();
-    gz.finish().unwrap();
+    let path = dir.join("test_args.ktz");
+    std::fs::write(&path, ktz_trace_file(&[e0], "{\"traceEvents\": [", "]}")).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
     assert_eq!(trace.total_events, 1);
+    let track = &trace.tracks[0];
+    let ev = &track.events[0];
+    let args = &trace.raw_bufs[track.raw_buf_idx as usize]
+        [ev.args_off as usize..(ev.args_off + ev.args_len as u32) as usize];
+    assert_eq!(std::str::from_utf8(args).unwrap(), r#"{"op":"matmul"}"#);
 
     std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn test_load_trace_no_events() {
-    let json = r#"{"traceEvents": []}"#;
     let dir = std::env::temp_dir().join("tv_test_empty");
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("empty.json");
-    std::fs::write(&path, json).unwrap();
+    let path = dir.join("empty.ktz");
+    std::fs::write(&path, ktz_trace_file(&[], "{\"traceEvents\": [", "]}")).unwrap();
 
-    let result = load_trace(path.to_str().unwrap(), &test_counter(), 0, None);
+    let result = load_trace(path.to_str().unwrap(), &test_counter());
     assert!(result.is_err());
 
     std::fs::remove_file(&path).ok();
 }
 
 #[test]
-fn test_load_cache_rejects_future_version() {
-    // Forward-compat: a cache format newer than this build understands must
-    // still be rejected (its layout may have diverged in ways this reader
-    // can't handle) — unaffected by making *older* versions (see
-    // test_compute_kernel_stats_min_dur) load via a fallback instead.
-    let mut buf = vec![0u8; 80];
-    buf[0..4].copy_from_slice(b"TRV2");
-    buf[4..8].copy_from_slice(&999u32.to_le_bytes());
-    assert!(crate::loader::load_cache_from_bytes(&buf).is_none(), "a from-the-future cache version must not load");
+fn test_load_trace_rejects_non_ktz() {
+    let dir = std::env::temp_dir().join("tv_test_nonktz");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("trace.json");
+    std::fs::write(&path, "{\"traceEvents\": []}").unwrap();
+
+    let err = match load_trace(path.to_str().unwrap(), &test_counter()) {
+        Err(e) => e,
+        Ok(_) => panic!("a non-ktz file must not load"),
+    };
+    assert!(err.contains("only .ktz"), "unexpected error: {err}");
+
+    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn test_compute_kernel_stats_min_dur() {
-    // v4 grew KernelStats (added min_dur); cache files written before that
-    // (any version < 4) have the old, smaller per-entry stats layout on
-    // disk. load_cache_from_bytes skips those bytes and recomputes stats
-    // from the raw events instead (see compute_kernel_stats) — this checks
-    // that recompute path actually produces the right min, not a guess.
     let names = vec!["kernel_a"];
     let events = vec![ev(0.0, 30.0, 0, 0), ev(50.0, 10.0, 0, 0), ev(100.0, 20.0, 0, 0)];
     let trace = make_trace(names, vec![("GPU 0", true, events)]);
@@ -978,109 +963,29 @@ fn test_compute_kernel_stats_min_dur() {
 }
 
 #[test]
-fn test_cache_roundtrip() {
-    let json = r#"{"vllm_version": "0.26.1rc1.dev528+gf8d03e774", "distributedInfo": {"backend": "nccl", "rank": 3, "world_size": 8, "pg_config": [{"pg_name": "0", "ranks": [0, 1, 2, 3, 4, 5, 6, 7]}]}, "traceEvents": [
-        {"ph":"X","ts":100,"dur":50,"pid":1,"tid":1,"name":"kern_a","cat":"kernel","args":{"op":"matmul"}},
-        {"ph":"X","ts":200,"dur":30,"pid":1,"tid":1,"name":"kern_b","cat":"kernel"},
-        {"ph":"X","ts":300,"dur":40,"pid":1,"tid":2,"name":"cpu_fn","cat":"cpu_op"},
-        {"ph":"M","ts":0,"pid":1,"tid":1,"name":"thread_name","args":{"name":"GPU Stream 0"}}
-    ]}"#;
-    let dir = std::env::temp_dir().join("tv_test_cache");
+fn test_load_trace_metadata() {
+    // The ktz head/foot text carries the JSON metadata finish_trace scans:
+    // vllm_version and distributedInfo rank/world_size.
+    let head = "{\"vllm_version\": \"0.26.1rc1.dev528+gf8d03e774\", \
+                \"distributedInfo\": {\"backend\": \"nccl\", \"rank\": 3, \"world_size\": 8}, \
+                \"traceEvents\": [";
+    let events = vec![
+        kx(1, 1, "kern_a", "kernel", 100.0, 50.0),
+        kx(1, 1, "kern_b", "kernel", 200.0, 30.0),
+        kx(1, 2, "cpu_fn", "cpu_op", 300.0, 40.0),
+        kthread_name(1, 1, "GPU Stream 0"),
+    ];
+    let dir = std::env::temp_dir().join("tv_test_meta");
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("cache_test.json");
-    std::fs::write(&path, json).unwrap();
-    let path_str = path.to_str().unwrap();
+    let path = dir.join("meta.ktz");
+    std::fs::write(&path, ktz_trace_file(&events, head, "]}")).unwrap();
 
-    let original = load_trace(path_str, &test_counter(), 0, None).unwrap();
-    // Opening a trace no longer writes caches as a side effect — export
-    // explicitly, the way File > Export Merged TV Cache does.
-    let cache_path = crate::loader::export_single_cache(&original, path_str)
-        .expect("explicit cache export should write the cache file");
-
-    let cached = crate::loader::load_cache(path_str, None).expect("cache should load");
-    assert_eq!(cached.total_events, original.total_events);
-    assert_eq!(cached.tracks.len(), original.tracks.len());
-    assert_eq!(cached.names, original.names);
-    assert_eq!(cached.cats, original.cats);
-    assert_eq!(cached.max_ts, original.max_ts);
-    assert_eq!(cached.device, original.device);
-    assert_eq!(original.vllm_version, "0.26.1rc1.dev528+gf8d03e774");
-    assert_eq!(cached.vllm_version, original.vllm_version);
-    assert_eq!(original.dist_rank, 3);
-    assert_eq!(original.dist_world, 8);
-    assert_eq!(cached.dist_rank, original.dist_rank);
-    assert_eq!(cached.dist_world, original.dist_world);
-    assert_eq!(cached.stats.len(), original.stats.len());
-    for (a, b) in cached.tracks.iter().zip(original.tracks.iter()) {
-        assert_eq!(a.label, b.label);
-        assert_eq!(a.gpu, b.gpu);
-        assert_eq!(a.max_depth, b.max_depth);
-        assert_eq!(a.events.len(), b.events.len());
-        for (ea, eb) in a.events.iter().zip(b.events.iter()) {
-            assert_eq!(ea.ts, eb.ts);
-            assert_eq!(ea.dur, eb.dur);
-            assert_eq!(ea.name, eb.name);
-            assert_eq!(ea.depth, eb.depth);
-            assert_eq!(ea.args_off, eb.args_off);
-            assert_eq!(ea.args_len, eb.args_len);
-        }
-        assert_eq!(a.prefix_max_dur, b.prefix_max_dur);
-    }
-    let orig_args = &original.raw_bufs[0];
-    let cached_args = &cached.raw_bufs[0];
-    assert_eq!(orig_args.len(), cached_args.len());
-    assert_eq!(&orig_args[..], &cached_args[..]);
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
+    assert_eq!(trace.vllm_version, "0.26.1rc1.dev528+gf8d03e774");
+    assert_eq!(trace.dist_rank, 3);
+    assert_eq!(trace.dist_world, 8);
 
     std::fs::remove_file(&path).ok();
-    std::fs::remove_file(&cache_path).ok();
-}
-
-#[test]
-fn test_rank_paths_trailer_roundtrip() {
-    let mut trace = make_trace(
-        vec!["kern_a"],
-        vec![("  Rank 0 GPU", true, vec![Event { ts: 0.0, dur: 1.0, name: 0, cat: 0, args_off: 0, depth: 0, args_len: 0 }])],
-    );
-    trace.rank_paths = vec![(0, "dp0_tp0_rank0.json".to_string()), (1, "dp0_tp1_rank1.json".to_string())];
-
-    let dir = std::env::temp_dir().join("tv_test_rank_paths_trailer");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("rank_paths_test.json");
-    std::fs::write(&path, "{}").unwrap();
-    let path_str = path.to_str().unwrap();
-
-    crate::loader::save_cache(&trace, path_str, None);
-    let cache_path = format!("{path_str}.tvcache");
-    let cached = crate::loader::load_cache(path_str, None).expect("cache should load");
-    assert_eq!(cached.rank_paths, trace.rank_paths);
-
-    std::fs::remove_file(&path).ok();
-    std::fs::remove_file(&cache_path).ok();
-}
-
-#[test]
-fn test_rank_paths_trailer_absent_is_empty() {
-    // A trace with no rank_paths (the common single-rank case) must not
-    // write/read back a spurious nonempty section.
-    let trace = make_trace(
-        vec!["kern_a"],
-        vec![("gpu0", true, vec![Event { ts: 0.0, dur: 1.0, name: 0, cat: 0, args_off: 0, depth: 0, args_len: 0 }])],
-    );
-    assert!(trace.rank_paths.is_empty());
-
-    let dir = std::env::temp_dir().join("tv_test_rank_paths_absent");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("rank_paths_absent_test.json");
-    std::fs::write(&path, "{}").unwrap();
-    let path_str = path.to_str().unwrap();
-
-    crate::loader::save_cache(&trace, path_str, None);
-    let cache_path = format!("{path_str}.tvcache");
-    let cached = crate::loader::load_cache(path_str, None).expect("cache should load");
-    assert!(cached.rank_paths.is_empty());
-
-    std::fs::remove_file(&path).ok();
-    std::fs::remove_file(&cache_path).ok();
 }
 
 #[test]
@@ -1257,67 +1162,22 @@ fn test_find_exec_context_names() {
 
 #[test]
 fn test_load_trace_depth_assignment() {
-    let json = r#"{"traceEvents": [
-        {"ph":"X","ts":0,"dur":100,"pid":1,"tid":1,"name":"outer","cat":"kernel"},
-        {"ph":"X","ts":10,"dur":30,"pid":1,"tid":1,"name":"inner1","cat":"kernel"},
-        {"ph":"X","ts":50,"dur":30,"pid":1,"tid":1,"name":"inner2","cat":"kernel"}
-    ]}"#;
+    let events = vec![
+        kx(1, 1, "outer", "kernel", 0.0, 100.0),
+        kx(1, 1, "inner1", "kernel", 10.0, 30.0),
+        kx(1, 1, "inner2", "kernel", 50.0, 30.0),
+    ];
     let dir = std::env::temp_dir().join("tv_test_depth");
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("depth.json");
-    std::fs::write(&path, json).unwrap();
+    let path = dir.join("depth.ktz");
+    std::fs::write(&path, ktz_trace_file(&events, "{\"traceEvents\": [", "]}")).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
     let track = &trace.tracks[0];
     assert_eq!(track.events.len(), 3);
     let depths: Vec<u16> = track.events.iter().map(|e| e.depth).collect();
     assert_eq!(depths[0], 0);
     assert!(depths[1] > 0 || depths[2] > 0);
-
-    std::fs::remove_file(&path).ok();
-}
-
-#[test]
-fn test_load_trace_truncated_json() {
-    let json = r#"{"traceEvents": [
-        {"ph":"X","ts":100,"dur":50,"pid":1,"tid":1,"name":"kern_a","cat":"kernel"},
-        {"ph":"X","ts":200,"dur":30,"pid":1,"tid":1,"name":"kern_b","cat":"kernel"},
-        {"ph":"X","ts":300,"dur":40,"pid":1,"tid":1,"name":"kern_c","cat":"ke"#;
-    let dir = std::env::temp_dir().join("tv_test_truncated");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("truncated.json");
-    std::fs::write(&path, json).unwrap();
-
-    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
-    assert!(trace.total_events >= 2, "should parse complete events from truncated JSON, got {}", trace.total_events);
-
-    std::fs::remove_file(&path).ok();
-}
-
-#[test]
-fn test_load_trace_truncated_gz() {
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-
-    let json = br#"{"traceEvents": [
-        {"ph":"X","ts":100,"dur":50,"pid":1,"tid":1,"name":"kern_a","cat":"kernel"},
-        {"ph":"X","ts":200,"dur":30,"pid":1,"tid":1,"name":"kern_b","cat":"kernel"},
-        {"ph":"X","ts":300,"dur":40,"pid":1,"tid":1,"name":"kern_c","cat":"kernel"}
-    ]}"#;
-    let dir = std::env::temp_dir().join("tv_test_truncgz");
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("truncated.json.gz");
-
-    let mut buf = Vec::new();
-    {
-        let mut gz = GzEncoder::new(&mut buf, Compression::fast());
-        std::io::Write::write_all(&mut gz, json).unwrap();
-        gz.finish().unwrap();
-    }
-    std::fs::write(&path, &buf[..buf.len() - 10]).unwrap();
-
-    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
-    assert!(trace.total_events >= 2, "should parse events from truncated gz, got {}", trace.total_events);
 
     std::fs::remove_file(&path).ok();
 }
@@ -2027,8 +1887,8 @@ fn test_detect_rank_groups_isolates_directories() {
     std::fs::create_dir_all(&dir_a).unwrap();
     std::fs::create_dir_all(&dir_b).unwrap();
     for dir in [&dir_a, &dir_b] {
-        std::fs::write(dir.join("trace-rank-0.json"), "{}").unwrap();
-        std::fs::write(dir.join("trace-rank-1.json"), "{}").unwrap();
+        std::fs::write(dir.join("trace-rank-0.ktz"), "").unwrap();
+        std::fs::write(dir.join("trace-rank-1.ktz"), "").unwrap();
     }
 
     let paths = vec![dir_a.to_str().unwrap().to_string(), dir_b.to_str().unwrap().to_string()];
@@ -2049,14 +1909,12 @@ fn test_detect_rank_groups_isolates_directories() {
 
 #[test]
 fn test_is_trace_file() {
-    assert!(crate::loader::is_trace_file("foo.json"));
-    assert!(crate::loader::is_trace_file("foo.json.gz"));
-    assert!(crate::loader::is_trace_file("foo.tar.gz"));
-    assert!(crate::loader::is_trace_file("foo.tgz"));
     assert!(crate::loader::is_trace_file("foo.pt.trace.json.ktz"));
+    assert!(crate::loader::is_trace_file("foo.ktz"));
+    assert!(!crate::loader::is_trace_file("foo.json"));
+    assert!(!crate::loader::is_trace_file("foo.json.gz"));
     assert!(!crate::loader::is_trace_file("foo.txt"));
     assert!(!crate::loader::is_trace_file("foo.csv"));
-    assert!(!crate::loader::is_trace_file("foo.gz"));
 }
 
 // --- merge_traces ---
@@ -2100,12 +1958,12 @@ fn test_merge_traces_sorts_ranks_numerically_not_lexicographically() {
     }
 }
 
-// Ranks arrive at merge_traces per-rank-compacted (see load_trace_for_merge),
-// so the merge must keep every rank's args buffer instead of re-compacting
-// into one, and rebase each track's raw_buf_idx by its rank's buffer base —
-// the old blanket `raw_buf_idx = trace_idx` read a multi-buffer rank's
-// second track out of the wrong buffer entirely. Rank 1 here owns two
-// buffers with its track pointing at the second one.
+// Every rank keeps its own decoder-written args buffer (one per .ktz
+// file), so the merge must keep them all instead of collapsing into one,
+// and rebase each track's raw_buf_idx by its rank's buffer base — the old
+// blanket `raw_buf_idx = trace_idx` read a multi-buffer rank's second
+// track out of the wrong buffer entirely. Rank 1 here owns two buffers
+// with its track pointing at the second one.
 #[test]
 fn test_merge_keeps_per_rank_args_buffers() {
     let rank_trace = |blobs: Vec<&str>, buf_idx: u8| -> Trace {
@@ -2113,7 +1971,7 @@ fn test_merge_keeps_per_rank_args_buffers() {
             // Compact format: offset 0 is a reserved 0 byte, args at 1.
             let mut v = vec![0u8];
             v.extend_from_slice(b.as_bytes());
-            Arc::new(ArgsBuf::Heap(v))
+            Arc::new(ArgsBuf(v))
         }).collect();
         let blob = blobs[buf_idx as usize];
         let track = Track {
@@ -2161,11 +2019,8 @@ fn test_wave_count_bounds_concurrent_blob_memory() {
 }
 
 // The actual user-visible fix: even a Trace whose *stored* track order is
-// already wrong (e.g. a .tvcache exported before merge_traces sorted
-// correctly — the label text still has the real rank in it, only the
-// on-disk order predates the fix) should still *display* in rank order,
-// because the view computes its own default order rather than trusting
-// storage order. Deliberately construct tracks in bad (lexicographic)
+// already wrong should still *display* in rank order, because the view
+// computes its own default order rather than trusting storage order. Deliberately construct tracks in bad (lexicographic)
 // order here to simulate that old-file case.
 #[test]
 fn test_default_track_order_fixes_bad_stored_order() {
@@ -2190,7 +2045,7 @@ fn test_default_track_order_fixes_bad_stored_order() {
 fn bench_search_rebuild() {
     let path = match std::env::var("TV_BENCH_TRACE") {
         Ok(p) => p,
-        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache or a directory> to run this bench"); return; }
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.ktz or a directory> to run this bench"); return; }
     };
     let trace = if std::path::Path::new(&path).is_dir() {
         let (rank_groups, standalone) = detect_rank_groups(&[path.clone()]);
@@ -2201,12 +2056,12 @@ fn bench_search_rebuild() {
         use rayon::prelude::*;
         let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len().max(1)).max(2);
         let traces: Vec<(usize, Trace)> = all_paths.par_iter().filter_map(|(rank, p)| {
-            load_trace(p, &counter, tpf, None).ok().map(|t| (*rank, t))
+            load_trace(p, &counter).ok().map(|t| (*rank, t))
         }).collect();
         merge_traces(traces)
     } else {
         let counter = test_counter();
-        load_trace(&path, &counter, 8, None).expect("load trace")
+        load_trace(&path, &counter).expect("load trace")
     };
     eprintln!("loaded: {} tracks, {} events, {} names",
         trace.tracks.len(), trace.total_events, trace.names.len());
@@ -2237,10 +2092,10 @@ fn bench_search_rebuild() {
 fn bench_merge_filter() {
     let path = match std::env::var("TV_BENCH_TRACE") {
         Ok(p) => p,
-        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache> to run this bench"); return; }
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.ktz> to run this bench"); return; }
     };
     let counter = test_counter();
-    let trace = load_trace(&path, &counter, 8, None).expect("load trace");
+    let trace = load_trace(&path, &counter).expect("load trace");
     eprintln!(
         "loaded: {} tracks, {} events, span {:.0}..{:.0} us",
         trace.tracks.len(), trace.total_events, trace.min_ts, trace.max_ts
@@ -2356,7 +2211,7 @@ fn bench_progressive_load() {
     let (tx, rx) = std::sync::mpsc::channel();
     let counter = test_counter();
     let t0 = std::time::Instant::now();
-    load_trace_progressive(&path, &counter, 0, &tx, None);
+    load_trace_progressive(&path, &counter, &tx);
     let mut n = 0;
     while let Ok(Ok(t)) = rx.try_recv() {
         n += 1;
@@ -2391,7 +2246,7 @@ fn bench_multi_merge_args() {
 
     let counter = test_counter();
     let (tx, rx) = std::sync::mpsc::channel();
-    crate::loader::load_multi_progressive(all_paths, &counter, 2, &tx, None, true);
+    crate::loader::load_multi_progressive(all_paths, &counter, &tx);
     let trace = rx.recv().expect("merged load result").expect("merged trace");
 
     eprintln!("merged: {} events, {} tracks, {} args buffers",
@@ -2420,17 +2275,17 @@ fn bench_multi_merge_args() {
 // merge-group build that bench_merge_filter isolates. Run with:
 //   cargo test --release bench_draw_timeline -- --ignored --nocapture
 //
-// TV_BENCH_TRACE accepts either a single pre-merged .tvcache file, or a
-// directory of per-rank files (the same thing a `tv <dir>` CLI open takes) —
-// the latter is loaded and merged in parallel here, mirroring the `--bench`
-// CLI path in main.rs, so this bench works straight off a fresh sweep-result
-// folder without needing an already-exported merged cache first.
+// TV_BENCH_TRACE accepts either a single merged .ktz file, or a directory
+// of per-rank files (the same thing a `tv <dir>` CLI open takes) — the
+// latter is loaded and merged in parallel here, mirroring the `--bench`
+// CLI path in main.rs, so this bench works straight off a fresh
+// sweep-result folder.
 #[test]
 #[ignore]
 fn bench_draw_timeline() {
     let path = match std::env::var("TV_BENCH_TRACE") {
         Ok(p) => p,
-        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache or a directory> to run this bench"); return; }
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.ktz or a directory> to run this bench"); return; }
     };
     let trace = if std::path::Path::new(&path).is_dir() {
         let (rank_groups, standalone) = detect_rank_groups(&[path.clone()]);
@@ -2441,13 +2296,13 @@ fn bench_draw_timeline() {
         use rayon::prelude::*;
         let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len().max(1)).max(2);
         let traces: Vec<(usize, Trace)> = all_paths.par_iter().filter_map(|(rank, p)| {
-            load_trace(p, &counter, tpf, None).ok().map(|t| (*rank, t))
+            load_trace(p, &counter).ok().map(|t| (*rank, t))
         }).collect();
         eprintln!("loaded {} rank files from {path}", traces.len());
         merge_traces(traces)
     } else {
         let counter = test_counter();
-        load_trace(&path, &counter, 8, None).expect("load trace")
+        load_trace(&path, &counter).expect("load trace")
     };
     eprintln!("loaded: {} tracks, {} events, span 0..{:.0} us", trace.tracks.len(), trace.total_events, trace.max_ts);
 
@@ -2574,7 +2429,7 @@ fn bench_draw_timeline() {
 fn bench_selection_stats() {
     let path = match std::env::var("TV_BENCH_TRACE") {
         Ok(p) => p,
-        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache or a directory> to run this bench"); return; }
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.ktz or a directory> to run this bench"); return; }
     };
     let trace = if std::path::Path::new(&path).is_dir() {
         let (rank_groups, standalone) = detect_rank_groups(&[path.clone()]);
@@ -2585,12 +2440,12 @@ fn bench_selection_stats() {
         use rayon::prelude::*;
         let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len().max(1)).max(2);
         let traces: Vec<(usize, Trace)> = all_paths.par_iter().filter_map(|(rank, p)| {
-            load_trace(p, &counter, tpf, None).ok().map(|t| (*rank, t))
+            load_trace(p, &counter).ok().map(|t| (*rank, t))
         }).collect();
         merge_traces(traces)
     } else {
         let counter = test_counter();
-        load_trace(&path, &counter, 8, None).expect("load trace")
+        load_trace(&path, &counter).expect("load trace")
     };
 
     let mut sel: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
@@ -2857,18 +2712,16 @@ fn test_individual_stats_occupancy_limit_lookup() {
     // A normal small-grid kernel (WARPS-limited, trustworthy) and a
     // large-shared-memory kernel whose "SMEM" verdict is a known calculator
     // artifact (opts into more than the 48KB default static limit).
-    let json = r#"{"traceEvents": [
-        {"ph":"X","ts":100,"dur":10,"pid":1,"tid":1,"name":"warps_kernel","cat":"kernel",
-         "args":{"shared memory":1024,"occupancy":{"limitingFactors":"WARPS"}}},
-        {"ph":"X","ts":200,"dur":20,"pid":1,"tid":1,"name":"smem_kernel","cat":"kernel",
-         "args":{"shared memory":180000,"occupancy":{"limitingFactors":"SMEM"}}}
-    ]}"#;
+    let mut warps = kx(1, 1, "warps_kernel", "kernel", 100.0, 10.0);
+    warps.args = r#"{"shared memory":1024,"occupancy":{"limitingFactors":"WARPS"}}"#.to_string();
+    let mut smem = kx(1, 1, "smem_kernel", "kernel", 200.0, 20.0);
+    smem.args = r#"{"shared memory":180000,"occupancy":{"limitingFactors":"SMEM"}}"#.to_string();
     let dir = std::env::temp_dir().join("tv_test_occ");
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("occ.json");
-    std::fs::write(&path, json).unwrap();
+    let path = dir.join("occ.ktz");
+    std::fs::write(&path, ktz_trace_file(&[warps, smem], "{\"traceEvents\": [", "]}")).unwrap();
 
-    let trace = load_trace(path.to_str().unwrap(), &test_counter(), 0, None).unwrap();
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
     let warps_name = trace.names.iter().position(|n| n == "warps_kernel").unwrap() as u32;
     let smem_name = trace.names.iter().position(|n| n == "smem_kernel").unwrap() as u32;
 
@@ -3006,12 +2859,12 @@ fn bench_stats_sort_cost() {
     // Profiling harness (not part of the normal suite): measures the actual
     // cost of one `draw_stats_table` resort at realistic row counts, using
     // real trace data through the real `kernel_occ_limit` code path. Run with:
-    //   TV_BENCH_TRACE=/path/to/trace.json.gz cargo test --release -- --ignored --nocapture bench_stats_sort_cost
+    //   TV_BENCH_TRACE=/path/to/trace.ktz cargo test --release -- --ignored --nocapture bench_stats_sort_cost
     let path = match std::env::var("TV_BENCH_TRACE") {
         Ok(p) => p,
         Err(_) => { eprintln!("skipped: set TV_BENCH_TRACE"); return; }
     };
-    let trace = load_trace(&path, &test_counter(), 0, None).unwrap();
+    let trace = load_trace(&path, &test_counter()).unwrap();
 
     let mut all_stats: Vec<KernelStats> = Vec::new();
     let mut all_refs: Vec<(u32, u32)> = Vec::new();
@@ -3153,12 +3006,12 @@ fn bench_merge_gpu_collect_cost() {
     // check scans forward from each surviving event to its own end, so a
     // whole-generation-step wrapper (hundreds of ms, spanning thousands of
     // descendants) is the worst case for that scan. Run with:
-    //   TV_BENCH_TRACE=/path/to/trace.json.gz cargo test --release -- --ignored --nocapture bench_merge_gpu_collect_cost
+    //   TV_BENCH_TRACE=/path/to/trace.ktz cargo test --release -- --ignored --nocapture bench_merge_gpu_collect_cost
     let path = match std::env::var("TV_BENCH_TRACE") {
         Ok(p) => p,
         Err(_) => { eprintln!("skipped: set TV_BENCH_TRACE"); return; }
     };
-    let trace = load_trace(&path, &test_counter(), 0, None).unwrap();
+    let trace = load_trace(&path, &test_counter()).unwrap();
 
     let exec_names: std::collections::HashSet<u32> = trace.names.iter().enumerate()
         .filter(|(_, n)| n.contains("execute_context"))
@@ -3199,12 +3052,12 @@ fn bench_selection_histogram_rebuild_cost() {
     // (buf.sel_bars rebuild + sort_unstable_by), which — unlike the stats
     // table — has no generation-based cache and reruns on every redraw
     // regardless of whether the selection changed. Run with:
-    //   TV_BENCH_TRACE=/path/to/trace.json.gz cargo test --release -- --ignored --nocapture bench_selection_histogram_rebuild_cost
+    //   TV_BENCH_TRACE=/path/to/trace.ktz cargo test --release -- --ignored --nocapture bench_selection_histogram_rebuild_cost
     let path = match std::env::var("TV_BENCH_TRACE") {
         Ok(p) => p,
         Err(_) => { eprintln!("skipped: set TV_BENCH_TRACE"); return; }
     };
-    let trace = load_trace(&path, &test_counter(), 0, None).unwrap();
+    let trace = load_trace(&path, &test_counter()).unwrap();
 
     let mut all_durs: Vec<(f64, u32)> = Vec::new();
     for track in &trace.tracks {
@@ -3236,7 +3089,7 @@ fn bench_parallel_occ_limit_parse() {
         Ok(p) => p,
         Err(_) => { eprintln!("skipped: set TV_BENCH_TRACE"); return; }
     };
-    let trace = crate::loader::load_trace(&path, &test_counter(), 0, None).unwrap();
+    let trace = crate::loader::load_trace(&path, &test_counter()).unwrap();
 
     let mut refs: Vec<(u32, u32)> = Vec::new();
     for (ti, t) in trace.tracks.iter().enumerate() {
@@ -3267,17 +3120,17 @@ fn bench_parallel_occ_limit_parse() {
 // one-time build cost per rank group — collect phase in isolation for
 // attribution, production builder end-to-end — plus, for reference, the
 // per-frame windowed-render cost the old per-frame rebuild used to dominate.
-// Accepts a single pre-merged .tvcache (same as bench_merge_filter). Run with:
-//   TV_BENCH_TRACE=<merged.tvcache> cargo test --release bench_merge_phases -- --ignored --nocapture
+// Accepts a single merged trace file (same as bench_merge_filter). Run with:
+//   TV_BENCH_TRACE=<merged.ktz> cargo test --release bench_merge_phases -- --ignored --nocapture
 #[test]
 #[ignore]
 fn bench_merge_phases() {
     let path = match std::env::var("TV_BENCH_TRACE") {
         Ok(p) => p,
-        Err(_) => { eprintln!("set TV_BENCH_TRACE=<merged.tvcache> to run this bench"); return; }
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<merged.ktz> to run this bench"); return; }
     };
     let counter = test_counter();
-    let trace = load_trace(&path, &counter, 8, None).expect("load trace");
+    let trace = load_trace(&path, &counter).expect("load trace");
     eprintln!("{} tracks, {} events", trace.tracks.len(), trace.total_events);
 
     // Group GPU tracks by rank, mirroring ui.rs merge pre-grouping.
@@ -4043,10 +3896,10 @@ fn test_nav_step_and_frame_step() {
 }
 
 #[test]
-#[ignore] // loads a 85MB local trace; run explicitly with --ignored
-fn test_steps_on_real_merged_trace() {
-    let path = "/Users/ecrncevi/vllm-profiles/20260923-114925.tvcache/_merged.tvcache";
-    let trace = match load_trace(path, &test_counter(), 8, None) {
+#[ignore] // loads a local 7MB trace; run explicitly with --ignored
+fn test_steps_on_real_trace() {
+    let path = "/Users/ecrncevi/dsv4traces/dsv41-pd-1p1d-dep8-spec3-prof-001-20261022-2124-pd1p1d-dep8-spec3-vllm-profile-prefill/wide-ep-dss-vllm-dsv41-flash-0-5b1b47f7-prefill-0/dsv41-pd-1p1d-dep8-spec3-prof-001-20261022-2124-pd1p1d-dep8-spec3-c128-prefill_dp0_pp0_tp0_dcp0_ep0_rank0.1792700652303433785.pt.trace.json.ktz";
+    let trace = match load_trace(path, &test_counter()) {
         Ok(t) => t,
         Err(e) => { eprintln!("could not load {path}: {e}, skipping"); return; }
     };
@@ -4133,8 +3986,8 @@ fn test_find_exec_context_names_all_formats() {
 #[test]
 #[ignore] // exercises the Steps tab against a real trace; run with --ignored
 fn test_steps_table_real_trace() {
-    let path = "/Users/ecrncevi/vllm-profiles/20260923-114925.tvcache/_merged.tvcache";
-    let trace = match load_trace(path, &test_counter(), 8, None) {
+    let path = "/Users/ecrncevi/dsv4traces/dsv41-pd-1p1d-dep8-spec3-prof-001-20261022-2124-pd1p1d-dep8-spec3-vllm-profile-prefill/wide-ep-dss-vllm-dsv41-flash-0-5b1b47f7-prefill-0/dsv41-pd-1p1d-dep8-spec3-prof-001-20261022-2124-pd1p1d-dep8-spec3-c128-prefill_dp0_pp0_tp0_dcp0_ep0_rank0.1792700652303433785.pt.trace.json.ktz";
+    let trace = match load_trace(path, &test_counter()) {
         Ok(t) => t,
         Err(e) => { eprintln!("could not load {path}: {e}, skipping"); return; }
     };
@@ -4204,7 +4057,7 @@ fn test_steps_detailed_annotation_trace() {
     // encoded in span names. Use its merged cache.
     let dir = "/Users/ecrncevi/vllm-profiles/20260914-125236.tvcache";
     let path = format!("{dir}/_merged.tvcache");
-    let trace = match load_trace(&path, &test_counter(), 8, None) {
+    let trace = match load_trace(&path, &test_counter()) {
         Ok(t) => t,
         Err(e) => { eprintln!("could not load {path}: {e}, skipping"); return; }
     };
@@ -4274,6 +4127,203 @@ fn ktz_framed(magic: &[u8; 4], n_events: u64, payload: &[u8]) -> Vec<u8> {
     ktz_varint(&mut f, comp.len() as u64);
     f.extend_from_slice(&comp);
     f
+}
+
+// ====================== ktz test-fixture builder ======================
+// Builds small KTZ3 files event-by-event for the file-based load tests —
+// the replacement for the old hand-written JSON fixtures (the loader only
+// reads .ktz now). args are given as ordinary JSON text and encoded to
+// blob tokens by a mini walker, so fixtures read like the traces they
+// model.
+
+/// Test-side symtab: span -> id with slot 0 reserved (absent), same rule
+/// the container format uses. Spans keep their quotes, so `b"\"kern_a\""`
+/// (a name) and `b"1234"` (a raw pid number span) coexist.
+struct KSymTab {
+    spans: Vec<Vec<u8>>,
+    ids: std::collections::HashMap<Vec<u8>, u64>,
+}
+
+impl KSymTab {
+    fn new() -> Self {
+        KSymTab { spans: vec![Vec::new()], ids: Default::default() }
+    }
+    fn intern(&mut self, span: &[u8]) -> u64 {
+        if let Some(&id) = self.ids.get(span) { return id; }
+        let id = self.spans.len() as u64;
+        self.spans.push(span.to_vec());
+        self.ids.insert(span.to_vec(), id);
+        id
+    }
+}
+
+/// One event for `ktz_trace_file`. `cat` empty = absent; `dur_us` 0.0 =
+/// absent; `args` empty = none (otherwise the JSON text of the "args"
+/// object); `id` empty = no flow id (otherwise its raw digits).
+struct KEv {
+    ph: &'static str,
+    pid: u64,
+    tid: u64,
+    name: String,
+    cat: String,
+    ts_us: f64,
+    dur_us: f64,
+    args: String,
+    id: String,
+}
+
+/// `KEv` with the common X-event shape and no args/id.
+fn kx(pid: u64, tid: u64, name: &str, cat: &str, ts_us: f64, dur_us: f64) -> KEv {
+    KEv { ph: "X", pid, tid, name: name.into(), cat: cat.into(), ts_us, dur_us,
+          args: String::new(), id: String::new() }
+}
+
+/// An M/thread_name metadata event naming its (pid, tid) track.
+fn kthread_name(pid: u64, tid: u64, label: &str) -> KEv {
+    KEv { ph: "M", pid, tid, name: "thread_name".into(), cat: String::new(),
+          ts_us: 0.0, dur_us: 0.0, args: format!("{{\"name\":\"{label}\"}}"),
+          id: String::new() }
+}
+
+fn ktz_trim(v: &[u8]) -> &[u8] {
+    let s = v.iter().position(|&b| !b.is_ascii_whitespace()).unwrap_or(v.len());
+    let e = v.iter().rposition(|&b| !b.is_ascii_whitespace()).map(|i| i + 1).unwrap_or(s);
+    &v[s..e]
+}
+
+/// Encode one JSON value's text as blob tokens. Keys and string values
+/// become TK_STR syms (span includes the quotes); integers become TK_INTABS
+/// (absolute, no dmap involvement); other numbers TK_RAWNUM verbatim;
+/// true/false/null their tags; objects/arrays recurse with member/element
+/// counts.
+fn ktz_encode_json(buf: &mut Vec<u8>, v: &[u8], tab: &mut KSymTab) {
+    let v = ktz_trim(v);
+    match v.first() {
+        Some(b'"') => { buf.push(3); ktz_varint(buf, tab.intern(v)); }
+        Some(b'{') => {
+            buf.push(1); // TK_OBJ
+            let mut members: Vec<(usize, usize)> = Vec::new();
+            let mut p = 1;
+            loop {
+                p = skip_ws(v, p);
+                if p >= v.len() || v[p] == b'}' { break; }
+                if v[p] == b',' { p += 1; continue; }
+                let ks = p;
+                p = skip_string(v, p);
+                members.push((ks, p));
+                p = skip_ws(v, p);
+                if p < v.len() && v[p] == b':' { p += 1; }
+                p = skip_ws(v, p);
+                let vs = p;
+                p = skip_value(v, p);
+                members.push((vs, p));
+            }
+            ktz_varint(buf, (members.len() / 2) as u64);
+            for p in members.chunks(2) {
+                buf.push(3); ktz_varint(buf, tab.intern(&v[p[0].0..p[0].1]));
+                ktz_encode_json(buf, &v[p[1].0..p[1].1], tab);
+            }
+        }
+        Some(b'[') => {
+            buf.push(2); // TK_ARR
+            let mut elems: Vec<(usize, usize)> = Vec::new();
+            let mut p = 1;
+            loop {
+                p = skip_ws(v, p);
+                if p >= v.len() || v[p] == b']' { break; }
+                if v[p] == b',' { p += 1; continue; }
+                let vs = p;
+                p = skip_value(v, p);
+                elems.push((vs, p));
+            }
+            ktz_varint(buf, elems.len() as u64);
+            for e in elems {
+                ktz_encode_json(buf, &v[e.0..e.1], tab);
+            }
+        }
+        Some(b't') => buf.push(6),
+        Some(b'f') => buf.push(7),
+        Some(b'n') => buf.push(8),
+        Some(_) => {
+            let txt = std::str::from_utf8(v).unwrap_or("");
+            if let Ok(i) = txt.parse::<i64>() {
+                buf.push(10); ktz_varint(buf, ktz_zz(i));
+            } else {
+                buf.push(5); ktz_varint(buf, v.len() as u64); buf.extend_from_slice(v);
+            }
+        }
+        None => {}
+    }
+}
+
+/// Build a KTZ3 file from events: the 7 per-event columns (ts as a
+/// zz1-delta chain per pid/tid pair, dur as absolute zz1 ns), one
+/// v3-style blob stream per event name (blens + blobs sections), symtab,
+/// and the head/foot text `finish_trace` scans for metadata.
+fn ktz_trace_file(events: &[KEv], head: &str, foot: &str) -> Vec<u8> {
+    let mut tab = KSymTab::new();
+    let mut cols: [Vec<u8>; 7] = Default::default();
+    let mut last_ts: std::collections::HashMap<(u64, u64), i64> = Default::default();
+    // Per name-sym-id stream: (name id, per-event-of-that-name blob lens,
+    // concatenated blobs), entries in global event order.
+    let mut streams: Vec<(u64, Vec<u64>, Vec<u8>)> = Vec::new();
+    let mut stream_idx: std::collections::HashMap<u64, usize> = Default::default();
+
+    for e in events {
+        let ph_id = tab.intern(format!("\"{}\"", e.ph).as_bytes());
+        let pid_id = tab.intern(e.pid.to_string().as_bytes());
+        let tid_id = tab.intern(e.tid.to_string().as_bytes());
+        let name_id = tab.intern(format!("\"{}\"", e.name).as_bytes());
+        let cat_id = if e.cat.is_empty() { 0 } else { tab.intern(format!("\"{}\"", e.cat).as_bytes()) };
+
+        for (c, v) in cols.iter_mut().zip([ph_id, pid_id, tid_id, name_id, cat_id]) {
+            ktz_varint(c, v);
+        }
+
+        let ts_ns = (e.ts_us * 1000.0).round() as i64;
+        let key = (pid_id, tid_id);
+        let base = *last_ts.get(&key).unwrap_or(&0);
+        ktz_varint(&mut cols[5], ktz_zz1(ts_ns - base));
+        last_ts.insert(key, ts_ns);
+        let dur_enc = if e.dur_us == 0.0 { 0 } else { ktz_zz1((e.dur_us * 1000.0).round() as i64) };
+        ktz_varint(&mut cols[6], dur_enc);
+
+        let mut blob = Vec::new();
+        if !e.args.is_empty() {
+            blob.push(3); ktz_varint(&mut blob, tab.intern(b"\"args\""));
+            ktz_encode_json(&mut blob, e.args.as_bytes(), &mut tab);
+        }
+        if !e.id.is_empty() {
+            blob.push(3); ktz_varint(&mut blob, tab.intern(b"\"id\""));
+            blob.push(3); ktz_varint(&mut blob, tab.intern(e.id.as_bytes()));
+        }
+        let si = *stream_idx.entry(name_id).or_insert_with(|| {
+            streams.push((name_id, Vec::new(), Vec::new()));
+            streams.len() - 1
+        });
+        streams[si].1.push(blob.len() as u64);
+        streams[si].2.extend_from_slice(&blob);
+    }
+
+    let mut payload = Vec::new();
+    for c in &cols { ktz_section(&mut payload, c); }
+    ktz_varint(&mut payload, streams.len() as u64);
+    for (nid, blens, blobs) in &streams {
+        ktz_varint(&mut payload, *nid);
+        let mut bl = Vec::new();
+        for b in blens { ktz_varint(&mut bl, *b); }
+        ktz_section(&mut payload, &bl);
+        ktz_section(&mut payload, blobs);
+    }
+    let mut symsec = Vec::new();
+    ktz_varint(&mut symsec, tab.spans.len() as u64);
+    for s in &tab.spans {
+        ktz_varint(&mut symsec, s.len() as u64);
+        symsec.extend_from_slice(s);
+    }
+    ktz_section(&mut payload, &symsec);
+    ktz_section(&mut payload, &ktz_head_foot(head.as_bytes(), foot.as_bytes()));
+    ktz_framed(b"KTZ3", events.len() as u64, &payload)
 }
 
 fn ktz_v4_synthetic_file() -> Vec<u8> {
@@ -4517,7 +4567,7 @@ fn multi_ktz_load_progress_is_monotonic() {
     let (tx, rx) = std::sync::mpsc::channel();
     let ctr = counter.clone();
     let handle = std::thread::spawn(move || {
-        crate::loader::load_multi_progressive(rank_paths, &ctr, 0, &tx, None, true);
+        crate::loader::load_multi_progressive(rank_paths, &ctr, &tx);
         drop(tx);
     });
 
@@ -4992,42 +5042,10 @@ fn ktz_real_file_loads_end_to_end() {
         eprintln!("sample trace missing, skipping");
         return;
     }
-    let trace = load_trace(sample, &test_counter(), 8, None).expect("load ktz trace");
+    let trace = load_trace(sample, &test_counter()).expect("load ktz trace");
     eprintln!("loaded {} tracks, {} events", trace.tracks.len(), trace.total_events);
     assert!(trace.total_events > 1_000_000);
     assert!(!trace.tracks.is_empty());
-}
-
-#[test]
-#[cfg(not(target_arch = "wasm32"))]
-fn resolve_tool_finds_first_match_on_path() {
-    // A tool present in a listed PATH dir resolves to that dir's copy,
-    // in listing order (first hit wins).
-    let tmp = std::env::temp_dir().join("tv-resolve-tool-test");
-    std::fs::create_dir_all(&tmp).unwrap();
-    let tool = tmp.join("tv-fake-tool");
-    std::fs::write(&tool, b"#!/bin/sh\n").unwrap();
-    let path = format!("{}:{}", tmp.display(), std::path::Path::new("/nonexistent-dir").display());
-    assert_eq!(resolve_tool_in(Some(&path), "tv-fake-tool"), tool);
-    std::fs::remove_dir_all(&tmp).ok();
-}
-
-#[test]
-#[cfg(not(target_arch = "wasm32"))]
-fn resolve_tool_falls_back_to_bare_name_when_missing() {
-    // Not on PATH and not in the Homebrew prefixes (name is unique
-    // enough): the bare name comes back so a spawn error names the tool.
-    let missing = resolve_tool_in(Some("/nonexistent-dir"), "tv-no-such-tool-anywhere");
-    assert_eq!(missing, std::path::Path::new("tv-no-such-tool-anywhere"));
-}
-
-#[test]
-#[cfg(not(target_arch = "wasm32"))]
-fn resolve_tool_handles_no_path() {
-    // Dock/Finder launches can have no useful PATH at all; must not panic
-    // and must still fall through to the prefix candidates.
-    let r = resolve_tool_in(None, "tv-no-such-tool-anywhere");
-    assert_eq!(r, std::path::Path::new("tv-no-such-tool-anywhere"));
 }
 
 #[test]
@@ -5133,7 +5151,7 @@ fn debug_steps_dump() {
 
     let (tx, rx) = std::sync::mpsc::channel();
     let counter = test_counter();
-    crate::loader::load_multi_progressive(rank_paths, &counter, 2, &tx, None, true);
+    crate::loader::load_multi_progressive(rank_paths, &counter, &tx);
     let trace = rx.recv().expect("load result").expect("trace loaded");
     eprintln!("merged: {} tracks, {} events, span 0..{:.0} us", trace.tracks.len(), trace.total_events, trace.max_ts);
 
@@ -5384,7 +5402,7 @@ fn debug_sel_overlap_trace() {
 
     let (tx, rx) = std::sync::mpsc::channel();
     let counter = test_counter();
-    crate::loader::load_multi_progressive(rank_paths, &counter, 2, &tx, None, true);
+    crate::loader::load_multi_progressive(rank_paths, &counter, &tx);
     let trace = rx.recv().expect("load result").expect("trace loaded");
     eprintln!("merged: {} tracks, {} events, span 0..{:.0} us", trace.tracks.len(), trace.total_events, trace.max_ts);
 
@@ -6381,7 +6399,7 @@ fn gaps_table_rows_are_clickable() {
 fn bench_heat_bounds() {
     let path = match std::env::var("TV_BENCH_TRACE") {
         Ok(p) => p,
-        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache or a directory> to run this bench"); return; }
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.ktz or a directory> to run this bench"); return; }
     };
     let trace = if std::path::Path::new(&path).is_dir() {
         let (rank_groups, standalone) = detect_rank_groups(&[path.clone()]);
@@ -6392,12 +6410,12 @@ fn bench_heat_bounds() {
         use rayon::prelude::*;
         let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len().max(1)).max(2);
         let traces: Vec<(usize, Trace)> = all_paths.par_iter().filter_map(|(rank, p)| {
-            load_trace(p, &counter, tpf, None).ok().map(|t| (*rank, t))
+            load_trace(p, &counter).ok().map(|t| (*rank, t))
         }).collect();
         merge_traces(traces)
     } else {
         let counter = test_counter();
-        load_trace(&path, &counter, 8, None).expect("load trace")
+        load_trace(&path, &counter).expect("load trace")
     };
 
     let mut logs: Vec<f64> = Vec::new();
@@ -6437,7 +6455,7 @@ fn bench_heat_bounds() {
 fn bench_top_gpu_events() {
     let path = match std::env::var("TV_BENCH_TRACE") {
         Ok(p) => p,
-        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache or a directory> to run this bench"); return; }
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.ktz or a directory> to run this bench"); return; }
     };
     let trace = if std::path::Path::new(&path).is_dir() {
         let (rank_groups, standalone) = detect_rank_groups(&[path.clone()]);
@@ -6448,12 +6466,12 @@ fn bench_top_gpu_events() {
         use rayon::prelude::*;
         let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len().max(1)).max(2);
         let traces: Vec<(usize, Trace)> = all_paths.par_iter().filter_map(|(rank, p)| {
-            load_trace(p, &counter, tpf, None).ok().map(|t| (*rank, t))
+            load_trace(p, &counter).ok().map(|t| (*rank, t))
         }).collect();
         merge_traces(traces)
     } else {
         let counter = test_counter();
-        load_trace(&path, &counter, 8, None).expect("load trace")
+        load_trace(&path, &counter).expect("load trace")
     };
     let mut top: Vec<(f64, &str, &str, &str)> = Vec::new(); // (dur, name, cat, track)
     for tr in &trace.tracks {
