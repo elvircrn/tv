@@ -6655,8 +6655,18 @@ fn test_trace_build_ref() {
 }
 
 #[test]
-fn test_extract_json_string() {
-    use crate::source::extract_json_string;
+fn test_encode_uri_path() {
+    use crate::source::encode_uri_path;
+    assert_eq!(encode_uri_path("/Users/x/vllm/a.py"), "/Users/x/vllm/a.py");
+    // Spaces and friends must be escaped: a raw space in a vscode:// URL
+    // truncates the path at the shell-quoted boundary.
+    assert_eq!(encode_uri_path("/tmp/my file.py"), "/tmp/my%20file.py");
+    assert_eq!(encode_uri_path("/tmp/ünïcode.cu"), "/tmp/%C3%BCn%C3%AFcode.cu");
+    assert_eq!(encode_uri_path("/a(b).cu"), "/a%28b%29.cu");
+}
+
+#[test]
+fn test_extract_json_string() {    use crate::source::extract_json_string;
     let body = r#"{"sha":"40941f2c4ba96fba0a7e282a5355e89cd74d9ac5","commit":{}}"#;
     assert_eq!(extract_json_string(body, "sha").as_deref(),
         Some("40941f2c4ba96fba0a7e282a5355e89cd74d9ac5"));

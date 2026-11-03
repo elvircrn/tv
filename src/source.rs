@@ -317,15 +317,41 @@ fn editor_candidates(editor: &str) -> Vec<String> {
     cands
 }
 
+/// Percent-encode a filesystem path for a `vscode://file/` URI: keep the
+/// URI unreserved set plus `/`, escape everything else (spaces, the
+/// unicode the default glyph rules wouldn't render, ...).
+pub(crate) fn encode_uri_path(p: &str) -> String {
+    let mut out = String::with_capacity(p.len());
+    for b in p.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+                | b'-' | b'_' | b'.' | b'~' | b'/' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Open `path:line` in the user's editor. `editor` is the editor's CLI
-/// command ("code", "cursor", ...); VS Code and Cursor both take `-g
-/// file:line`, Zed takes `file:line` directly.
+/// command ("code", "cursor", ...); Zed takes `file:line` directly, the
+/// rest take `-g file:line`. VS Code is special: `-g` positions the
+/// cursor only on a fresh open — when the file is already open in a
+/// window it just focuses the tab and leaves the cursor where it was —
+/// so `code` jumps via the `vscode://file/<path>:<line>` protocol URL
+/// instead, whose handler applies the selection to an open editor too.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_in_editor(editor: &str, hit: &SourceHit) -> Result<(), String> {
     let loc = format!("{}:{}", hit.path.display(), hit.line);
     for exe in editor_candidates(editor) {
         let mut c = std::process::Command::new(&exe);
-        if editor == "zed" { c.arg(&loc); } else { c.arg("-g").arg(&loc); }
+        if editor == "zed" {
+            c.arg(&loc);
+        } else if editor == "code" {
+            c.args(["--open-url",
+                &format!("vscode://file/{}:{}", encode_uri_path(&hit.path.display().to_string()), hit.line)]);
+        } else {
+            c.arg("-g").arg(&loc);
+        }
         match c.spawn() {
             Ok(_) => return Ok(()),
             // Not found -> try the next install location; anything else
