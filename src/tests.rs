@@ -4276,8 +4276,7 @@ fn ktz_framed(magic: &[u8; 4], n_events: u64, payload: &[u8]) -> Vec<u8> {
     f
 }
 
-#[test]
-fn ktz_v4_synthetic() {
+fn ktz_v4_synthetic_file() -> Vec<u8> {
     let syms: Vec<&[u8]> = vec![
         b"",               // 0: reserved (absent)
         b"\"X\"",          // 1: ph
@@ -4358,7 +4357,12 @@ fn ktz_v4_synthetic() {
     ktz_section(&mut payload, &ktz_symtab(&syms));
     ktz_section(&mut payload, &ktz_head_foot(b"{\"traceEvents\": [\n", b"]\n}\n"));
 
-    let file = ktz_framed(b"KTZ4", 3, &payload);
+    ktz_framed(b"KTZ4", 3, &payload)
+}
+
+#[test]
+fn ktz_v4_synthetic() {
+    let file = ktz_v4_synthetic_file();
     let got = ktz::decode(&file, &test_counter()).expect("decode");
     let expected = concat!(
         "{\"traceEvents\": [\n",
@@ -4539,8 +4543,7 @@ fn multi_ktz_load_progress_is_monotonic() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[test]
-fn ktz_v3_synthetic() {
+fn ktz_v3_synthetic_file() -> Vec<u8> {
     // KTZ3: framed like KTZ4 but per-name streams are blens+blobs sections.
     let syms: Vec<&[u8]> = vec![b"", b"\"X\"", b"1", b"2", b"\"Op\"", b"\"k\""];
     let mut blob = Vec::new();
@@ -4572,7 +4575,12 @@ fn ktz_v3_synthetic() {
     ktz_section(&mut payload, &ktz_symtab(&syms));
     ktz_section(&mut payload, &ktz_head_foot(b"{\n\"traceEvents\": [\n", b"]\n}\n"));
 
-    let file = ktz_framed(b"KTZ3", 2, &payload);
+    ktz_framed(b"KTZ3", 2, &payload)
+}
+
+#[test]
+fn ktz_v3_synthetic() {
+    let file = ktz_v3_synthetic_file();
     let got = ktz::decode(&file, &test_counter()).expect("decode");
     let expected = concat!(
         "{\n\"traceEvents\": [\n",
@@ -4583,8 +4591,7 @@ fn ktz_v3_synthetic() {
     assert_eq!(std::str::from_utf8(&got).unwrap(), expected);
 }
 
-#[test]
-fn ktz_v2_synthetic() {
+fn ktz_v2_synthetic_file() -> Vec<u8> {
     // KTZ2: the whole file is one zstd frame holding KTZ2 + nEvents + the
     // same v2-style sections as KTZ3.
     let syms: Vec<&[u8]> = vec![b"", b"\"X\"", b"1", b"2", b"\"Op\"", b"\"k\""];
@@ -4618,7 +4625,12 @@ fn ktz_v2_synthetic() {
     ktz_section(&mut payload, &ktz_symtab(&syms));
     ktz_section(&mut payload, &ktz_head_foot(b"{\n\"traceEvents\": [\n", b"]\n}\n"));
 
-    let file = zstd::bulk::compress(&payload, 3).unwrap();
+    zstd::bulk::compress(&payload, 3).unwrap()
+}
+
+#[test]
+fn ktz_v2_synthetic() {
+    let file = ktz_v2_synthetic_file();
     let got = ktz::decode(&file, &test_counter()).expect("decode");
     let expected = concat!(
         "{\n\"traceEvents\": [\n",
@@ -4642,6 +4654,299 @@ fn ktz_rejects_garbage() {
     ktz_varint(&mut f, 5);
     f.extend_from_slice(&[0u8; 3]); // frame shorter than declared
     assert!(ktz::decode(&f, &c).is_err());
+}
+
+// ====================== ktz direct (columnar) decoding ======================
+// The sections -> events path (KtzDecoder/decode_trace) must produce the
+// same trace the render() -> parse_chunk pipeline did, so each synthetic
+// file above is decoded both ways and the direct results are asserted
+// against what the reference JSON (printed in the tests above) implies.
+
+fn ktz_direct(file: &[u8]) -> (ktz::KtzTrace, Vec<u8>) {
+    ktz::decode_trace(file, &test_counter()).expect("direct decode")
+}
+
+fn ktz_args_text(t: &ktz::KtzTrace, i: usize) -> &[u8] {
+    let ev = &t.events[i].2;
+    &t.args[ev.args_off as usize..ev.args_off as usize + ev.args_len as usize]
+}
+
+#[test]
+fn ktz_is_ktz_magic() {
+    assert!(ktz::is_ktz(&ktz_v4_synthetic_file()));
+    assert!(ktz::is_ktz(&ktz_v3_synthetic_file()));
+    assert!(ktz::is_ktz(&ktz_v2_synthetic_file()));
+    assert!(!ktz::is_ktz(b"not a ktz file at all"));
+    assert!(!ktz::is_ktz(b"{\"traceEvents\": []}"));
+    assert!(!ktz::is_ktz(b""));
+}
+
+#[test]
+fn ktz_direct_v4_events() {
+    let (t, hf) = ktz_direct(&ktz_v4_synthetic_file());
+    // 3 events scanned; event 1 (dur absent) is dropped, so 2 X events.
+    assert_eq!(t.scan_count, 3);
+    assert_eq!(t.total_events, 2);
+    assert_eq!(t.events.len(), 2);
+    assert_eq!(t.min_ts, 0.0);
+    assert_eq!(t.max_ts, 2998.5); // 3000.000 - 1.500
+    let tid = fnv1a(b"T-1");
+    let (pid, tp, ev) = &t.events[0];
+    assert_eq!((*pid, *tp), (1234, tid));
+    assert_eq!((ev.ts, ev.dur), (0.0, 1.5));
+    assert_eq!(t.names.str(ev.name), "Op");
+    assert_eq!(t.cats.str(ev.cat), "cat");
+    assert_eq!(ktz_args_text(&t, 0), b"{\"a\":7,\"b\":\"x\"}");
+    let (pid, tp, ev) = &t.events[1];
+    assert_eq!((*pid, *tp), (1234, tid));
+    assert_eq!((ev.ts, ev.dur), (3000.0, -1.5));
+    assert_eq!(t.cats.str(ev.cat), "");
+    assert_eq!(ktz_args_text(&t, 1), b"{\"a\":9,\"b\":\"x\"}");
+    // head ++ foot, concatenated for finish_trace's metadata scans
+    assert_eq!(hf, b"{\"traceEvents\": [\n]\n}\n");
+}
+
+#[test]
+fn ktz_direct_metadata_and_flows() {
+    // M thread_name (blob args), s/f flows (wrap=false "id" column), and an
+    // X event with blob args — the non-X phs that parse_chunk fed from side
+    // data, plus the blob "args" pair path.
+    let syms: Vec<&[u8]> = vec![
+        b"", b"\"X\"", b"\"M\"", b"\"s\"", b"\"f\"", b"1", b"2",
+        b"\"thread_name\"", b"\"flow\"", b"\"Op\"",
+        b"\"args\"", b"\"name\"", b"\"thread 1\"", b"\"k\"", b"\"id\"",
+    ];
+    let mut blob_m = Vec::new();
+    blob_m.push(3u8); ktz_varint(&mut blob_m, 10); // "args":
+    blob_m.push(1u8); ktz_varint(&mut blob_m, 1);  // TK_OBJ {1 member}
+    blob_m.push(3u8); ktz_varint(&mut blob_m, 11); //   "name":
+    blob_m.push(3u8); ktz_varint(&mut blob_m, 12); //   TK_STR "thread 1"
+    let mut blob_x = Vec::new();
+    blob_x.push(3u8); ktz_varint(&mut blob_x, 10);             // "args":
+    blob_x.push(1u8); ktz_varint(&mut blob_x, 1);              // TK_OBJ {1 member}
+    blob_x.push(3u8); ktz_varint(&mut blob_x, 13);             //   "k":
+    blob_x.push(4u8); ktz_varint(&mut blob_x, ktz_zz(5));      //   TK_INT 5
+
+    // "flow" stream: wrap=false (columns are top-level event keys), one
+    // int column "id" — where flow events carry their link id.
+    let mut col_id = Vec::new();
+    ktz_varint(&mut col_id, ktz_zz(42));
+    ktz_varint(&mut col_id, ktz_zz(0));
+    let mut flow_stream = Vec::new();
+    ktz_varint(&mut flow_stream, 1);                       // nKeys
+    flow_stream.push(0);                                   // wrap = false
+    ktz_varint(&mut flow_stream, 14); flow_stream.push(0); // key "id", kind int
+    ktz_varint(&mut flow_stream, col_id.len() as u64);
+    flow_stream.extend_from_slice(&col_id);
+    ktz_varint(&mut flow_stream, 2);                       // 2 flags
+    ktz_varint(&mut flow_stream, 1); ktz_varint(&mut flow_stream, 1);
+    ktz_varint(&mut flow_stream, 0);                       // no blobs
+
+    let mut blob_stream = |blob: &[u8]| {
+        let mut s = Vec::new();
+        ktz_varint(&mut s, 0); // nKeys
+        s.push(0);             // wrap = false
+        ktz_varint(&mut s, 1); // flags section: 1 byte
+        ktz_varint(&mut s, 2); //   flag: blob
+        let mut blen = Vec::new();
+        ktz_varint(&mut blen, blob.len() as u64);
+        ktz_varint(&mut s, blen.len() as u64); // blens section: byte length
+        s.extend_from_slice(&blen);
+        s.extend_from_slice(blob);
+        s
+    };
+    let m_stream = blob_stream(&blob_m);
+    let x_stream = blob_stream(&blob_x);
+
+    let mut payload = Vec::new();
+    for col in [
+        vec![2u64, 3, 4, 1],                                   // ph: M, s, f, X
+        vec![5u64, 5, 5, 5],                                   // pid
+        vec![6u64, 6, 6, 6],                                   // tid
+        vec![7u64, 8, 8, 9],                                   // name
+        vec![0u64, 0, 0, 0],                                   // cat
+        vec![ktz_zz1(0), ktz_zz1(1000), ktz_zz1(1000), ktz_zz1(1000)], // ts
+        vec![0u64, 0, 0, ktz_zz1(500)],                        // dur
+    ] {
+        let mut sec = Vec::new();
+        for v in col { ktz_varint(&mut sec, v); }
+        ktz_section(&mut payload, &sec);
+    }
+    ktz_varint(&mut payload, 3); // nStreams
+    ktz_varint(&mut payload, 7); ktz_section(&mut payload, &m_stream);
+    ktz_varint(&mut payload, 8); ktz_section(&mut payload, &flow_stream);
+    ktz_varint(&mut payload, 9); ktz_section(&mut payload, &x_stream);
+    ktz_section(&mut payload, &ktz_symtab(&syms));
+    ktz_section(&mut payload, &ktz_head_foot(b"{\"traceEvents\": [\n", b"]\n}\n"));
+
+    let file = ktz_framed(b"KTZ4", 4, &payload);
+    let (t, _) = ktz_direct(&file);
+    assert_eq!(t.scan_count, 4);
+    assert_eq!(t.thread_names.get(&(1, 2)).map(String::as_str), Some("thread 1"));
+    assert_eq!(t.flows, vec![
+        (42, 1, 2, 1.0, true),
+        (42, 1, 2, 2.0, false),
+    ]);
+    assert_eq!(t.total_events, 1);
+    let (pid, tid, ev) = &t.events[0];
+    assert_eq!((*pid, *tid), (1, 2));
+    assert_eq!((ev.ts, ev.dur), (3.0, 0.5));
+    assert_eq!(t.names.str(ev.name), "Op");
+    assert_eq!(ktz_args_text(&t, 0), b"{\"k\":5}");
+}
+
+#[test]
+fn ktz_direct_range_resets() {
+    // 8194 events crossing the 8192-event range boundary; every event is
+    // X-with-dur so all are kept and their args observable. Events
+    // 8191/8192 are blob events whose "args" pair exercises the dmap
+    // reset; event 8193 is the first columnized event of range 1 (column
+    // delta base reset).
+    const N: u64 = 8194;
+    let syms: Vec<&[u8]> = vec![b"", b"\"X\"", b"1234", b"7", b"\"Op\"", b"\"a\"", b"\"args\""];
+
+    let mut blob_8191 = Vec::new();
+    blob_8191.push(3u8); ktz_varint(&mut blob_8191, 6);            // "args":
+    blob_8191.push(4u8); ktz_varint(&mut blob_8191, ktz_zz(5000)); // TK_INT 5000
+    let mut blob_8192 = Vec::new();
+    blob_8192.push(3u8); ktz_varint(&mut blob_8192, 6);            // "args":
+    blob_8192.push(9u8); ktz_varint(&mut blob_8192, ktz_zz(7));    // TK_DINT +7 vs reset dmap
+
+    // Column "a" (int): flag-1 events are 0..=8190 (values = index) and
+    // 8193 (first of range 1, delta vs a reset base of 0).
+    let mut col_a = Vec::new();
+    for i in 0..=8190u64 {
+        ktz_varint(&mut col_a, ktz_zz(if i == 0 { 0 } else { 1 }));
+    }
+    ktz_varint(&mut col_a, ktz_zz(8193));
+
+    let mut stream = Vec::new();
+    ktz_varint(&mut stream, 1);                    // nKeys
+    stream.push(1);                                // wrap
+    ktz_varint(&mut stream, 5); stream.push(0);    // key "a", kind int
+    ktz_varint(&mut stream, col_a.len() as u64);
+    stream.extend_from_slice(&col_a);
+    let mut flags = Vec::new();
+    for i in 0..N {
+        ktz_varint(&mut flags, if i == 8191 || i == 8192 { 2 } else { 1 });
+    }
+    ktz_varint(&mut stream, flags.len() as u64);
+    stream.extend_from_slice(&flags);
+    ktz_varint(&mut stream, 2); // two blens (one per flag-2 event)
+    ktz_varint(&mut stream, blob_8191.len() as u64);
+    ktz_varint(&mut stream, blob_8192.len() as u64);
+    stream.extend_from_slice(&blob_8191);
+    stream.extend_from_slice(&blob_8192);
+
+    let mut payload = Vec::new();
+    let mut rep = |vals: &dyn Fn(u64) -> u64| {
+        let mut sec = Vec::new();
+        for i in 0..N { ktz_varint(&mut sec, vals(i)); }
+        ktz_section(&mut payload, &sec);
+    };
+    rep(&|_| 1);                                            // ph
+    rep(&|_| 2);                                            // pid
+    rep(&|_| 3);                                            // tid
+    rep(&|_| 4);                                            // name
+    rep(&|_| 0);                                            // cat absent
+    rep(&|i| if i == 0 { ktz_zz1(0) } else { ktz_zz1(1000) }); // ts: i us
+    rep(&|_| ktz_zz1(100));                                 // dur: 100ns, every event
+    ktz_varint(&mut payload, 1); // nStreams
+    ktz_varint(&mut payload, 4); // nid
+    ktz_section(&mut payload, &stream);
+    ktz_section(&mut payload, &ktz_symtab(&syms));
+    ktz_section(&mut payload, &ktz_head_foot(b"[", b"]\n"));
+
+    let file = ktz_framed(b"KTZ4", N, &payload);
+    let (t, _) = ktz_direct(&file);
+    assert_eq!(t.scan_count, N);
+    assert_eq!(t.total_events, N as usize);
+    assert_eq!(t.events.len(), N as usize);
+    assert_eq!(t.min_ts, 0.0);
+    assert_eq!(t.max_ts, 8193.1);
+    assert_eq!(t.events[8192].2.ts, 8192.0);
+    assert_eq!(ktz_args_text(&t, 8190), b"{\"a\":8190}");
+    assert_eq!(ktz_args_text(&t, 8191), b"5000");
+    assert_eq!(ktz_args_text(&t, 8192), b"7"); // dmap reset: 7, not 5007
+    assert_eq!(ktz_args_text(&t, 8193), b"{\"a\":8193}"); // col base reset
+}
+
+#[test]
+fn ktz_direct_huge_args_len_zero() {
+    // args larger than u16::MAX render fully into the buffer but the
+    // event's args_len is 0 (display truncation), matching parse_chunk's
+    // `if len <= u16::MAX { len } else { 0 }`.
+    let syms: Vec<&[u8]> = vec![b"", b"\"X\"", b"1", b"2", b"\"Op\"", b"\"args\""];
+    let raw = vec![b'a'; 70_000];
+    let mut blob = Vec::new();
+    blob.push(3u8); ktz_varint(&mut blob, 5);                    // "args":
+    blob.push(5u8); ktz_varint(&mut blob, raw.len() as u64);     // TK_RAWNUM
+    blob.extend_from_slice(&raw);
+    let mut stream = Vec::new();
+    ktz_varint(&mut stream, 0); // nKeys
+    stream.push(0);             // wrap = false
+    ktz_varint(&mut stream, 1); // flags section: 1 byte
+    ktz_varint(&mut stream, 2); //   flag: blob
+    let mut blen = Vec::new();
+    ktz_varint(&mut blen, blob.len() as u64);
+    ktz_varint(&mut stream, blen.len() as u64); // blens section: byte length
+    stream.extend_from_slice(&blen);
+    stream.extend_from_slice(&blob);
+
+    let mut payload = Vec::new();
+    for col in [
+        vec![1u64], vec![2u64], vec![3u64], vec![4u64], vec![0u64],
+        vec![ktz_zz1(0)], vec![ktz_zz1(100)],
+    ] {
+        let mut sec = Vec::new();
+        for v in col { ktz_varint(&mut sec, v); }
+        ktz_section(&mut payload, &sec);
+    }
+    ktz_varint(&mut payload, 1); // nStreams
+    ktz_varint(&mut payload, 4); // nid
+    ktz_section(&mut payload, &stream);
+    ktz_section(&mut payload, &ktz_symtab(&syms));
+    ktz_section(&mut payload, &ktz_head_foot(b"[", b"]"));
+    let file = ktz_framed(b"KTZ4", 1, &payload);
+    let (t, _) = ktz_direct(&file);
+    assert_eq!(t.total_events, 1);
+    let ev = &t.events[0].2;
+    assert!(ev.args_off != 0);
+    assert_eq!(ev.args_len, 0);
+    assert_eq!(t.args.len(), 1 + raw.len());
+}
+
+#[test]
+fn ktz_direct_v3_and_v2() {
+    // Both builders hold 2 X events without dur: scanned, then dropped.
+    for file in [ktz_v3_synthetic_file(), ktz_v2_synthetic_file()] {
+        let (t, hf) = ktz_direct(&file);
+        assert_eq!(t.scan_count, 2);
+        assert_eq!(t.total_events, 0);
+        assert!(t.events.is_empty());
+        assert_eq!(t.min_ts, f64::MAX);
+        assert_eq!(t.max_ts, f64::MIN);
+        assert_eq!(hf, b"{\n\"traceEvents\": [\n]\n}\n");
+    }
+}
+
+#[test]
+fn ktz_direct_step_resume() {
+    // Stepping one event at a time must land the same trace as one shot —
+    // the wasm loader's whole reason for the resumable decoder.
+    let file = ktz_all_x_events(100);
+    let (whole, _) = ktz::decode_trace(&file, &test_counter()).expect("one-shot");
+    let mut dec = ktz::KtzDecoder::new(&file).expect("new");
+    let mut stepped = ktz::KtzTrace::with_events(dec.n_events());
+    let c = test_counter();
+    while !dec.step(&mut stepped, 1, &c).expect("step") {}
+    assert_eq!(stepped.total_events, whole.total_events);
+    assert_eq!(stepped.events.len(), whole.events.len());
+    for (a, b) in stepped.events.iter().zip(whole.events.iter()) {
+        assert_eq!((a.0, a.1), (b.0, b.1));
+        assert_eq!((a.2.ts, a.2.dur, a.2.name, a.2.args_off, a.2.args_len), (b.2.ts, b.2.dur, b.2.name, b.2.args_off, b.2.args_len));
+    }
+    assert_eq!(stepped.args, whole.args);
 }
 
 #[test]
