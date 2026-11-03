@@ -866,6 +866,14 @@ pub struct Pane {
     /// include whole-step wrappers that would otherwise dominate the top
     /// of the range and flatten the kernel scale.
     pub heat_bounds: Option<(f64, f64)>,
+    /// Source tab: hits from the last kernel-name query (or the last
+    /// multi-hit Detail-tab resolution), listed as clickable rows that open
+    /// the editor. Per-pane so each tab keeps its query results.
+    pub src_hits: Vec<crate::source::SourceHit>,
+    /// Source tab kernel-name query buffer (Enter runs `resolve_kernel`).
+    pub src_query: String,
+    /// Last editor-launch error from the Source tab, shown until replaced.
+    pub src_error: Option<String>,
 }
 
 impl Pane {
@@ -944,6 +952,9 @@ impl Pane {
             sync_message: None,
             color_by_dur: false,
             heat_bounds: None,
+            src_hits: Vec::new(),
+            src_query: String::new(),
+            src_error: None,
         }
     }
 
@@ -2138,6 +2149,20 @@ pub struct AppState {
     /// `(pane_idx, event)` — pane index guards against the popup surviving a
     /// tab switch and firing against the wrong pane's trace.
     pub kernel_ctx_menu: Option<(usize, EventRef)>,
+    /// Source cross-reference: vLLM checkout path typed into the Source tab
+    /// (input buffer; indexing starts from a copy of it).
+    pub src_path: String,
+    /// Editor CLI the "open source" buttons launch ("code", "cursor",
+    /// "zed" — see `source::open_in_editor` for the arg convention).
+    pub src_editor: String,
+    /// The built index for the checkout at `src_path`. Built on a background
+    /// thread (`src_thread`) — walking a vLLM checkout takes seconds and
+    /// must not freeze the frame loop.
+    pub src_idx: Option<Box<crate::source::SourceIndex>>,
+    /// In-flight background index build. `about_to_wait` keeps the loop in
+    /// Poll while this is alive, exactly like a trace load.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub src_thread: Option<std::thread::JoinHandle<Box<crate::source::SourceIndex>>>,
 }
 
 impl AppState {

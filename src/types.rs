@@ -528,7 +528,7 @@ pub struct DiffResult {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-pub enum BottomTab { Detail, Selection, Steps, Gaps }
+pub enum BottomTab { Detail, Selection, Steps, Gaps, Source }
 
 /// One GPU idle gap ("bubble"): a wall-time interval where a rank's GPU was
 /// doing no work at all, plus the CPU-side annotation that explains it.

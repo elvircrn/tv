@@ -141,6 +141,11 @@ fn make_state(trace: Trace) -> AppState {
         diff_bar_zoom: 1.0,
         diff_pane_indices: None,
         kernel_ctx_menu: None,
+        src_path: String::new(),
+        src_editor: "code".to_string(),
+        src_idx: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        src_thread: None,
     }
 }
 
@@ -6367,3 +6372,61 @@ fn bench_top_gpu_events() {
     }
 }
 
+
+// ============================== source cross-reference
+
+#[test]
+fn test_kernel_base_name() {
+    use crate::source::kernel_base_name;
+    assert_eq!(
+        kernel_base_name("void vllm::deepseek_v4_fused_ops::fusedDeepseekV4QNormRopeKVRopeQuantInsertKernel<c10::BFloat16, 0>(const c10::BFloat16*)"),
+        "fusedDeepseekV4QNormRopeKVRopeQuantInsertKernel"
+    );
+    assert_eq!(kernel_base_name("mhc_pre_big_fuse_with_norm_tilelang_kernel"), "mhc_pre_big_fuse_with_norm_tilelang_kernel");
+    // aten-style: template + args, last :: segment
+    assert_eq!(kernel_base_name("void at::native::vectorized_elementwise_kernel<4, int>(int*)"), "vectorized_elementwise_kernel");
+    // already-base names pass through
+    assert_eq!(kernel_base_name("triton_foobar_0d1d2"), "triton_foobar_0d1d2");
+}
+
+#[test]
+fn test_source_index_resolves() {
+    // A fake checkout: one py module with a def, one csrc kernel, and a
+    // non-source file that must not be indexed.
+    let dir = std::env::temp_dir().join("tv_test_source");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("vllm/model_executor")).unwrap();
+    std::fs::create_dir_all(dir.join("csrc")).unwrap();
+    std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+    std::fs::write(dir.join("vllm/model_executor/k.py"), "x = 1\n\ndef mhc_kernel():\n    pass\n").unwrap();
+    std::fs::write(dir.join("csrc/k.cu"), "__global__ void fusedThing(const float* x) {}\n").unwrap();
+    std::fs::write(dir.join(".git/should_not_index.py"), "def ghost()\n").unwrap();
+    std::fs::write(dir.join("README.md"), "def not_python()\n").unwrap();
+
+    let mut idx = crate::source::SourceIndex::build(&dir);
+    // Python def lookup, exact name.
+    let hits = idx.resolve_kernel("mhc_kernel");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].rel, "vllm/model_executor/k.py");
+    assert_eq!(hits[0].line, 3);
+    // Triton-style jitted suffix still resolves (segment dropped once).
+    let hits = idx.resolve_kernel("mhc_kernel_0d1d2");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].line, 3);
+    // Demangled csrc kernel -> content search of the C-family files.
+    let hits = idx.resolve_kernel("void vllm::fusedThing<c10::BFloat16>(const float*)");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].rel, "csrc/k.cu");
+    assert_eq!(hits[0].line, 1);
+    // aten kernels live outside vllm: no hit, no guess.
+    assert!(idx.resolve_kernel("void at::native::vectorized_elementwise_kernel<4, int>(int*)").is_empty());
+    // CallFrom: exact file:line; traversal and missing files rejected.
+    let hit = idx.resolve_callfrom("vllm/model_executor/k.py:2").unwrap();
+    assert_eq!(hit.line, 2);
+    assert!(idx.resolve_callfrom("/etc/passwd:1").is_none());
+    assert!(idx.resolve_callfrom("../../etc/passwd:1").is_none());
+    assert!(idx.resolve_callfrom("vllm/missing.py:1").is_none());
+    assert!(idx.resolve_callfrom("no-line-number").is_none());
+
+    std::fs::remove_dir_all(&dir).ok();
+}

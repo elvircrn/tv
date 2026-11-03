@@ -30,6 +30,10 @@ mod ui;
 mod diff;
 mod time;
 mod ktz;
+// wasm: nothing in here is reachable (the Source tab is native-only), so
+// the types are dead code on that target.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+mod source;
 #[cfg(target_os = "macos")]
 mod dock_menu;
 
@@ -277,6 +281,11 @@ impl App {
                 diff_bar_zoom: 1.0,
                 diff_pane_indices: None,
                 kernel_ctx_menu: None,
+                src_path: String::new(),
+                src_editor: "code".to_string(),
+                src_idx: None,
+                #[cfg(not(target_arch = "wasm32"))]
+                src_thread: None,
             },
             last_frame: Instant::now(),
             scale_factor: 1.0,
@@ -1100,13 +1109,31 @@ impl ApplicationHandler for App {
         #[cfg(not(target_arch = "wasm32"))]
         let awaiting_real_size = false;
 
+        // A background source-index build: join it when the thread finishes
+        // (the Source tab shows "indexing..." until then) and keep polling
+        // while it runs, exactly like a trace load — a Wait-mode loop would
+        // otherwise sleep forever after the click that started it.
+        #[cfg(not(target_arch = "wasm32"))]
+        let src_indexing = self.state.src_thread.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let src_indexing = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(h) = self.state.src_thread.take() {
+            if h.is_finished() {
+                self.state.src_idx = Some(h.join().unwrap());
+            } else {
+                self.state.src_thread = Some(h);
+            }
+        }
+
         let needs_poll = self.state.panes.iter().any(|p| p.loading.is_some())
             || self.nav_keys != 0
             || self.nav_pan_vel.abs() > 1e-6
             || self.nav_zoom_vel.abs() > 1e-6
             || any_watching
             || awaiting_real_size
-            || self.state.panes.iter().any(|p| p.view.anim.is_some());
+            || self.state.panes.iter().any(|p| p.view.anim.is_some())
+            || src_indexing;
         if needs_poll {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             if let Some(w) = &self.window {
@@ -2099,6 +2126,10 @@ impl App {
                                 state.buf.detail_buf.push_str("  |  Start: +");
                                 write_time(&mut state.buf.detail_buf, ev.ts);
                                 write!(state.buf.detail_buf, "\nCat: {}  |  Track: {}", trace.cats[ev.cat as usize], track.label).unwrap();
+                                // CallFrom (kineto with_stack) is the exact
+                                // python file:line this frame was called from
+                                // — captured here for the View Source button.
+                                let mut callfrom: Option<String> = None;
                                 if ev.args_off > 0 {
                                     let raw = &trace.raw_bufs[track.raw_buf_idx as usize];
                                     let off = ev.args_off as usize;
@@ -2110,10 +2141,49 @@ impl App {
                                         if !pairs.is_empty() {
                                             state.buf.detail_buf.push('\n');
                                             for &[k, v] in &pairs {
+                                                if callfrom.is_none() && strs.str(k) == "CallFrom" {
+                                                    callfrom = Some(strs.str(v).to_string());
+                                                }
                                                 write!(state.buf.detail_buf, "\n{}: ", strs.str(k)).unwrap();
                                                 format_arg_value(&mut state.buf.detail_buf, strs.str(v), 0);
                                             }
                                         }
+                                    }
+                                }
+                                // View Source: exact jump for python frames
+                                // (CallFrom), kernel-name resolution for GPU
+                                // ops. Multiple hits land in the Source tab
+                                // as a list; one opens the editor directly.
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if state.src_idx.is_some() && (callfrom.is_some() || track.gpu) {
+                                    if ui.small_button("View Source") {
+                                        let idx = state.src_idx.as_mut().unwrap();
+                                        let hits = if let Some(cf) = &callfrom {
+                                            idx.resolve_callfrom(cf).into_iter().collect::<Vec<_>>()
+                                        } else {
+                                            idx.resolve_kernel(name)
+                                        };
+                                        match hits.len() {
+                                            0 => pane.src_error = Some(format!(
+                                                "no source found for `{}` in the checkout", name)),
+                                            1 => {
+                                                let h = hits.into_iter().next().unwrap();
+                                                if let Err(e) = source::open_in_editor(&state.src_editor, &h) {
+                                                    pane.src_error = Some(e);
+                                                }
+                                            }
+                                            _ => {
+                                                pane.src_hits = hits;
+                                                pane.pending_tab = Some(BottomTab::Source);
+                                            }
+                                        }
+                                    }
+                                    if ui.is_item_hovered() {
+                                        ui.tooltip_text(if callfrom.is_some() {
+                                            "Open the exact file:line this python frame was called from"
+                                        } else {
+                                            "Resolve this kernel's name to source (def for triton/tilelang, csrc for vllm:: kernels)"
+                                        });
                                     }
                                 }
                                 let avail = ui.content_region_avail();
@@ -2136,6 +2206,123 @@ impl App {
                                     .build();
                             } else {
                                 ui.text_colored([0.5, 0.5, 0.5, 1.0], "Click an event to see details");
+                            }
+                        }
+
+                        // Source cross-reference. No in-app viewer: tv's job
+                        // ends at resolving an event to a file:line, the
+                        // user's editor renders it (see source.rs for why).
+                        // The wasm build has no checkout to walk, so the tab
+                        // doesn't exist there.
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let src_flags = if pending == Some(BottomTab::Source) {
+                                imgui::TabItemFlags::SET_SELECTED
+                            } else { imgui::TabItemFlags::empty() };
+                            if let Some(_t) = imgui::TabItem::new("Source").flags(src_flags).begin(&ui) {
+                                pane.bottom_tab = BottomTab::Source;
+                                // Row 1: checkout path + Index button.
+                                let mut go = false;
+                                ui.set_next_item_width((ui.content_region_avail()[0] - 140.0).max(120.0));
+                                if ui.input_text("##srcpath", &mut state.src_path)
+                                    .hint("/path/to/vllm")
+                                    .build() { go = true; }
+                                ui.same_line();
+                                if ui.button("Index") { go = true; }
+                                if go && state.src_thread.is_none() {
+                                    let p = std::path::PathBuf::from(&state.src_path);
+                                    if p.is_dir() {
+                                        state.src_idx = None;
+                                        state.src_thread = Some(std::thread::spawn(move || {
+                                            Box::new(source::SourceIndex::build(&p))
+                                        }));
+                                    } else {
+                                        pane.src_error = Some(format!("not a directory: {}", state.src_path));
+                                    }
+                                }
+                                if state.src_thread.is_some() {
+                                    ui.text_colored([0.9, 0.8, 0.4, 1.0], "indexing checkout...");
+                                } else if let Some(idx) = state.src_idx.as_mut() {
+                                    // Version banner: the trace's build commit
+                                    // (hex tail of vllm_version) vs the
+                                    // checkout's git describe. A mismatch means
+                                    // line numbers can drift — the one way this
+                                    // feature silently lies otherwise.
+                                    let trace_ver = pane.trace.as_ref()
+                                        .map(|t| t.vllm_version.clone())
+                                        .unwrap_or_default();
+                                    if !trace_ver.is_empty() {
+                                        let build = trace_ver.rsplit('.').next().unwrap_or("");
+                                        let hexish = build.len() >= 7
+                                            && build.chars().all(|c| c.is_ascii_hexdigit());
+                                        state.buf.fmt.clear();
+                                        if let (Some(desc), true) = (&idx.git_desc, hexish) {
+                                            if desc.contains(build) {
+                                                write!(state.buf.fmt, "checkout matches trace build {}", &build[..7]).unwrap();
+                                                ui.text_colored([0.4, 0.8, 0.5, 1.0], &state.buf.fmt);
+                                            } else {
+                                                write!(state.buf.fmt, "trace built at {} but checkout is at {} - line numbers may drift", &build[..build.len().min(12)], desc).unwrap();
+                                                ui.text_colored([0.9, 0.7, 0.3, 1.0], &state.buf.fmt);
+                                            }
+                                        } else {
+                                            write!(state.buf.fmt, "trace vllm_version: {}", trace_ver).unwrap();
+                                            ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
+                                        }
+                                    }
+                                    // Row 2: kernel-name query.
+                                    let (n_defs, n_c) = idx.stats();
+                                    ui.set_next_item_width((ui.content_region_avail()[0] - 190.0).max(120.0));
+                                    let mut find = ui.input_text("##srcquery", &mut pane.src_query)
+                                        .hint("kernel or def name")
+                                        .build();
+                                    ui.same_line();
+                                    if ui.button("Find") { find = true; }
+                                    if find {
+                                        pane.src_hits = idx.resolve_kernel(&pane.src_query);
+                                        if pane.src_hits.is_empty() {
+                                            pane.src_error = Some(format!(
+                                                "no match for `{}` (aten/CUB/CUTLASS kernels live outside vllm)",
+                                                pane.src_query));
+                                        }
+                                    }
+                                    ui.same_line();
+                                    ui.set_next_item_width(70.0);
+                                    ui.input_text("##srceditor", &mut state.src_editor)
+                                        .hint("editor")
+                                        .build();
+                                    ui.same_line();
+                                    state.buf.fmt.clear();
+                                    write!(state.buf.fmt, "{} defs, {} C files", n_defs, n_c).unwrap();
+                                    ui.text_colored([0.5, 0.5, 0.5, 1.0], &state.buf.fmt);
+                                    // Hit rows: click to open file:line.
+                                    if !pane.src_hits.is_empty() {
+                                        ui.separator();
+                                        let hits = std::mem::take(&mut pane.src_hits);
+                                        for h in &hits {
+                                            state.buf.fmt.clear();
+                                            write!(state.buf.fmt, "{}:{}", h.rel, h.line).unwrap();
+                                            if ui.selectable(&state.buf.fmt) {
+                                                if let Err(e) = source::open_in_editor(&state.src_editor, h) {
+                                                    pane.src_error = Some(e);
+                                                }
+                                            }
+                                        }
+                                        pane.src_hits = hits;
+                                    }
+                                } else {
+                                    ui.text_colored([0.5, 0.5, 0.5, 1.0],
+                                        "Point tv at a vLLM checkout to cross-reference kernels\n\
+                                        and python frames with source. CallFrom args jump to the\n\
+                                        exact line; kernel names resolve via def/class indexing.");
+                                }
+                                if pane.src_error.is_some() {
+                                    let clear = ui.small_button("x##srcclear");
+                                    ui.same_line();
+                                    if let Some(e) = &pane.src_error {
+                                        ui.text_colored([0.9, 0.45, 0.45, 1.0], e);
+                                    }
+                                    if clear { pane.src_error = None; }
+                                }
                             }
                         }
                     }
