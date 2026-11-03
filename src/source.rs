@@ -308,3 +308,20 @@ pub fn open_in_editor(editor: &str, hit: &SourceHit) -> Result<(), String> {
         Err(e) => Err(format!("couldn't launch `{}`: {e} (is it on PATH?)", editor)),
     }
 }
+
+/// The machine's default vLLM checkout, if one exists: `~/vllm` that looks
+/// like the repo (has the `vllm/` package dir and a `.git`). Returns the
+/// display path plus an already-running background index build, so the
+/// Source features work with zero setup on a machine that has a checkout
+/// at the conventional place — the walk costs the main thread nothing.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn default_checkout_start() -> (String, Option<std::thread::JoinHandle<Box<SourceIndex>>>) {
+    let Ok(home) = std::env::var("HOME") else { return (String::new(), None) };
+    let def = Path::new(&home).join("vllm");
+    if !def.join("vllm").is_dir() || !def.join(".git").exists() {
+        return (String::new(), None);
+    }
+    let disp = def.to_string_lossy().into_owned();
+    let handle = std::thread::spawn(move || Box::new(SourceIndex::build(&def)));
+    (disp, Some(handle))
+}

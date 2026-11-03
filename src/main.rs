@@ -262,6 +262,14 @@ struct App {
 
 impl App {
     fn new(files: Vec<String>) -> Self {
+        // Zero-setup source cross-referencing: if the machine has a vLLM
+        // checkout at the conventional place (~/vllm), prefill the Source
+        // tab with it and start the index build right away — the walk is
+        // on a background thread, so this costs the first frames nothing.
+        #[cfg(not(target_arch = "wasm32"))]
+        let (src_path, src_thread) = source::default_checkout_start();
+        #[cfg(target_arch = "wasm32")]
+        let (src_path, _src_thread) = (String::new(), ());
         Self {
             window: None,
             imgui: None,
@@ -281,11 +289,11 @@ impl App {
                 diff_bar_zoom: 1.0,
                 diff_pane_indices: None,
                 kernel_ctx_menu: None,
-                src_path: String::new(),
+                src_path,
                 src_editor: "code".to_string(),
                 src_idx: None,
                 #[cfg(not(target_arch = "wasm32"))]
-                src_thread: None,
+                src_thread,
             },
             last_frame: Instant::now(),
             scale_factor: 1.0,
@@ -1067,6 +1075,23 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::DroppedFile(path) => {
+                // A dropped directory is not a trace: treat it as the source
+                // checkout for the Source tab (drag a vllm checkout onto the
+                // window to index it). Files go through the trace pipeline.
+                #[cfg(not(target_arch = "wasm32"))]
+                if path.is_dir() {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if name == "vllm" || path.join("vllm").is_dir() {
+                            self.state.src_idx = None;
+                            self.state.src_path = path.to_string_lossy().into_owned();
+                            let p = path.clone();
+                            self.state.src_thread = Some(std::thread::spawn(move || {
+                                Box::new(source::SourceIndex::build(&p))
+                            }));
+                            return;
+                        }
+                    }
+                }
                 self.pending_drops.push(path.to_string_lossy().into());
             }
 
@@ -2152,30 +2177,17 @@ impl App {
                                 }
                                 // View Source: exact jump for python frames
                                 // (CallFrom), kernel-name resolution for GPU
-                                // ops. Multiple hits land in the Source tab
-                                // as a list; one opens the editor directly.
+                                // ops. Shown even before a checkout is
+                                // indexed — clicking then routes to the
+                                // Source tab to set one up.
                                 #[cfg(not(target_arch = "wasm32"))]
-                                if state.src_idx.is_some() && (callfrom.is_some() || track.gpu) {
+                                if callfrom.is_some() || track.gpu {
                                     if ui.small_button("View Source") {
-                                        let idx = state.src_idx.as_mut().unwrap();
-                                        let hits = if let Some(cf) = &callfrom {
-                                            idx.resolve_callfrom(cf).into_iter().collect::<Vec<_>>()
-                                        } else {
-                                            idx.resolve_kernel(name)
-                                        };
-                                        match hits.len() {
-                                            0 => pane.src_error = Some(format!(
-                                                "no source found for `{}` in the checkout", name)),
-                                            1 => {
-                                                let h = hits.into_iter().next().unwrap();
-                                                if let Err(e) = source::open_in_editor(&state.src_editor, &h) {
-                                                    pane.src_error = Some(e);
-                                                }
-                                            }
-                                            _ => {
-                                                pane.src_hits = hits;
-                                                pane.pending_tab = Some(BottomTab::Source);
-                                            }
+                                        if let Some(r) = pane.selected {
+                                            let act = resolve_event_source(&mut state.src_idx, pane, r);
+                                            apply_src_action(
+                                                &mut pane.src_error, &mut pane.src_hits,
+                                                &mut pane.pending_tab, &state.src_editor, act);
                                         }
                                     }
                                     if ui.is_item_hovered() {
@@ -2604,6 +2616,17 @@ impl App {
                                         Err(e) => (false, format!("Sync failed: {e}")),
                                     });
                                 }
+                                // Right-click -> source in one interaction: no
+                                // selecting, no tab hop through Detail.
+                                #[cfg(not(target_arch = "wasm32"))]
+                                if ui.menu_item("View Source") {
+                                    let act = resolve_event_source(
+                                        &mut state.src_idx, &state.panes[ai], r);
+                                    let pane = &mut state.panes[ai];
+                                    apply_src_action(
+                                        &mut pane.src_error, &mut pane.src_hits,
+                                        &mut pane.pending_tab, &state.src_editor, act);
+                                }
                             });
                         }
                     }
@@ -2873,6 +2896,108 @@ impl App {
         if frame_ms > 50.0 {
             tlog!("\nSLOW FRAME: {:.0}ms", frame_ms);
         }
+    }
+}
+
+/// What `resolve_event_source` decided to do with an event's source
+/// linkage; `apply_src_action` turns it into UI effects.
+#[cfg(not(target_arch = "wasm32"))]
+enum SrcAction {
+    /// Surface this message in the Source tab's error line.
+    Error(String),
+    /// Exactly one hit: launch the editor at it.
+    Open(source::SourceHit),
+    /// Several hits: list them in the Source tab and switch to it.
+    List(Vec<source::SourceHit>),
+    /// No checkout indexed yet: switch to the Source tab for setup.
+    NeedCheckout,
+}
+
+/// Event -> source resolution, shared by the Detail tab's "View Source"
+/// button and the timeline right-click menu. Takes `pane` by shared
+/// reference and the index/editor as separate borrows, so it can be called
+/// from tab-body scopes that hold `&mut pane` — the disjoint-field borrow
+/// split those bodies already rely on.
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_event_source(
+    idx: &mut Option<Box<source::SourceIndex>>,
+    pane: &Pane,
+    r: EventRef,
+) -> SrcAction {
+    let Some(trace) = pane.trace.as_ref() else {
+        return SrcAction::Error("no trace".into());
+    };
+    // Resolve defensively: an EventRef can outlive a reload/merge that
+    // shrank the trace (same reasoning as the Detail tab's sel_ev).
+    let Some(track) = trace.tracks.get(r.track_idx as usize) else {
+        return SrcAction::Error("stale event reference".into());
+    };
+    let Some(ev) = track.events.get(r.event_idx as usize) else {
+        return SrcAction::Error("stale event reference".into());
+    };
+    let name = &trace.names[ev.name as usize];
+    // CallFrom (kineto with_stack) is the exact python file:line.
+    let mut callfrom: Option<String> = None;
+    if ev.args_off > 0 {
+        let raw = &trace.raw_bufs[track.raw_buf_idx as usize];
+        let off = ev.args_off as usize;
+        if off < raw.len() {
+            let end = skip_value(raw, off);
+            let mut strs = InternTable::new();
+            let mut pairs = Vec::new();
+            parse_args_flat(&raw[off..end], &mut strs, &mut pairs);
+            for &[k, v] in &pairs {
+                if strs.str(k) == "CallFrom" {
+                    callfrom = Some(strs.str(v).to_string());
+                    break;
+                }
+            }
+        }
+    }
+    if callfrom.is_none() && !track.gpu {
+        return SrcAction::Error(format!(
+            "no source linkage for `{}` (not a GPU op or python frame)", name));
+    }
+    let Some(idx) = idx.as_mut() else { return SrcAction::NeedCheckout };
+    let hits = if let Some(cf) = &callfrom {
+        idx.resolve_callfrom(cf).into_iter().collect::<Vec<_>>()
+    } else {
+        idx.resolve_kernel(name)
+    };
+    match hits.len() {
+        0 => SrcAction::Error(format!(
+            "no source found for `{}` in the checkout (aten/CUB/CUTLASS kernels live outside vllm)", name)),
+        1 => SrcAction::Open(hits.into_iter().next().unwrap()),
+        _ => SrcAction::List(hits),
+    }
+}
+
+/// Apply a resolution: open the editor, fill the Source tab's hit list,
+/// or park the message in `src_error` (shown in the Source tab). Takes the
+/// three affected Pane fields individually, not `&mut Pane` — the Detail
+/// tab calls this while holding a shared borrow of `pane.trace` across it
+/// (the duration histogram below uses it too).
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_src_action(
+    err: &mut Option<String>,
+    hits: &mut Vec<source::SourceHit>,
+    pending_tab: &mut Option<BottomTab>,
+    editor: &str,
+    act: SrcAction,
+) {
+    match act {
+        SrcAction::Error(e) => *err = Some(e),
+        SrcAction::Open(h) => {
+            if let Err(e) = source::open_in_editor(editor, &h) {
+                *err = Some(e);
+            }
+        }
+        SrcAction::List(hs) => {
+            *hits = hs;
+            *pending_tab = Some(BottomTab::Source);
+        }
+        // No checkout yet: the Source tab is where one gets set up.
+        SrcAction::NeedCheckout => *pending_tab = Some(BottomTab::Source),
     }
 }
 
