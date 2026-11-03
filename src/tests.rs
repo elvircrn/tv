@@ -2543,6 +2543,38 @@ fn reload_clears_finished_selection_refs() {
 }
 
 #[test]
+fn test_fresh_load_hides_execute_context_by_default() {
+    let exec_trace = |gen: &str| make_trace(
+        vec!["", "kernel_a", gen],
+        vec![("GPU 0", true, vec![
+            ev(0.0, 1.0, 1, 0),
+            ev(10.0, 2.0, 2, 0),
+        ])],
+    );
+    let mut pane = Pane::new();
+
+    // Fresh load: execute_context names land in hidden_names without any
+    // user action.
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Ok(exec_trace("execute_context_0(0)_generation_15(15)"))).unwrap();
+    pane.loading = Some(rx);
+    pane.poll_loading();
+    assert_eq!(pane.exec_context_names, vec![2]);
+    assert!(pane.hidden_names.get(2).unwrap(), "execute context hidden by default on fresh load");
+    assert!(!pane.hidden_names.get(1).unwrap(), "kernel names untouched");
+
+    // The user shows them (View > Show Execute Context)...
+    for &i in &pane.exec_context_names { pane.hidden_names.set(i, false); }
+
+    // ...and a reload of the same shape keeps that choice.
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(Ok(exec_trace("execute_context_0(0)_generation_15(15)"))).unwrap();
+    pane.loading = Some(rx);
+    pane.poll_loading();
+    assert!(!pane.hidden_names.get(2).unwrap(), "reload preserves an explicit show");
+}
+
+#[test]
 fn test_zoom_to_search_frames_first_match_80pct_fill() {
     // Two tracks; "foo" matches appear on both. The earliest match (ts=50 on
     // track 1) is what we frame, not the bounding box of all matches.

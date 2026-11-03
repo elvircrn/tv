@@ -1643,6 +1643,16 @@ impl Pane {
                 self.exec_context_names = self.trace.as_ref()
                     .map(|t| find_exec_context_names(&t.names))
                     .unwrap_or_default();
+                // Fresh loads start with the execute-context wrapper spans
+                // hidden (they're per-generation bookkeeping, not work worth
+                // timeline space); View > Show Execute Context brings them
+                // back. Reloads keep the user's last choice — the
+                // hidden_names bits survive the resize above.
+                if !is_reload {
+                    for &i in &self.exec_context_names {
+                        self.hidden_names.set(i, true);
+                    }
+                }
                 self.recompute_steps();
             }
             Ok(Err(e)) => {
