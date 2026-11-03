@@ -2205,8 +2205,8 @@ pub fn draw_timeline(
     // A gradient nobody can decode is decoration, not information: while
     // color-by-duration is on, pin a compact legend chip to the timeline's
     // bottom-right showing what the scale means. The end labels are the
-    // trace's actual p5/p95 GPU-event durations (`heat_bounds`, the same
-    // numbers the LUT maps onto), not abstract 0%/100%. Drawn on the
+    // trace's actual p5 and slowest GPU-event durations (`heat_bounds`, the
+    // same numbers the LUT maps onto), not abstract 0%/100%. Drawn on the
     // existing `dl` (single-instance rule) as a non-interactive overlay —
     // mouse events pass through to the events underneath.
     if color_by_dur {

@@ -1608,7 +1608,7 @@ impl App {
                                         pane.color_by_dur = true;
                                     }
                                     if ui.is_item_hovered() {
-                                        ui.tooltip_text("Heat-map events by duration (blue = short, red = long) instead of by name.\nThe scale is the 5th-95th percentile of GPU-event durations, fixed per trace.\nThe legend at the bottom-right of the timeline shows the actual durations.");
+                                        ui.tooltip_text("Heat-map events by duration (blue = short, red = long) instead of by name.\nThe scale runs from the 5th percentile of GPU-event durations up to the slowest one,\nso the warmest color is exactly the slowest kernel. Fixed per trace.\nThe legend at the bottom-right of the timeline shows the actual durations.");
                                     }
                                 });
                                 if multi_rank {

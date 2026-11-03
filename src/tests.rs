@@ -5199,9 +5199,11 @@ fn heat_dim_scales_channels() {
 }
 
 #[test]
-fn heat_bounds_percentiles_resist_outliers() {
-    // 100 ordinary kernels plus one giant memcpy: the p95 bound must stay
-    // near the bulk, not stretch to the outlier.
+fn heat_bounds_top_anchor_is_slowest_event() {
+    // 100 ordinary kernels plus one giant memcpy: the top of the scale must
+    // be the outlier's own duration, so it alone sits at full red — an
+    // earlier p95 anchor clamped the whole slow tail to one identical
+    // color, hiding exactly the kernel the mode exists to flag.
     let mut events = Vec::new();
     for i in 0..100 {
         events.push(ev(i as f64 * 20.0, 10.0, 0, 0));
@@ -5213,7 +5215,7 @@ fn heat_bounds_percentiles_resist_outliers() {
     pane.ensure_heat_bounds();
     let (lo, hi) = pane.heat_bounds.expect("bounds computed");
     assert!(lo <= 1.0, "p5 bound below the bulk's log10(10), got {lo}");
-    assert!(hi >= 1.0 && hi < 5.0, "p95 bound near the bulk, got {hi}");
+    assert!((hi - 6.0).abs() < 1e-9, "top anchor is the slowest event's log10(1e6), got {hi}");
     // Idempotent: a second call keeps the same bounds.
     pane.ensure_heat_bounds();
     assert_eq!(pane.heat_bounds, Some((lo, hi)));
@@ -5904,3 +5906,55 @@ fn gaps_table_rows_are_clickable() {
     assert_eq!(clicked, vec![12], "click on row 12 must register exactly row 12");
 }
 
+
+// Prints the GPU-event duration distribution (log10 µs) that the By Duration
+// heat map's bounds are drawn from, plus what each candidate bound pair does
+// to the visible spread. Run with:
+//   TV_BENCH_TRACE=<trace> cargo test --release bench_heat_bounds -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_heat_bounds() {
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache or a directory> to run this bench"); return; }
+    };
+    let trace = if std::path::Path::new(&path).is_dir() {
+        let (rank_groups, standalone) = detect_rank_groups(&[path.clone()]);
+        let mut all_paths: Vec<(usize, String)> = Vec::new();
+        for (group, _) in &rank_groups { all_paths.extend(group.clone()); }
+        for (i, (p, _)) in standalone.iter().enumerate() { all_paths.push((all_paths.len() + i, p.clone())); }
+        let counter = test_counter();
+        use rayon::prelude::*;
+        let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len().max(1)).max(2);
+        let traces: Vec<(usize, Trace)> = all_paths.par_iter().filter_map(|(rank, p)| {
+            load_trace(p, &counter, tpf, None).ok().map(|t| (*rank, t))
+        }).collect();
+        merge_traces(traces)
+    } else {
+        let counter = test_counter();
+        load_trace(&path, &counter, 8, None).expect("load trace")
+    };
+
+    let mut logs: Vec<f64> = Vec::new();
+    for tr in &trace.tracks {
+        if !tr.gpu { continue; }
+        for ev in &tr.events {
+            if ev.dur > 0.0 { logs.push(ev.dur.log10()); }
+        }
+    }
+    logs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let q = |p: f64| logs[((logs.len() as f64 - 1.0) * p) as usize];
+    let n_above = |v: f64| logs.iter().filter(|&&l| l >= v).count();
+    eprintln!("{} gpu events (log10 us): min={:.2} p5={:.2} p50={:.2} p95={:.2} p99={:.2} p99.9={:.2} max={:.2}",
+        logs.len(), logs[0], q(0.05), q(0.50), q(0.95), q(0.99), q(0.999), logs[logs.len() - 1]);
+    eprintln!("events clamped to max red under (p5,p95): {} ({:.1}%)",
+        n_above(q(0.95)), 100.0 * n_above(q(0.95)) as f64 / logs.len() as f64);
+    eprintln!("events clamped to max red under (p5,max): 1 (the slowest kernel)");
+    let spread = |lo: f64, hi: f64, name: &str| {
+        // where the p95 event lands in [0,1] under these bounds
+        let t95 = ((q(0.95) - lo) / (hi - lo)).clamp(0.0, 1.0);
+        eprintln!("{name}: span {:.2} decades, p95 event lands at t={:.2}", hi - lo, t95);
+    };
+    spread(q(0.05), q(0.95), "(p5,p95)");
+    spread(q(0.05), logs[logs.len() - 1], "(p5,max)");
+}

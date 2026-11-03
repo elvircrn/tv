@@ -874,13 +874,16 @@ pub struct Pane {
     /// hashing the name. Per-pane like show_cpu/merge_gpu so two tabs can
     /// use different modes.
     pub color_by_dur: bool,
-    /// Log10 duration bounds (p5, p95) the heat map maps onto blue→red,
+    /// Log10 duration bounds (p5, max) the heat map maps onto blue→red,
     /// computed lazily by `ensure_heat_bounds` the first frame the mode is
-    /// on, and cleared whenever a new trace lands. Percentiles (sampled to
-    /// ~100k events) rather than min/max so one huge memcpy outlier can't
-    /// push every kernel into the cold end of the scale. GPU-track events
-    /// only: CPU spans include whole-step wrappers that would otherwise
-    /// dominate the top of the range and flatten the kernel scale.
+    /// on, and cleared whenever a new trace lands. The top anchor is the
+    /// slowest GPU event, exactly — the warmest color must read as "the
+    /// slowest kernel", not "the top 5% of kernels" (an earlier p95 anchor
+    /// clamped that whole tail to one identical red). p5 low anchor is
+    /// sampled; the log scale keeps the bulk visible even when the max is
+    /// a couple decades out. GPU-track events only: CPU spans include
+    /// whole-step wrappers that would otherwise dominate the top of the
+    /// range and flatten the kernel scale.
     pub heat_bounds: Option<(f64, f64)>,
 }
 
@@ -2172,10 +2175,10 @@ impl Pane {
         self.sel_overlap_gen = self.sel_generation;
     }
 
-    /// Compute `heat_bounds` if stale (see the field doc). Sampling keeps
-    /// this at ~100k durations regardless of trace size — enough for stable
-    /// p5/p95 on a log scale, at a fraction of a full collect+select on the
-    /// 1M+ events a large trace carries.
+    /// Compute `heat_bounds` if stale (see the field doc). The p5 low bound
+    /// is sampled (~100k durations regardless of trace size — plenty for a
+    /// stable low anchor); the max is exact, since the whole point of the
+    /// top anchor is that the single slowest event sits alone at full red.
     pub fn ensure_heat_bounds(&mut self) {
         if self.heat_bounds.is_some() { return; }
         let bounds = match &self.trace {
@@ -2186,26 +2189,24 @@ impl Pane {
                 } else {
                     let stride = (n_gpu / 100_000).max(1);
                     let mut logs: Vec<f64> = Vec::with_capacity(n_gpu / stride + 1);
+                    let mut max_log = f64::MIN;
                     for track in t.tracks.iter().filter(|tr| tr.gpu) {
-                        for ev in track.events.iter().step_by(stride) {
-                            if ev.dur > 0.0 { logs.push(ev.dur.log10()); }
+                        for (i, ev) in track.events.iter().enumerate() {
+                            if ev.dur > 0.0 {
+                                let l = ev.dur.log10();
+                                if l > max_log { max_log = l; }
+                                if i % stride == 0 { logs.push(l); }
+                            }
                         }
                     }
                     if logs.is_empty() {
                         (0.0, 1.0)
                     } else {
-                        // Two in-place selections: after the p5 select, the
-                        // lower half is all <= logs[i5], so the p95 select can
-                        // run on the upper slice without disturbing it.
                         let i5 = (logs.len() as f64 * 0.05).clamp(0.0, (logs.len() - 1) as f64) as usize;
                         logs.select_nth_unstable_by(i5, |a, b| a.partial_cmp(b).unwrap());
-                        let i95 = (logs.len() as f64 * 0.95).clamp(0.0, (logs.len() - 1) as f64) as usize;
-                        if i95 > i5 {
-                            logs[i5..].select_nth_unstable_by(i95 - i5, |a, b| a.partial_cmp(b).unwrap());
-                        }
-                        let (mut lo, mut hi) = (logs[i5], logs[i95]);
+                        let lo = logs[i5].max(0.0); // sub-µs floor; log10 of tiny durs still sorts fine
+                        let mut hi = max_log;
                         if hi <= lo { hi = lo + 1.0; }
-                        if lo < 0.0 { lo = 0.0; } // sub-µs floor; log10 of tiny durs still sorts fine
                         (lo, hi)
                     }
                 }
