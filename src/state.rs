@@ -2159,6 +2159,39 @@ pub struct AppState {
     /// per name (see `source::SourceIndex`), so there is no index build,
     /// no background thread, and no staleness on a branch switch.
     pub src_idx: Option<Box<crate::source::SourceIndex>>,
+    /// In-flight exact-build clone: View Source auto-materializes the
+    /// trace's build commit/tag into /tmp (see `source::materialize_build`).
+    /// When it finishes, about_to_wait stashes the result in
+    /// `src_clone_done` and the next frame swaps it in as the checkout and
+    /// re-runs the jump that started it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub src_clone: Option<SrcCloneTask>,
+    /// A finished clone's outcome, awaiting the next frame (which has the
+    /// ui access the rejump needs).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub src_clone_done: Option<(Option<(usize, EventRef)>, String,
+        Result<(std::path::PathBuf, String), String>)>,
+    /// A build ref that already failed to materialize (id, message) —
+    /// don't retry it on every jump.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub src_clone_fail: Option<(String, String)>,
+    /// The user pinned a checkout explicitly (Set button or a dropped
+    /// folder) — auto-materialization stands down while pinned.
+    pub src_pinned: bool,
+    /// Input buffer for the setup popup's manual exact-build field
+    /// (commit sha or tag), for traces whose version carries a pipeline
+    /// stamp that matches no repo.
+    pub src_build: String,
+}
+
+/// One background exact-build clone, spawned by a View Source jump.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct SrcCloneTask {
+    pub handle: std::thread::JoinHandle<Result<(std::path::PathBuf, String), String>>,
+    /// The jump to re-run once the tree lands (pane index guards against
+    /// the tab closing while the clone runs).
+    pub rejump: Option<(usize, EventRef)>,
+    pub build_id: String,
 }
 
 impl AppState {

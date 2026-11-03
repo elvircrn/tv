@@ -144,6 +144,14 @@ fn make_state(trace: Trace) -> AppState {
         src_path: String::new(),
         src_editor: "code".to_string(),
         src_idx: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        src_clone: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        src_clone_done: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        src_clone_fail: None,
+        src_pinned: false,
+        src_build: String::new(),
     }
 }
 
@@ -6626,4 +6634,57 @@ fn test_trace_build_commit() {
     // No commit tail, or a non-hex one: None.
     assert_eq!(trace_build_commit("0.33.0"), None);
     assert_eq!(trace_build_commit(""), None);
+}
+
+#[test]
+fn test_trace_build_ref() {
+    use crate::source::{trace_build_ref, BuildRef};
+    // Commit hexes win first, both conventions.
+    assert!(matches!(trace_build_ref("0.33.0rc1.dev573+llmd.cfee12e985dc6f4f74fd"),
+        Some(BuildRef::Commit(h)) if h == "cfee12e985dc6f4f74fd"));
+    assert!(matches!(trace_build_ref("0.26.1rc1.dev528+g1a2b3c4d5e6f"),
+        Some(BuildRef::Commit(h)) if h == "1a2b3c4d5e6f"));
+    // Clean release versions map to tags.
+    assert!(matches!(trace_build_ref("0.11.0"), Some(BuildRef::Tag(t)) if t == "v0.11.0"));
+    assert!(matches!(trace_build_ref("0.33.0rc1"), Some(BuildRef::Tag(t)) if t == "v0.33.0rc1"));
+    // Dev versions without a commit pin nothing (the commit lives only
+    // in the repo it was built in), and neither does garbage.
+    assert!(trace_build_ref("0.33.0rc1.dev573").is_none());
+    assert!(trace_build_ref("").is_none());
+    assert!(trace_build_ref("unknown").is_none());
+}
+
+#[test]
+fn test_extract_json_string() {
+    use crate::source::extract_json_string;
+    let body = r#"{"sha":"40941f2c4ba96fba0a7e282a5355e89cd74d9ac5","commit":{}}"#;
+    assert_eq!(extract_json_string(body, "sha").as_deref(),
+        Some("40941f2c4ba96fba0a7e282a5355e89cd74d9ac5"));
+    // The api's error bodies have no sha key.
+    assert_eq!(extract_json_string(r#"{"message":"No commit found for SHA: x"}"#, "sha"), None);
+    assert_eq!(extract_json_string("", "sha"), None);
+}
+
+/// End-to-end materialize_build against the real network: fetches the
+/// commit the 0936 traces were built from, shallow + blobless + sparse.
+/// Gated so CI never needs the network. Run with TV_NET=1 --nocapture.
+#[test]
+#[ignore]
+fn materialize_build_real() {
+    if std::env::var("TV_NET").map(|v| v != "1").unwrap_or(true) { return; }
+    let t0 = std::time::Instant::now();
+    let (wt, desc) = crate::source::materialize_build(
+        &crate::source::BuildRef::Commit("40941f2c4b".into()))
+        .expect("materialize failed");
+    eprintln!("worktree: {} ({}) in {:.1}s", wt.display(), desc, t0.elapsed().as_secs_f64());
+    assert!(wt.join("vllm").is_dir(), "sparse checkout must include vllm/");
+    assert!(wt.join("csrc").is_dir(), "sparse checkout must include csrc/");
+    assert!(!wt.join("docs").exists(), "sparse checkout must exclude docs/");
+    assert!(desc.contains("40941f2c4b"), "describe must identify the commit");
+    // A repeat call reuses the worktree without network work.
+    let t1 = std::time::Instant::now();
+    let (wt2, _) = crate::source::materialize_build(
+        &crate::source::BuildRef::Commit("40941f2c4b".into())).unwrap();
+    assert_eq!(wt2, wt);
+    eprintln!("reuse: {:.2}s", t1.elapsed().as_secs_f64());
 }

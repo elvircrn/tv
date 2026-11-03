@@ -339,6 +339,203 @@ pub fn open_in_editor(editor: &str, hit: &SourceHit) -> Result<(), String> {
         editor))
 }
 
+// ===================================================== exact-build cloning
+
+/// What a trace's `vllm_version` pins the source to: a commit (dev builds
+/// carry one) or a tag (clean releases). `None` when the string pins
+/// nothing usable.
+#[derive(Clone)]
+pub enum BuildRef {
+    Commit(String),
+    Tag(String),
+}
+
+impl BuildRef {
+    /// The identity used for match checks and failure memoization.
+    pub fn id(&self) -> &str {
+        match self { BuildRef::Commit(c) => c, BuildRef::Tag(t) => t }
+    }
+}
+
+/// The build ref a trace's `vllm_version` names, or None. Commit first
+/// (the existing hex extraction), then a clean release version -> tag.
+/// A `.devN` version with no commit hex pins nothing (the commit lives
+/// only in the repo it was built in).
+pub fn trace_build_ref(vllm_version: &str) -> Option<BuildRef> {
+    if let Some(c) = trace_build_commit(vllm_version) {
+        return Some(BuildRef::Commit(c.to_string()));
+    }
+    let v = vllm_version.trim();
+    if !v.contains('+') && !v.contains(".dev")
+        && v.starts_with(|c: char| c.is_ascii_digit()) && v.contains('.')
+    {
+        return Some(BuildRef::Tag(format!("v{v}")));
+    }
+    None
+}
+
+/// Run git, map failure to a message with trimmed stderr.
+fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
+    let mut c = std::process::Command::new("git");
+    if let Some(d) = dir { c.arg("-C").arg(d); }
+    c.args(args);
+    let out = c.output().map_err(|e| format!("couldn't run git: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("git {}: {}", args.join(" "), err.trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Where exact builds come from, in order: the user's fork first (their
+/// branches' commits live there, not upstream), then vllm-project.
+const BUILD_REMOTES: [&str; 2] = [
+    "https://github.com/elvircrn/vllm",
+    "https://github.com/vllm-project/vllm",
+];
+
+/// Resolve an abbreviated commit sha to its full form plus the remote that
+/// has it. GitHub's fetch protocol only accepts full shas, but the REST API
+/// resolves prefixes — which also doubles as the existence check: a nightly
+/// pipeline stamp (`+llmd.cfee12e...`) 404s in every repo, and that's how
+/// tv tells "real commit" from "stamp that matches no repo".
+fn resolve_full_sha(hex: &str) -> Result<(String, &'static str), String> {
+    let mut not_found = false;
+    for remote in BUILD_REMOTES {
+        let repo = remote.trim_start_matches("https://github.com/");
+        let url = format!("https://api.github.com/repos/{repo}/commits/{hex}");
+        let out = std::process::Command::new("curl")
+            .args(["-s", "-m", "15", &url])
+            .output()
+            .map_err(|e| format!("couldn't run curl: {e}"))?;
+        let body = String::from_utf8_lossy(&out.stdout).into_owned();
+        if let Some(full) = extract_json_string(&body, "sha") {
+            if full.len() == 40 && full.starts_with(hex) {
+                return Ok((full, remote));
+            }
+            continue;
+        }
+        if body.contains("No commit found") { not_found = true; continue; }
+        if body.contains("rate limit") {
+            return Err("github api rate limited - try again in a minute or set a checkout manually".into());
+        }
+        // Network error / garbage: try the next remote, remember nothing.
+    }
+    if not_found {
+        return Err(format!(
+            "{hex} is not a commit in elvircrn/vllm or vllm-project/vllm - it looks like a \
+             pipeline build stamp, not a repo commit. Set a checkout manually (or paste the \
+             real build commit in the source setup popup)"));
+    }
+    Err(format!("couldn't resolve {hex} via the github api (network?)"))
+}
+
+/// The first `"key": "value"` string in `body` (whitespace-tolerant — the
+/// api pretty-prints). Crude on purpose: the response's first field is the
+/// sha we want, and pulling in a json crate for one field isn't worth it.
+pub(crate) fn extract_json_string(body: &str, key: &str) -> Option<String> {
+    let key_at = body.find(&format!("\"{key}\""))?;
+    let colon = body[key_at..].find(':')? + key_at;
+    let open = body[colon..].find('"')? + colon;
+    let rest = &body[open + 1..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Materialize the exact tree a trace was built from, as cheaply as the
+/// network allows: a blobless depth-1 fetch (commit + trees only, no file
+/// contents) into a persistent object cache (`~/.cache/tv/vllm.git`), then
+/// a sparse worktree at `/tmp/vllm-<short>` holding only `vllm/` and
+/// `csrc/` — the two trees source resolution scans — so the lazy blob
+/// fetch during checkout downloads just those, not docs/, tests/, or
+/// examples/. Returns the worktree path plus its `git describe` (the full
+/// sha when tags weren't fetched, which still contains the abbreviated
+/// hex, so the drift check passes). Reuses an existing worktree for the
+/// same ref. Network: one api call (commits only, and only when the cache
+/// lacks the sha) plus the filtered fetch.
+pub fn materialize_build(build: &BuildRef) -> Result<(PathBuf, String), String> {
+    let home = std::env::var("HOME").map_err(|_| "no $HOME".to_string())?;
+    let cache = PathBuf::from(&home).join(".cache/tv/vllm.git");
+    if !cache.is_dir() {
+        git(None, &["init", "--bare", &cache.to_string_lossy()])?;
+    }
+    // What the worktree checks out, and the /tmp dir name. Fetches go
+    // through `origin` — the promisor remote lazy blob fetches use —
+    // pointed at wherever the ref actually lives.
+    let (checkout_ref, short) = match build {
+        BuildRef::Commit(hex) => {
+            // Fetch needs the full sha; the cache may already have it.
+            if git(Some(&cache), &["cat-file", "-e", &format!("{hex}^{{commit}}")]).is_err() {
+                let (full, remote) = resolve_full_sha(hex)?;
+                set_origin(&cache, remote)?;
+                git(Some(&cache), &["fetch", "--depth", "1", "--filter=blob:none", "origin", &full])?;
+            }
+            (hex.clone(), hex[..hex.len().min(10)].to_string())
+        }
+        BuildRef::Tag(t) => {
+            if git(Some(&cache), &["rev-parse", "--verify", "-q", &format!("refs/tags/{t}")]).is_err() {
+                fetch_tag(&cache, t)?;
+            }
+            (t.clone(), t.trim_start_matches('v').to_string())
+        }
+    };
+    let wt = std::path::PathBuf::from("/tmp").join(format!("vllm-{short}"));
+    // Reuse a worktree that's already at this ref; wipe anything else
+    // (a partial checkout from a crash) and re-add. Tags peel to a commit
+    // sha for the comparison; commits compare by prefix.
+    let head_target = match build {
+        BuildRef::Commit(hex) => hex.clone(),
+        BuildRef::Tag(t) => git(Some(&cache), &["rev-parse", &format!("refs/tags/{t}^{{commit}}")])?,
+    };
+    let at_ref = git(Some(&wt), &["rev-parse", "HEAD"])
+        .map(|h| h == head_target || h.starts_with(&head_target))
+        .unwrap_or(false);
+    if !at_ref {
+        let _ = std::fs::remove_dir_all(&wt);
+        git(Some(&cache), &["worktree", "prune"])?;
+        git(Some(&cache), &["worktree", "add", "--no-checkout",
+            &wt.to_string_lossy(), &checkout_ref])?;
+        // Sparse: only the trees resolution scans. If the local git is too
+        // old for `sparse-checkout`, fall back to a full checkout (more
+        // blobs, same correctness).
+        if git(Some(&wt), &["sparse-checkout", "set", "vllm", "csrc"]).is_ok() {
+            git(Some(&wt), &["reset", "--hard"])?;
+        } else {
+            git(Some(&wt), &["checkout", "--detach", &checkout_ref])?;
+        }
+    }
+    // --abbrev=40 so a sha fallback is the full commit: the drift check
+    // compares the version string's 12-18 char hex against this, and a
+    // 7-char abbreviation can't contain it.
+    let desc = git(Some(&wt), &["describe", "--tags", "--always", "--dirty", "--abbrev=40"])
+        .unwrap_or_else(|_| checkout_ref.clone());
+    Ok((wt, desc))
+}
+
+/// Point the cache's `origin` at `remote`. Must be the remote the ref came
+/// from: it's the promisor lazy blob fetches go to.
+fn set_origin(cache: &Path, remote: &str) -> Result<(), String> {
+    match git(Some(cache), &["remote", "get-url", "origin"]) {
+        Ok(_) => git(Some(cache), &["remote", "set-url", "origin", remote]).map(|_| ()),
+        Err(_) => git(Some(cache), &["remote", "add", "origin", remote]).map(|_| ()),
+    }
+}
+
+/// Fetch a tag shallow + blobless, trying each remote in order (the fork
+/// may lag upstream's tags, or carry some upstream doesn't).
+fn fetch_tag(cache: &Path, tag: &str) -> Result<(), String> {
+    let spec = format!("refs/tags/{tag}:refs/tags/{tag}");
+    let mut last = String::new();
+    for remote in BUILD_REMOTES {
+        set_origin(cache, remote)?;
+        match git(Some(cache), &["fetch", "--depth", "1", "--filter=blob:none", "origin", &spec]) {
+            Ok(_) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(format!("tag {tag} not found in any remote ({last})"))
+}
+
 /// The machine's default vLLM checkout, if one exists: `~/vllm` that looks
 /// like the repo (has the `vllm/` package dir and a `.git`). Cheap — an
 /// index now holds nothing but a root until the first jump, so there is no

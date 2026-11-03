@@ -295,6 +295,14 @@ impl App {
                 src_path,
                 src_editor: "code".to_string(),
                 src_idx,
+                #[cfg(not(target_arch = "wasm32"))]
+                src_clone: None,
+                #[cfg(not(target_arch = "wasm32"))]
+                src_clone_done: None,
+                #[cfg(not(target_arch = "wasm32"))]
+                src_clone_fail: None,
+                src_pinned: false,
+                src_build: String::new(),
             },
             last_frame: Instant::now(),
             scale_factor: 1.0,
@@ -1086,6 +1094,7 @@ impl ApplicationHandler for App {
                         if name == "vllm" || path.join("vllm").is_dir() {
                             self.state.src_path = path.to_string_lossy().into_owned();
                             self.state.src_idx = Some(Box::new(source::SourceIndex::new(path)));
+                            self.state.src_pinned = true;
                             if let Some(pane) = self.state.panes.get_mut(self.state.active) {
                                 pane.src_msg = Some((SrcNote::Ok,
                                     format!("source checkout: {}", self.state.src_path)));
@@ -1136,13 +1145,33 @@ impl ApplicationHandler for App {
         #[cfg(not(target_arch = "wasm32"))]
         let awaiting_real_size = false;
 
+        // A finished exact-build clone: stash the outcome for the next
+        // frame (the rejump needs ui access) — and keep the loop in Poll
+        // while one runs, exactly like a trace load, so a Wait-mode loop
+        // doesn't sleep past the clone finishing.
+        #[cfg(not(target_arch = "wasm32"))]
+        let src_cloning = self.state.src_clone.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let src_cloning = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(task) = self.state.src_clone.take() {
+            if task.handle.is_finished() {
+                let res = task.handle.join()
+                    .unwrap_or_else(|_| Err("clone thread panicked".to_string()));
+                self.state.src_clone_done = Some((task.rejump, task.build_id, res));
+            } else {
+                self.state.src_clone = Some(task);
+            }
+        }
+
         let needs_poll = self.state.panes.iter().any(|p| p.loading.is_some())
             || self.nav_keys != 0
             || self.nav_pan_vel.abs() > 1e-6
             || self.nav_zoom_vel.abs() > 1e-6
             || any_watching
             || awaiting_real_size
-            || self.state.panes.iter().any(|p| p.view.anim.is_some());
+            || self.state.panes.iter().any(|p| p.view.anim.is_some())
+            || src_cloning;
         if needs_poll {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             if let Some(w) = &self.window {
@@ -1350,6 +1379,40 @@ impl App {
                 let e = $t.elapsed().as_secs_f64() * 1000.0;
                 if e > 20.0 { tlog!("  {}:{:.0} ", $name, e); }
                 $t = Instant::now();
+            }
+        }
+
+        // A finished exact-build clone lands here (stashed by
+        // about_to_wait): swap it in as the checkout and re-run the jump
+        // that started it. On failure, remember the ref so every jump
+        // doesn't re-curl a stamp that matches no repo, then still jump
+        // against whatever checkout exists (the drift warning rides it).
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((rejump, build_id, res)) = state.src_clone_done.take() {
+            match res {
+                Ok((path, desc)) => {
+                    let disp = path.to_string_lossy().into_owned();
+                    state.src_idx = Some(Box::new(source::SourceIndex::new(path)));
+                    state.src_pinned = false;
+                    if let Some(p) = state.panes.get_mut(state.active) {
+                        p.src_msg = Some((SrcNote::Ok,
+                            format!("exact vllm build {} ({})", desc, disp)));
+                    }
+                }
+                Err(e) => {
+                    state.src_clone_fail = Some((build_id.clone(), e.clone()));
+                    if let Some(p) = state.panes.get_mut(state.active) {
+                        p.src_msg = Some((SrcNote::Warn, e));
+                    }
+                }
+            }
+            if let Some((pi, r)) = rejump {
+                if pi < state.panes.len() && state.panes[pi].has_trace() {
+                    let (act, warn) = resolve_event_source(&mut state.src_idx, &state.panes[pi], r);
+                    let pane = &mut state.panes[pi];
+                    apply_src_action(ui, &mut pane.src_msg, &mut pane.src_hits,
+                        &state.src_editor, act, warn);
+                }
             }
         }
 
@@ -2329,7 +2392,8 @@ impl App {
                 }
                 // Applying is free — nothing is indexed until a jump, so
                 // switching checkouts (or branches) is instant and always
-                // current.
+                // current. An explicit Set pins: auto-materialization
+                // stands down until a different trace's build asks again.
                 let mut go = false;
                 ui.set_next_item_width(320.0);
                 if ui.input_text("##srcpath", &mut state.src_path)
@@ -2341,6 +2405,7 @@ impl App {
                     let p = std::path::PathBuf::from(&state.src_path);
                     if p.is_dir() {
                         state.src_idx = Some(Box::new(source::SourceIndex::new(p)));
+                        state.src_pinned = true;
                         state.panes[ai].src_msg =
                             Some((SrcNote::Ok, format!("source checkout: {}", state.src_path)));
                         ui.close_current_popup();
@@ -2348,6 +2413,35 @@ impl App {
                         state.panes[ai].src_msg =
                             Some((SrcNote::Err, format!("not a directory: {}", state.src_path)));
                     }
+                }
+                // Manual exact-build: for traces whose version carries a
+                // pipeline stamp (matches no repo), paste the real build
+                // commit or tag (from the image label, the PR, ...) and tv
+                // materializes it like the automatic path would have.
+                let mut fetch = false;
+                ui.set_next_item_width(320.0);
+                if ui.input_text("##srcbuild", &mut state.src_build)
+                    .hint("exact build: commit sha or tag (e.g. 40941f2c4b, v0.11.0)")
+                    .build() { fetch = true; }
+                ui.same_line();
+                if ui.button("Fetch") { fetch = true; }
+                if fetch && state.src_clone.is_none() && !state.src_build.trim().is_empty() {
+                    // A '.' means version tag (a sha never has one).
+                    let t = state.src_build.trim();
+                    let b = if t.contains('.') {
+                        source::BuildRef::Tag(format!("v{}", t.trim_start_matches('v')))
+                    } else {
+                        source::BuildRef::Commit(t.to_string())
+                    };
+                    let bid = b.id().to_string();
+                    state.src_clone = Some(SrcCloneTask {
+                        handle: std::thread::spawn(move || source::materialize_build(&b)),
+                        rejump: None,
+                        build_id: bid.clone(),
+                    });
+                    state.panes[ai].src_msg = Some((SrcNote::Ok,
+                        format!("fetching exact vllm build {} ...", bid)));
+                    ui.close_current_popup();
                 }
                 ui.set_next_item_width(90.0);
                 ui.input_text("##srceditor", &mut state.src_editor)
@@ -2575,18 +2669,57 @@ impl App {
                                     });
                                 }
                                 // Right-click -> source: the one gesture for
-                                // the whole feature. Setup (no checkout yet)
-                                // and multi-hit picks are popups, outcomes
-                                // land in the status bar.
+                                // the whole feature. When the trace names
+                                // its build commit/tag and the checkout on
+                                // hand isn't it, first go get the exact
+                                // tree (background clone into /tmp) and
+                                // re-run this jump when it lands — jumps
+                                // against a drifted checkout are how "right
+                                // file, wrong line" happens. Stands down
+                                // when the user pinned a checkout, a clone
+                                // is already running, or this build already
+                                // failed to resolve (nightly pipeline
+                                // stamps match no repo).
                                 #[cfg(not(target_arch = "wasm32"))]
                                 if ui.menu_item("View Source") {
-                                    let (act, warn) = resolve_event_source(
-                                        &mut state.src_idx, &state.panes[ai], r);
-                                    let pane = &mut state.panes[ai];
-                                    apply_src_action(
-                                        ui,
-                                        &mut pane.src_msg, &mut pane.src_hits,
-                                        &state.src_editor, act, warn);
+                                    let build = state.panes[ai].trace.as_ref()
+                                        .and_then(|t| source::trace_build_ref(&t.vllm_version));
+                                    let clone = match &build {
+                                        Some(b) if !state.src_pinned
+                                            && state.src_clone.is_none()
+                                            && state.src_clone_fail.as_ref()
+                                                .map(|(id, _)| id != b.id()).unwrap_or(true)
+                                            && !state.src_idx.as_mut()
+                                                .and_then(|i| i.git_desc())
+                                                .is_some_and(|d| d.contains(b.id())) =>
+                                        {
+                                            let bid = b.id().to_string();
+                                            state.src_clone = Some(SrcCloneTask {
+                                                handle: std::thread::spawn({
+                                                    let b = b.clone();
+                                                    move || source::materialize_build(&b)
+                                                }),
+                                                rejump: Some((ai, r)),
+                                                build_id: bid.clone(),
+                                            });
+                                            state.panes[ai].src_msg = Some((SrcNote::Ok,
+                                                format!("fetching exact vllm build {} ...", bid)));
+                                            true
+                                        }
+                                        _ => false,
+                                    };
+                                    if !clone && state.src_clone.is_some() {
+                                        state.panes[ai].src_msg = Some((SrcNote::Ok,
+                                            "still fetching exact vllm build ...".to_string()));
+                                    } else if !clone {
+                                        let (act, warn) = resolve_event_source(
+                                            &mut state.src_idx, &state.panes[ai], r);
+                                        let pane = &mut state.panes[ai];
+                                        apply_src_action(
+                                            ui,
+                                            &mut pane.src_msg, &mut pane.src_hits,
+                                            &state.src_editor, act, warn);
+                                    }
                                 }
                             });
                         }
