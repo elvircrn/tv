@@ -801,6 +801,12 @@ pub struct Pane {
     pub label_w: f32,
     pub sel_median: f64,
     pub sel_agg_stats: Vec<KernelStats>,
+    /// Earliest start time of each aggregate row's events (same row order as
+    /// `sel_agg_stats`), for the Selection table's "Start" column — sorting
+    /// it orders the kernels chronologically by first occurrence. The
+    /// per-event table doesn't need a parallel array: each row's (track,
+    /// event) ref is enough to read its `ts` directly in `draw_stats_table`.
+    pub sel_agg_starts: Vec<f64>,
     pub sel_individual: Vec<KernelStats>,
     /// (track_idx, event_idx) parallel to `sel_individual`, so the stats table
     /// can look up each row's raw args (e.g. CUDA occupancy-limiting factor).
@@ -930,6 +936,7 @@ impl Pane {
             label_w: LABEL_W,
             sel_median: 0.0,
             sel_agg_stats: Vec::new(),
+            sel_agg_starts: Vec::new(),
             sel_individual: Vec::new(),
             sel_individual_refs: Vec::new(),
             sel_overlap: false,
@@ -1179,6 +1186,7 @@ impl Pane {
         self.focused_gap = None;
         self.sel_median = 0.0;
         self.sel_agg_stats.clear();
+        self.sel_agg_starts.clear();
         self.sel_individual.clear();
         self.sel_individual_refs.clear();
     }
@@ -1665,7 +1673,7 @@ impl Pane {
         let t_start = crate::time::Instant::now();
         if self.trace.is_none() { return; }
         if self.finished_sel.is_none() {
-            self.selection_stats.clear(); self.sel_gpu.clear(); self.sel_agg_stats.clear(); self.sel_individual.clear(); self.sel_individual_refs.clear(); self.sel_median = 0.0;
+            self.selection_stats.clear(); self.sel_gpu.clear(); self.sel_agg_stats.clear(); self.sel_agg_starts.clear(); self.sel_individual.clear(); self.sel_individual_refs.clear(); self.sel_median = 0.0;
             return;
         }
         // finished_sel_events is the frozen (track_idx, event_idx) set
@@ -2144,7 +2152,7 @@ impl Pane {
         self.heat_bounds = Some(bounds);
     }
 
-    fn compute_aggregates(&mut self) {
+    pub(crate) fn compute_aggregates(&mut self) {
         self.sel_generation = self.sel_generation.wrapping_add(1);
         let mut all_durs: Vec<f64> = self.selection_stats.iter().flat_map(|s| s.durations.iter().copied()).collect();
         self.sel_median = median_inplace(&mut all_durs);
@@ -2158,6 +2166,15 @@ impl Pane {
                 max_dur: s.durations.iter().copied().fold(0.0f64, f64::max),
                 min_dur: s.durations.iter().copied().fold(f64::MAX, f64::min),
             }
+        }).collect();
+        // First-occurrence start per aggregate row, for the chronological
+        // ("Start") sort. One indexed read per selected event, same shape as
+        // the totals loop above.
+        let trace = self.trace.as_ref().unwrap();
+        self.sel_agg_starts = self.selection_stats.iter().map(|s| {
+            s.event_refs.iter().map(|&(ti, ei)| {
+                trace.tracks[ti as usize].events[ei as usize].ts
+            }).fold(f64::MAX, f64::min)
         }).collect();
 
         // One row per event, in whatever order selection_stats yields them —

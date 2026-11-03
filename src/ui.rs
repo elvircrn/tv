@@ -431,7 +431,7 @@ pub fn draw_selection_histogram(
 /// (so a persisted sort_col/column layout survives switching aggregate modes)
 /// but is only ever populated in individual-row mode, since an aggregate row
 /// can span kernel launches with different limiting factors.
-const STATS_HEADERS: [&str; 9] = ["Name", "Count", "Total", "%", "Mean", "Median", "Max", "Min", "Occ Limit"];
+const STATS_HEADERS: [&str; 10] = ["Name", "Count", "Total", "%", "Mean", "Median", "Max", "Min", "Occ Limit", "Start"];
 
 /// CUDA's default static shared-memory-per-block cap (48KB) on every
 /// architecture since Kepler. A kernel that opts into more via
@@ -519,6 +519,12 @@ pub fn draw_stats_table(
     // `None` renders the plain sums (and is always passed for the
     // per-event table, where a row is one launch).
     overlap_totals: Option<&[f64]>,
+    // Per-row start times for the "Start" column — the chronological sort.
+    // Aggregate mode passes each kernel's first occurrence in the selection
+    // (Pane::sel_agg_starts); the per-event table passes `None` and the
+    // column reads each row's own `ts` straight off its event_ref (below),
+    // which is the launch time of that single event.
+    starts: Option<&[f64]>,
     // Bumped by `compute_aggregates` whenever the selection is rebuilt; part
     // of the sort cache key (see `sort_cache_key` below) so an unchanged
     // selection doesn't get re-sorted every redraw.
@@ -569,7 +575,7 @@ pub fn draw_stats_table(
     let num_w = ui
         .calc_text_size("0000.00 ms")[0]
         .max(ui.calc_text_size("Median")[0] + 22.0);
-    let cols: [TableColumnSetup<&str>; 9] = std::array::from_fn(|i| {
+    let cols: [TableColumnSetup<&str>; 10] = std::array::from_fn(|i| {
         let mut c = TableColumnSetup::new(STATS_HEADERS[i]);
         if i == 0 {
             // Name can't be hidden (it's the key). Fixed at a generous width
@@ -577,6 +583,13 @@ pub fn draw_stats_table(
             c.flags |= TableColumnFlags::WIDTH_FIXED | TableColumnFlags::NO_HIDE;
             c.init_width_or_weight = (avail[0] * 0.45).max(240.0);
         } else if i == 8 {
+            // Occ Limit used to be the trailing stretch column; Start took
+            // that slot. Fixed at a width covering CUPTI's longest common
+            // limiting factor so the column doesn't trade slack for clipping
+            // — it stays resizable, and long values still get a tooltip.
+            c.flags |= TableColumnFlags::WIDTH_FIXED;
+            c.init_width_or_weight = ui.calc_text_size("Static Shared Memory")[0] + 16.0;
+        } else if i == 9 {
             // The ONLY stretch column, and it must be the last one: imgui
             // does a spreadsheet-style offsetting resize (grow this column,
             // push everything right of it along, extend the table) only when
@@ -637,6 +650,16 @@ pub fn draw_stats_table(
             None => ("", false),
         }
     };
+    // Start time of row si: the caller's array in aggregate mode (first
+    // occurrence), else the launch's own ts via its event ref. Two indexed
+    // reads, cheap enough to call straight from the sort comparator.
+    let start_of = |si: usize| -> f64 {
+        if let Some(s) = starts { return s[si]; }
+        match event_refs.and_then(|r| r.get(si)) {
+            Some(&(ti, ei)) => trace.tracks[ti as usize].events[ei as usize].ts,
+            None => 0.0,
+        }
+    };
     // This table resorts on every call — i.e. every redraw, which fires on
     // every mouse-move, not just when the user actually changes the sort or
     // the selection. Skip the O(n log n) sort_by entirely when nothing that
@@ -678,7 +701,8 @@ pub fn draw_stats_table(
                 5 => sa.median_dur.partial_cmp(&sb.median_dur).unwrap(),
                 6 => sa.max_dur.partial_cmp(&sb.max_dur).unwrap(),
                 7 => sa.min_dur.partial_cmp(&sb.min_dur).unwrap(),
-                _ => occ_limit_for_sort(a).0.cmp(occ_limit_for_sort(b).0),
+                8 => occ_limit_for_sort(a).0.cmp(occ_limit_for_sort(b).0),
+                _ => start_of(a).partial_cmp(&start_of(b)).unwrap(),
             };
             if *sort_asc { ord } else { ord.reverse() }
         });
@@ -789,6 +813,22 @@ pub fn draw_stats_table(
                         );
                     }
                 }
+            }
+        }
+        if ui.table_set_column_index(9) {
+            buf.fmt.clear();
+            write_time(&mut buf.fmt, start_of(si));
+            ui.text(&buf.fmt);
+            if ui.is_item_hovered() {
+                ui.tooltip_text(if event_refs.is_some() {
+                    "Time since trace start when this launch began.\n\
+                    Sort by this column (click the header) for\n\
+                    chronological order."
+                } else {
+                    "Time since trace start of this kernel's first\n\
+                    occurrence in the selection. Sort by this column\n\
+                    (click the header) for chronological order."
+                });
             }
         }
     }

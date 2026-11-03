@@ -1992,9 +1992,9 @@ impl App {
                                     // `trace` binding.
                                     if pane.sel_overlap { pane.ensure_sel_overlap_totals(); }
                                     let overlap = if pane.sel_overlap { Some(&pane.sel_overlap_totals[..]) } else { None };
-                                    draw_stats_table(&ui, pane.trace.as_ref().unwrap(), &pane.sel_agg_stats, None, overlap, pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut pane.sort_cache_key, &mut pane.sort_idx, &mut state.buf, "##selstats");
+                                    draw_stats_table(&ui, pane.trace.as_ref().unwrap(), &pane.sel_agg_stats, None, overlap, Some(&pane.sel_agg_starts), pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut pane.sort_cache_key, &mut pane.sort_idx, &mut state.buf, "##selstats");
                                 } else {
-                                    draw_stats_table(&ui, pane.trace.as_ref().unwrap(), &pane.sel_individual, Some(&pane.sel_individual_refs), None, pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut pane.sort_cache_key, &mut pane.sort_idx, &mut state.buf, "##selstats");
+                                    draw_stats_table(&ui, pane.trace.as_ref().unwrap(), &pane.sel_individual, Some(&pane.sel_individual_refs), None, None, pane.sel_generation, &mut pane.search, &mut search_changed, &mut pane.sort_col, &mut pane.sort_asc, &mut pane.sort_cache_key, &mut pane.sort_idx, &mut state.buf, "##selstats");
                                 }
                                 let tbl_ms = t_tbl.elapsed().as_secs_f64() * 1000.0;
                                 let tbl_rows = if pane.sel_aggregate { pane.sel_agg_stats.len() } else { pane.sel_individual.len() };

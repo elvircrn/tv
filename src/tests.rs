@@ -3534,7 +3534,7 @@ fn stats_table_sorts_by_overlap_totals_when_overlap_aware() {
             .size([1600.0, 400.0], imgui::Condition::Always)
             .build(|| {
                 draw_stats_table(
-                    &ui, &trace, &stats, None, overlap, 7,
+                    &ui, &trace, &stats, None, overlap, None, 7,
                     &mut search, &mut search_changed,
                     &mut sort_col, &mut sort_asc, &mut cache, &mut sort_idx,
                     &mut buf, "##selstats",
@@ -3547,6 +3547,116 @@ fn stats_table_sorts_by_overlap_totals_when_overlap_aware() {
     assert_eq!(run(None), vec![0, 1], "plain mode: heavy_sum (40us sum) sorts first");
     assert_eq!(run(Some(&overlap)), vec![1, 0],
         "overlap mode: light_sum (15us union) sorts first, and the cache key must force a re-sort");
+}
+
+#[test]
+fn stats_table_sorts_chronologically_by_start() {
+    // The "Start" column sorts the Selection table chronologically. In
+    // per-event mode each row's start is its own launch ts (read off the
+    // row's event ref); in aggregate mode it's the caller's first-occurrence
+    // array. Rows here are scrambled relative to time in both modes, and
+    // the two calls share sort state + table id the way toggling Aggregate
+    // does, so this also pins the cache key distinguishing the modes.
+    let trace = make_trace(
+        vec!["late_kernel", "early_kernel"],
+        vec![
+            ("Rank 0 stream 0", true, vec![
+                ev(500.0, 10.0, 0, 0), // (0,0)
+                ev(100.0, 5.0, 1, 0),  // (0,1)
+            ]),
+            ("Rank 1 stream 0", true, vec![
+                ev(300.0, 8.0, 1, 0),  // (1,0)
+                ev(200.0, 7.0, 0, 0),  // (1,1)
+            ]),
+        ],
+    );
+    let one = |name: u32, d: f64| crate::types::KernelStats {
+        name, count: 1, total_dur: d, median_dur: d, max_dur: d, min_dur: d,
+    };
+    // Individual rows in deliberately non-chronological order: ts 200, 500,
+    // 100, 300.
+    let individual = vec![one(0, 7.0), one(0, 10.0), one(1, 5.0), one(1, 8.0)];
+    let refs: Vec<(u32, u32)> = vec![(1, 1), (0, 0), (0, 1), (1, 0)];
+    // Aggregate rows: late_kernel first occurs at 500, early_kernel at 100.
+    let agg = vec![
+        crate::types::KernelStats { name: 0, count: 2, total_dur: 17.0, median_dur: 7.0, max_dur: 10.0, min_dur: 7.0 },
+        crate::types::KernelStats { name: 1, count: 2, total_dur: 13.0, median_dur: 5.0, max_dur: 8.0, min_dur: 5.0 },
+    ];
+    let starts = vec![500.0, 100.0];
+
+    let _imgui_ctx = IMGUI_CTX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut imgui = imgui::Context::create();
+    imgui.io_mut().display_size = [1600.0, 900.0];
+    imgui.fonts().build_rgba32_texture();
+    let mut search = String::new();
+    let mut search_changed = false;
+    let mut sort_col = 9usize; // Start
+    let mut sort_asc = true;   // chronological = ascending
+    let mut cache: Option<(u64, usize, bool, usize, bool, bool)> = None;
+    let mut sort_idx: Vec<usize> = Vec::new();
+    let mut buf = DrawBuf::default();
+    let mut run = |per_event: bool| {
+        let (stats, event_refs, starts): (&[_], Option<&[(u32, u32)]>, Option<&[f64]>) = if per_event {
+            (&individual, Some(&refs), None)
+        } else {
+            (&agg, None, Some(&starts))
+        };
+        let ui = imgui.new_frame();
+        ui.window("##tblwin")
+            .flags(imgui::WindowFlags::NO_SAVED_SETTINGS | imgui::WindowFlags::NO_DECORATION)
+            .size([1600.0, 400.0], imgui::Condition::Always)
+            .build(|| {
+                draw_stats_table(
+                    &ui, &trace, stats, event_refs, None, starts, 7,
+                    &mut search, &mut search_changed,
+                    &mut sort_col, &mut sort_asc, &mut cache, &mut sort_idx,
+                    &mut buf, "##selstats",
+                );
+            });
+        drop(ui);
+        imgui.render();
+        sort_idx.clone()
+    };
+    assert_eq!(run(true), vec![2, 0, 3, 1],
+        "per-event rows in launch order: 100, 200, 300, 500");
+    assert_eq!(run(false), vec![1, 0],
+        "aggregate rows in first-occurrence order: early_kernel (100) before late_kernel (500)");
+}
+
+#[test]
+fn compute_aggregates_builds_first_occurrence_starts() {
+    // sel_agg_starts must hold each kernel's earliest ts in the selection,
+    // whatever order the event refs were collected in.
+    let trace = make_trace(
+        vec!["kernel_a", "kernel_b"],
+        vec![
+            ("Rank 0 stream 0", true, vec![
+                ev(100.0, 5.0, 0, 0),
+                ev(400.0, 5.0, 0, 0),
+            ]),
+            ("Rank 1 stream 0", true, vec![
+                ev(200.0, 5.0, 1, 0),
+                ev(50.0, 5.0, 1, 0),
+            ]),
+        ],
+    );
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    pane.selection_stats = vec![
+        crate::types::SelectionEntry {
+            name: 0, count: 2, total_dur: 10.0,
+            durations: vec![5.0, 5.0],
+            event_refs: vec![(0, 1), (0, 0)], // later launch listed first
+        },
+        crate::types::SelectionEntry {
+            name: 1, count: 2, total_dur: 10.0,
+            durations: vec![5.0, 5.0],
+            event_refs: vec![(1, 0), (1, 1)],
+        },
+    ];
+    pane.compute_aggregates();
+    assert_eq!(pane.sel_agg_starts, vec![100.0, 50.0]);
+    assert_eq!(pane.sel_individual.len(), 4);
 }
 
 #[test]
