@@ -5200,22 +5200,27 @@ fn heat_dim_scales_channels() {
 
 #[test]
 fn heat_bounds_top_anchor_is_slowest_event() {
-    // 100 ordinary kernels plus one giant memcpy: the top of the scale must
-    // be the outlier's own duration, so it alone sits at full red — an
-    // earlier p95 anchor clamped the whole slow tail to one identical
-    // color, hiding exactly the kernel the mode exists to flag.
+    // 100 ordinary kernels plus one giant kernel plus an even gianter
+    // gpu_user_annotation span. The top of the scale must be the slowest
+    // KERNEL's own duration, so it alone sits at full red — an earlier p95
+    // anchor clamped the whole slow tail to one identical color, and an
+    // annotation-inclusive max anchored 14x past every real kernel
+    // (execute_context wrappers span whole generations in vLLM traces).
     let mut events = Vec::new();
     for i in 0..100 {
-        events.push(ev(i as f64 * 20.0, 10.0, 0, 0));
+        events.push(evc(i as f64 * 20.0, 10.0, 0, 0));
     }
-    events.push(ev(1e6, 1_000_000.0, 0, 0));
-    let trace = make_trace(vec!["k"], vec![("stream 7", true, events)]);
+    events.push(evc(1e6, 1_000_000.0, 0, 0));       // slowest kernel
+    events.push(evc(2e6, 100_000_000.0, 0, 3));     // slower annotation
+    let mut trace = make_trace(vec!["k", "wrap"], vec![("stream 7", true, events)]);
+    trace.cats = vec!["kernel".to_string(), "cpu_op".to_string(), "runtime".to_string(),
+        "gpu_user_annotation".to_string()];
     let mut pane = Pane::new();
     pane.trace = Some(trace);
     pane.ensure_heat_bounds();
     let (lo, hi) = pane.heat_bounds.expect("bounds computed");
     assert!(lo <= 1.0, "p5 bound below the bulk's log10(10), got {lo}");
-    assert!((hi - 6.0).abs() < 1e-9, "top anchor is the slowest event's log10(1e6), got {hi}");
+    assert!((hi - 6.0).abs() < 1e-9, "top anchor is the slowest kernel's log10(1e6), not the annotation's log10(1e8), got {hi}");
     // Idempotent: a second call keeps the same bounds.
     pane.ensure_heat_bounds();
     assert_eq!(pane.heat_bounds, Some((lo, hi)));
@@ -5227,6 +5232,17 @@ fn heat_bounds_fall_back_without_gpu_events() {
         vec!["op"],
         vec![("python (CPU)", false, vec![ev(0.0, 5.0, 0, 0)])],
     );
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    pane.ensure_heat_bounds();
+    assert_eq!(pane.heat_bounds, Some((0.0, 1.0)));
+    // A GPU track carrying ONLY annotations has no real work to scale.
+    let mut trace = make_trace(
+        vec!["wrap"],
+        vec![("stream 7", true, vec![evc(0.0, 5.0, 0, 3)])],
+    );
+    trace.cats = vec!["kernel".to_string(), "cpu_op".to_string(), "runtime".to_string(),
+        "gpu_user_annotation".to_string()];
     let mut pane = Pane::new();
     pane.trace = Some(trace);
     pane.ensure_heat_bounds();
@@ -5249,13 +5265,16 @@ fn draw_timeline_heat_mode_renders() {
     imgui.io_mut().display_size = [1600.0, 900.0];
     imgui.fonts().build_rgba32_texture();
 
-    let trace = make_trace(
+    let mut trace = make_trace(
         vec!["fast", "slow"],
         vec![
             ("python (CPU)", false, vec![ev(0.0, 30.0, 0, 0), ev(5.0, 2.0, 0, 1)]),
-            ("stream 7", true, vec![ev(1.0, 1.0, 0, 0), ev(10.0, 40.0, 1, 0)]),
+            ("stream 7", true, vec![evc(1.0, 1.0, 0, 0), evc(10.0, 40.0, 1, 0)]),
         ],
     );
+    // Real traces carry cats; the heat bounds only sample kernel/memcpy/
+    // memset events, so give the GPU track's events the kernel category.
+    trace.cats = vec!["kernel".to_string()];
     let mut pane = Pane::new();
     pane.trace = Some(trace);
     pane.collapsed = BitSet::with_len(2);
@@ -5939,7 +5958,12 @@ fn bench_heat_bounds() {
     for tr in &trace.tracks {
         if !tr.gpu { continue; }
         for ev in &tr.events {
-            if ev.dur > 0.0 { logs.push(ev.dur.log10()); }
+            if ev.dur <= 0.0 { continue; }
+            // Same real-GPU-work filter as ensure_heat_bounds.
+            let c = &trace.cats[ev.cat as usize];
+            if c != "kernel" && !c.starts_with("gpu_") { continue; }
+            if c == "gpu_user_annotation" { continue; }
+            logs.push(ev.dur.log10());
         }
     }
     logs.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -5957,4 +5981,50 @@ fn bench_heat_bounds() {
     };
     spread(q(0.05), q(0.95), "(p5,p95)");
     spread(q(0.05), logs[logs.len() - 1], "(p5,max)");
+}
+
+// Prints the slowest events on GPU-classified tracks (name, cat, dur) — the
+// candidates for the By Duration heat map's top anchor. Run with:
+//   TV_BENCH_TRACE=<trace> cargo test --release bench_top_gpu_events -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_top_gpu_events() {
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<path.tvcache or a directory> to run this bench"); return; }
+    };
+    let trace = if std::path::Path::new(&path).is_dir() {
+        let (rank_groups, standalone) = detect_rank_groups(&[path.clone()]);
+        let mut all_paths: Vec<(usize, String)> = Vec::new();
+        for (group, _) in &rank_groups { all_paths.extend(group.clone()); }
+        for (i, (p, _)) in standalone.iter().enumerate() { all_paths.push((all_paths.len() + i, p.clone())); }
+        let counter = test_counter();
+        use rayon::prelude::*;
+        let tpf = (std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4) / all_paths.len().max(1)).max(2);
+        let traces: Vec<(usize, Trace)> = all_paths.par_iter().filter_map(|(rank, p)| {
+            load_trace(p, &counter, tpf, None).ok().map(|t| (*rank, t))
+        }).collect();
+        merge_traces(traces)
+    } else {
+        let counter = test_counter();
+        load_trace(&path, &counter, 8, None).expect("load trace")
+    };
+    let mut top: Vec<(f64, &str, &str, &str)> = Vec::new(); // (dur, name, cat, track)
+    for tr in &trace.tracks {
+        if !tr.gpu { continue; }
+        for ev in &tr.events {
+            top.push((ev.dur, trace.names[ev.name as usize].as_str(),
+                trace.cats[ev.cat as usize].as_str(), tr.label.as_str()));
+        }
+    }
+    top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    eprintln!("slowest 25 events on GPU tracks:");
+    for (dur, name, cat, track) in top.iter().take(25) {
+        eprintln!("  {:>12.1} us  cat={:<22} name={:<50} track={}", dur, cat, name, track);
+    }
+    // And the slowest pure-kernel event, for comparison.
+    let top_kernel = top.iter().find(|(_, _, cat, _)| *cat == "kernel");
+    if let Some((dur, name, _, _)) = top_kernel {
+        eprintln!("slowest cat=kernel event: {:.1} us  {}", dur, name);
+    }
 }

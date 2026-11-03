@@ -877,13 +877,16 @@ pub struct Pane {
     /// Log10 duration bounds (p5, max) the heat map maps onto blue→red,
     /// computed lazily by `ensure_heat_bounds` the first frame the mode is
     /// on, and cleared whenever a new trace lands. The top anchor is the
-    /// slowest GPU event, exactly — the warmest color must read as "the
-    /// slowest kernel", not "the top 5% of kernels" (an earlier p95 anchor
-    /// clamped that whole tail to one identical red). p5 low anchor is
-    /// sampled; the log scale keeps the bulk visible even when the max is
-    /// a couple decades out. GPU-track events only: CPU spans include
-    /// whole-step wrappers that would otherwise dominate the top of the
-    /// range and flatten the kernel scale.
+    /// slowest real GPU-work event, exactly — the warmest color must read
+    /// as "the slowest kernel", not "the top 5% of kernels" (an earlier
+    /// p95 anchor clamped that whole tail to one identical red) nor a
+    /// wrapper span (GPU-track `gpu_user_annotation` events — vLLM's
+    /// execute_context wrappers — are excluded; they cover whole
+    /// generations and sit far past every kernel). Sampled p5 low anchor;
+    /// the log scale keeps the bulk visible even when the max is a couple
+    /// decades out. Kernels/memcpys/memsets on GPU tracks only: CPU spans
+    /// include whole-step wrappers that would otherwise dominate the top
+    /// of the range and flatten the kernel scale.
     pub heat_bounds: Option<(f64, f64)>,
 }
 
@@ -2179,6 +2182,11 @@ impl Pane {
     /// is sampled (~100k durations regardless of trace size — plenty for a
     /// stable low anchor); the max is exact, since the whole point of the
     /// top anchor is that the single slowest event sits alone at full red.
+    /// Only real GPU work is sampled: kernels, memcpys, memsets. GPU-track
+    /// annotations (`gpu_user_annotation` — vLLM's per-generation
+    /// execute_context wrappers span whole generations, ~200ms in a decode
+    /// trace vs ~15ms for the slowest real kernel) are excluded, or they'd
+    /// anchor the scale 14x past every kernel and flatten the heat map.
     pub fn ensure_heat_bounds(&mut self) {
         if self.heat_bounds.is_some() { return; }
         let bounds = match &self.trace {
@@ -2192,11 +2200,13 @@ impl Pane {
                     let mut max_log = f64::MIN;
                     for track in t.tracks.iter().filter(|tr| tr.gpu) {
                         for (i, ev) in track.events.iter().enumerate() {
-                            if ev.dur > 0.0 {
-                                let l = ev.dur.log10();
-                                if l > max_log { max_log = l; }
-                                if i % stride == 0 { logs.push(l); }
-                            }
+                            if ev.dur <= 0.0 { continue; }
+                            let c = &t.cats[ev.cat as usize];
+                            if c != "kernel" && !c.starts_with("gpu_") { continue; }
+                            if c == "gpu_user_annotation" { continue; }
+                            let l = ev.dur.log10();
+                            if l > max_log { max_log = l; }
+                            if i % stride == 0 { logs.push(l); }
                         }
                     }
                     if logs.is_empty() {
