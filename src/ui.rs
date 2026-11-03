@@ -1313,7 +1313,12 @@ pub fn draw_timeline(
                     p.ends[start..end].iter().any(|&e| e >= view.t0)
                 };
                 let scale = track_scales.get(first).copied().unwrap_or(1.0);
-                let h = md as f32 * SUB_LANE_H * scale;
+                // The collapse flag lives on the row's first member track,
+                // like everything else keyed off a merged row: a collapsed
+                // rank row is one summary lane, same as a collapsed plain
+                // row. (The old code ignored it entirely, so double-click
+                // collapse silently did nothing on merged rows.)
+                let h = track_height(md, collapsed.get(first).unwrap_or(false), scale);
                 let vi = buf.visible.len();
                 g.vi = vi;
                 buf.visible.push(first);
@@ -1636,7 +1641,11 @@ pub fn draw_timeline(
             let merged_group = merged_gpu_groups.iter().find(|g| g.vi == vi);
 
             if let Some(group) = merged_group {
-                let total_depth = group.pack.max_depth;
+                // A collapsed merged row is the same summary lane a
+                // collapsed plain row is: depth-0 packed events across the
+                // full row height, flag on the first member track.
+                let is_collapsed = collapsed.get(buf.visible[vi]).unwrap_or(false);
+                let total_depth = if is_collapsed { 1 } else { group.pack.max_depth };
                 let sub_h = track_h / total_depth as f32;
                 buf.last_px.clear();
                 buf.last_px.resize(total_depth as usize, -1i32);
@@ -1662,6 +1671,7 @@ pub fn draw_timeline(
                     let ti32 = p.refs[gi].0;
                     let ei = p.refs[gi].1 as usize;
                     let eff_depth = p.depth[gi];
+                    if is_collapsed && eff_depth > 0 { continue; }
                     let ev_ts = p.ts[gi];
                     let ev_end = p.ends[gi];
                     if ev_end < view.t0 { continue; }
@@ -1670,7 +1680,9 @@ pub fn draw_timeline(
                     let x0 = t2x(ev_ts, view.t0, px_per_us, tl_left).max(tl_left);
                     let x1 = t2x(ev_end, view.t0, px_per_us, tl_left).min(rect[2]);
                     let w = x1 - x0;
-                    let (lo, hi) = p.stretch[gi];
+                    // Collapsed: one lane at the row's full height (the
+                    // depth-0-only skip above already ran).
+                    let (lo, hi) = if is_collapsed { (0, 0) } else { p.stretch[gi] };
                     let stretched_h = (hi - lo + 1) as f32 * sub_h - LANE_GAP;
 
                     let matches = !filtering
@@ -1925,13 +1937,20 @@ pub fn draw_timeline(
                     let sel_loc = find_vi_and_depth(sel_ti, sel.event_idx as usize, sel_ev.depth);
                     if let Some((sel_vi, sel_eff_depth)) = sel_loc {
                         let sel_gpu = sel_track.gpu;
-                        let total_depth: u16 = merged_gpu_groups.iter()
-                            .find(|g| g.vi == sel_vi)
-                            .map_or(sel_track.max_depth.max(1), |g| g.pack.max_depth);
+                        // Collapsed rows draw one full-height lane, so the
+                        // anchor sits mid-row at depth 0, not in the top
+                        // sliver of a max_depth-divided row.
+                        let sel_coll = collapsed.get(buf.visible[sel_vi]).unwrap_or(false);
+                        let total_depth: u16 = if sel_coll { 1 } else {
+                            merged_gpu_groups.iter()
+                                .find(|g| g.vi == sel_vi)
+                                .map_or(sel_track.max_depth.max(1), |g| g.pack.max_depth)
+                        };
                         let src_sub_h = buf.heights[sel_vi] / total_depth as f32;
                         let src_lane_h = src_sub_h - LANE_GAP;
                         let src_y = tracks_top + buf.y_offsets[sel_vi] - view.scroll_y
-                            + sel_eff_depth as f32 * src_sub_h + EV_INSET + src_lane_h / 2.0;
+                            + (if sel_coll { 0.0 } else { sel_eff_depth as f32 }) * src_sub_h
+                            + EV_INSET + src_lane_h / 2.0;
                         let src_x = if sel_gpu {
                             t2x(sel_ev.ts, view.t0, px_per_us, tl_left)
                         } else {
@@ -1953,13 +1972,17 @@ pub fn draw_timeline(
                             let dst_ev = dst_evs[dst_ei];
 
                             let (dst_x, dst_y) = if let Some((dst_vi, dst_eff_depth)) = find_vi_and_depth(dst_ti, dst_ei, dst_ev.depth) {
-                                let dst_total: u16 = merged_gpu_groups.iter()
-                                    .find(|g| g.vi == dst_vi)
-                                    .map_or(trace.tracks[dst_ti].max_depth.max(1), |g| g.pack.max_depth);
+                                let dst_coll = collapsed.get(buf.visible[dst_vi]).unwrap_or(false);
+                                let dst_total: u16 = if dst_coll { 1 } else {
+                                    merged_gpu_groups.iter()
+                                        .find(|g| g.vi == dst_vi)
+                                        .map_or(trace.tracks[dst_ti].max_depth.max(1), |g| g.pack.max_depth)
+                                };
                                 let dst_sub_h = buf.heights[dst_vi] / dst_total as f32;
                                 let dst_lane_h = dst_sub_h - LANE_GAP;
                                 let dy = tracks_top + buf.y_offsets[dst_vi] - view.scroll_y
-                                    + dst_eff_depth as f32 * dst_sub_h + EV_INSET + dst_lane_h / 2.0;
+                                    + (if dst_coll { 0.0 } else { dst_eff_depth as f32 }) * dst_sub_h
+                                    + EV_INSET + dst_lane_h / 2.0;
                                 let dx = if sel_gpu {
                                     t2x(dst_ev.ts + dst_ev.dur, view.t0, px_per_us, tl_left)
                                 } else {
@@ -2192,7 +2215,11 @@ pub fn draw_timeline(
             let track_h = buf.heights[vi];
             let y = tracks_top + buf.y_offsets[vi] - view.scroll_y;
             if mouse_pos[1] >= y && mouse_pos[1] < y + track_h {
-                if trace.tracks[orig_ti].max_depth > 1 {
+                // Row depth, not the first member's own: a merged rank row
+                // of one-lane streams still has lanes to collapse.
+                let row_depth = merged_gpu_groups.iter().find(|g| g.vi == vi)
+                    .map_or(trace.tracks[orig_ti].max_depth, |g| g.pack.max_depth);
+                if row_depth > 1 {
                     if orig_ti < collapsed.len() {
                         let c = collapsed[orig_ti];
                         collapsed.set(orig_ti, !c);

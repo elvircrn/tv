@@ -1117,13 +1117,18 @@ impl Pane {
                 // Same windowing the render loop uses (pack is whole-span,
                 // view-independent — see MergedPack).
                 let p = &group.pack;
-                let max_depth = p.max_depth.max(1);
+                // Mirror the renderer: a collapsed merged row is one lane
+                // of depth-0 events, flag on the row's first track (what
+                // geom.visible[vi] holds for a merged row).
+                let is_collapsed = self.collapsed.get(self.geom.visible[vi]).unwrap_or(false);
+                let max_depth = if is_collapsed { 1 } else { p.max_depth.max(1) };
                 let sub_h = track_h / max_depth as f32;
                 let start = p.overlap_start(s0);
                 let end = p.ts_end(s1);
                 for gi in start..end {
                     let (ti32, ei32) = p.refs[gi];
                     let depth = p.depth[gi];
+                    if is_collapsed && depth > 0 { continue; }
                     let ts = p.ts[gi];
                     let end_t = p.ends[gi];
                     if !(end_t >= s0 && ts <= s1) { continue; }
@@ -1150,7 +1155,8 @@ impl Pane {
                         // covers the lower (stretched) part of its bar, not
                         // just its own lane. Same stale-cache guard the
                         // render loop applies.
-                        let (lo, hi) = p.stretch.get(gi).copied().unwrap_or((depth, depth));
+                        let (lo, hi) = if is_collapsed { (0, 0) }
+                            else { p.stretch.get(gi).copied().unwrap_or((depth, depth)) };
                         let ev_top = track_top + lo as f32 * sub_h;
                         let ev_bot = ev_top + (hi - lo + 1) as f32 * sub_h;
                         if ev_bot < y0 || ev_top > y1 { continue; }

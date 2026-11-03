@@ -676,6 +676,52 @@ fn test_collapsed_track_selection_matches_rendered_lanes() {
 }
 
 #[test]
+fn test_collapsed_merged_row_selection_matches_rendered_lanes() {
+    // Same contract as the plain-row test above, on a merged rank row:
+    // the collapse flag lives on the first member track, and a collapsed
+    // merged row is one summary lane of depth-0 packed events. Before the
+    // fix, capture divided by pack.max_depth for a row the renderer had
+    // collapsed (and the renderer ignored the flag entirely, making
+    // double-click collapse a silent no-op on rank rows).
+    let trace = make_trace(
+        vec!["kA", "kB"],
+        vec![
+            ("GPU dp0/ep0", true, vec![ev(0.0, 10.0, 0, 0)]),
+            ("GPU dp0/ep1", true, vec![ev(0.0, 10.0, 1, 0)]),
+        ],
+    );
+    let mut state = make_state(trace);
+    let p = &mut state.panes[0];
+    // Merged row: kA packed at depth 0, kB at depth 1 (pack max_depth 2).
+    p.geom.merged = vec![MergedGeom { vi: 0, pack: make_merged_pack(&[
+        (0.0, 10.0, 0, 0, 0, 0, 0),
+        (0.0, 10.0, 1, 0, 1, 1, 1),
+    ]).into() }];
+    p.geom.visible = vec![0]; // merged row is keyed by its first member
+    p.geom.heights[0] = track_height(2, true, 1.0); // collapsed: one lane
+    p.geom.y_offsets[0] = 0.0;
+    let mut c = BitSet::with_len(2);
+    c.set(0, true); // collapse flag on the first member track
+    p.collapsed = c;
+
+    let row_bottom = p.geom.heights[0] as f64;
+    let sel = p.capture_sel_events([0.0, 10.0, 0.0, row_bottom]);
+    assert_eq!(sel.len(), 1, "collapsed merged row must select only the depth-0 event, got {sel:?}");
+    assert_eq!(sel[0], (0, 0), "the selected event must be kA (track 0, depth 0)");
+
+    // Full-height mapping: the bottom half of the row is still kA.
+    let sel_bottom = p.capture_sel_events([0.0, 10.0, row_bottom * 0.5, row_bottom]);
+    assert_eq!(sel_bottom, vec![(0, 0)]);
+
+    // Control: uncollapsed, the same full-row drag captures both lanes.
+    p.collapsed.set(0, false);
+    p.geom.heights[0] = track_height(2, false, 1.0);
+    let row_bottom = p.geom.heights[0] as f64;
+    let sel = p.capture_sel_events([0.0, 10.0, 0.0, row_bottom]);
+    assert_eq!(sel.len(), 2, "uncollapsed merged row must select both packed events");
+}
+
+#[test]
 fn test_selection_survives_layout_change() {
     let trace = make_trace(
         vec!["", "gpu_kern", "cpu_kern"],
