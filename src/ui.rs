@@ -7,6 +7,27 @@ use std::fmt::Write;
 use std::os::raw::c_char;
 use winit::keyboard::KeyCode;
 
+/// `Ui::table_set_column_index`, guarded for tables whose column set
+/// varies with the trace (the Steps table builds 10 columns when any step
+/// parsed a batch, 7 otherwise). imgui-rs only catches an out-of-range
+/// column in debug builds — release goes straight into ImGui's C++
+/// `ImSpan::operator[]`, which aborts the whole app with an opaque
+/// imgui_internal.h assert (the batch-less Steps table hit exactly this:
+/// 7 columns addressed as 8/9). A column map out of sync with the columns
+/// the table built is a programming bug that would silently draw cells
+/// into the wrong column if skipped, so it panics here with the numbers
+/// involved — same failure, readable message. Cost is one extra FFI int
+/// read per cell; tables draw a ListClipper-bounded screenful of rows, so
+/// this is well under a microsecond per frame and never touches the
+/// timeline hot path.
+pub(crate) fn set_table_column(ui: &imgui::Ui, column: usize) -> bool {
+    let n = ui.table_column_count();
+    assert!(column < n,
+        "table column index {column} out of range: the table built {n} columns \
+         (a column map is out of sync with the columns it indexes)");
+    ui.table_set_column_index(column)
+}
+
 fn draw_text_clipped(col: ImColor32, text: &str, pos: [f32; 2], clip: [f32; 4]) {
     unsafe {
         let raw_dl = imgui_sys::igGetWindowDrawList();
@@ -729,7 +750,7 @@ pub fn draw_stats_table(
         ui.table_next_row();
 
         // Name cell: color swatch + (clipped) name, clickable to search.
-        ui.table_set_column_index(0);
+        set_table_column(ui, 0);
         let cur = ui.cursor_screen_pos();
         dl.add_rect(
             [cur[0], cur[1] + EV_INSET],
@@ -753,42 +774,42 @@ pub fn draw_stats_table(
             ui.set_clipboard_text(name);
         }
 
-        if ui.table_set_column_index(1) {
+        if set_table_column(ui, 1) {
             buf.fmt.clear();
             write!(buf.fmt, "{}", s.count).unwrap();
             ui.text(&buf.fmt);
         }
-        if ui.table_set_column_index(2) {
+        if set_table_column(ui, 2) {
             buf.fmt.clear();
             write_time(&mut buf.fmt, total_of(si));
             ui.text(&buf.fmt);
         }
-        if ui.table_set_column_index(3) {
+        if set_table_column(ui, 3) {
             buf.fmt.clear();
             write!(buf.fmt, "{:.1}%", pct_of(si) * 100.0).unwrap();
             ui.text(&buf.fmt);
         }
-        if ui.table_set_column_index(4) {
+        if set_table_column(ui, 4) {
             buf.fmt.clear();
             write_time(&mut buf.fmt, avg(s));
             ui.text(&buf.fmt);
         }
-        if ui.table_set_column_index(5) {
+        if set_table_column(ui, 5) {
             buf.fmt.clear();
             write_time(&mut buf.fmt, s.median_dur);
             ui.text(&buf.fmt);
         }
-        if ui.table_set_column_index(6) {
+        if set_table_column(ui, 6) {
             buf.fmt.clear();
             write_time(&mut buf.fmt, s.max_dur);
             ui.text(&buf.fmt);
         }
-        if ui.table_set_column_index(7) {
+        if set_table_column(ui, 7) {
             buf.fmt.clear();
             write_time(&mut buf.fmt, s.min_dur);
             ui.text(&buf.fmt);
         }
-        if ui.table_set_column_index(8) {
+        if set_table_column(ui, 8) {
             let (limit, suspect) = occ_limit(si);
             if !limit.is_empty() {
                 if suspect {
@@ -815,7 +836,7 @@ pub fn draw_stats_table(
                 }
             }
         }
-        if ui.table_set_column_index(9) {
+        if set_table_column(ui, 9) {
             buf.fmt.clear();
             write_time(&mut buf.fmt, start_of(si));
             ui.text(&buf.fmt);
@@ -2412,38 +2433,43 @@ pub fn draw_steps_table(
         let s = &steps[i];
         ui.table_next_row();
         // Batch columns participate only when the trace carries them; index
-        // into a compact list of the columns actually present.
+        // into a compact list of the columns actually present. In the
+        // batch-less table only 7 columns exist (Step..Idle before, Ranks,
+        // Kernels = indices 0-6), so Ranks/Kernels land at 5/6 — mapping
+        // them to their HEADERS slots (8/9) indexed table->Columns past
+        // its end and aborted inside ImSpan::operator[] the moment the
+        // Steps tab drew.
         let colmap: [usize; 10] = if has_batch {
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         } else {
-            [0, 1, 2, 3, 4, 8, 8, 8, 8, 9]
+            [0, 1, 2, 3, 4, 5, 5, 5, 5, 6]
         };
-        ui.table_set_column_index(colmap[0]);
+        set_table_column(ui, colmap[0]);
         // Whole-row click target via a span-all-columns selectable.
         if ui.selectable_config(format!("{i}")).span_all_columns(true).build() {
             *step_clicked = Some(i);
         }
         // The remaining cells, in HEADERS order.
-        ui.table_set_column_index(colmap[1]);
+        set_table_column(ui, colmap[1]);
         buf.fmt.clear();
         write_time(&mut buf.fmt, s.t0);
         ui.text(&buf.fmt);
-        ui.table_set_column_index(colmap[2]);
+        set_table_column(ui, colmap[2]);
         buf.fmt.clear();
         write_time(&mut buf.fmt, s.t1 - s.t0);
         ui.text(&buf.fmt);
-        ui.table_set_column_index(colmap[3]);
+        set_table_column(ui, colmap[3]);
         buf.fmt.clear();
         write_time(&mut buf.fmt, s.gpu_dur);
         ui.text(&buf.fmt);
-        ui.table_set_column_index(colmap[4]);
+        set_table_column(ui, colmap[4]);
         buf.fmt.clear();
         write_time(&mut buf.fmt, s.idle_before);
         ui.text(&buf.fmt);
         if has_batch {
             match s.batch {
                 Some(b) => {
-                    ui.table_set_column_index(colmap[5]);
+                    set_table_column(ui, colmap[5]);
                     // When every DP group ran the same local batch, show the
                     // split alongside the total ("4 (4x1)" = 4 groups of 1
                     // token) — the uniform-TP case at a glance; hover shows
@@ -2460,32 +2486,32 @@ pub fn draw_steps_table(
                     hover_group_breakdown(ui, buf, s, |g| {
                         format!("{} tok", g.total_tokens)
                     });
-                    ui.table_set_column_index(colmap[6]);
+                    set_table_column(ui, colmap[6]);
                     // Request count with the phase's token count — the
                     // interesting part for chunked-prefill sizing.
                     ui.text(format!("{} ({})", b.n_ctx, b.ctx_tokens));
                     hover_group_breakdown(ui, buf, s, |g| {
                         format!("{} reqs ({} tok)", g.n_ctx, g.ctx_tokens)
                     });
-                    ui.table_set_column_index(colmap[7]);
+                    set_table_column(ui, colmap[7]);
                     ui.text(format!("{} ({})", b.n_gen, b.gen_tokens));
                     hover_group_breakdown(ui, buf, s, |g| {
                         format!("{} reqs ({} tok)", g.n_gen, g.gen_tokens)
                     });
                 }
                 None => {
-                    ui.table_set_column_index(colmap[5]);
+                    set_table_column(ui, colmap[5]);
                     ui.text("-");
-                    ui.table_set_column_index(colmap[6]);
+                    set_table_column(ui, colmap[6]);
                     ui.text("-");
-                    ui.table_set_column_index(colmap[7]);
+                    set_table_column(ui, colmap[7]);
                     ui.text("-");
                 }
             }
         }
-        ui.table_set_column_index(colmap[8]);
+        set_table_column(ui, colmap[8]);
         ui.text(format!("{}", s.n_ranks));
-        ui.table_set_column_index(colmap[9]);
+        set_table_column(ui, colmap[9]);
         ui.text(format!("{}", s.kernel_count));
     }
 }
@@ -2614,7 +2640,7 @@ pub fn draw_gaps_table(
         // and rows of the same rank must not share one — duplicate IDs make
         // the rows unclickable (verified by gaps_table_rows_are_clickable).
         // The Steps table gets uniqueness for free from its row-index label.
-        ui.table_set_column_index(0);
+        set_table_column(ui, 0);
         let rank_label = match g.rank {
             Some(r) => format!("{r}##gap{row}"),
             None => format!("-##gap{row}"),
@@ -2627,16 +2653,16 @@ pub fn draw_gaps_table(
             *gap_clicked = Some(row as usize);
         }
 
-        ui.table_set_column_index(1);
+        set_table_column(ui, 1);
         buf.fmt.clear();
         write_time(&mut buf.fmt, g.t0);
         ui.text(&buf.fmt);
-        ui.table_set_column_index(2);
+        set_table_column(ui, 2);
         buf.fmt.clear();
         write_time(&mut buf.fmt, g.t1 - g.t0);
         ui.text(&buf.fmt);
 
-        ui.table_set_column_index(3);
+        set_table_column(ui, 3);
         if g.has_cpu {
             // Low CPU-busy during a big gap is the headline finding —
             // color it so it scans without reading every row.
@@ -2652,7 +2678,7 @@ pub fn draw_gaps_table(
         } else {
             ui.text("-");
         }
-        ui.table_set_column_index(4);
+        set_table_column(ui, 4);
         if g.has_cpu {
             ui.text(format!("{:.0}%", g.runtime_frac * 100.0));
             if ui.is_item_hovered() {
@@ -2662,14 +2688,14 @@ pub fn draw_gaps_table(
             ui.text("-");
         }
 
-        ui.table_set_column_index(5);
+        set_table_column(ui, 5);
         let (why, col) = gap_why(g);
         ui.text_colored(col, why);
         if ui.is_item_hovered() && g.has_cpu {
             ui.tooltip_text("runtime-bound: most of the CPU's time in the gap was CUDA runtime calls -\nmany short launches (launch-bound) or one long blocking call (sync).\nSee \"CPU was doing\" for which.");
         }
 
-        ui.table_set_column_index(6);
+        set_table_column(ui, 6);
         buf.fmt.clear();
         for (i, &(name, count, dur)) in g.cpu_top.iter().enumerate() {
             if i > 0 { buf.fmt.push_str(", "); }
@@ -2695,7 +2721,7 @@ pub fn draw_gaps_table(
         }
 
         for (col_idx, name) in [(7, g.prev_name), (8, g.next_name)] {
-            ui.table_set_column_index(col_idx);
+            set_table_column(ui, col_idx);
             match name {
                 Some(n) => {
                     ui.text(&trace.names[n as usize]);

@@ -4165,6 +4165,37 @@ fn test_steps_table_real_trace() {
     eprintln!("table rendered OK");
 }
 
+// The batch-less Steps table (no step parsed a batch out of its span name)
+// has 7 columns, and the Ranks/Kernels cells used to address table columns
+// 8/9 — past the column span's end, aborting inside ImSpan::operator[] the
+// first time the tab drew (a 32-rank c16 .ktz merge hit exactly this).
+// Draws the table under a real imgui context: if the column map regresses,
+// imgui's C-side assert kills the test process outright.
+#[test]
+fn test_steps_table_renders_without_batch_columns() {
+    let _imgui_ctx = IMGUI_CTX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut imgui = imgui::Context::create();
+    imgui.io_mut().display_size = [1600.0, 900.0];
+    imgui.fonts().build_rgba32_texture();
+    let steps: Vec<StepInfo> = (0..50).map(|i| StepInfo {
+        t0: i as f64 * 100.0, t1: i as f64 * 100.0 + 80.0,
+        gpu_dur: 60.0, idle_before: 20.0, n_ranks: 32,
+        kernel_count: 1000 + i, batch: None, group_batches: Vec::new(),
+    }).collect();
+    let mut buf = DrawBuf::default();
+    for _ in 0..2 {
+        let ui = imgui.new_frame();
+        let mut clicked: Option<usize> = None;
+        ui.window("steps")
+            .position([0.0, 700.0], imgui::Condition::Always)
+            .size([1600.0, 200.0], imgui::Condition::Always)
+            .build(|| {
+                draw_steps_table(&ui, &steps, &mut buf, &mut clicked);
+            });
+        imgui.render();
+    }
+}
+
 
 #[test]
 #[ignore] // real-trace smoke test for the detailed-annotation format

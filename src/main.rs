@@ -2160,20 +2160,20 @@ impl App {
                                             let idle = span - g.busy;
                                             let pct = if span > 0.0 { idle / span * 100.0 } else { 0.0 };
                                             ui.table_next_row();
-                                            ui.table_set_column_index(0);
+                                            set_table_column(ui, 0);
                                             match g.rank {
                                                 Some(r) => ui.text(format!("rank {r}")),
                                                 None => ui.text("trace"),
                                             }
-                                            ui.table_set_column_index(1);
+                                            set_table_column(ui, 1);
                                             state.buf.fmt.clear();
                                             write_time(&mut state.buf.fmt, idle);
                                             ui.text(&state.buf.fmt);
-                                            ui.table_set_column_index(2);
+                                            set_table_column(ui, 2);
                                             state.buf.fmt.clear();
                                             write_time(&mut state.buf.fmt, span);
                                             ui.text(&state.buf.fmt);
-                                            ui.table_set_column_index(3);
+                                            set_table_column(ui, 3);
                                             ui.text(format!("{pct:.0}%"));
                                         }
                                     }
