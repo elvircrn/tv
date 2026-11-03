@@ -196,8 +196,11 @@ impl SourceIndex {
 
     /// Kernel-name resolution: python defs first (triton/tilelang), then a
     /// content search of the C-family files. If the exact name misses, the
-    /// trailing `_`-separated segments are dropped one at a time (triton
-    /// suffixes its jitted names), up to two times.
+    /// trailing `_`-separated segment is dropped — but ONLY when it looks
+    /// like triton's mangled dims suffix (`0d1d2`), never a real name part:
+    /// dropping `kernel` from `vectorized_elementwise_kernel` once produced
+    /// `vectorized`, which substring-matched a different function and sent
+    /// the viewer to a confidently wrong line. Up to two drops.
     pub fn resolve_kernel(&mut self, kernel: &str) -> Vec<SourceHit> {
         let mut base = kernel_base_name(kernel);
         if base.is_empty() { return Vec::new(); }
@@ -205,8 +208,10 @@ impl SourceIndex {
             let mut hits = self.py_lookup(&base);
             if hits.is_empty() { hits = self.c_lookup(&base); }
             if !hits.is_empty() { return hits; }
-            // Drop the trailing segment: `name_kernel_0d1d2` -> `name_kernel` -> `name`.
-            let next = base.rsplit_once('_').map(|(h, _)| h.to_string());
+            // Drop the trailing triton dims: `name_0d1d2` -> `name`.
+            let next = base.rsplit_once('_')
+                .filter(|(_, seg)| is_triton_dims(seg))
+                .map(|(h, _)| h.to_string());
             match next {
                 Some(n) if attempt < 2 => base = n,
                 _ => break,
@@ -220,10 +225,12 @@ impl SourceIndex {
             .unwrap_or_default()
     }
 
-    /// Content search for `name(` in the C-family files (the base name
-    /// followed by '(' avoids every identifier substring hit). Memoized —
-    /// a kernel name repeats on every one of its thousands of launches, and
-    /// the first search is a full read of every .cu/.cc/.h in the repo.
+    /// Content search for `name(` in the C-family files, at a word boundary
+    /// (the char before the match must not be an identifier char — otherwise
+    /// `vectorized(` matches inside `scaled_fp8_conversion_vectorized(`).
+    /// Memoized — a kernel name repeats on every one of its thousands of
+    /// launches, and the first search is a full read of every .cu/.cc/.h
+    /// in the repo.
     #[cfg(not(target_arch = "wasm32"))]
     fn c_lookup(&mut self, name: &str) -> Vec<SourceHit> {
         if let Some(v) = self.c_memo.get(name) { return v.clone(); }
@@ -236,7 +243,7 @@ impl SourceIndex {
             let Ok(text) = std::fs::read(path) else { continue };
             // Line-by-line: a definition never spans lines.
             for (i, line) in text.split(|&b| b == b'\n').enumerate() {
-                if find_sub(line, &needle) {
+                if find_def(line, &needle) {
                     found.push((path.clone(), (i + 1) as u32));
                     if found.len() >= 8 { break 'files; }
                 }
@@ -263,8 +270,24 @@ impl SourceIndex {
     }
 }
 
-fn find_sub(hay: &[u8], needle: &[u8]) -> bool {
-    hay.windows(needle.len()).any(|w| w == needle)
+/// Is this `_`-separated name segment a triton dims suffix (`0d1d2`,
+/// `1d3d5`)? Digits and 'd's only, non-empty.
+fn is_triton_dims(seg: &str) -> bool {
+    !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit() || c == 'd')
+}
+
+/// `needle` occurs in `line` at an identifier-word boundary. The char after
+/// is always '(' (part of the needle), so only the char before matters.
+fn find_def(line: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || line.len() < needle.len() { return false; }
+    for i in 0..=line.len() - needle.len() {
+        if &line[i..i + needle.len()] == needle
+            && (i == 0 || !(line[i - 1].is_ascii_alphanumeric() || line[i - 1] == b'_'))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // ============================================================== editor jump

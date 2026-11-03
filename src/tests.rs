@@ -6400,6 +6400,11 @@ fn test_source_index_resolves() {
     std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
     std::fs::write(dir.join("vllm/model_executor/k.py"), "x = 1\n\ndef mhc_kernel():\n    pass\n").unwrap();
     std::fs::write(dir.join("csrc/k.cu"), "__global__ void fusedThing(const float* x) {}\n").unwrap();
+    // Regression bait for the word-boundary rule: an aten-style name whose
+    // suffix-dropped form must NOT substring-match this differently-named
+    // function (this exact false positive shipped `vectorized` ->
+    // scaled_fp8_conversion_vectorized on the first run against real data).
+    std::fs::write(dir.join("csrc/other.cu"), "void scaled_fp8_conversion_vectorized(const float* x) {}\n").unwrap();
     std::fs::write(dir.join(".git/should_not_index.py"), "def ghost()\n").unwrap();
     std::fs::write(dir.join("README.md"), "def not_python()\n").unwrap();
 
@@ -6418,7 +6423,8 @@ fn test_source_index_resolves() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].rel, "csrc/k.cu");
     assert_eq!(hits[0].line, 1);
-    // aten kernels live outside vllm: no hit, no guess.
+    // aten kernels live outside vllm: no hit, no guess — including no
+    // suffix-drop false positive against the bait file above.
     assert!(idx.resolve_kernel("void at::native::vectorized_elementwise_kernel<4, int>(int*)").is_empty());
     // CallFrom: exact file:line; traversal and missing files rejected.
     let hit = idx.resolve_callfrom("vllm/model_executor/k.py:2").unwrap();
@@ -6429,4 +6435,120 @@ fn test_source_index_resolves() {
     assert!(idx.resolve_callfrom("no-line-number").is_none());
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Real-data validation for the Source tab's resolvers, against a local
+/// vLLM checkout. Gated on env vars so CI never needs the fixtures:
+///   TV_SOURCE_TRACE=<rank.ktz>  TV_SOURCE_ROOT=<vllm checkout>
+/// Run with --nocapture to see the per-class resolution breakdown.
+#[test]
+#[ignore]
+fn source_resolution_real_trace() {
+    let (trace_path, root) = match (std::env::var("TV_SOURCE_TRACE"), std::env::var("TV_SOURCE_ROOT")) {
+        (Ok(t), Ok(r)) => (t, r),
+        _ => { eprintln!("set TV_SOURCE_TRACE=<rank.ktz> and TV_SOURCE_ROOT=<vllm checkout> to run this"); return; }
+    };
+    let trace = load_trace(&trace_path, &test_counter()).unwrap();
+    let mut idx = crate::source::SourceIndex::build(std::path::Path::new(&root));
+    eprintln!("checkout: {} ({:?})", root, idx.git_desc);
+    eprintln!("trace vllm_version: {}", trace.vllm_version);
+
+    // Unique kernel names on GPU tracks, classified the way the resolvers
+    // will see them.
+    let kernel_cat = trace.cats.iter().position(|c| c == "kernel").unwrap();
+    let mut names: Vec<&str> = Vec::new();
+    for t in &trace.tracks {
+        if !t.gpu { continue; }
+        for ev in &t.events {
+            if ev.cat as usize == kernel_cat && !names.contains(&trace.names[ev.name as usize].as_str()) {
+                names.push(&trace.names[ev.name as usize]);
+            }
+        }
+    }
+    eprintln!("unique kernel names: {}", names.len());
+    let (mut n_vllm, mut n_vllm_resolved, mut n_resolved) = (0usize, 0usize, 0usize);
+    for n in &names {
+        let is_vllm = n.contains("vllm::");
+        if is_vllm { n_vllm += 1; }
+        let hits = idx.resolve_kernel(n);
+        if !hits.is_empty() {
+            n_resolved += 1;
+            if is_vllm { n_vllm_resolved += 1; }
+        } else if is_vllm {
+            eprintln!("  vllm:: kernel did NOT resolve: {}", n);
+        }
+    }
+    eprintln!("  vllm:: csrc names: {}/{} resolved", n_vllm_resolved, n_vllm);
+    eprintln!("  resolved total: {}/{} (the rest are aten/CUB/CUTLASS, outside vllm)", n_resolved, names.len());
+    // Every vllm:: kernel must resolve in a checkout that contains it.
+    assert_eq!(n_vllm_resolved, n_vllm, "a vllm:: kernel failed to resolve");
+
+    // Sample resolved hits with their actual source lines, so a wrong-line
+    // resolution is visible in the output.
+    let mut shown = 0;
+    for n in &names {
+        if shown >= 5 { break; }
+        let hits = idx.resolve_kernel(n);
+        if let Some(h) = hits.first() {
+            let line = std::fs::read_to_string(&h.path).ok().and_then(|t| {
+                t.lines().nth(h.line as usize - 1).map(|s| s.trim().to_string())
+            }).unwrap_or_default();
+            eprintln!("  {} -> {}:{}  | {}", n, h.rel, h.line, line);
+            shown += 1;
+        }
+    }
+
+    // CallFrom args: exact file:line resolution. Only vllm/-relative paths
+    // are expected to land — torch/ and multiprocessing/ frames live outside
+    // the checkout and must be reported as not found, not guessed.
+    let py_cat = trace.cats.iter().position(|c| c == "python_function").unwrap();
+    let mut seen: Vec<String> = Vec::new();
+    let (mut n_cf, mut n_cf_ok, mut n_cf_vllm, mut n_cf_vllm_ok) = (0usize, 0usize, 0usize, 0usize);
+    'outer: for t in &trace.tracks {
+        for ev in &t.events {
+            if ev.cat as usize != py_cat || ev.args_off == 0 { continue; }
+            let raw = &trace.raw_bufs[t.raw_buf_idx as usize];
+            let off = ev.args_off as usize;
+            if off >= raw.len() { continue; }
+            let end = skip_value(raw, off);
+            let mut strs = InternTable::new();
+            let mut pairs = Vec::new();
+            parse_args_flat(&raw[off..end], &mut strs, &mut pairs);
+            for &[k, v] in &pairs {
+                if strs.str(k) == "CallFrom" {
+                    let cf = strs.str(v).to_string();
+                    if seen.contains(&cf) { continue; }
+                    seen.push(cf.clone());
+                    n_cf += 1;
+                    let is_vllm = cf.starts_with("vllm/");
+                    if is_vllm { n_cf_vllm += 1; }
+                    match idx.resolve_callfrom(&cf) {
+                        Some(h) => {
+                            n_cf_ok += 1;
+                            if is_vllm { n_cf_vllm_ok += 1; }
+                            if n_cf_vllm_ok <= 3 {
+                                let line = std::fs::read_to_string(&h.path).ok().and_then(|t| {
+                                    t.lines().nth(h.line as usize - 1).map(|s| s.trim().to_string())
+                                }).unwrap_or_default();
+                                eprintln!("  CallFrom {} -> {}:{}  | {}", cf, h.rel, h.line, line);
+                            }
+                        }
+                        None => {
+                            if is_vllm { eprintln!("  CallFrom {} -> NOT FOUND (in checkout!)", cf); }
+                        }
+                    }
+                    if n_cf >= 2000 { break 'outer; }
+                }
+            }
+        }
+    }
+    eprintln!("CallFrom: {}/{} unique resolved (vllm/-scoped: {}/{})",
+        n_cf_ok, n_cf, n_cf_vllm_ok, n_cf_vllm);
+    // vllm/-scoped CallFroms must resolve — unless the checkout is at a
+    // different commit than the traced build (the tab's banner case), where
+    // files move. The known instance here: the trace's cfee12e build has
+    // vllm/third_party/flashmla/flash_mla_interface.py, which doesn't exist
+    // at the 4239fa3 branch used as the test fixture. 95% floor.
+    assert!(n_cf_vllm_ok * 20 >= n_cf_vllm * 19,
+        "too many vllm/-scoped CallFroms failed: {}/{}", n_cf_vllm_ok, n_cf_vllm);
 }
