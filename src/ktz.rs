@@ -1,9 +1,7 @@
 //! KTZ compressed-trace decoding — the container format written by
-//! CLionProjects/compression (`ktz c`). The main entry point is
-//! `KtzDecoder`, which turns the columnar sections straight into events +
-//! args text (see `KtzTrace`) without ever materializing the JSON document.
-//! `decode` (kept as the reference/test path) instead reconstructs the
-//! original JSON text byte-for-byte identically to `ktz d`.
+//! CLionProjects/compression (`ktz c`). The entry point is `KtzDecoder`,
+//! which turns the columnar sections straight into events + args text (see
+//! `KtzTrace`) without ever materializing the JSON document.
 //!
 //! Containers (see ktz.cpp):
 //! - KTZ4/KTZ3: `KTZ{3,4}` + varint nEvents + varint nFrames + per-frame
@@ -106,25 +104,6 @@ fn framed_payload(data: &[u8]) -> Result<(Vec<u8>, u64, bool), String> {
         payload.extend_from_slice(&p);
     }
     Ok((payload, n_events, is_v4))
-}
-
-/// Mirrors `ktz d` from CLionProjects/compression: takes a whole .ktz file
-/// (any of KTZ2/KTZ3/KTZ4) and returns the reconstructed JSON text.
-/// `counter` receives one bump per rendered event (loader progress).
-pub fn decode(data: &[u8], counter: &AtomicUsize) -> Result<Vec<u8>, String> {
-    if data.len() >= 4 && (&data[..4] == b"KTZ3" || &data[..4] == b"KTZ4") {
-        let (payload, n_events, is_v4) = framed_payload(data)?;
-        render(&payload, n_events, is_v4, counter)
-    } else {
-        // v2: the whole file is one zstd frame holding KTZ2 + nEvents + sections
-        let payload = decompress_whole(data)?;
-        if payload.len() < 4 || &payload[..4] != b"KTZ2" {
-            return Err("not a ktz file (bad magic and not a zstd frame)".into());
-        }
-        let mut c = Cur { d: &payload, p: 4 };
-        let n_events = c.varint()?;
-        render(&payload[c.p..], n_events, false, counter)
-    }
 }
 
 /// Decompress one ktz zstd frame whose payload must be exactly `pay` bytes
@@ -269,23 +248,6 @@ impl<'a> Cur<'a> {
         self.p = end;
         Ok(s)
     }
-
-    fn rest(&self) -> &'a [u8] {
-        &self.d[self.p..]
-    }
-}
-
-fn read_section<'a>(c: &mut Cur<'a>) -> Result<&'a [u8], String> {
-    let len = usize::try_from(c.varint()?)
-        .map_err(|_| "corrupt ktz: section length overflow".to_string())?;
-    if len > c.d.len() {
-        return Err("corrupt ktz: section length exceeds payload".into());
-    }
-    c.take(len)
-}
-
-fn section_cur<'a>(c: &mut Cur<'a>) -> Result<Cur<'a>, String> {
-    Ok(Cur::new(read_section(c)?))
 }
 
 // ============================================================= section ranges
@@ -546,303 +508,15 @@ fn emit_tok(
     Ok(())
 }
 
-// =============================================================== event render
-
-/// Per-name stream state. v4 streams carry columns + flags; v2/3 streams
-/// only blens + blobs (flags/cols stay empty and are never read).
-struct NameStream<'a> {
-    key_ids: Vec<u64>,
-    kinds: Vec<u8>, // 0 = int, 1 = str
-    cols: Vec<Cur<'a>>,
-    col_last: Vec<i64>, // per-column delta base; reset at range changes
-    col_range: usize,   // range of col_last; usize::MAX = none decoded yet
-    wrap: bool,         // columns live inside one "args" object
-    flags: Cur<'a>,
-    blens: Cur<'a>,
-    blobs: Cur<'a>,
-}
-
-fn parse_v4_stream(sec: &[u8]) -> Result<NameStream<'_>, String> {
-    let mut q = Cur::new(sec);
-    let n_keys = usize::try_from(q.varint()?)
-        .map_err(|_| "corrupt ktz: key count overflow".to_string())?;
-    // Each key costs at least a varint + a kind byte.
-    if n_keys > sec.len() {
-        return Err("corrupt ktz: key count exceeds section".into());
-    }
-    let wrap = q.byte()? != 0;
-    let mut key_ids = Vec::with_capacity(n_keys);
-    let mut kinds = Vec::with_capacity(n_keys);
-    for _ in 0..n_keys {
-        key_ids.push(q.varint()?);
-        kinds.push(q.byte()?);
-    }
-    let mut cols = Vec::with_capacity(n_keys);
-    for _ in 0..n_keys {
-        let cl = usize::try_from(q.varint()?)
-            .map_err(|_| "corrupt ktz: column length overflow".to_string())?;
-        cols.push(Cur::new(q.take(cl)?));
-    }
-    let fl = usize::try_from(q.varint()?)
-        .map_err(|_| "corrupt ktz: flags length overflow".to_string())?;
-    let flags = Cur::new(q.take(fl)?);
-    let bl = usize::try_from(q.varint()?)
-        .map_err(|_| "corrupt ktz: blens length overflow".to_string())?;
-    let blens = Cur::new(q.take(bl)?);
-    let blobs = Cur::new(q.rest());
-    Ok(NameStream {
-        key_ids,
-        kinds,
-        cols,
-        col_last: vec![0; n_keys],
-        col_range: usize::MAX,
-        wrap,
-        flags,
-        blens,
-        blobs,
-    })
-}
-
-/// The sections -> JSON text pass; output is byte-identical to `ktz d`.
-fn render(payload: &[u8], n_events: u64, is_v4: bool, counter: &AtomicUsize) -> Result<Vec<u8>, String> {
-    // Each event consumes at least one byte from each of the 7 columns.
-    if n_events > payload.len() as u64 {
-        return Err("corrupt ktz: event count exceeds payload".into());
-    }
-    let mut c = Cur::new(payload);
-    let mut c_ph = section_cur(&mut c)?;
-    let mut c_pid = section_cur(&mut c)?;
-    let mut c_tid = section_cur(&mut c)?;
-    let mut c_name = section_cur(&mut c)?;
-    let mut c_cat = section_cur(&mut c)?;
-    let mut c_ts = section_cur(&mut c)?;
-    let mut c_dur = section_cur(&mut c)?;
-
-    // Per-name streams. Each stream costs at least a varint + a section
-    // header, so the count can never exceed the payload size.
-    let n_streams = c.varint()?;
-    if n_streams > payload.len() as u64 {
-        return Err("corrupt ktz: stream count exceeds payload".into());
-    }
-    let mut names: HashMap<u64, NameStream> = HashMap::with_capacity(n_streams as usize);
-    for _ in 0..n_streams {
-        let nid = c.varint()?;
-        if is_v4 {
-            let sec = read_section(&mut c)?;
-            names.insert(nid, parse_v4_stream(sec)?);
-        } else {
-            let blens = section_cur(&mut c)?;
-            let blobs = section_cur(&mut c)?;
-            names.insert(nid, NameStream {
-                key_ids: Vec::new(),
-                kinds: Vec::new(),
-                cols: Vec::new(),
-                col_last: Vec::new(),
-                col_range: usize::MAX,
-                wrap: false,
-                flags: Cur::new(&[]),
-                blens,
-                blobs,
-            });
-        }
-    }
-
-    // Symbol table: raw JSON spans, slot 0 reserved for "absent".
-    let sym_sec = read_sec(payload, &mut c)?;
-    let mut q = Cur::new(&payload[sym_sec.start..sym_sec.end]);
-    let n_syms = usize::try_from(q.varint()?)
-        .map_err(|_| "corrupt ktz: symbol count overflow".to_string())?;
-    if n_syms > sym_sec.end - sym_sec.start {
-        return Err("corrupt ktz: symbol count exceeds section".into());
-    }
-    let mut syms: Vec<Sec> = Vec::with_capacity(n_syms);
-    for _ in 0..n_syms {
-        let len = usize::try_from(q.varint()?)
-            .map_err(|_| "corrupt ktz: symbol length overflow".to_string())?;
-        let start = sym_sec.start + q.p;
-        q.take(len)?;
-        syms.push(Sec { start, end: start + len });
-    }
-
-    // Header + footer text (everything before/after the event lines).
-    let hf_sec = read_section(&mut c)?;
-    let mut q = Cur::new(hf_sec);
-    let hl = usize::try_from(q.varint()?)
-        .map_err(|_| "corrupt ktz: header length overflow".to_string())?;
-    let head = q.take(hl)?;
-    let fl = usize::try_from(q.varint()?)
-        .map_err(|_| "corrupt ktz: footer length overflow".to_string())?;
-    let foot = q.take(fl)?;
-
-    let mut out = Vec::with_capacity(head.len() + foot.len() + payload.len().saturating_mul(4));
-    out.extend_from_slice(head);
-
-    let mut dmap: HashMap<u64, i64> = HashMap::with_capacity(256);
-    let mut last_ts: HashMap<u64, i64> = HashMap::new();
-
-    macro_rules! put_sym {
-        ($first:expr, $k:expr, $id:expr) => {
-            if !$first {
-                out.push(b',');
-            }
-            $first = false;
-            out.push(b'"');
-            out.extend_from_slice($k);
-            out.extend_from_slice(b"\":");
-            out.extend_from_slice(sym(payload, &syms, $id)?);
-        };
-    }
-
-    for i in 0..n_events {
-        let ph_id = c_ph.varint()?;
-        let pid_id = c_pid.varint()?;
-        let tid_id = c_tid.varint()?;
-        let name_id = c_name.varint()?;
-        let cat_id = c_cat.varint()?;
-        let ts_enc = c_ts.varint()?;
-        let dur_enc = c_dur.varint()?;
-
-        // Name-stream flag/blen are consumed BEFORE the range reset
-        // (mirrors the reader's read order in ktz.cpp).
-        let mut blen = 0usize;
-        let mut args_mode = 0u8; // 0 = none, 1 = columnized, 2 = blob
-        if let Some(ns) = names.get_mut(&name_id) {
-            if is_v4 {
-                let flag = ns.flags.varint()?;
-                if flag == 1 {
-                    args_mode = 1;
-                } else if flag == 2 {
-                    args_mode = 2;
-                    blen = usize::try_from(ns.blens.varint()?)
-                        .map_err(|_| "corrupt ktz: blob length overflow".to_string())?;
-                }
-            } else {
-                blen = usize::try_from(ns.blens.varint()?)
-                    .map_err(|_| "corrupt ktz: blob length overflow".to_string())?;
-                if blen != 0 {
-                    args_mode = 2;
-                }
-            }
-        }
-
-        if i % EVENTS_PER_RANGE == 0 {
-            dmap.clear(); // mirror the writer's per-range worker reset
-        }
-
-        out.extend_from_slice(b"  {");
-        let mut first = true;
-        if ph_id != 0 { put_sym!(first, b"ph", ph_id); }
-        if pid_id != 0 { put_sym!(first, b"pid", pid_id); }
-        if tid_id != 0 { put_sym!(first, b"tid", tid_id); }
-        if name_id != 0 { put_sym!(first, b"name", name_id); }
-        if cat_id != 0 { put_sym!(first, b"cat", cat_id); }
-        if ts_enc != 0 {
-            let d = decode_zz1(ts_enc);
-            // (uint64_t)pidId << 32 | (uint32_t)tidId — tid truncated to 32 bits
-            let key = (pid_id << 32) | (tid_id as u32 as u64);
-            let base = last_ts.get(&key).copied().unwrap_or(0);
-            let ns = base.wrapping_add(d);
-            last_ts.insert(key, ns);
-            if !first {
-                out.push(b',');
-            }
-            first = false;
-            out.extend_from_slice(b"\"ts\":");
-            push_ns(&mut out, ns);
-        }
-        if dur_enc != 0 {
-            if !first {
-                out.push(b',');
-            }
-            first = false;
-            out.extend_from_slice(b"\"dur\":");
-            push_ns(&mut out, decode_zz1(dur_enc));
-        }
-
-        if args_mode == 1 {
-            // Columnized values; the delta base resets when the global event
-            // index crosses into a new 8192-event range.
-            let ns = names.get_mut(&name_id)
-                .ok_or("corrupt ktz: columnized event references a missing name stream")?;
-            let rng = (i / EVENTS_PER_RANGE) as usize;
-            if rng != ns.col_range {
-                ns.col_last.fill(0);
-                ns.col_range = rng;
-            }
-            if ns.wrap {
-                if !first {
-                    out.push(b',');
-                }
-                first = true; // inner fields restart the comma logic
-                out.extend_from_slice(b"\"args\":{");
-            }
-            for j in 0..ns.key_ids.len() {
-                if !first {
-                    out.push(b',');
-                }
-                first = false;
-                out.extend_from_slice(sym(payload, &syms, ns.key_ids[j])?);
-                out.push(b':');
-                let u = ns.cols[j].varint()?;
-                let v = unzigzag(u);
-                if ns.kinds[j] == 1 {
-                    // str: delta of the symbol id
-                    let idx = ns.col_last[j].wrapping_add(v);
-                    out.extend_from_slice(sym(payload, &syms, idx as u64)?);
-                    ns.col_last[j] = idx;
-                } else {
-                    // int: delta vs the last value in this column
-                    ns.col_last[j] = ns.col_last[j].wrapping_add(v);
-                    push_i64(&mut out, ns.col_last[j]);
-                }
-            }
-            if ns.wrap {
-                out.push(b'}');
-            }
-        } else if blen != 0 {
-            // Blob fallback: key/value pairs, braces omitted. The blob's
-            // bytes are bounded exactly like ktz.cpp's q0/q0e cursors.
-            let ns = names.get_mut(&name_id)
-                .ok_or("corrupt ktz: blob event references a missing name stream")?;
-            let region = ns.blobs.d.get(ns.blobs.p..ns.blobs.p + blen)
-                .ok_or("corrupt ktz: blob length overruns stream")?;
-            let mut q = Cur::new(region);
-            while q.p < region.len() {
-                if !first {
-                    out.push(b',');
-                }
-                first = false;
-                let tag = q.byte()?;
-                if tag != TK_STR {
-                    return Err("corrupt ktz: blob key is not a string token".into());
-                }
-                let kid = q.varint()?;
-                out.extend_from_slice(sym(payload, &syms, kid)?);
-                out.push(b':');
-                emit_tok(&mut q, kid, payload, &syms, &mut dmap, &mut out, 0)?;
-            }
-            ns.blobs.p += blen;
-        }
-
-        out.extend_from_slice(if i + 1 < n_events { b"},\n" } else { b"}\n" });
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    out.extend_from_slice(foot);
-    Ok(out)
-}
-
 // =============================================================== direct decode
 //
 // The sections -> events path: decodes the columnar format straight into
-// the loader's chunk shape without materializing the JSON document (the
-// render() path above inflates a 3.7MB c16 file to ~1.5GB of text just so
-// parse_chunk can re-scan it). Semantics deliberately mirror
-// render()+parse_chunk so a .ktz load produces the exact trace a .json
-// load of the same data did: same interning, same fnv1a/parse_f64 pid/tid
-// keys, bit-identical ts/dur f64s, same args text, same drop rules (only
-// ph X-with-dur events become tracks; M thread_name and s/f flows feed
-// their side tables).
+// the loader's chunk shape without ever materializing the JSON document
+// (the old render()-then-rescan path inflated a 3.7MB c16 file to ~1.5GB
+// of text). Semantics mirror what the old .json load produced: same
+// interning, same fnv1a/parse_f64 pid/tid keys, bit-identical ts/dur
+// f64s, same args text, same drop rules (only ph X-with-dur events
+// become tracks; M thread_name and s/f flows feed their side tables).
 
 /// The decode output — everything `parse_chunk` used to collect from the
 /// rendered JSON, plus the compact args buffer (byte 0 reserved so
@@ -1055,18 +729,13 @@ impl KtzDecoder {
         self.n_events
     }
 
-    /// head ++ foot text, for finish_trace's metadata scans.
-    pub fn head_foot(&self) -> &[u8] {
-        &self.head_foot
-    }
-
     pub fn into_head_foot(self) -> Vec<u8> {
         self.head_foot
     }
 
     /// Decode up to `max_events` more events into `out`. Returns true when
-    /// the whole file is decoded. `counter` receives one bump per event,
-    /// like the render path's progress.
+    /// the whole file is decoded. `counter` receives one bump per event
+    /// (loader progress).
     pub fn step(
         &mut self,
         out: &mut KtzTrace,
@@ -1324,15 +993,4 @@ impl KtzDecoder {
         }
         Ok(*next_event >= *n_events)
     }
-}
-
-/// Decode a whole ktz file to a `KtzTrace` (+ head/foot text) in one go —
-/// the native loaders' path. The wasm single-threaded loader instead holds
-/// the `KtzDecoder` and steps it from the event loop.
-pub fn decode_trace(data: &[u8], counter: &AtomicUsize) -> Result<(KtzTrace, Vec<u8>), String> {
-    let mut dec = KtzDecoder::new(data)?;
-    let n = dec.n_events();
-    let mut out = KtzTrace::with_events(n);
-    while !dec.step(&mut out, 65_536, counter)? {}
-    Ok((out, dec.into_head_foot()))
 }

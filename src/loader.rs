@@ -21,7 +21,8 @@ fn kernel_stats_from_dur_map(dur_map: HashMap<u32, Vec<f64>>) -> Vec<KernelStats
 }
 
 /// `kernel_stats_from_dur_map` straight from a trace's tracks — the shared
-/// body behind both `finish_trace` and the tests' `make_trace` helper.
+/// body behind the tests' `make_trace` helper.
+#[cfg(test)]
 pub(crate) fn compute_kernel_stats(tracks: &[Track]) -> Vec<KernelStats> {
     let mut dur_map: HashMap<u32, Vec<f64>> = HashMap::new();
     for t in tracks {

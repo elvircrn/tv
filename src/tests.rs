@@ -4054,12 +4054,25 @@ fn test_steps_table_renders_without_batch_columns() {
 #[ignore] // real-trace smoke test for the detailed-annotation format
 fn test_steps_detailed_annotation_trace() {
     // 20260914-125236: vLLM with detailed_trace_annotation — batch counts
-    // encoded in span names. Use its merged cache.
-    let dir = "/Users/ecrncevi/vllm-profiles/20260914-125236.tvcache";
-    let path = format!("{dir}/_merged.tvcache");
-    let trace = match load_trace(&path, &test_counter()) {
-        Ok(t) => t,
-        Err(e) => { eprintln!("could not load {path}: {e}, skipping"); return; }
+    // encoded in span names. Ranks transcoded to .ktz next to the raw
+    // .json.gz dir (ktz c); loaded as a multi-rank merge like the app does.
+    let dir = "/Users/ecrncevi/vllm-profiles/20260914-125236-ktz".to_string();
+    let (groups, standalone) = crate::loader::detect_rank_groups(&[dir.clone()]);
+    let mut rank_paths: Vec<(usize, String)> = Vec::new();
+    for (g, _) in groups { rank_paths.extend(g); }
+    for (p, _) in standalone { rank_paths.push((rank_paths.len(), p)); }
+    if rank_paths.is_empty() {
+        eprintln!("no ktz ranks under {dir}, skipping");
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let trace = match {
+        crate::loader::load_multi_progressive(rank_paths, &test_counter(), &tx);
+        rx.recv()
+    } {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => { eprintln!("could not load {dir}: {e}, skipping"); return; }
+        Err(e) => { eprintln!("no load result for {dir}: {e}, skipping"); return; }
     };
     let ec_names = find_exec_context_names(&trace.names);
     assert!(!ec_names.is_empty(), "detailed-format names must be found");
@@ -4076,8 +4089,8 @@ fn test_steps_detailed_annotation_trace() {
 
 // =========================== ktz decoding ===========================
 // Synthetic files hand-built to the ktz.cpp spec (varints, sections, zstd
-// framing) and decoded through ktz::decode; expected output is what
-// `ktz d` would emit, since that binary is the format's reference reader.
+// framing) and decoded through ktz::KtzDecoder; assertions describe what
+// `ktz d` (the format's reference reader) would make of the same data.
 
 fn ktz_varint(buf: &mut Vec<u8>, mut v: u64) {
     loop {
@@ -4410,98 +4423,8 @@ fn ktz_v4_synthetic_file() -> Vec<u8> {
     ktz_framed(b"KTZ4", 3, &payload)
 }
 
-#[test]
-fn ktz_v4_synthetic() {
-    let file = ktz_v4_synthetic_file();
-    let got = ktz::decode(&file, &test_counter()).expect("decode");
-    let expected = concat!(
-        "{\"traceEvents\": [\n",
-        "  {\"ph\":\"X\",\"pid\":1234,\"tid\":\"T-1\",\"name\":\"Op\",\"cat\":\"cat\",\"ts\":0.000,\"dur\":1.500,\"args\":{\"a\":7,\"b\":\"x\"}},\n",
-        "  {\"ph\":\"X\",\"pid\":5678,\"tid\":\"T-1\",\"name\":\"Op\",\"ts\":2500.000,\"k\":100,\"s\":\"hello\",\"nested\":{\"a\":5},\"arr\":[5,1.25,true,false,null]},\n",
-        "  {\"ph\":\"X\",\"pid\":1234,\"tid\":\"T-1\",\"name\":\"Op\",\"ts\":3000.000,\"dur\":-1.500,\"args\":{\"a\":9,\"b\":\"x\"}}\n",
-        "]\n}\n",
-    );
-    assert_eq!(std::str::from_utf8(&got).unwrap(), expected);
-}
-
-#[test]
-fn ktz_v4_range_resets() {
-    // 8194 events crossing the 8192-event range boundary: column delta
-    // bases and the blob dmap must both reset at event index 8192. Events
-    // 8191/8192 are blob events sharing key "k" — without the dmap reset
-    // the TK_DINT at 8192 would decode as 5007 instead of 7.
-    const N: u64 = 8194;
-    let syms: Vec<&[u8]> = vec![b"", b"\"X\"", b"1234", b"7", b"\"Op\"", b"\"a\"", b"\"k\""];
-
-    let mut blob_8191 = Vec::new();
-    blob_8191.push(3u8); ktz_varint(&mut blob_8191, 6);   // "k":
-    blob_8191.push(4u8); ktz_varint(&mut blob_8191, ktz_zz(5000)); // TK_INT 5000
-    let mut blob_8192 = Vec::new();
-    blob_8192.push(3u8); ktz_varint(&mut blob_8192, 6);   // "k":
-    blob_8192.push(9u8); ktz_varint(&mut blob_8192, ktz_zz(7)); // TK_DINT +7 vs reset dmap
-
-    // Column "a" (int): flag-1 events are 0..=8190 (values = index) and
-    // 8193 (value 8193, first of range 1 so delta vs a reset base of 0).
-    let mut col_a = Vec::new();
-    for i in 0..=8190u64 {
-        ktz_varint(&mut col_a, ktz_zz(if i == 0 { 0 } else { 1 }));
-    }
-    ktz_varint(&mut col_a, ktz_zz(8193));
-
-    let mut stream = Vec::new();
-    ktz_varint(&mut stream, 1);          // nKeys
-    stream.push(1);                      // wrap
-    ktz_varint(&mut stream, 5); stream.push(0); // key "a", kind int
-    ktz_varint(&mut stream, col_a.len() as u64); stream.extend_from_slice(&col_a);
-    let mut flags = Vec::new();
-    for i in 0..N {
-        ktz_varint(&mut flags, if i == 8191 || i == 8192 { 2 } else { 1 });
-    }
-    ktz_varint(&mut stream, flags.len() as u64); stream.extend_from_slice(&flags);
-    ktz_varint(&mut stream, 2); // two blens (one per flag-2 event)
-    ktz_varint(&mut stream, blob_8191.len() as u64);
-    ktz_varint(&mut stream, blob_8192.len() as u64);
-    stream.extend_from_slice(&blob_8191);
-    stream.extend_from_slice(&blob_8192);
-
-    let mut payload = Vec::new();
-    let mut rep = |vals: &dyn Fn(u64) -> u64| {
-        let mut sec = Vec::new();
-        for i in 0..N { ktz_varint(&mut sec, vals(i)); }
-        ktz_section(&mut payload, &sec);
-    };
-    rep(&|_| 1);                 // ph
-    rep(&|_| 2);                 // pid
-    rep(&|_| 3);                 // tid
-    rep(&|_| 4);                 // name
-    rep(&|_| 0);                 // cat absent
-    rep(&|i| if i == 0 { ktz_zz1(0) } else { ktz_zz1(1000) }); // ts: i us
-    rep(&|_| 0);                 // dur absent
-    ktz_varint(&mut payload, 1); // nStreams
-    ktz_varint(&mut payload, 4); // nid
-    ktz_section(&mut payload, &stream);
-    ktz_section(&mut payload, &ktz_symtab(&syms));
-    ktz_section(&mut payload, &ktz_head_foot(b"[", b"]\n"));
-
-    let file = ktz_framed(b"KTZ4", N, &payload);
-    let got = ktz::decode(&file, &test_counter()).expect("decode");
-    let mut expected = String::from("[");
-    for i in 0..N {
-        expected.push_str("  {\"ph\":\"X\",\"pid\":1234,\"tid\":7,\"name\":\"Op\",\"ts\":");
-        expected.push_str(&format!("{i}.000"));
-        match i {
-            8191 => expected.push_str(",\"k\":5000"),
-            8192 => expected.push_str(",\"k\":7"), // dmap reset: 7, not 5007
-            _ => expected.push_str(&format!(",\"args\":{{\"a\":{i}}}")),
-        }
-        expected.push_str(if i + 1 < N { "},\n" } else { "}\n" });
-    }
-    expected.push_str("]\n");
-    assert_eq!(std::str::from_utf8(&got).unwrap(), expected);
-}
-
 /// A KTZ4 file of `n` complete-X events (same column/stream layout as
-/// ktz_v4_range_resets, minus the blob machinery): ph/pid/tid/name/cat
+/// ktz_direct_range_resets, minus the blob machinery): ph/pid/tid/name/cat
 /// columns, ts stepping 1us per event, constant 100ns dur, one int-arg
 /// stream. Decodes to a trace the loader can parse end to end.
 fn ktz_all_x_events(n: u64) -> Vec<u8> {
@@ -4541,13 +4464,13 @@ fn ktz_all_x_events(n: u64) -> Vec<u8> {
 }
 
 // The loader's event counter drives the "Loading: N events..." splash. It
-// must be monotonic across a whole load — including .ktz files, whose decode
-// counts rendered events and whose parse phase used to store(0) and re-count
-// (zeroing the shared counter mid-load, once per rank, while the other ranks
-// were still counting: the splash number visibly bounced). Each event is now
-// counted exactly once, at render time; the re-parse counts into a private
-// throwaway. This pins both halves: no decrease ever observed by a sampler
-// racing the load, and the final count is exactly the rendered total.
+// must be monotonic across a whole load — including .ktz files, where an
+// older design's parse phase used to store(0) and re-count (zeroing the
+// shared counter mid-load, once per rank, while the other ranks were still
+// counting: the splash number visibly bounced). Each event is now counted
+// exactly once, at decode time. This pins both halves: no decrease ever
+// observed by a sampler racing the load, and the final count is exactly
+// the decoded total.
 #[test]
 fn multi_ktz_load_progress_is_monotonic() {
     const N: u64 = 20_000;
@@ -4629,16 +4552,13 @@ fn ktz_v3_synthetic_file() -> Vec<u8> {
 }
 
 #[test]
-fn ktz_v3_synthetic() {
+fn ktz_v3_synthetic_file_decodes() {
+    // The reference JSON this file models (what `ktz d` would emit):
+    //   {"ph":"X","pid":1,"tid":2,"name":"Op","ts":0.500,"k":42},
+    //   {"ph":"X","pid":1,"tid":2,"name":"Op","ts":0.750}
+    // Asserted through the direct path by ktz_direct_v3_and_v2.
     let file = ktz_v3_synthetic_file();
-    let got = ktz::decode(&file, &test_counter()).expect("decode");
-    let expected = concat!(
-        "{\n\"traceEvents\": [\n",
-        "  {\"ph\":\"X\",\"pid\":1,\"tid\":2,\"name\":\"Op\",\"ts\":0.500,\"k\":42},\n",
-        "  {\"ph\":\"X\",\"pid\":1,\"tid\":2,\"name\":\"Op\",\"ts\":0.750}\n",
-        "]\n}\n",
-    );
-    assert_eq!(std::str::from_utf8(&got).unwrap(), expected);
+    assert!(ktz::is_ktz(&file));
 }
 
 fn ktz_v2_synthetic_file() -> Vec<u8> {
@@ -4679,23 +4599,9 @@ fn ktz_v2_synthetic_file() -> Vec<u8> {
 }
 
 #[test]
-fn ktz_v2_synthetic() {
-    let file = ktz_v2_synthetic_file();
-    let got = ktz::decode(&file, &test_counter()).expect("decode");
-    let expected = concat!(
-        "{\n\"traceEvents\": [\n",
-        "  {\"ph\":\"X\",\"pid\":1,\"tid\":2,\"name\":\"Op\",\"ts\":0.500,\"k\":42},\n",
-        "  {\"ph\":\"X\",\"pid\":1,\"tid\":2,\"name\":\"Op\",\"ts\":0.750}\n",
-        "]\n}\n",
-    );
-    assert_eq!(std::str::from_utf8(&got).unwrap(), expected);
-}
-
-#[test]
 fn ktz_rejects_garbage() {
-    let c = test_counter();
-    assert!(ktz::decode(b"not a ktz file at all", &c).is_err());
-    assert!(ktz::decode(b"KTZ4", &c).is_err()); // truncated header
+    assert!(ktz::KtzDecoder::new(b"not a ktz file at all").is_err());
+    assert!(ktz::KtzDecoder::new(b"KTZ4").is_err()); // truncated header
     let mut f = Vec::new();
     f.extend_from_slice(b"KTZ4");
     ktz_varint(&mut f, 1);
@@ -4703,17 +4609,20 @@ fn ktz_rejects_garbage() {
     ktz_varint(&mut f, 100);
     ktz_varint(&mut f, 5);
     f.extend_from_slice(&[0u8; 3]); // frame shorter than declared
-    assert!(ktz::decode(&f, &c).is_err());
+    assert!(ktz::KtzDecoder::new(&f).is_err());
 }
 
 // ====================== ktz direct (columnar) decoding ======================
-// The sections -> events path (KtzDecoder/decode_trace) must produce the
-// same trace the render() -> parse_chunk pipeline did, so each synthetic
-// file above is decoded both ways and the direct results are asserted
-// against what the reference JSON (printed in the tests above) implies.
+// The sections -> events path (KtzDecoder) must produce the trace the old
+// .json load of the same data did, so each synthetic file above is decoded
+// directly and asserted against what its reference JSON implies.
 
 fn ktz_direct(file: &[u8]) -> (ktz::KtzTrace, Vec<u8>) {
-    ktz::decode_trace(file, &test_counter()).expect("direct decode")
+    let mut dec = ktz::KtzDecoder::new(file).expect("new");
+    let mut out = ktz::KtzTrace::with_events(dec.n_events());
+    let c = test_counter();
+    while !dec.step(&mut out, 65_536, &c).expect("step") {}
+    (out, dec.into_head_foot())
 }
 
 fn ktz_args_text(t: &ktz::KtzTrace, i: usize) -> &[u8] {
@@ -4985,7 +4894,7 @@ fn ktz_direct_step_resume() {
     // Stepping one event at a time must land the same trace as one shot —
     // the wasm loader's whole reason for the resumable decoder.
     let file = ktz_all_x_events(100);
-    let (whole, _) = ktz::decode_trace(&file, &test_counter()).expect("one-shot");
+    let (whole, _) = ktz_direct(&file);
     let mut dec = ktz::KtzDecoder::new(&file).expect("new");
     let mut stepped = ktz::KtzTrace::with_events(dec.n_events());
     let c = test_counter();
@@ -4997,41 +4906,6 @@ fn ktz_direct_step_resume() {
         assert_eq!((a.2.ts, a.2.dur, a.2.name, a.2.args_off, a.2.args_len), (b.2.ts, b.2.dur, b.2.name, b.2.args_off, b.2.args_len));
     }
     assert_eq!(stepped.args, whole.args);
-}
-
-#[test]
-#[ignore]
-fn ktz_real_file_matches_ktz_d() {
-    let ktz_bin = "/Users/ecrncevi/CLionProjects/compression/ktz";
-    let sample = match std::env::var("TV_KTZ_SAMPLE") {
-        Ok(p) => p,
-        Err(_) => "/Users/ecrncevi/dsv4traces/dsv41-pd-1p1d-dep8-spec3-prof-001-20261022-2124-pd1p1d-dep8-spec3-vllm-profile-prefill/wide-ep-dss-vllm-dsv41-flash-0-5b1b47f7-prefill-0/dsv41-pd-1p1d-dep8-spec3-prof-001-20261022-2124-pd1p1d-dep8-spec3-c16-prefill_dp7_pp0_tp0_dcp0_ep7_rank0.1792698681095973251.pt.trace.json.ktz".to_string(),
-    };
-    if !std::path::Path::new(ktz_bin).exists() || !std::path::Path::new(&sample).exists() {
-        eprintln!("ktz binary or sample trace missing, skipping");
-        return;
-    }
-    let out_path = std::env::temp_dir().join(format!("tv_ktz_test_reference_{}.json", std::process::id()));
-    let status = std::process::Command::new(ktz_bin)
-        .args(["d", &sample, out_path.to_str().unwrap()])
-        .status()
-        .expect("spawn ktz");
-    assert!(status.success(), "ktz d failed");
-    let expected = std::fs::read(&out_path).expect("read ktz d output");
-    let data = std::fs::read(sample).expect("read ktz file");
-    let got = ktz::decode(&data, &test_counter()).expect("decode");
-    if got != expected {
-        let n = got.len().min(expected.len());
-        let pos = (0..n).find(|&i| got[i] != expected[i]).unwrap_or(n);
-        eprintln!(
-            "diverge at byte {pos}/{} (got {} bytes): got {:?} vs ktz d {:?}",
-            expected.len(),
-            got.len(),
-            String::from_utf8_lossy(&got[pos.saturating_sub(60)..(pos + 60).min(got.len())]),
-            String::from_utf8_lossy(&expected[pos.saturating_sub(60)..(pos + 60).min(expected.len())]),
-        );
-    }
-    assert_eq!(got, expected, "decoded output must match `ktz d` byte-for-byte");
 }
 
 #[test]

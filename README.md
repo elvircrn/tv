@@ -4,6 +4,10 @@ Vibe-coded native trace viewer for PyTorch/Chrome trace format. macOS only (Meta
 
 Handles large traces (1M+ events) with GPU-accelerated rendering via imgui + Metal.
 
+Traces load from `.ktz` files — the compressed columnar container written by
+the `ktz` tool (`ktz c trace.json trace.json.ktz`). The viewer decodes the
+columns directly; the JSON text is never materialized.
+
 ## Build
 
 Requires Rust. Install via [rustup](https://rustup.rs/) if you don't have it.
@@ -39,24 +43,22 @@ cargo build --profile dev-release && cargo test --profile dev-release
 ## Usage
 
 ```
-tv trace.json
-tv trace.json.gz
-tv trace.tar.gz
+tv trace.json.ktz
 ```
 
-Multiple files open in split panes:
+Multiple files open in tabs:
 
 ```
-tv left.json right.json
+tv left.ktz right.ktz
 ```
 
 Multi-rank distributed traces are detected automatically by filename (`*-rank-N.*`) and merged into a single pane with a shared time axis:
 
 ```
-tv rank-0.pt.trace.json.gz rank-1.pt.trace.json.gz rank-2.pt.trace.json.gz rank-3.pt.trace.json.gz
+tv rank-0.pt.trace.json.ktz rank-1.pt.trace.json.ktz rank-2.pt.trace.json.ktz rank-3.pt.trace.json.ktz
 ```
 
-You can also drag and drop files onto the window.
+You can also drag and drop files (or a directory of them) onto the window.
 
 ## Controls
 
