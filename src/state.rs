@@ -870,9 +870,12 @@ pub struct Pane {
     /// clickable rows that open the editor. Per-pane so each tab keeps its
     /// results.
     pub src_hits: Vec<crate::source::SourceHit>,
-    /// Last source-jump outcome (failed editor launch, unresolvable name),
-    /// shown inline in the Detail tab and the status bar until replaced.
-    pub src_error: Option<String>,
+    /// Last source-jump outcome: (is_error, text). Errors are red (launch
+    /// failure, unresolvable name), warnings yellow — chiefly "checkout is
+    /// not the trace's build commit, line numbers may be off", which is the
+    /// only way a jump that lands in the right file can still be wrong.
+    /// Shown inline in the Detail tab and the status bar until replaced.
+    pub src_msg: Option<(bool, String)>,
 }
 
 impl Pane {
@@ -952,7 +955,7 @@ impl Pane {
             color_by_dur: false,
             heat_bounds: None,
             src_hits: Vec::new(),
-            src_error: None,
+            src_msg: None,
         }
     }
 

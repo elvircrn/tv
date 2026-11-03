@@ -6577,3 +6577,52 @@ fn test_open_in_editor_missing_binary() {
     let err = crate::source::open_in_editor("tv_test_no_such_editor", &hit).unwrap_err();
     assert!(err.contains("tv_test_no_such_editor"), "error should name the editor: {err}");
 }
+
+/// cpu_op name-resolution landing spots, printed with line content, so a
+/// "right file, wrong line" report can be diagnosed (call-site vs def vs
+/// drift). Same env gating as source_resolution_real_trace.
+#[test]
+#[ignore]
+fn source_cpu_op_resolution_real_trace() {
+    let (trace_path, root) = match (std::env::var("TV_SOURCE_TRACE"), std::env::var("TV_SOURCE_ROOT")) {
+        (Ok(t), Ok(r)) => (t, r),
+        _ => { eprintln!("set TV_SOURCE_TRACE=<rank.ktz> and TV_SOURCE_ROOT=<vllm checkout>"); return; }
+    };
+    let trace = load_trace(&trace_path, &test_counter()).unwrap();
+    let mut idx = crate::source::SourceIndex::build(std::path::Path::new(&root));
+    eprintln!("checkout: {} ({:?})", root, idx.git_desc);
+    let cpu_cat = trace.cats.iter().position(|c| c == "cpu_op").unwrap();
+    let mut names: Vec<&str> = Vec::new();
+    for t in &trace.tracks {
+        if t.gpu { continue; }
+        for ev in &t.events {
+            let n = trace.names[ev.name as usize].as_str();
+            if ev.cat as usize == cpu_cat && !names.contains(&n) { names.push(n); }
+        }
+    }
+    eprintln!("unique cpu_op names: {}", names.len());
+    for n in &names {
+        if crate::source::is_torch_internal(n) { continue; }
+        let hits = idx.resolve_kernel(n);
+        match hits.first() {
+            Some(h) => {
+                let line = std::fs::read_to_string(&h.path).ok().and_then(|t| {
+                    t.lines().nth(h.line as usize - 1).map(|s| s.trim().to_string())
+                }).unwrap_or_default();
+                eprintln!("  {} -> {}:{}  | {}", n, h.rel, h.line, line);
+            }
+            None => eprintln!("  {} -> (no match)", n),
+        }
+    }
+}
+
+#[test]
+fn test_trace_build_commit() {
+    use crate::source::trace_build_commit;
+    assert_eq!(trace_build_commit("0.33.0rc1.dev573+llmd.cfee12e985dc6f4f74fd"),
+        Some("cfee12e985dc6f4f74fd"));
+    assert_eq!(trace_build_commit("0.26.1rc1.dev528+g1a2b3c4d5e6f"), Some("1a2b3c4d5e6f"));
+    // No commit tail, or a non-hex one: None.
+    assert_eq!(trace_build_commit("0.33.0"), None);
+    assert_eq!(trace_build_commit(""), None);
+}

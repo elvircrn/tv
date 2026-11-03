@@ -290,13 +290,31 @@ fn find_def(line: &[u8], needle: &[u8]) -> bool {
 
 /// torch/CUB/CUTLASS-namespace names: their source lives in pytorch, not
 /// the vLLM checkout, so resolving them would only ever produce junk
-/// (worst case a call site that happens to textually match).
+/// (worst case a call site that happens to textually match — `c10d::send`
+/// once landed on an unrelated `def send(` in a test file).
 pub fn is_torch_internal(name: &str) -> bool {
     let n = name.trim();
-    n.starts_with("aten::") || n.starts_with("c10::") || n.starts_with("void at::")
-        || n.starts_with("void c10::") || n.starts_with("at::native::")
-        || n.starts_with("(anonymous namespace)::at::") || n.starts_with("cub::")
-        || n.starts_with("cutlass")
+    n.starts_with("aten::") || n.starts_with("c10::") || n.starts_with("c10d::")
+        || n.starts_with("void at::") || n.starts_with("void c10::")
+        || n.starts_with("at::native::") || n.starts_with("(anonymous namespace)::at::")
+        || n.starts_with("cub::") || n.starts_with("cutlass")
+}
+
+/// The build commit a trace was built from, per its `vllm_version`. Two
+/// conventions in the wild: the llmd line appends `.<hex>` after a local
+/// version tag (`0.33.0rc1.dev573+llmd.cfee12e985dc6f4f74fd`), and
+/// setuptools-scm's is `+g<hex>` (`0.26.1rc1.dev528+g1a2b3c4d5e6f`).
+/// None when the version string carries no commit (or a non-vllm trace).
+pub fn trace_build_commit(vllm_version: &str) -> Option<&str> {
+    let hexish = |s: &str| s.len() >= 7 && s.chars().all(|c| c.is_ascii_hexdigit());
+    // llmd style: hex is the last '.'-separated segment.
+    if let Some(seg) = vllm_version.rsplit('.').next() {
+        if hexish(seg) { return Some(seg); }
+    }
+    // setuptools-scm style: hex follows the last '+', after a 'g'.
+    let tail = vllm_version.rsplit('+').next()?;
+    let hex = tail.strip_prefix('g').unwrap_or(tail);
+    hexish(hex).then_some(hex)
 }
 
 /// `code` -> ["code", "/usr/local/bin/code", ...]. An editor given as a

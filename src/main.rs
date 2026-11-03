@@ -2184,10 +2184,10 @@ impl App {
                                 if callfrom.is_some() || track.gpu || trace.cats[ev.cat as usize] == "cpu_op" {
                                     if ui.small_button("View Source") {
                                         if let Some(r) = pane.selected {
-                                            let act = resolve_event_source(&mut state.src_idx, pane, r);
+                                            let (act, warn) = resolve_event_source(&mut state.src_idx, pane, r);
                                             apply_src_action(
-                                                &mut pane.src_error, &mut pane.src_hits,
-                                                &mut pane.pending_tab, &state.src_editor, act);
+                                                &mut pane.src_msg, &mut pane.src_hits,
+                                                &mut pane.pending_tab, &state.src_editor, act, warn);
                                         }
                                     }
                                     if ui.is_item_hovered() {
@@ -2201,9 +2201,10 @@ impl App {
                                     // click happened: a failed editor launch or
                                     // an unresolvable name must not look like
                                     // the button did nothing.
-                                    if let Some(e) = &pane.src_error {
+                                    if let Some((is_err, e)) = &pane.src_msg {
                                         ui.same_line();
-                                        ui.text_colored([0.9, 0.4, 0.4, 1.0], e.lines().next().unwrap_or(e));
+                                        let color = if *is_err { [0.9, 0.4, 0.4, 1.0] } else { [0.9, 0.75, 0.3, 1.0] };
+                                        ui.text_colored(color, e.lines().next().unwrap_or(e));
                                         if ui.is_item_hovered() && e.contains('\n') {
                                             ui.tooltip_text(e);
                                         }
@@ -2260,36 +2261,34 @@ impl App {
                                             Box::new(source::SourceIndex::build(&p))
                                         }));
                                     } else {
-                                        pane.src_error = Some(format!("not a directory: {}", state.src_path));
+                                        pane.src_msg = Some((true, format!("not a directory: {}", state.src_path)));
                                     }
                                 }
                                 if state.src_thread.is_some() {
                                     ui.text_colored([0.9, 0.8, 0.4, 1.0], "indexing checkout...");
                                 } else if let Some(idx) = state.src_idx.as_mut() {
                                     // Version banner: the trace's build commit
-                                    // (hex tail of vllm_version) vs the
-                                    // checkout's git describe. A mismatch means
-                                    // line numbers can drift — the one way this
-                                    // feature silently lies otherwise.
+                                    // vs the checkout's git describe. A mismatch
+                                    // means line numbers can drift — the one way
+                                    // this feature silently lies otherwise.
                                     let trace_ver = pane.trace.as_ref()
                                         .map(|t| t.vllm_version.clone())
                                         .unwrap_or_default();
                                     if !trace_ver.is_empty() {
-                                        let build = trace_ver.rsplit('.').next().unwrap_or("");
-                                        let hexish = build.len() >= 7
-                                            && build.chars().all(|c| c.is_ascii_hexdigit());
                                         state.buf.fmt.clear();
-                                        if let (Some(desc), true) = (&idx.git_desc, hexish) {
-                                            if desc.contains(build) {
+                                        match (source::trace_build_commit(&trace_ver), &idx.git_desc) {
+                                            (Some(build), Some(desc)) if desc.contains(build) => {
                                                 write!(state.buf.fmt, "checkout matches trace build {}", &build[..7]).unwrap();
                                                 ui.text_colored([0.4, 0.8, 0.5, 1.0], &state.buf.fmt);
-                                            } else {
+                                            }
+                                            (Some(build), Some(desc)) => {
                                                 write!(state.buf.fmt, "trace built at {} but checkout is at {} - line numbers may drift", &build[..build.len().min(12)], desc).unwrap();
                                                 ui.text_colored([0.9, 0.7, 0.3, 1.0], &state.buf.fmt);
                                             }
-                                        } else {
-                                            write!(state.buf.fmt, "trace vllm_version: {}", trace_ver).unwrap();
-                                            ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
+                                            _ => {
+                                                write!(state.buf.fmt, "trace vllm_version: {}", trace_ver).unwrap();
+                                                ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
+                                            }
                                         }
                                     }
                                     // Row 2: the editor the jump buttons launch.
@@ -2312,7 +2311,7 @@ impl App {
                                             write!(state.buf.fmt, "{}:{}", h.rel, h.line).unwrap();
                                             if ui.selectable(&state.buf.fmt) {
                                                 if let Err(e) = source::open_in_editor(&state.src_editor, h) {
-                                                    pane.src_error = Some(e);
+                                                    pane.src_msg = Some((true, e));
                                                 }
                                             }
                                         }
@@ -2324,13 +2323,14 @@ impl App {
                                         and python frames with source. CallFrom args jump to the\n\
                                         exact line; kernel names resolve via def/class indexing.");
                                 }
-                                if pane.src_error.is_some() {
+                                if pane.src_msg.is_some() {
                                     let clear = ui.small_button("x##srcclear");
                                     ui.same_line();
-                                    if let Some(e) = &pane.src_error {
-                                        ui.text_colored([0.9, 0.45, 0.45, 1.0], e);
+                                    if let Some((is_err, e)) = &pane.src_msg {
+                                        let color = if *is_err { [0.9, 0.45, 0.45, 1.0] } else { [0.9, 0.75, 0.3, 1.0] };
+                                        ui.text_colored(color, e);
                                     }
-                                    if clear { pane.src_error = None; }
+                                    if clear { pane.src_msg = None; }
                                 }
                             }
                         }
@@ -2391,13 +2391,15 @@ impl App {
                         write!(state.buf.fmt, "{} | {} | {} events | {} tracks | {:.1}ms", fname, ranks, t.total_events, t.tracks.len(), dt * 1000.0).unwrap();
                     }
                     dl.add_text([win_pos[0] + 8.0, cy], col32(153, 153, 153, 255), &state.buf.fmt);
-                    // A source-jump failure rides the status bar's left side:
+                    // A source-jump outcome rides the status bar's left side:
                     // it's the only place a right-click "View Source" that
-                    // didn't land would otherwise be visible from.
-                    if let Some(e) = &pane.src_error {
+                    // didn't land (or landed on drifted lines) would
+                    // otherwise be visible from.
+                    if let Some((is_err, e)) = &pane.src_msg {
                         let left_w = ui.calc_text_size(&state.buf.fmt)[0];
                         let msg = e.lines().next().unwrap_or(e);
-                        dl.add_text([win_pos[0] + 8.0 + left_w + 14.0, cy], col32(220, 90, 90, 255), msg);
+                        let c = if *is_err { col32(220, 90, 90, 255) } else { col32(225, 185, 80, 255) };
+                        dl.add_text([win_pos[0] + 8.0 + left_w + 14.0, cy], c, msg);
                     }
 
                     let logo_scale = text_h / VLLM_LOGO_GRID;
@@ -2625,12 +2627,12 @@ impl App {
                                 // selecting, no tab hop through Detail.
                                 #[cfg(not(target_arch = "wasm32"))]
                                 if ui.menu_item("View Source") {
-                                    let act = resolve_event_source(
+                                    let (act, warn) = resolve_event_source(
                                         &mut state.src_idx, &state.panes[ai], r);
                                     let pane = &mut state.panes[ai];
                                     apply_src_action(
-                                        &mut pane.src_error, &mut pane.src_hits,
-                                        &mut pane.pending_tab, &state.src_editor, act);
+                                        &mut pane.src_msg, &mut pane.src_hits,
+                                        &mut pane.pending_tab, &state.src_editor, act, warn);
                                 }
                             });
                         }
@@ -2920,25 +2922,27 @@ enum SrcAction {
 
 /// Event -> source resolution, shared by the Detail tab's "View Source"
 /// button and the timeline right-click menu. Takes `pane` by shared
-/// reference and the index/editor as separate borrows, so it can be called
-/// from tab-body scopes that hold `&mut pane` — the disjoint-field borrow
-/// split those bodies already rely on.
+/// reference and the index as a separate borrow, so it can be called from
+/// tab-body scopes that hold `&mut pane` — the disjoint-field borrow split
+/// those bodies already rely on. Returns the action plus an optional drift
+/// warning to show even on success: a checkout that isn't the trace's build
+/// commit resolves the right FILES but shifted LINES.
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_event_source(
     idx: &mut Option<Box<source::SourceIndex>>,
     pane: &Pane,
     r: EventRef,
-) -> SrcAction {
+) -> (SrcAction, Option<String>) {
     let Some(trace) = pane.trace.as_ref() else {
-        return SrcAction::Error("no trace".into());
+        return (SrcAction::Error("no trace".into()), None);
     };
     // Resolve defensively: an EventRef can outlive a reload/merge that
     // shrank the trace (same reasoning as the Detail tab's sel_ev).
     let Some(track) = trace.tracks.get(r.track_idx as usize) else {
-        return SrcAction::Error("stale event reference".into());
+        return (SrcAction::Error("stale event reference".into()), None);
     };
     let Some(ev) = track.events.get(r.event_idx as usize) else {
-        return SrcAction::Error("stale event reference".into());
+        return (SrcAction::Error("stale event reference".into()), None);
     };
     let name = &trace.names[ev.name as usize];
     // CallFrom (kineto with_stack) is the exact python file:line.
@@ -2964,51 +2968,64 @@ fn resolve_event_source(
         // ops appear as cpu_op events on CPU tracks, so those must link too.
         let cat = &trace.cats[ev.cat as usize];
         if !(track.gpu || cat == "kernel" || cat == "cpu_op") {
-            return SrcAction::Error(format!(
-                "no source linkage for `{}` ({} events carry none)", name, cat));
+            return (SrcAction::Error(format!(
+                "no source linkage for `{}` ({} events carry none)", name, cat)), None);
         }
         if source::is_torch_internal(name) {
-            return SrcAction::Error(format!(
-                "`{}` is a torch op - its source lives in pytorch, not the vllm checkout", name));
+            return (SrcAction::Error(format!(
+                "`{}` is a torch op - its source lives in pytorch, not the vllm checkout", name)), None);
         }
     }
-    let Some(idx) = idx.as_mut() else { return SrcAction::NeedCheckout };
+    let Some(idx) = idx.as_mut() else { return (SrcAction::NeedCheckout, None) };
+    // Drift check, before the borrows get tangled: the trace's build commit
+    // vs the checkout's git describe. A mismatch is the one way a jump can
+    // land in the right file at the wrong line, so it must ride along with
+    // every success, not just sit in the Source tab's banner.
+    let warn = source::trace_build_commit(&trace.vllm_version).filter(|b| {
+        !idx.git_desc.as_deref().is_some_and(|d| d.contains(b))
+    }).map(|b| format!(
+        "checkout {} is not the trace's build commit {} - line numbers may be off",
+        idx.git_desc.as_deref().unwrap_or("?"), &b[..b.len().min(12)]));
     let hits = if let Some(cf) = &callfrom {
         idx.resolve_callfrom(cf).into_iter().collect::<Vec<_>>()
     } else {
         idx.resolve_kernel(name)
     };
-    match hits.len() {
+    let act = match hits.len() {
         0 => SrcAction::Error(format!(
             "no source found for `{}` in the checkout (aten/CUB/CUTLASS kernels live outside vllm)", name)),
         1 => SrcAction::Open(hits.into_iter().next().unwrap()),
         _ => SrcAction::List(hits),
-    }
+    };
+    (act, warn)
 }
 
 /// Apply a resolution: open the editor, fill the Source tab's hit list,
-/// or park the message in `src_error` (shown in the Source tab). Takes the
-/// three affected Pane fields individually, not `&mut Pane` — the Detail
-/// tab calls this while holding a shared borrow of `pane.trace` across it
-/// (the duration histogram below uses it too).
+/// or park the message in `src_msg` (shown inline and in the status bar).
+/// Takes the affected Pane fields individually, not `&mut Pane` — the
+/// Detail tab calls this while holding a shared borrow of `pane.trace`
+/// across it (the duration histogram below uses it too).
 #[cfg(not(target_arch = "wasm32"))]
 fn apply_src_action(
-    err: &mut Option<String>,
+    msg: &mut Option<(bool, String)>,
     hits: &mut Vec<source::SourceHit>,
     pending_tab: &mut Option<BottomTab>,
     editor: &str,
     act: SrcAction,
+    warn: Option<String>,
 ) {
     match act {
-        SrcAction::Error(e) => *err = Some(e),
-        SrcAction::Open(h) => {
-            if let Err(e) = source::open_in_editor(editor, &h) {
-                *err = Some(e);
-            }
-        }
+        SrcAction::Error(e) => *msg = Some((true, e)),
+        SrcAction::Open(h) => match source::open_in_editor(editor, &h) {
+            Err(e) => *msg = Some((true, e)),
+            // A clean open clears any stale message; a drift warning
+            // replaces it (yellow, not red — the jump did happen).
+            Ok(()) => *msg = warn.map(|w| (false, w)),
+        },
         SrcAction::List(hs) => {
             *hits = hs;
             *pending_tab = Some(BottomTab::Source);
+            *msg = warn.map(|w| (false, w));
         }
         // No checkout yet: the Source tab is where one gets set up.
         SrcAction::NeedCheckout => *pending_tab = Some(BottomTab::Source),
