@@ -163,6 +163,22 @@ struct Cur<'a> {
     p: usize,
 }
 
+/// nEvents from a KTZ3/KTZ4 header (the first varint after the magic),
+/// without decoding anything — loader wave-sizing uses it to estimate the
+/// expanded JSON size (~300 bytes/event) before committing to a load.
+/// None for KTZ2 (nEvents lives inside the zstd frame) or any non-ktz /
+/// unreadable file. Compiles on wasm too (std::fs stubs error there), but
+/// only the native path-based loader ever calls it.
+pub fn event_count_hint(path: &str) -> Option<u64> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut head = [0u8; 24];
+    f.read_exact(&mut head).ok()?;
+    if &head[..4] != b"KTZ3" && &head[..4] != b"KTZ4" { return None; }
+    let mut c = Cur { d: &head, p: 4 };
+    c.varint().ok()
+}
+
 impl<'a> Cur<'a> {
     fn new(d: &'a [u8]) -> Self {
         Cur { d, p: 0 }

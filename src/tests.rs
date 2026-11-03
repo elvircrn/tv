@@ -2100,6 +2100,66 @@ fn test_merge_traces_sorts_ranks_numerically_not_lexicographically() {
     }
 }
 
+// Ranks arrive at merge_traces per-rank-compacted (see load_trace_for_merge),
+// so the merge must keep every rank's args buffer instead of re-compacting
+// into one, and rebase each track's raw_buf_idx by its rank's buffer base —
+// the old blanket `raw_buf_idx = trace_idx` read a multi-buffer rank's
+// second track out of the wrong buffer entirely. Rank 1 here owns two
+// buffers with its track pointing at the second one.
+#[test]
+fn test_merge_keeps_per_rank_args_buffers() {
+    let rank_trace = |blobs: Vec<&str>, buf_idx: u8| -> Trace {
+        let raw_bufs: Vec<_> = blobs.iter().map(|b| {
+            // Compact format: offset 0 is a reserved 0 byte, args at 1.
+            let mut v = vec![0u8];
+            v.extend_from_slice(b.as_bytes());
+            Arc::new(ArgsBuf::Heap(v))
+        }).collect();
+        let blob = blobs[buf_idx as usize];
+        let track = Track {
+            label: "GPU 0".to_string(), gpu: true,
+            events: vec![Event { ts: 0.0, dur: 1.0, name: 0, cat: 0,
+                args_off: 1, args_len: blob.len() as u16, depth: 0 }],
+            max_depth: 1, prefix_max_dur: vec![1.0], raw_buf_idx: buf_idx,
+        };
+        Trace {
+            tracks: vec![track], names: vec!["k".to_string()], cats: vec!["kernel".to_string()],
+            raw_bufs, stats: Vec::new(), max_ts: 1.0, min_ts: 0.0, total_events: 1,
+            device: String::new(), vllm_version: String::new(), dist_rank: 0, dist_world: 0,
+            flow_pairs: Vec::new(), rank_paths: Vec::new(),
+        }
+    };
+    let merged = merge_traces(vec![
+        (0, rank_trace(vec!["rank0-args"], 0)),
+        (1, rank_trace(vec!["rank1-buf0", "rank1-buf1-args"], 1)),
+    ]);
+
+    // Per-rank buffers survive the merge — no collapse into one buffer.
+    assert_eq!(merged.raw_bufs.len(), 3);
+    // Each track still resolves to its own rank's bytes.
+    let args = |ti: usize| -> String {
+        let tr = &merged.tracks[ti];
+        let ev = &tr.events[0];
+        let raw = &merged.raw_bufs[tr.raw_buf_idx as usize];
+        std::str::from_utf8(&raw[ev.args_off as usize..ev.args_off as usize + ev.args_len as usize])
+            .unwrap().to_string()
+    };
+    assert_eq!(args(0), "rank0-args");
+    assert_eq!(args(1), "rank1-buf1-args");
+}
+
+// wave_count packs ranks into load waves under WAVE_MEM_BUDGET: filling the
+// budget exactly is fine, the rank that would overspend it starts the next
+// wave, and one oversized rank still loads (alone) rather than never.
+#[test]
+fn test_wave_count_bounds_concurrent_blob_memory() {
+    let gb = 1u64 << 30;
+    assert_eq!(crate::loader::wave_count(&[2 * gb, 2 * gb, 2 * gb, 2 * gb]), 4);
+    assert_eq!(crate::loader::wave_count(&[3 * gb, 3 * gb, 3 * gb]), 2);
+    assert_eq!(crate::loader::wave_count(&[50 * gb]), 1);
+    assert_eq!(crate::loader::wave_count(&[1024; 64]), 64);
+}
+
 // The actual user-visible fix: even a Trace whose *stored* track order is
 // already wrong (e.g. a .tvcache exported before merge_traces sorted
 // correctly — the label text still has the real rank in it, only the
@@ -2303,6 +2363,55 @@ fn bench_progressive_load() {
         eprintln!("  receive {n}: +{:.2}s ({} tracks, {} events)",
             t0.elapsed().as_secs_f64(), t.tracks.len(), t.total_events);
     }
+}
+
+// End-to-end check for the per-rank-compaction merge (see
+// load_trace_for_merge): runs a real multi-rank directory through the exact
+// production load path — load_multi_progressive, waves and all — and
+// verifies sampled events' args still resolve inside their own rank's
+// buffer as {...} JSON objects. The old post-merge compact built ONE args
+// buffer, whose u32 args_off wrapped past 4GB on large merges. Run with:
+//   TV_BENCH_TRACE=<dir of per-rank traces> cargo test --release bench_multi_merge_args -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bench_multi_merge_args() {
+    let path = match std::env::var("TV_BENCH_TRACE") {
+        Ok(p) => p,
+        Err(_) => { eprintln!("set TV_BENCH_TRACE=<dir of per-rank traces> to run this bench"); return; }
+    };
+    if !std::path::Path::new(&path).is_dir() {
+        eprintln!("TV_BENCH_TRACE must be a directory of per-rank files for this bench");
+        return;
+    }
+    let (rank_groups, standalone) = detect_rank_groups(&[path]);
+    let mut all_paths: Vec<(usize, String)> = Vec::new();
+    for (group, _) in &rank_groups { all_paths.extend(group.clone()); }
+    for (i, (p, _)) in standalone.iter().enumerate() { all_paths.push((all_paths.len() + i, p.clone())); }
+    assert!(all_paths.len() > 1, "expected a multi-rank directory");
+
+    let counter = test_counter();
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::loader::load_multi_progressive(all_paths, &counter, 2, &tx, None, true);
+    let trace = rx.recv().expect("merged load result").expect("merged trace");
+
+    eprintln!("merged: {} events, {} tracks, {} args buffers",
+        trace.total_events, trace.tracks.len(), trace.raw_bufs.len());
+    assert!(trace.raw_bufs.len() > 1, "per-rank args buffers should survive the merge");
+    let mut checked = 0usize;
+    for tr in &trace.tracks {
+        let raw = &trace.raw_bufs[tr.raw_buf_idx as usize];
+        for (i, ev) in tr.events.iter().enumerate() {
+            if ev.args_off == 0 || i % 997 != 0 { continue; }
+            let s = ev.args_off as usize;
+            let e = s + ev.args_len as usize;
+            assert!(e <= raw.len(), "args slice [{s}..{e}] escapes its buffer (len {})", raw.len());
+            assert_eq!(raw[s], b'{', "args should start a JSON object");
+            assert_eq!(raw[e - 1], b'}', "args should end a JSON object");
+            checked += 1;
+        }
+    }
+    eprintln!("sampled {} args objects, all intact", checked);
+    assert!(checked > 0, "expected events with args");
 }
 
 // Measures a *full* draw_timeline call (real imgui context, no renderer
@@ -4055,6 +4164,7 @@ fn test_steps_table_real_trace() {
     }
     eprintln!("table rendered OK");
 }
+
 
 #[test]
 #[ignore] // real-trace smoke test for the detailed-annotation format

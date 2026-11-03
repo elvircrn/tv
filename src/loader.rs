@@ -2311,17 +2311,31 @@ fn load_trace_inner(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: u
 }
 
 /// `load_trace_inner` for ranks going straight into `merge_traces`
-/// (multi-rank loads, the `--bench` multi-file branch), which runs its own
-/// `compact_args` over the merged args buffers. Compacting per-rank as well
-/// meant every args byte was copied twice, and the concurrent per-rank
-/// compacts fought each other for memory bandwidth: on 8x981MB .json.gz
-/// ranks (M4 Pro) they measured 0.6-1.0s each under contention, on top of
-/// the 0.91s merged compact. Skipping them removes one full ~2.3GB copy
-/// round with identical final output — the merge reads args_off/args_len
-/// from whatever buffer each rank's tracks point at, raw or compacted
-/// alike.
+/// (multi-rank loads, the `--bench` multi-file branch), plus the per-rank
+/// `compact_args` the merge itself no longer runs (see `merge_traces`).
+/// This used to skip the compact so the merge could compact everything in
+/// one pass, but that design breaks past a handful of ranks:
+///
+/// * `compact_args` builds ONE args buffer and `Event.args_off` is u32:
+///   past 4GB of merged args (32 c16 .ktz ranks carry ~20.7GB) the offsets
+///   silently wrap and every event's args read garbage. Compacting per
+///   rank keeps each buffer under 4GB, selected via `raw_buf_idx` — the
+///   multi-buffer design `Trace.raw_bufs` exists for.
+/// * Each rank's expanded JSON blob (~1.5GB per c16 .ktz rank) is released
+///   the moment its own compact finishes, instead of every rank holding
+///   its blob until a post-merge compact.
+///
+/// The double-copy cost that motivated the old skip is real but small next
+/// to that (0.6-1.0s per rank under contention on 8x981MB .json.gz ranks,
+/// M4 Pro), and `load_multi_progressive` loads ranks in memory-bounded
+/// waves now, so the copies don't even fight for bandwidth all at once.
 pub fn load_trace_for_merge(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, cache_dir: Option<&str>, t0: &Instant) -> Result<Trace, String> {
-    load_trace_inner(path, counter, max_parse_threads, cache_dir, t0).map(|(t, _)| t)
+    let (mut trace, from_cache) = load_trace_inner(path, counter, max_parse_threads, cache_dir, t0)?;
+    if !from_cache {
+        // Cached traces are already compacted; see load_trace_inner.
+        compact_args(&mut trace);
+    }
+    Ok(trace)
 }
 
 pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>, max_parse_threads: usize, cache_dir: Option<&str>) -> Result<Trace, String> {
@@ -2600,17 +2614,31 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
         remap_info.push((name_remap, cat_remap, time_offset));
     }
 
+    // Buffer base of each rank inside the merged `raw_bufs`: ranks keep
+    // their own (per-rank-compacted) args buffers — see
+    // `load_trace_for_merge` — so a rank's tracks must be rebased by how
+    // many buffers the ranks before it contributed, not blanket-assigned
+    // one buffer per rank. raw_buf_idx is u8, capping a merge at 256 args
+    // buffers (one per compacted rank) — far past the 32-rank merges this
+    // exists for.
+    let mut buf_bases: Vec<usize> = Vec::with_capacity(traces.len());
+    let mut base = 0usize;
+    for (_, t) in &traces {
+        buf_bases.push(base);
+        base += t.raw_bufs.len();
+    }
+
     let remapped: Vec<_> = traces.into_iter().zip(remap_info).enumerate()
         .collect::<Vec<_>>()
         .into_par_iter()
         .map(|(trace_idx, ((rank, mut trace), (name_remap, cat_remap, time_offset)))| {
-            let raw_buf_idx = trace_idx as u8;
+            let buf_base = buf_bases[trace_idx];
             let mut max_ts: f64 = 0.0;
             let mut total_events = 0usize;
             let mut local_dur: HashMap<u32, Vec<f64>> = HashMap::new();
             for track in &mut trace.tracks {
                 track.label = format!("  Rank {} {}", rank, track.label);
-                track.raw_buf_idx = raw_buf_idx;
+                track.raw_buf_idx = (buf_base + track.raw_buf_idx as usize) as u8;
                 for ev in &mut track.events {
                     ev.ts += time_offset;
                     ev.name = name_remap[ev.name as usize];
@@ -2687,13 +2715,19 @@ pub fn merge_traces(traces: Vec<(usize, Trace)>) -> Trace {
     names.shrink_to_fit();
     cats.shrink_to_fit();
 
-    let mut trace = Trace {
+    let trace = Trace {
         tracks: sorted_tracks, names, cats, raw_bufs: all_raw_bufs, stats,
         max_ts, min_ts: global_min, total_events, device, vllm_version,
         dist_rank: -1, dist_world, flow_pairs: all_flow_pairs,
         rank_paths: Vec::new(),
     };
-    compact_args(&mut trace);
+    // No compact_args here: every caller hands over per-rank-compacted
+    // traces (load_trace_for_merge, the wasm rank plans, load_trace in
+    // --bench), and re-compacting those would copy every args byte a
+    // second time — and truncate any blob whose args_len the first compact
+    // capped at u16::MAX (see the warning on load_trace_inner). Keeping
+    // the per-rank buffers also holds args_off well inside u32 range: one
+    // merged buffer past 4GB of args would silently wrap every offset.
     trace
 }
 
@@ -2856,6 +2890,67 @@ pub fn sync_multi_rank_clocks(trace: &mut Trace, rank_paths: &[(usize, String)],
         infos.len(), groups.len(), if groups.len() == 1 { "" } else { "s" }))
 }
 
+/// Transient-heap budget for one wave of concurrent rank loads in
+/// `load_multi_progressive`: the expanded JSON blobs of the in-flight
+/// ranks (each alive until its own compact_args finishes) plus parse
+/// scratch. 8GB holds a 32-rank c16 .ktz merge (~2.6GB estimated per
+/// rank) to ~3 ranks per wave instead of ~45GB all at once, while small
+/// traces still load together in one wave.
+const WAVE_MEM_BUDGET: u64 = 8 << 30;
+
+/// How many of `estimates` (per-rank transient-heap estimates from
+/// `estimated_load_heap`) fit in one wave: greedily pack ranks until the
+/// next one would overspend the budget, always at least one so a single
+/// oversized rank still loads (alone, exactly like before waves existed).
+pub(crate) fn wave_count(estimates: &[u64]) -> usize {
+    let mut n = 0usize;
+    let mut budget = WAVE_MEM_BUDGET as i64;
+    for &e in estimates {
+        if n > 0 && budget < e as i64 { break; }
+        budget -= e as i64;
+        n += 1;
+    }
+    n.max(1)
+}
+
+/// Estimated transient heap for loading one rank: the expanded JSON the
+/// parser scans plus the trace being built — ~1.75x the expanded size
+/// (measured on a c16 .ktz rank: a 1.48GB blob live alongside an 800MB
+/// trace). .ktz event counts come straight from the header (~300 bytes of
+/// JSON per event matched that measurement within 3%); .gz sizes from the
+/// gzip ISIZE trailer; .json is mmap'd, so only the parsed trace (well
+/// under the file size) lands on the heap.
+fn estimated_load_heap(path: &str) -> u64 {
+    let file = std::fs::metadata(path).map(|m| m.len()).unwrap_or(96 << 20);
+    let expanded: u64 = if let Some(n) = crate::ktz::event_count_hint(path) {
+        n.saturating_mul(300)
+    } else if path.ends_with(".json") {
+        return file;
+    } else if path.ends_with(".gz") {
+        gz_uncompressed_size(path).unwrap_or(file.saturating_mul(16))
+    } else if path.ends_with(".ktz") {
+        // Header unreadable: ktz measured 100-400x compressed size; pad.
+        file.saturating_mul(512)
+    } else {
+        file.saturating_mul(16)
+    };
+    expanded.saturating_mul(7) / 4
+}
+
+/// Uncompressed size from a gzip file's ISIZE trailer (exact below 4GB,
+/// where the u32 field wraps). None for anything malformed, or when the
+/// trailer says 0 (unknown / >= 4GB).
+fn gz_uncompressed_size(path: &str) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    if f.metadata().ok()?.len() < 18 { return None; }
+    f.seek(SeekFrom::End(-4)).ok()?;
+    let mut b = [0u8; 4];
+    f.read_exact(&mut b).ok()?;
+    let n = u32::from_le_bytes(b);
+    if n == 0 { None } else { Some(n as u64) }
+}
+
 pub fn load_multi_progressive(
     rank_paths: Vec<(usize, String)>, counter: &Arc<AtomicUsize>, tpf: usize,
     tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
@@ -2887,21 +2982,40 @@ pub fn load_multi_progressive(
     // Preserve the previous std::thread::scope + JoinHandle::join().ok()
     // behavior: a rank whose load panics is dropped (with a message) rather
     // than taking the whole multi-rank load down with it.
-    let results: Vec<(usize, Result<Trace, String>)> = rank_paths.par_iter().filter_map(|(rank, path)| {
-        let r = *rank;
-        let ctr = counter.clone();
-        let cd_ref = cd.as_deref();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_trace_for_merge(path, &ctr, tpf, cd_ref, &t0))) {
-            Ok(result) => Some((r, result)),
-            Err(e) => {
-                let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
-                    .or_else(|| e.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic".to_string());
-                tlog!("  rank {r} load thread panicked: {msg}");
-                None
+    //
+    // Ranks load in waves bounded by estimated blob memory, not all at
+    // once: each rank's expanded JSON blob (~300 bytes/event — 1.5GB per
+    // c16 .ktz rank) stays on the heap until that rank's own compact
+    // finishes, so 32 concurrent loads transiently need ~45GB+. A wave
+    // keeps the in-flight blobs under WAVE_MEM_BUDGET; completed ranks
+    // hold only their compacted traces. Waves run in order, so results
+    // arrive in the same rank order the old all-at-once par_iter gave.
+    let par = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+    let estimates: Vec<u64> = rank_paths.iter().map(|(_, p)| estimated_load_heap(p)).collect();
+    let wave = wave_count(&estimates);
+    tlog!("  loading {} ranks in waves of {}", rank_paths.len(), wave);
+    let mut results: Vec<(usize, Result<Trace, String>)> = Vec::new();
+    for wave_paths in rank_paths.chunks(wave) {
+        // Fewer concurrent ranks than the caller sized tpf for: give each
+        // in-flight rank a proportionally larger share of the cores.
+        let wave_tpf = tpf.max(par / wave_paths.len()).max(2);
+        let wave_results: Vec<(usize, Result<Trace, String>)> = wave_paths.par_iter().filter_map(|(rank, path)| {
+            let r = *rank;
+            let ctr = counter.clone();
+            let cd_ref = cd.as_deref();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_trace_for_merge(path, &ctr, wave_tpf, cd_ref, &t0))) {
+                Ok(result) => Some((r, result)),
+                Err(e) => {
+                    let msg = e.downcast_ref::<&str>().map(|s| s.to_string())
+                        .or_else(|| e.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".to_string());
+                    tlog!("  rank {r} load thread panicked: {msg}");
+                    None
+                }
             }
-        }
-    }).collect();
+        }).collect();
+        results.extend(wave_results);
+    }
     let mut traces = Vec::new();
     for (rank, result) in results {
         match result {
@@ -3092,10 +3206,9 @@ pub fn load_trace_from_bytes_progressive(
 
 /// wasm counterpart of `load_trace_inner` (see there for the `from_cache`
 /// flag): the cache short-circuits plus parse→build, without the trailing
-/// `compact_args` — for the single-file wrapper above and for ranks going
-/// straight into `merge_traces` (`load_multi_from_bytes_progressive`),
-/// which compacts the merged trace once at the end instead of once per
-/// rank and once merged.
+/// `compact_args` — the single-file wrapper above and
+/// `load_multi_from_bytes_progressive` each compact the result themselves
+/// (per-rank, before the merge; see `load_trace_for_merge` for why).
 #[cfg(all(target_arch = "wasm32", feature = "mt"))]
 fn load_trace_from_bytes_inner(
     name: &str, raw_input: Vec<u8>, counter: &Arc<AtomicUsize>, t0: &Instant,
@@ -3212,9 +3325,11 @@ pub fn group_by_rank_bytes(
 /// wasm equivalent of `load_multi_progressive`: takes each rank's bytes
 /// already in memory instead of a path, and skips the merged-cache round
 /// trip entirely (no persistent cache on wasm — see `load_cache`'s stub).
-/// Each rank loads uncompacted via `load_trace_from_bytes_inner` —
-/// `merge_traces` compacts the merged trace once at the end, so a per-rank
-/// compact would only add a second copy round (see `load_trace_for_merge`).
+/// Each rank loads and compacts via `load_trace_from_bytes_inner` +
+/// `compact_args` — the same per-rank compact `load_trace_for_merge` does
+/// on native, for the same reasons (see there): `merge_traces` no longer
+/// compacts, and each rank's JSON blob is released at its own compact
+/// instead of every rank holding one until after the merge.
 #[cfg(all(target_arch = "wasm32", feature = "mt"))]
 pub fn load_multi_from_bytes_progressive(
     rank_named_bytes: Vec<(usize, String, Vec<u8>)>,
@@ -3225,7 +3340,11 @@ pub fn load_multi_from_bytes_progressive(
 
     let results: Vec<(usize, Result<Trace, String>)> = rank_named_bytes.into_par_iter()
         .map(|(rank, name, bytes)| {
-            let result = load_trace_from_bytes_inner(&name, bytes, counter, &t0).map(|(t, _)| t);
+            let result = load_trace_from_bytes_inner(&name, bytes, counter, &t0)
+                .map(|(mut t, from_cache)| {
+                    if !from_cache { compact_args(&mut t); }
+                    t
+                });
             (rank, result)
         })
         .collect();
@@ -3287,9 +3406,9 @@ pub enum Prepared {
 /// one blocking call), Parse (chunks), Merge (`TraceScan::merge_chunk`),
 /// Assemble (`assemble_track` per track, then `finish_trace`), and — for a
 /// single-rank load — Compact (`compact_track` per track). Multi-rank
-/// member plans stop after Assemble: `merge_traces` concatenates the ranks
-/// and compacts the merged args itself (mirrors
-/// `load_multi_from_bytes_progressive`).
+/// member plans run the Compact phase too: each rank compacts its own args
+/// (releasing its JSON blob) and `merge_traces` concatenates the compacted
+/// buffers as-is (mirrors `load_trace_for_merge`).
 #[cfg(all(target_arch = "wasm32", not(feature = "mt")))]
 pub struct WasmParsePlan {
     phase: PlanPhase,
@@ -3804,9 +3923,11 @@ impl WasmMultiParsePlan {
         let mut plans = Vec::new();
         let mut done = Vec::new();
         for (rank, name, bytes) in rank_named_bytes {
-            // Member plans skip their own Compact phase: merge_traces
-            // concatenates the ranks and compacts the merged args once.
-            match WasmParsePlan::prepare(&name, bytes, counter, false) {
+            // Member plans run their own Compact phase (same as
+            // load_trace_for_merge on native): merge_traces no longer
+            // compacts, and each rank's blob is released at its own
+            // compact instead of after the merge.
+            match WasmParsePlan::prepare(&name, bytes, counter, true) {
                 Prepared::Plan(SteppedParse::Single(p)) => plans.push((rank, p)),
                 Prepared::Plan(SteppedParse::Multi(_)) => unreachable!("single prepare cannot return a multi plan"),
                 Prepared::Done(Ok(t)) => done.push((rank, t)),
