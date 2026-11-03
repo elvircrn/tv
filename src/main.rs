@@ -264,12 +264,15 @@ impl App {
     fn new(files: Vec<String>) -> Self {
         // Zero-setup source cross-referencing: if the machine has a vLLM
         // checkout at the conventional place (~/vllm), prefill the Source
-        // tab with it and start the index build right away — the walk is
-        // on a background thread, so this costs the first frames nothing.
+        // tab with it. An index holds nothing until the first jump, so
+        // this is free.
         #[cfg(not(target_arch = "wasm32"))]
-        let (src_path, src_thread) = source::default_checkout_start();
+        let (src_path, src_idx) = match source::default_checkout() {
+            Some((p, idx)) => (p, Some(idx)),
+            None => (String::new(), None),
+        };
         #[cfg(target_arch = "wasm32")]
-        let (src_path, _src_thread) = (String::new(), ());
+        let (src_path, src_idx) = (String::new(), None);
         Self {
             window: None,
             imgui: None,
@@ -291,9 +294,7 @@ impl App {
                 kernel_ctx_menu: None,
                 src_path,
                 src_editor: "code".to_string(),
-                src_idx: None,
-                #[cfg(not(target_arch = "wasm32"))]
-                src_thread,
+                src_idx,
             },
             last_frame: Instant::now(),
             scale_factor: 1.0,
@@ -1077,17 +1078,13 @@ impl ApplicationHandler for App {
             WindowEvent::DroppedFile(path) => {
                 // A dropped directory is not a trace: treat it as the source
                 // checkout for the Source tab (drag a vllm checkout onto the
-                // window to index it). Files go through the trace pipeline.
+                // window to use it). Files go through the trace pipeline.
                 #[cfg(not(target_arch = "wasm32"))]
                 if path.is_dir() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         if name == "vllm" || path.join("vllm").is_dir() {
-                            self.state.src_idx = None;
                             self.state.src_path = path.to_string_lossy().into_owned();
-                            let p = path.clone();
-                            self.state.src_thread = Some(std::thread::spawn(move || {
-                                Box::new(source::SourceIndex::build(&p))
-                            }));
+                            self.state.src_idx = Some(Box::new(source::SourceIndex::new(path)));
                             return;
                         }
                     }
@@ -1134,31 +1131,13 @@ impl ApplicationHandler for App {
         #[cfg(not(target_arch = "wasm32"))]
         let awaiting_real_size = false;
 
-        // A background source-index build: join it when the thread finishes
-        // (the Source tab shows "indexing..." until then) and keep polling
-        // while it runs, exactly like a trace load — a Wait-mode loop would
-        // otherwise sleep forever after the click that started it.
-        #[cfg(not(target_arch = "wasm32"))]
-        let src_indexing = self.state.src_thread.is_some();
-        #[cfg(target_arch = "wasm32")]
-        let src_indexing = false;
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(h) = self.state.src_thread.take() {
-            if h.is_finished() {
-                self.state.src_idx = Some(h.join().unwrap());
-            } else {
-                self.state.src_thread = Some(h);
-            }
-        }
-
         let needs_poll = self.state.panes.iter().any(|p| p.loading.is_some())
             || self.nav_keys != 0
             || self.nav_pan_vel.abs() > 1e-6
             || self.nav_zoom_vel.abs() > 1e-6
             || any_watching
             || awaiting_real_size
-            || self.state.panes.iter().any(|p| p.view.anim.is_some())
-            || src_indexing;
+            || self.state.panes.iter().any(|p| p.view.anim.is_some());
         if needs_poll {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             if let Some(w) = &self.window {
@@ -2245,28 +2224,26 @@ impl App {
                             } else { imgui::TabItemFlags::empty() };
                             if let Some(_t) = imgui::TabItem::new("Source").flags(src_flags).begin(&ui) {
                                 pane.bottom_tab = BottomTab::Source;
-                                // Row 1: checkout path + Index button.
+                                // Row 1: checkout path + Set button. Applying is
+                                // free — nothing is indexed until a jump, so
+                                // switching checkouts (or branches) is instant
+                                // and always current.
                                 let mut go = false;
                                 ui.set_next_item_width((ui.content_region_avail()[0] - 140.0).max(120.0));
                                 if ui.input_text("##srcpath", &mut state.src_path)
                                     .hint("/path/to/vllm")
                                     .build() { go = true; }
                                 ui.same_line();
-                                if ui.button("Index") { go = true; }
-                                if go && state.src_thread.is_none() {
+                                if ui.button("Set") { go = true; }
+                                if go {
                                     let p = std::path::PathBuf::from(&state.src_path);
                                     if p.is_dir() {
-                                        state.src_idx = None;
-                                        state.src_thread = Some(std::thread::spawn(move || {
-                                            Box::new(source::SourceIndex::build(&p))
-                                        }));
+                                        state.src_idx = Some(Box::new(source::SourceIndex::new(p)));
                                     } else {
                                         pane.src_msg = Some((true, format!("not a directory: {}", state.src_path)));
                                     }
                                 }
-                                if state.src_thread.is_some() {
-                                    ui.text_colored([0.9, 0.8, 0.4, 1.0], "indexing checkout...");
-                                } else if let Some(idx) = state.src_idx.as_mut() {
+                                if let Some(idx) = state.src_idx.as_mut() {
                                     // Version banner: the trace's build commit
                                     // vs the checkout's git describe. A mismatch
                                     // means line numbers can drift — the one way
@@ -2274,9 +2251,10 @@ impl App {
                                     let trace_ver = pane.trace.as_ref()
                                         .map(|t| t.vllm_version.clone())
                                         .unwrap_or_default();
+                                    let git_desc = idx.git_desc();
                                     if !trace_ver.is_empty() {
                                         state.buf.fmt.clear();
-                                        match (source::trace_build_commit(&trace_ver), &idx.git_desc) {
+                                        match (source::trace_build_commit(&trace_ver), git_desc.as_deref()) {
                                             (Some(build), Some(desc)) if desc.contains(build) => {
                                                 write!(state.buf.fmt, "checkout matches trace build {}", &build[..7]).unwrap();
                                                 ui.text_colored([0.4, 0.8, 0.5, 1.0], &state.buf.fmt);
@@ -2981,11 +2959,12 @@ fn resolve_event_source(
     // vs the checkout's git describe. A mismatch is the one way a jump can
     // land in the right file at the wrong line, so it must ride along with
     // every success, not just sit in the Source tab's banner.
+    let git_desc = idx.git_desc();
     let warn = source::trace_build_commit(&trace.vllm_version).filter(|b| {
-        !idx.git_desc.as_deref().is_some_and(|d| d.contains(b))
+        !git_desc.as_deref().is_some_and(|d| d.contains(b))
     }).map(|b| format!(
         "checkout {} is not the trace's build commit {} - line numbers may be off",
-        idx.git_desc.as_deref().unwrap_or("?"), &b[..b.len().min(12)]));
+        git_desc.as_deref().unwrap_or("?"), &b[..b.len().min(12)]));
     let hits = if let Some(cf) = &callfrom {
         idx.resolve_callfrom(cf).into_iter().collect::<Vec<_>>()
     } else {

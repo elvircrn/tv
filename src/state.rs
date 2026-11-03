@@ -2150,20 +2150,16 @@ pub struct AppState {
     /// `(pane_idx, event)` — pane index guards against the popup surviving a
     /// tab switch and firing against the wrong pane's trace.
     pub kernel_ctx_menu: Option<(usize, EventRef)>,
-    /// Source cross-reference: vLLM checkout path typed into the Source tab
-    /// (input buffer; indexing starts from a copy of it).
+    /// Source cross-reference: vLLM checkout path typed into the Source tab.
     pub src_path: String,
     /// Editor CLI the "open source" buttons launch ("code", "cursor",
     /// "zed" — see `source::open_in_editor` for the arg convention).
     pub src_editor: String,
-    /// The built index for the checkout at `src_path`. Built on a background
-    /// thread (`src_thread`) — walking a vLLM checkout takes seconds and
-    /// must not freeze the frame loop.
+    /// The checkout at `src_path`. Holds nothing until the first jump —
+    /// kernel names resolve through on-demand scans of the tree, memoized
+    /// per name (see `source::SourceIndex`), so there is no index build,
+    /// no background thread, and no staleness on a branch switch.
     pub src_idx: Option<Box<crate::source::SourceIndex>>,
-    /// In-flight background index build. `about_to_wait` keeps the loop in
-    /// Poll while this is alive, exactly like a trace load.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub src_thread: Option<std::thread::JoinHandle<Box<crate::source::SourceIndex>>>,
 }
 
 impl AppState {

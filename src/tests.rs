@@ -144,8 +144,6 @@ fn make_state(trace: Trace) -> AppState {
         src_path: String::new(),
         src_editor: "code".to_string(),
         src_idx: None,
-        #[cfg(not(target_arch = "wasm32"))]
-        src_thread: None,
     }
 }
 
@@ -6408,7 +6406,7 @@ fn test_source_index_resolves() {
     std::fs::write(dir.join(".git/should_not_index.py"), "def ghost()\n").unwrap();
     std::fs::write(dir.join("README.md"), "def not_python()\n").unwrap();
 
-    let mut idx = crate::source::SourceIndex::build(&dir);
+    let mut idx = crate::source::SourceIndex::new(dir.clone());
     // Python def lookup, exact name.
     let hits = idx.resolve_kernel("mhc_kernel");
     assert_eq!(hits.len(), 1);
@@ -6449,8 +6447,9 @@ fn source_resolution_real_trace() {
         _ => { eprintln!("set TV_SOURCE_TRACE=<rank.ktz> and TV_SOURCE_ROOT=<vllm checkout> to run this"); return; }
     };
     let trace = load_trace(&trace_path, &test_counter()).unwrap();
-    let mut idx = crate::source::SourceIndex::build(std::path::Path::new(&root));
-    eprintln!("checkout: {} ({:?})", root, idx.git_desc);
+    let t0 = std::time::Instant::now();
+    let mut idx = crate::source::SourceIndex::new(std::path::PathBuf::from(&root));
+    eprintln!("checkout: {} ({:?})", root, idx.git_desc());
     eprintln!("trace vllm_version: {}", trace.vllm_version);
 
     // Unique kernel names on GPU tracks, classified the way the resolvers
@@ -6482,6 +6481,8 @@ fn source_resolution_real_trace() {
     eprintln!("  resolved total: {}/{} (the rest are aten/CUB/CUTLASS, outside vllm)", n_resolved, names.len());
     // Every vllm:: kernel must resolve in a checkout that contains it.
     assert_eq!(n_vllm_resolved, n_vllm, "a vllm:: kernel failed to resolve");
+    eprintln!("  on-demand scans for {} unique names: {:.2}s (memoized per name)",
+        names.len(), t0.elapsed().as_secs_f64());
 
     // Sample resolved hits with their actual source lines, so a wrong-line
     // resolution is visible in the output.
@@ -6589,8 +6590,8 @@ fn source_cpu_op_resolution_real_trace() {
         _ => { eprintln!("set TV_SOURCE_TRACE=<rank.ktz> and TV_SOURCE_ROOT=<vllm checkout>"); return; }
     };
     let trace = load_trace(&trace_path, &test_counter()).unwrap();
-    let mut idx = crate::source::SourceIndex::build(std::path::Path::new(&root));
-    eprintln!("checkout: {} ({:?})", root, idx.git_desc);
+    let mut idx = crate::source::SourceIndex::new(std::path::PathBuf::from(&root));
+    eprintln!("checkout: {} ({:?})", root, idx.git_desc());
     let cpu_cat = trace.cats.iter().position(|c| c == "cpu_op").unwrap();
     let mut names: Vec<&str> = Vec::new();
     for t in &trace.tracks {

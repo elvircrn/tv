@@ -71,23 +71,25 @@ fn split_callfrom(s: &str) -> Option<(&str, u32)> {
     Some((file, line))
 }
 
-// ================================================================ the index
+// ============================================================ the "index"
 
-/// A walked vLLM checkout: python def/class index for kernel-name lookups,
-/// the C-family file list for content searches, and the checkout's git
-/// description for the version-mismatch banner (a checkout at a different
-/// commit than the traced build means line numbers can drift).
+/// A configured vLLM checkout. Nothing is precomputed — the old design
+/// walked the whole tree at startup (8k files, ~1s, every launch) to build
+/// a def index that silently went stale the moment you checked out a
+/// different branch. Instead, each kernel name is resolved by an on-demand
+/// parallel grep of the tree (`def NAME(` in python, `NAME(` at a word
+/// boundary in C-family files), memoized so the scan runs once per
+/// distinct name. A click is user-driven and rare; paying ~200ms on the
+/// first click of each new kernel beats paying a full-tree walk on every
+/// launch, and it always reflects the tree as it is right now.
 pub struct SourceIndex {
     root: PathBuf,
-    /// `def NAME(` / `class NAME` -> (file, line). Triton/Tilelang kernels
-    /// resolve through this exactly.
-    py_defs: HashMap<String, Vec<(PathBuf, u32)>>,
-    /// C-family files under the root, searched by content on demand.
-    c_files: Vec<PathBuf>,
-    /// Memoized content-search results (kernel base name -> hits).
-    c_memo: HashMap<String, Vec<SourceHit>>,
-    pub git_desc: Option<String>,
-    pub n_files: usize,
+    /// Kernel base name -> hits, the scan memo. A kernel repeats on every
+    /// one of its thousands of launches; only distinct names scan.
+    memo: HashMap<String, Vec<SourceHit>>,
+    /// `git describe --tags --always --dirty`, computed on first use (one
+    /// process spawn) and cached for the session.
+    git_desc: Option<String>,
 }
 
 /// Directory names never worth walking into.
@@ -97,75 +99,21 @@ fn skip_dir(name: &str) -> bool {
 }
 
 impl SourceIndex {
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn build(root: &Path) -> SourceIndex {
-        let t0 = std::time::Instant::now();
-        let mut idx = SourceIndex {
-            root: root.to_path_buf(),
-            py_defs: HashMap::new(),
-            c_files: Vec::new(),
-            c_memo: HashMap::new(),
-            git_desc: None,
-            n_files: 0,
-        };
-        idx.walk(root);
-        idx.git_desc = idx.git_describe();
-        crate::tlog!("source index: {} files ({} py defs, {} C files) in {:.2}s",
-            idx.n_files, idx.py_defs.len(), idx.c_files.len(), t0.elapsed().as_secs_f64());
-        idx
+    pub fn new(root: PathBuf) -> SourceIndex {
+        SourceIndex { root, memo: HashMap::new(), git_desc: None }
+    }
+
+    /// `git describe --tags --always --dirty` in the checkout, for the
+    /// banner and the drift warning. Cached after the first call. No
+    /// filesystem on wasm: always unknown there.
+    pub fn git_desc(&mut self) -> Option<String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.git_desc.is_none() { self.git_desc = self.run_git_describe(); }
+        self.git_desc.clone()
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn walk(&mut self, dir: &Path) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for entry in rd.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            let path = entry.path();
-            if ft.is_dir() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if !skip_dir(&name) { self.walk(&path); }
-            } else if ft.is_file() {
-                self.n_files += 1;
-                match Lang::of_path(&path) {
-                    Some(Lang::Py) => self.index_py(&path),
-                    Some(Lang::CFamily) => self.c_files.push(path),
-                    None => {}
-                }
-            }
-        }
-    }
-
-    /// Record every top-level `def NAME(` / `class NAME` at its line. A line
-    /// scan, not a parse — good enough for name lookups.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn index_py(&mut self, path: &Path) {
-        let Ok(text) = std::fs::read_to_string(path) else { return };
-        for (i, line) in text.lines().enumerate() {
-            let t = line.trim_start();
-            let rest = if let Some(r) = t.strip_prefix("def ") {
-                r
-            } else if let Some(r) = t.strip_prefix("class ") {
-                r
-            } else if let Some(r) = t.strip_prefix("async def ") {
-                r
-            } else {
-                continue;
-            };
-            // Name runs to the first non-identifier char (a def with no
-            // parens yet, or a class header).
-            let name: String = rest
-                .chars()
-                .take_while(|&c| c.is_alphanumeric() || c == '_')
-                .collect();
-            if name.is_empty() { continue; }
-            self.py_defs.entry(name).or_default().push((path.to_path_buf(), (i + 1) as u32));
-        }
-    }
-
-    /// `git describe --tags --always --dirty` in the checkout, for the banner.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn git_describe(&self) -> Option<String> {
+    fn run_git_describe(&self) -> Option<String> {
         let out = std::process::Command::new("git")
             .arg("-C").arg(&self.root)
             .args(["describe", "--tags", "--always", "--dirty"])
@@ -194,19 +142,21 @@ impl SourceIndex {
         Some(self.hit(path, line))
     }
 
-    /// Kernel-name resolution: python defs first (triton/tilelang), then a
-    /// content search of the C-family files. If the exact name misses, the
-    /// trailing `_`-separated segment is dropped — but ONLY when it looks
-    /// like triton's mangled dims suffix (`0d1d2`), never a real name part:
-    /// dropping `kernel` from `vectorized_elementwise_kernel` once produced
-    /// `vectorized`, which substring-matched a different function and sent
-    /// the viewer to a confidently wrong line. Up to two drops.
+    /// Kernel-name resolution: on-demand scan, python defs first
+    /// (triton/tilelang) then C-family content hits. If the exact name
+    /// misses, the trailing `_`-separated segment is dropped — but ONLY
+    /// when it looks like triton's mangled dims suffix (`0d1d2`), never a
+    /// real name part: dropping `kernel` from
+    /// `vectorized_elementwise_kernel` once produced `vectorized`, which
+    /// substring-matched a different function and sent the viewer to a
+    /// confidently wrong line. Up to two drops.
     pub fn resolve_kernel(&mut self, kernel: &str) -> Vec<SourceHit> {
         let mut base = kernel_base_name(kernel);
         if base.is_empty() { return Vec::new(); }
         for attempt in 0..3 {
-            let mut hits = self.py_lookup(&base);
-            if hits.is_empty() { hits = self.c_lookup(&base); }
+            if let Some(v) = self.memo.get(&base) { return v.clone(); }
+            let hits = self.scan(&base);
+            self.memo.insert(base.clone(), hits.clone());
             if !hits.is_empty() { return hits; }
             // Drop the trailing triton dims: `name_0d1d2` -> `name`.
             let next = base.rsplit_once('_')
@@ -220,41 +170,55 @@ impl SourceIndex {
         Vec::new()
     }
 
-    fn py_lookup(&self, name: &str) -> Vec<SourceHit> {
-        self.py_defs.get(name).map(|v| v.iter().map(|&(ref p, l)| self.hit(p.clone(), l)).collect())
-            .unwrap_or_default()
-    }
-
-    /// Content search for `name(` in the C-family files, at a word boundary
-    /// (the char before the match must not be an identifier char — otherwise
-    /// `vectorized(` matches inside `scaled_fp8_conversion_vectorized(`).
-    /// Memoized — a kernel name repeats on every one of its thousands of
-    /// launches, and the first search is a full read of every .cu/.cc/.h
-    /// in the repo.
+    /// One grep of the tree for `name`: `def name(` in python files, `name(`
+    /// at an identifier word boundary in C-family files (the boundary
+    /// matters — without it `vectorized(` matches inside
+    /// `scaled_fp8_conversion_vectorized(`). Walk + read are parallel
+    /// across files; python hits sort ahead of C hits because triton and
+    /// tilelang kernels ARE python defs. Capped at 16 so a generic name
+    /// can't produce an unbounded list.
     #[cfg(not(target_arch = "wasm32"))]
-    fn c_lookup(&mut self, name: &str) -> Vec<SourceHit> {
-        if let Some(v) = self.c_memo.get(name) { return v.clone(); }
+    fn scan(&self, name: &str) -> Vec<SourceHit> {
+        use rayon::prelude::*;
         let t0 = std::time::Instant::now();
-        let needle: Vec<u8> = format!("{name}(").into_bytes();
-        // (path, line) pairs collected first, mapped to hits after the loop:
-        // the iteration borrows self.c_files, and hit() borrows all of self.
-        let mut found: Vec<(PathBuf, u32)> = Vec::new();
-        'files: for path in &self.c_files {
-            let Ok(text) = std::fs::read(path) else { continue };
-            // Line-by-line: a definition never spans lines.
-            for (i, line) in text.split(|&b| b == b'\n').enumerate() {
-                if find_def(line, &needle) {
-                    found.push((path.clone(), (i + 1) as u32));
-                    if found.len() >= 8 { break 'files; }
+        let py_needle: Vec<u8> = format!("def {name}(").into_bytes();
+        let c_needle: Vec<u8> = format!("{name}(").into_bytes();
+        let mut files = Vec::new();
+        self.collect_files(&self.root, &mut files);
+        let (py, c): (Vec<SourceHit>, Vec<SourceHit>) = files
+            .par_iter()
+            .filter_map(|path| {
+                let Ok(text) = std::fs::read(path) else { return None };
+                let needle = match Lang::of_path(path) {
+                    Some(Lang::Py) => &py_needle,
+                    _ => &c_needle,
+                };
+                let mut out = Vec::new();
+                // Line-by-line: a definition never spans lines.
+                for (i, line) in text.split(|&b| b == b'\n').enumerate() {
+                    if find_def(line, needle) {
+                        out.push((i + 1) as u32);
+                    }
                 }
-            }
-        }
-        let hits: Vec<SourceHit> = found.into_iter().map(|(p, l)| self.hit(p, l)).collect();
+                if out.is_empty() { None } else { Some((path, out)) }
+            })
+            .map(|(path, lines)| {
+                let py = Lang::of_path(path) == Some(Lang::Py);
+                let hits: Vec<SourceHit> = lines.into_iter()
+                    .map(|l| self.hit(path.clone(), l)).collect();
+                if py { (hits, Vec::new()) } else { (Vec::new(), hits) }
+            })
+            .reduce(|| (Vec::new(), Vec::new()), |(mut pa, mut ca), (pb, cb)| {
+                pa.extend(pb); ca.extend(cb); (pa, ca)
+            });
+        let mut hits = py;
+        hits.extend(c);
+        hits.truncate(16);
         let elapsed = t0.elapsed().as_secs_f64();
         if elapsed > 0.25 {
-            crate::tlog!("c_lookup({name}): {} hits in {:.2}s", hits.len(), elapsed);
+            crate::tlog!("source scan({name}): {} hits, {} files, {:.2}s",
+                hits.len(), files.len(), elapsed);
         }
-        self.c_memo.insert(name.to_string(), hits.clone());
         hits
     }
 
@@ -262,8 +226,26 @@ impl SourceIndex {
     /// wasm because Pane state references its types, but the Source tab UI
     /// that drives it is native-only, so it's never reached.)
     #[cfg(target_arch = "wasm32")]
-    fn c_lookup(&mut self, _name: &str) -> Vec<SourceHit> { Vec::new() }
+    fn scan(&self, _name: &str) -> Vec<SourceHit> { Vec::new() }
 
+    /// Recursive collect of the python + C-family files under `dir`.
+    /// Re-walked per scan (the walk is cheap; the reads dominate) so a
+    /// branch switch between clicks is picked up, not served stale.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn collect_files(&self, dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else { continue };
+            let path = entry.path();
+            if ft.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !skip_dir(&name) { self.collect_files(&path, out); }
+            } else if ft.is_file() && Lang::of_path(&path).is_some() {
+                out.push(path);
+            }
+        }
+    }
 }
 
 /// Is this `_`-separated name segment a triton dims suffix (`0d1d2`,
@@ -358,18 +340,17 @@ pub fn open_in_editor(editor: &str, hit: &SourceHit) -> Result<(), String> {
 }
 
 /// The machine's default vLLM checkout, if one exists: `~/vllm` that looks
-/// like the repo (has the `vllm/` package dir and a `.git`). Returns the
-/// display path plus an already-running background index build, so the
-/// Source features work with zero setup on a machine that has a checkout
-/// at the conventional place — the walk costs the main thread nothing.
+/// like the repo (has the `vllm/` package dir and a `.git`). Cheap — an
+/// index now holds nothing but a root until the first jump, so there is no
+/// startup cost to configure the Source features on machines with a
+/// checkout at the conventional place.
 #[cfg(not(target_arch = "wasm32"))]
-pub fn default_checkout_start() -> (String, Option<std::thread::JoinHandle<Box<SourceIndex>>>) {
-    let Ok(home) = std::env::var("HOME") else { return (String::new(), None) };
+pub fn default_checkout() -> Option<(String, Box<SourceIndex>)> {
+    let Ok(home) = std::env::var("HOME") else { return None };
     let def = Path::new(&home).join("vllm");
     if !def.join("vllm").is_dir() || !def.join(".git").exists() {
-        return (String::new(), None);
+        return None;
     }
     let disp = def.to_string_lossy().into_owned();
-    let handle = std::thread::spawn(move || Box::new(SourceIndex::build(&def)));
-    (disp, Some(handle))
+    Some((disp, Box::new(SourceIndex::new(def))))
 }
