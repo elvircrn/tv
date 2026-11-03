@@ -2655,12 +2655,15 @@ impl App {
                                     .map(|ev| t.names[ev.name as usize].clone())
                             });
                             ui.popup("##kernel_ctx_menu", || {
+                                // No name row: demangled kernel names are
+                                // hundreds of chars wide, and the hover
+                                // tooltip already shows the name. Menu items
+                                // only, so the menu stays as narrow as its
+                                // longest label.
                                 let Some(name) = &name_opt else {
                                     ui.close_current_popup();
                                     return;
                                 };
-                                ui.text_disabled(name);
-                                ui.separator();
                                 if ui.menu_item("Sync Ranks to End of This Event") {
                                     let pane = &mut state.panes[ai];
                                     pane.sync_message = Some(match pane.sync_clocks_on(name) {
