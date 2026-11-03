@@ -2374,14 +2374,14 @@ impl App {
                 let git_desc = state.src_idx.as_mut().and_then(|i| i.git_desc());
                 if !trace_ver.is_empty() {
                     state.buf.fmt.clear();
-                    match (source::trace_build_commit(&trace_ver), git_desc.as_deref()) {
-                        (Some(build), Some(desc)) if desc.contains(build) => {
-                            write!(state.buf.fmt, "checkout matches trace build {}", &build[..7]).unwrap();
+                    match (source::trace_build_ref(&trace_ver), git_desc.as_deref()) {
+                        (Some(b), Some(desc)) if b.matches_desc(desc) => {
+                            write!(state.buf.fmt, "checkout matches trace build {}", b.id()).unwrap();
                             ui.text_colored([0.4, 0.8, 0.5, 1.0], &state.buf.fmt);
                         }
-                        (Some(build), Some(desc)) => {
+                        (Some(b), Some(desc)) => {
                             write!(state.buf.fmt, "trace built at {} but checkout is at {} - line numbers may drift",
-                                &build[..build.len().min(12)], desc).unwrap();
+                                b.id(), desc).unwrap();
                             ui.text_colored([0.9, 0.7, 0.3, 1.0], &state.buf.fmt);
                         }
                         _ => {
@@ -2675,11 +2675,12 @@ impl App {
                                 // tree (background clone into /tmp) and
                                 // re-run this jump when it lands — jumps
                                 // against a drifted checkout are how "right
-                                // file, wrong line" happens. Stands down
-                                // when the user pinned a checkout, a clone
-                                // is already running, or this build already
-                                // failed to resolve (nightly pipeline
-                                // stamps match no repo).
+                                // file, wrong line" happens. Stamped dev
+                                // versions infer their commit from repo
+                                // history (the dev count is a tag distance).
+                                // Stands down when the user pinned a
+                                // checkout, a clone is already running, or
+                                // this build already failed to resolve.
                                 #[cfg(not(target_arch = "wasm32"))]
                                 if ui.menu_item("View Source") {
                                     let build = state.panes[ai].trace.as_ref()
@@ -2688,10 +2689,10 @@ impl App {
                                         Some(b) if !state.src_pinned
                                             && state.src_clone.is_none()
                                             && state.src_clone_fail.as_ref()
-                                                .map(|(id, _)| id != b.id()).unwrap_or(true)
+                                                .map(|(id, _)| id != &b.id()).unwrap_or(true)
                                             && !state.src_idx.as_mut()
                                                 .and_then(|i| i.git_desc())
-                                                .is_some_and(|d| d.contains(b.id())) =>
+                                                .is_some_and(|d| b.matches_desc(d.as_str())) =>
                                         {
                                             let bid = b.id().to_string();
                                             state.src_clone = Some(SrcCloneTask {
@@ -3064,16 +3065,16 @@ fn resolve_event_source(
         }
     }
     let Some(idx) = idx.as_mut() else { return (SrcAction::NeedCheckout, None) };
-    // Drift check, before the borrows get tangled: the trace's build commit
+    // Drift check, before the borrows get tangled: the trace's build ref
     // vs the checkout's git describe. A mismatch is the one way a jump can
     // land in the right file at the wrong line, so it must ride along with
     // every success, not just sit in the Source tab's banner.
     let git_desc = idx.git_desc();
-    let warn = source::trace_build_commit(&trace.vllm_version).filter(|b| {
-        !git_desc.as_deref().is_some_and(|d| d.contains(b))
+    let warn = source::trace_build_ref(&trace.vllm_version).filter(|b| {
+        !git_desc.as_deref().is_some_and(|d| b.matches_desc(d))
     }).map(|b| format!(
-        "checkout {} is not the trace's build commit {} - line numbers may be off",
-        git_desc.as_deref().unwrap_or("?"), &b[..b.len().min(12)]));
+        "checkout {} is not the trace's build {} - line numbers may be off",
+        git_desc.as_deref().unwrap_or("?"), b.id()));
     let hits = if let Some(cf) = &callfrom {
         idx.resolve_callfrom(cf).into_iter().collect::<Vec<_>>()
     } else {

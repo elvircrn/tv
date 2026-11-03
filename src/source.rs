@@ -282,21 +282,16 @@ pub fn is_torch_internal(name: &str) -> bool {
         || n.starts_with("cub::") || n.starts_with("cutlass")
 }
 
-/// The build commit a trace was built from, per its `vllm_version`. Two
-/// conventions in the wild: the llmd line appends `.<hex>` after a local
-/// version tag (`0.33.0rc1.dev573+llmd.cfee12e985dc6f4f74fd`), and
-/// setuptools-scm's is `+g<hex>` (`0.26.1rc1.dev528+g1a2b3c4d5e6f`).
-/// None when the version string carries no commit (or a non-vllm trace).
+/// The build commit a trace was built from, per its `vllm_version`, when
+/// the string actually carries one. That's setuptools-scm's `+g<hex>`
+/// (`0.26.1rc1.dev528+g1a2b3c4d5e6f`) — and ONLY that: a local tag like
+/// `+llmd.cfee12e...` is a pipeline stamp that matches no repo, so
+/// treating its hex as a commit is how jumps end up on a drifted
+/// ~/vllm with a bogus "not the build commit" warning. Stamped dev
+/// versions are recovered by distance instead (see `BuildRef::Dev`).
 pub fn trace_build_commit(vllm_version: &str) -> Option<&str> {
-    let hexish = |s: &str| s.len() >= 7 && s.chars().all(|c| c.is_ascii_hexdigit());
-    // llmd style: hex is the last '.'-separated segment.
-    if let Some(seg) = vllm_version.rsplit('.').next() {
-        if hexish(seg) { return Some(seg); }
-    }
-    // setuptools-scm style: hex follows the last '+', after a 'g'.
-    let tail = vllm_version.rsplit('+').next()?;
-    let hex = tail.strip_prefix('g').unwrap_or(tail);
-    hexish(hex).then_some(hex)
+    let hex = vllm_version.rsplit('+').next()?.strip_prefix('g')?;
+    (hex.len() >= 7 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(hex)
 }
 
 /// `code` -> ["code", "/usr/local/bin/code", ...]. An editor given as a
@@ -367,29 +362,55 @@ pub fn open_in_editor(editor: &str, hit: &SourceHit) -> Result<(), String> {
 
 // ===================================================== exact-build cloning
 
-/// What a trace's `vllm_version` pins the source to: a commit (dev builds
-/// carry one) or a tag (clean releases). `None` when the string pins
-/// nothing usable.
+/// What a trace's `vllm_version` pins the source to. Commit (`+g<hex>`),
+/// tag (clean release), or — the interesting case — a dev build whose
+/// version carries no commit at all (`0.33.0rc1.dev573+llmd.<stamp>`):
+/// setuptools-scm wrote that as bump(last tag) + ".dev" + N where N is
+/// the commit distance from the tag, and the build commit is the Nth
+/// commit after it, recoverable from repo history. `None` when the
+/// string pins nothing usable.
 #[derive(Clone)]
 pub enum BuildRef {
     Commit(String),
     Tag(String),
+    /// Dev build at `dist` commits after the tag that `base` bumps.
+    Dev { base: String, dist: usize },
 }
 
 impl BuildRef {
-    /// The identity used for match checks and failure memoization.
-    pub fn id(&self) -> &str {
-        match self { BuildRef::Commit(c) => c, BuildRef::Tag(t) => t }
+    /// The identity used for display and failure memoization. For a Dev
+    /// ref that's the plain version (the commit isn't known until
+    /// inference runs).
+    pub fn id(&self) -> String {
+        match self {
+            BuildRef::Commit(c) => c.clone(),
+            BuildRef::Tag(t) => t.clone(),
+            BuildRef::Dev { base, dist } => format!("{base}.dev{dist}"),
+        }
+    }
+
+    /// Does a checkout's `git describe` match this ref? Commits and tags
+    /// appear verbatim; a Dev ref's exact tree describes as
+    /// `v<tag>-<dist>-g<sha>`, so the `-<dist>-g` marker is the check.
+    pub fn matches_desc(&self, desc: &str) -> bool {
+        match self {
+            BuildRef::Commit(c) => desc.contains(c.as_str()),
+            BuildRef::Tag(t) => desc.contains(t.as_str()),
+            BuildRef::Dev { dist, .. } => desc.contains(&format!("-{dist}-g")),
+        }
     }
 }
 
-/// The build ref a trace's `vllm_version` names, or None. Commit first
-/// (the existing hex extraction), then a clean release version -> tag.
-/// A `.devN` version with no commit hex pins nothing (the commit lives
-/// only in the repo it was built in).
+/// The build ref a trace's `vllm_version` names, or None: a `+g<hex>`
+/// commit, else a `.devN` distance (stamped or not), else a clean
+/// release version -> tag.
 pub fn trace_build_ref(vllm_version: &str) -> Option<BuildRef> {
     if let Some(c) = trace_build_commit(vllm_version) {
         return Some(BuildRef::Commit(c.to_string()));
+    }
+    let plain = vllm_version.split('+').next().unwrap_or(vllm_version);
+    if let Some((base, dist)) = parse_dev(plain) {
+        return Some(BuildRef::Dev { base: base.to_string(), dist });
     }
     let v = vllm_version.trim();
     if !v.contains('+') && !v.contains(".dev")
@@ -398,6 +419,44 @@ pub fn trace_build_ref(vllm_version: &str) -> Option<BuildRef> {
         return Some(BuildRef::Tag(format!("v{v}")));
     }
     None
+}
+
+/// "0.33.0rc1.dev573" -> ("0.33.0rc1", 573): setuptools-scm's dev count
+/// is the commit distance from the last tag at build time.
+pub(crate) fn parse_dev(plain: &str) -> Option<(&str, usize)> {
+    let (base, n) = plain.rsplit_once(".dev")?;
+    if base.is_empty() { return None; }
+    Some((base, n.parse().ok()?))
+}
+
+/// Tag names that could be the `git describe` anchor for a dev build of
+/// `base`: setuptools-scm writes the version as bump(anchor) + ".dev" +
+/// distance, so the anchor is usually `base` with its pre-release
+/// bumped DOWN (rc1 was built after a rc0 tag); try `base` itself and
+/// the family's final release too. Order is best-guess-first; every
+/// candidate is validated by describe before use.
+pub(crate) fn candidate_anchors(base: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |t: String| {
+        if !out.contains(&t) { out.push(t); }
+    };
+    if let Some((pre, rel)) = base.rsplit_once("rc") {
+        if let Ok(n) = rel.parse::<u32>() {
+            if n > 0 { push(format!("v{pre}rc{}", n - 1)); }
+            else { push(format!("v{pre}")); }
+        }
+    } else if let Some((pre, patch)) = base.rsplit_once('.') {
+        // final base "X.Y.Z" -> the previous patch release
+        if let Ok(z) = patch.parse::<u32>() {
+            if z > 0 { push(format!("v{pre}.{}", z - 1)); }
+        }
+    }
+    push(format!("v{base}"));
+    // family final: "0.33.0rc1" -> "v0.33.0"
+    if let Some(end) = base.find(|c: char| !c.is_ascii_digit() && c != '.') {
+        push(format!("v{}", &base[..end]));
+    }
+    out
 }
 
 /// Run git, map failure to a message with trimmed stderr.
@@ -468,6 +527,69 @@ pub(crate) fn extract_json_string(body: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Recover the exact commit a stamped dev version was built from, given
+/// the object cache. setuptools-scm wrote `0.33.0rc1.dev573` as
+/// bump(tag) + ".dev" + N from the build commit's `git describe`
+/// (`v0.33.0rc0-573-g<sha>`), so the commit is the Nth commit after the
+/// anchor tag on main. Needs main's commit history in the cache — a
+/// blobless deepen, incremental after the first time — plus the anchor
+/// tag (depth 1). Each candidate anchor is validated by re-describing
+/// the picked commit, so a wrong anchor tag is rejected, not guessed at.
+/// Upstream main is the truth for distance (CI builds from it); the fork
+/// is the fallback when upstream is unreachable.
+fn infer_dev_commit(cache: &Path, base: &str, dist: usize) -> Result<String, String> {
+    let marker = format!("-{dist}-g");
+    let mut errs = String::new();
+    // Upstream first for this one, reverse of BUILD_REMOTES' fork-first
+    // order: the fork's main can lag or carry extra commits, which would
+    // shift the walk even when the distance check still validates.
+    for remote in BUILD_REMOTES.iter().rev() {
+        set_origin(cache, remote)?;
+        // --depth=100000: the cache is shallow from per-commit fetches,
+        // and a depthless fetch into a shallow repo keeps the old
+        // boundary. Blobless, so this is commits + trees only.
+        if let Err(e) = git(Some(cache), &["fetch", "--filter=blob:none",
+            "--depth=100000", remote, "+refs/heads/main:refs/tv/main"])
+        {
+            errs.push_str(&format!("{e}; "));
+            continue;
+        }
+        for tag in candidate_anchors(base) {
+            let have = git(Some(cache), &["rev-parse", "--verify", "-q",
+                &format!("refs/tags/{tag}^{{commit}}")]).is_ok();
+            if !have {
+                let spec = format!("refs/tags/{tag}:refs/tags/{tag}");
+                let _ = git(Some(cache), &["fetch", "--depth", "1",
+                    "--filter=blob:none", remote, &spec]);
+                if git(Some(cache), &["rev-parse", "--verify", "-q",
+                    &format!("refs/tags/{tag}^{{commit}}")]).is_err()
+                {
+                    continue;
+                }
+            }
+            let range = format!("refs/tags/{tag}..refs/tv/main");
+            let Ok(count) = git(Some(cache), &["rev-list", "--count", &range])
+                .and_then(|c| c.parse::<usize>().map_err(|e| e.to_string()))
+            else { continue };
+            if count < dist { continue; }
+            let Ok(c) = git(Some(cache), &["rev-list", "--skip",
+                &(count - dist).to_string(), "--max-count", "1", &range])
+            else { continue };
+            // Validate: the picked commit must describe as exactly `dist`
+            // commits after a tag — a wrong anchor gives some other
+            // distance and is discarded.
+            if git(Some(cache), &["describe", "--tags", &c])
+                .is_ok_and(|d| d.contains(&marker))
+            {
+                return Ok(c);
+            }
+        }
+    }
+    Err(format!(
+        "couldn't infer the build commit for {base}.dev{dist} from repo \
+         history ({errs}no anchor tag walked to a matching commit)"))
+}
+
 /// Materialize the exact tree a trace was built from, as cheaply as the
 /// network allows: a blobless depth-1 fetch (commit + trees only, no file
 /// contents) into a persistent object cache (`~/.cache/tv/vllm.git`), then
@@ -485,10 +607,21 @@ pub fn materialize_build(build: &BuildRef) -> Result<(PathBuf, String), String> 
     if !cache.is_dir() {
         git(None, &["init", "--bare", &cache.to_string_lossy()])?;
     }
+    // A dev-distance ref resolves to its commit first (history walk in
+    // the cache); after that it's an ordinary commit, already fetched.
+    let inferred;
+    let build = match build {
+        BuildRef::Dev { base, dist } => {
+            inferred = BuildRef::Commit(infer_dev_commit(&cache, base, *dist)?);
+            &inferred
+        }
+        b => b,
+    };
     // What the worktree checks out, and the /tmp dir name. Fetches go
     // through `origin` — the promisor remote lazy blob fetches use —
     // pointed at wherever the ref actually lives.
     let (checkout_ref, short) = match build {
+        BuildRef::Dev { .. } => unreachable!("resolved to a commit above"),
         BuildRef::Commit(hex) => {
             // Fetch needs the full sha; the cache may already have it.
             if git(Some(&cache), &["cat-file", "-e", &format!("{hex}^{{commit}}")]).is_err() {
@@ -510,6 +643,7 @@ pub fn materialize_build(build: &BuildRef) -> Result<(PathBuf, String), String> 
     // (a partial checkout from a crash) and re-add. Tags peel to a commit
     // sha for the comparison; commits compare by prefix.
     let head_target = match build {
+        BuildRef::Dev { .. } => unreachable!("resolved to a commit above"),
         BuildRef::Commit(hex) => hex.clone(),
         BuildRef::Tag(t) => git(Some(&cache), &["rev-parse", &format!("refs/tags/{t}^{{commit}}")])?,
     };

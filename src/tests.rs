@@ -6628,9 +6628,11 @@ fn source_cpu_op_resolution_real_trace() {
 #[test]
 fn test_trace_build_commit() {
     use crate::source::trace_build_commit;
-    assert_eq!(trace_build_commit("0.33.0rc1.dev573+llmd.cfee12e985dc6f4f74fd"),
-        Some("cfee12e985dc6f4f74fd"));
+    // Only setuptools-scm's +g<hex> carries a real commit...
     assert_eq!(trace_build_commit("0.26.1rc1.dev528+g1a2b3c4d5e6f"), Some("1a2b3c4d5e6f"));
+    // ...a pipeline stamp's hex is NOT one (it matches no repo; the
+    // build is recovered by distance instead).
+    assert_eq!(trace_build_commit("0.33.0rc1.dev573+llmd.cfee12e985dc6f4f74fd"), None);
     // No commit tail, or a non-hex one: None.
     assert_eq!(trace_build_commit("0.33.0"), None);
     assert_eq!(trace_build_commit(""), None);
@@ -6639,19 +6641,43 @@ fn test_trace_build_commit() {
 #[test]
 fn test_trace_build_ref() {
     use crate::source::{trace_build_ref, BuildRef};
-    // Commit hexes win first, both conventions.
-    assert!(matches!(trace_build_ref("0.33.0rc1.dev573+llmd.cfee12e985dc6f4f74fd"),
-        Some(BuildRef::Commit(h)) if h == "cfee12e985dc6f4f74fd"));
+    // A +g<hex> commit.
     assert!(matches!(trace_build_ref("0.26.1rc1.dev528+g1a2b3c4d5e6f"),
         Some(BuildRef::Commit(h)) if h == "1a2b3c4d5e6f"));
     // Clean release versions map to tags.
     assert!(matches!(trace_build_ref("0.11.0"), Some(BuildRef::Tag(t)) if t == "v0.11.0"));
     assert!(matches!(trace_build_ref("0.33.0rc1"), Some(BuildRef::Tag(t)) if t == "v0.33.0rc1"));
-    // Dev versions without a commit pin nothing (the commit lives only
-    // in the repo it was built in), and neither does garbage.
-    assert!(trace_build_ref("0.33.0rc1.dev573").is_none());
+    // Stamped or bare dev versions carry a tag distance instead of a
+    // commit: 0.33.0rc1.dev573 was built 573 commits after its tag.
+    for v in ["0.33.0rc1.dev573+llmd.cfee12e985dc6f4f74fd", "0.33.0rc1.dev573"] {
+        assert!(matches!(trace_build_ref(v),
+            Some(BuildRef::Dev { base, dist: 573 }) if base == "0.33.0rc1"), "{v}");
+    }
     assert!(trace_build_ref("").is_none());
     assert!(trace_build_ref("unknown").is_none());
+}
+
+#[test]
+fn test_dev_inference_helpers() {
+    use crate::source::{candidate_anchors, parse_dev, BuildRef};
+    assert_eq!(parse_dev("0.33.0rc1.dev573"), Some(("0.33.0rc1", 573)));
+    assert_eq!(parse_dev("0.33.0.dev12"), Some(("0.33.0", 12)));
+    assert_eq!(parse_dev("0.33.0"), None);
+    assert_eq!(parse_dev("0.33.0.devX"), None);
+    // The anchor for a dev build of 0.33.0rc1 is the rc0 tag (setuptools
+    // bumped rc0 -> rc1), with the base and family final as fallbacks.
+    assert_eq!(candidate_anchors("0.33.0rc1"),
+        vec!["v0.33.0rc0", "v0.33.0rc1", "v0.33.0"]);
+    // A final base falls back to the previous patch release first.
+    assert_eq!(candidate_anchors("0.34.1"),
+        vec!["v0.34.0", "v0.34.1"]);
+    // A Dev ref matches its exact tree by describe distance marker.
+    let d = BuildRef::Dev { base: "0.33.0rc1".into(), dist: 573 };
+    assert!(d.matches_desc("v0.33.0rc0-573-g40941f2c4ba96fba0a7e282a5355e89cd74d9ac5"));
+    assert!(!d.matches_desc("v0.30.1rc0-20-g52813e747d"));
+    // ...and must not match a distance it merely ends with (1573 vs 573).
+    assert!(!d.matches_desc("v0.33.0rc0-1573-gabcdef"));
+    assert_eq!(d.id(), "0.33.0rc1.dev573");
 }
 
 #[test]
@@ -6697,4 +6723,23 @@ fn materialize_build_real() {
         &crate::source::BuildRef::Commit("40941f2c4b".into())).unwrap();
     assert_eq!(wt2, wt);
     eprintln!("reuse: {:.2}s", t1.elapsed().as_secs_f64());
+}
+
+/// The 0936 traces' version is a stamped dev build
+/// (`0.33.0rc1.dev573+llmd.<hex>`): no commit in the string, so the
+/// commit is inferred from the dev count (573 commits after the rc0
+/// tag on main) and must land on the same tree as the sha above.
+#[test]
+#[ignore]
+fn infer_dev_build_real() {
+    if std::env::var("TV_NET").map(|v| v != "1").unwrap_or(true) { return; }
+    let t0 = std::time::Instant::now();
+    let (wt, desc) = crate::source::materialize_build(
+        &crate::source::BuildRef::Dev { base: "0.33.0rc1".into(), dist: 573 })
+        .expect("dev inference failed");
+    eprintln!("dev worktree: {} ({}) in {:.1}s", wt.display(), desc, t0.elapsed().as_secs_f64());
+    assert!(desc.contains("40941f2c4b"), "573 after v0.33.0rc0 is 40941f2c4b, got {desc}");
+    assert!(desc.contains("-573-g"), "describe must carry the distance: {desc}");
+    assert!(wt.join("vllm").is_dir());
+    assert_eq!(wt, std::path::Path::new("/tmp/vllm-40941f2c4b"));
 }
