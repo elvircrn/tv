@@ -6552,3 +6552,28 @@ fn source_resolution_real_trace() {
     assert!(n_cf_vllm_ok * 20 >= n_cf_vllm * 19,
         "too many vllm/-scoped CallFroms failed: {}/{}", n_cf_vllm_ok, n_cf_vllm);
 }
+
+#[test]
+fn test_is_torch_internal() {
+    use crate::source::is_torch_internal;
+    assert!(is_torch_internal("aten::mm"));
+    assert!(is_torch_internal("void at::native::vectorized_elementwise_kernel<4, int>(int*)"));
+    assert!(is_torch_internal("c10::intrusive_ptr"));
+    assert!(is_torch_internal("cub::DeviceRadixSort"));
+    assert!(!is_torch_internal("void vllm::deepseek_v4_fused_ops::FusedThing<c10::BFloat16>(const float*)"));
+    assert!(!is_torch_internal("mhc_pre_big_fuse_with_norm_tilelang_kernel"));
+    assert!(!is_torch_internal("vllm::unified_attention_with_output"));
+}
+
+#[test]
+fn test_open_in_editor_missing_binary() {
+    // A bogus editor must produce a readable error naming the command,
+    // after trying the fallback install locations.
+    let hit = crate::source::SourceHit {
+        path: "/definitely/not/a/real/file.py".into(),
+        line: 1,
+        rel: "x.py".into(),
+    };
+    let err = crate::source::open_in_editor("tv_test_no_such_editor", &hit).unwrap_err();
+    assert!(err.contains("tv_test_no_such_editor"), "error should name the editor: {err}");
+}

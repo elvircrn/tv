@@ -264,10 +264,6 @@ impl SourceIndex {
     #[cfg(target_arch = "wasm32")]
     fn c_lookup(&mut self, _name: &str) -> Vec<SourceHit> { Vec::new() }
 
-    /// (python def/class names, C-family files) for the tab's status line.
-    pub fn stats(&self) -> (usize, usize) {
-        (self.py_defs.len(), self.c_files.len())
-    }
 }
 
 /// Is this `_`-separated name segment a triton dims suffix (`0d1d2`,
@@ -292,21 +288,55 @@ fn find_def(line: &[u8], needle: &[u8]) -> bool {
 
 // ============================================================== editor jump
 
+/// torch/CUB/CUTLASS-namespace names: their source lives in pytorch, not
+/// the vLLM checkout, so resolving them would only ever produce junk
+/// (worst case a call site that happens to textually match).
+pub fn is_torch_internal(name: &str) -> bool {
+    let n = name.trim();
+    n.starts_with("aten::") || n.starts_with("c10::") || n.starts_with("void at::")
+        || n.starts_with("void c10::") || n.starts_with("at::native::")
+        || n.starts_with("(anonymous namespace)::at::") || n.starts_with("cub::")
+        || n.starts_with("cutlass")
+}
+
+/// `code` -> ["code", "/usr/local/bin/code", ...]. An editor given as a
+/// path is used as-is.
+fn editor_candidates(editor: &str) -> Vec<String> {
+    if editor.contains('/') { return vec![editor.to_string()]; }
+    let mut cands = vec![editor.to_string()];
+    if editor == "code" {
+        // A GUI-launched app doesn't inherit the shell's PATH, so a bare
+        // `code` fails even when the CLI is installed; try the usual spots.
+        cands.push("/usr/local/bin/code".into());
+        cands.push("/opt/homebrew/bin/code".into());
+        if let Ok(home) = std::env::var("HOME") {
+            cands.push(format!("{home}/.vscode/bin/code"));
+        }
+        cands.push("/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code".into());
+    }
+    cands
+}
+
 /// Open `path:line` in the user's editor. `editor` is the editor's CLI
 /// command ("code", "cursor", ...); VS Code and Cursor both take `-g
 /// file:line`, Zed takes `file:line` directly.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_in_editor(editor: &str, hit: &SourceHit) -> Result<(), String> {
     let loc = format!("{}:{}", hit.path.display(), hit.line);
-    let out = if editor == "zed" {
-        std::process::Command::new(editor).arg(&loc).spawn()
-    } else {
-        std::process::Command::new(editor).arg("-g").arg(&loc).spawn()
-    };
-    match out {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!("couldn't launch `{}`: {e} (is it on PATH?)", editor)),
+    for exe in editor_candidates(editor) {
+        let mut c = std::process::Command::new(&exe);
+        if editor == "zed" { c.arg(&loc); } else { c.arg("-g").arg(&loc); }
+        match c.spawn() {
+            Ok(_) => return Ok(()),
+            // Not found -> try the next install location; anything else
+            // (permission denied, ...) is a real failure, don't retry.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("couldn't launch `{}`: {e}", exe)),
+        }
     }
+    Err(format!(
+        "couldn't launch `{}` (tried PATH and the usual install dirs - is the editor's shell command installed?)",
+        editor))
 }
 
 /// The machine's default vLLM checkout, if one exists: `~/vllm` that looks

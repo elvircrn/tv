@@ -866,13 +866,12 @@ pub struct Pane {
     /// include whole-step wrappers that would otherwise dominate the top
     /// of the range and flatten the kernel scale.
     pub heat_bounds: Option<(f64, f64)>,
-    /// Source tab: hits from the last kernel-name query (or the last
-    /// multi-hit Detail-tab resolution), listed as clickable rows that open
-    /// the editor. Per-pane so each tab keeps its query results.
+    /// Source tab: hits from the last multi-hit event resolution, listed as
+    /// clickable rows that open the editor. Per-pane so each tab keeps its
+    /// results.
     pub src_hits: Vec<crate::source::SourceHit>,
-    /// Source tab kernel-name query buffer (Enter runs `resolve_kernel`).
-    pub src_query: String,
-    /// Last editor-launch error from the Source tab, shown until replaced.
+    /// Last source-jump outcome (failed editor launch, unresolvable name),
+    /// shown inline in the Detail tab and the status bar until replaced.
     pub src_error: Option<String>,
 }
 
@@ -953,7 +952,6 @@ impl Pane {
             color_by_dur: false,
             heat_bounds: None,
             src_hits: Vec::new(),
-            src_query: String::new(),
             src_error: None,
         }
     }

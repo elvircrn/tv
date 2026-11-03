@@ -2181,7 +2181,7 @@ impl App {
                                 // indexed — clicking then routes to the
                                 // Source tab to set one up.
                                 #[cfg(not(target_arch = "wasm32"))]
-                                if callfrom.is_some() || track.gpu {
+                                if callfrom.is_some() || track.gpu || trace.cats[ev.cat as usize] == "cpu_op" {
                                     if ui.small_button("View Source") {
                                         if let Some(r) = pane.selected {
                                             let act = resolve_event_source(&mut state.src_idx, pane, r);
@@ -2194,8 +2194,19 @@ impl App {
                                         ui.tooltip_text(if callfrom.is_some() {
                                             "Open the exact file:line this python frame was called from"
                                         } else {
-                                            "Resolve this kernel's name to source (def for triton/tilelang, csrc for vllm:: kernels)"
+                                            "Resolve this name to source (def for triton/tilelang, csrc for vllm:: kernels and ops)"
                                         });
+                                    }
+                                    // The last attempt's outcome, right where the
+                                    // click happened: a failed editor launch or
+                                    // an unresolvable name must not look like
+                                    // the button did nothing.
+                                    if let Some(e) = &pane.src_error {
+                                        ui.same_line();
+                                        ui.text_colored([0.9, 0.4, 0.4, 1.0], e.lines().next().unwrap_or(e));
+                                        if ui.is_item_hovered() && e.contains('\n') {
+                                            ui.tooltip_text(e);
+                                        }
                                     }
                                 }
                                 let avail = ui.content_region_avail();
@@ -2281,32 +2292,18 @@ impl App {
                                             ui.text_colored([0.6, 0.6, 0.6, 1.0], &state.buf.fmt);
                                         }
                                     }
-                                    // Row 2: kernel-name query.
-                                    let (n_defs, n_c) = idx.stats();
-                                    ui.set_next_item_width((ui.content_region_avail()[0] - 190.0).max(120.0));
-                                    let mut find = ui.input_text("##srcquery", &mut pane.src_query)
-                                        .hint("kernel or def name")
-                                        .build();
-                                    ui.same_line();
-                                    if ui.button("Find") { find = true; }
-                                    if find {
-                                        pane.src_hits = idx.resolve_kernel(&pane.src_query);
-                                        if pane.src_hits.is_empty() {
-                                            pane.src_error = Some(format!(
-                                                "no match for `{}` (aten/CUB/CUTLASS kernels live outside vllm)",
-                                                pane.src_query));
-                                        }
-                                    }
-                                    ui.same_line();
-                                    ui.set_next_item_width(70.0);
+                                    // Row 2: the editor the jump buttons launch.
+                                    // No kernel-name search here — that's what
+                                    // the IDE is for; this tab is setup and
+                                    // the landing spot for multi-hit jumps.
+                                    ui.set_next_item_width(90.0);
                                     ui.input_text("##srceditor", &mut state.src_editor)
                                         .hint("editor")
                                         .build();
                                     ui.same_line();
-                                    state.buf.fmt.clear();
-                                    write!(state.buf.fmt, "{} defs, {} C files", n_defs, n_c).unwrap();
-                                    ui.text_colored([0.5, 0.5, 0.5, 1.0], &state.buf.fmt);
-                                    // Hit rows: click to open file:line.
+                                    ui.text_colored([0.5, 0.5, 0.5, 1.0], "editor command (code, cursor, zed)");
+                                    // Hit rows from a multi-hit event jump:
+                                    // click to open file:line.
                                     if !pane.src_hits.is_empty() {
                                         ui.separator();
                                         let hits = std::mem::take(&mut pane.src_hits);
@@ -2394,6 +2391,14 @@ impl App {
                         write!(state.buf.fmt, "{} | {} | {} events | {} tracks | {:.1}ms", fname, ranks, t.total_events, t.tracks.len(), dt * 1000.0).unwrap();
                     }
                     dl.add_text([win_pos[0] + 8.0, cy], col32(153, 153, 153, 255), &state.buf.fmt);
+                    // A source-jump failure rides the status bar's left side:
+                    // it's the only place a right-click "View Source" that
+                    // didn't land would otherwise be visible from.
+                    if let Some(e) = &pane.src_error {
+                        let left_w = ui.calc_text_size(&state.buf.fmt)[0];
+                        let msg = e.lines().next().unwrap_or(e);
+                        dl.add_text([win_pos[0] + 8.0 + left_w + 14.0, cy], col32(220, 90, 90, 255), msg);
+                    }
 
                     let logo_scale = text_h / VLLM_LOGO_GRID;
                     let logo_w = VLLM_LOGO_GRID * logo_scale;
@@ -2954,9 +2959,18 @@ fn resolve_event_source(
             }
         }
     }
-    if callfrom.is_none() && !track.gpu {
-        return SrcAction::Error(format!(
-            "no source linkage for `{}` (not a GPU op or python frame)", name));
+    if callfrom.is_none() {
+        // Name resolution covers GPU kernels AND cpu custom ops — `vllm::`
+        // ops appear as cpu_op events on CPU tracks, so those must link too.
+        let cat = &trace.cats[ev.cat as usize];
+        if !(track.gpu || cat == "kernel" || cat == "cpu_op") {
+            return SrcAction::Error(format!(
+                "no source linkage for `{}` ({} events carry none)", name, cat));
+        }
+        if source::is_torch_internal(name) {
+            return SrcAction::Error(format!(
+                "`{}` is a torch op - its source lives in pytorch, not the vllm checkout", name));
+        }
     }
     let Some(idx) = idx.as_mut() else { return SrcAction::NeedCheckout };
     let hits = if let Some(cf) = &callfrom {
