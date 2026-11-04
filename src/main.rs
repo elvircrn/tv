@@ -3211,6 +3211,139 @@ enum SrcAction {
     NeedCheckout,
 }
 
+/// What kineto's launch plumbing knows about where a GPU kernel came from.
+/// `op` is the name of the CPU-side event carrying the same `External id`
+/// (the RecordFunction that launched the kernel, e.g. `vllm::foo`), and
+/// `at` is the (track, event) of the CPU launch event itself, whose
+/// enclosing python frames name the file:line that issued the launch.
+#[cfg(not(target_arch = "wasm32"))]
+struct LaunchLink {
+    op: Option<String>,
+    at: Option<(u32, u32)>,
+}
+
+/// Follow a kernel's `External id` / `correlation` args to its CPU-side
+/// launch. This is the only route to source for kernels whose name carries
+/// nothing: CUPTI reports CuTe DSL's JIT-loaded cubins as plain `Kernel`,
+/// so the name cannot resolve, but every launch still correlates to the
+/// event that issued it. Only the categories that ever carry a correlation
+/// are parsed (`cpu_op` for External id, `cuda_driver`/`cuda_runtime` for
+/// the launch call), which keeps the scan at ~0.2s even on a 15M-event
+/// trace; python_function events are 98% of a kineto trace and never carry
+/// either key.
+#[cfg(not(target_arch = "wasm32"))]
+fn launch_link(trace: &Trace, track_idx: u32, event_idx: u32) -> Option<LaunchLink> {
+    let track = trace.tracks.get(track_idx as usize)?;
+    let ev = track.events.get(event_idx as usize)?;
+    if ev.args_off == 0 { return None; }
+    let raw = &trace.raw_bufs[track.raw_buf_idx as usize];
+    let off = ev.args_off as usize;
+    if off >= raw.len() { return None; }
+    let end = skip_value(raw, off);
+    let mut strs = InternTable::new();
+    let mut pairs = Vec::new();
+    parse_args_flat(&raw[off..end], &mut strs, &mut pairs);
+    let (mut extid, mut corr) = (None, None);
+    for &[k, v] in &pairs {
+        match strs.str(k) {
+            "External id" => extid = Some(strs.str(v).to_string()),
+            "correlation" => corr = Some(strs.str(v).to_string()),
+            _ => {}
+        }
+    }
+    if extid.is_none() && corr.is_none() { return None; }
+    // A merged trace interleaves ranks whose correlation ids are independent
+    // counters, so a match from another rank's tracks is a false positive.
+    // Prefer the same "Rank N" prefix when the kernel track carries one.
+    let want_rank = rank_tag(&track.label);
+    let mut link = LaunchLink { op: None, at: None };
+    let mut other_strs = InternTable::new();
+    let mut other_pairs = Vec::new();
+    for (tj, tjr) in trace.tracks.iter().enumerate() {
+        if tj as u32 == track_idx { continue; }
+        if let (Some(want), Some(got)) = (&want_rank, rank_tag(&tjr.label)) {
+            if want != &got { continue; }
+        }
+        let traw = &trace.raw_bufs[tjr.raw_buf_idx as usize];
+        for (ej, e2) in tjr.events.iter().enumerate() {
+            let cat = &trace.cats[e2.cat as usize];
+            if !(cat == "cpu_op" || cat == "cuda_driver" || cat == "cuda_runtime") { continue; }
+            if e2.args_off == 0 { continue; }
+            let eoff = e2.args_off as usize;
+            if eoff >= traw.len() { continue; }
+            let eend = skip_value(traw, eoff);
+            other_pairs.truncate(0);
+            parse_args_flat(&traw[eoff..eend], &mut other_strs, &mut other_pairs);
+            for &[k, v] in &other_pairs {
+                let (key, val) = (other_strs.str(k), other_strs.str(v));
+                if key == "External id" && extid.as_deref() == Some(val) {
+                    link.op = Some(trace.names[e2.name as usize].clone());
+                    link.at.get_or_insert((tj as u32, ej as u32));
+                } else if key == "correlation" && corr.as_deref() == Some(val) {
+                    link.at = Some((tj as u32, ej as u32));
+                }
+            }
+            if link.op.is_some() && link.at.is_some() { return Some(link); }
+        }
+    }
+    (link.op.is_some() || link.at.is_some()).then_some(link)
+}
+
+/// `"  Rank 3 stream 19"` -> `Some("Rank 3")`; used to keep a merged
+/// trace's cross-rank correlation ids from matching each other.
+#[cfg(not(target_arch = "wasm32"))]
+fn rank_tag(label: &str) -> Option<String> {
+    let mut it = label.trim().strip_prefix("Rank ")?.split_whitespace();
+    Some(format!("Rank {}", it.next()?))
+}
+
+/// `vllm/v1/worker/gpu/model_runner.py(1813): execute_model` ->
+/// (`vllm/v1/worker/gpu/model_runner.py`, 1813). Also accepts kineto's
+/// older `execute_model(vllm/...py:1813)` spelling. None for frames that
+/// carry no file:line (`<built-in function launch>`, `<module>`).
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_frame_site(name: &str) -> Option<(&str, u32)> {
+    if let Some(i) = name.find(".py(") {
+        let rest = &name[i + 4..];
+        let close = rest.find(')')?;
+        let line = rest[..close].parse().ok()?;
+        return Some((&name[..i + 3], line));
+    }
+    let i = name.find(".py:")?;
+    let start = name[..i].rfind('(').map_or(0, |p| p + 1);
+    let rest = &name[i + 4..];
+    let close = rest.find(')').unwrap_or(rest.len());
+    let line = rest[..close].parse().ok()?;
+    Some((&name[start..i + 3], line))
+}
+
+/// The innermost enclosing python frame of `(track, event)` that resolves
+/// in the checkout. Frames nest by time on the same track, so the shortest
+/// enclosing span is the innermost one; walking outward past torch/triton
+/// frames (which don't exist under the checkout root) lands on the vLLM
+/// frame that actually issued the operation.
+#[cfg(not(target_arch = "wasm32"))]
+fn enclosing_frame(
+    trace: &Trace,
+    at: (u32, u32),
+    idx: &source::SourceIndex,
+) -> Option<source::SourceHit> {
+    let track = trace.tracks.get(at.0 as usize)?;
+    let ev = track.events.get(at.1 as usize)?;
+    let py = trace.cats.iter().position(|c| c == "python_function")? as u32;
+    let mut cands: Vec<(f64, String)> = track.events.iter()
+        .filter(|e| e.cat == py && e.ts <= ev.ts && ev.ts <= e.ts + e.dur)
+        .map(|e| (e.dur, trace.names[e.name as usize].clone()))
+        .collect();
+    cands.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (_, name) in cands {
+        let Some((file, line)) = parse_frame_site(&name) else { continue };
+        let Some(hit) = idx.resolve_callfrom(&format!("{file}:{line}")) else { continue };
+        return Some(hit);
+    }
+    None
+}
+
 /// Event -> source resolution, shared by the Detail tab's "View Source"
 /// button and the timeline right-click menu. Takes `pane` by shared
 /// reference and the index as a separate borrow, so it can be called from
@@ -3236,6 +3369,7 @@ fn resolve_event_source(
         return (SrcAction::Error("stale event reference".into()), None);
     };
     let name = &trace.names[ev.name as usize];
+    let cat = &trace.cats[ev.cat as usize];
     // CallFrom (kineto with_stack) is the exact python file:line.
     let mut callfrom: Option<String> = None;
     if ev.args_off > 0 {
@@ -3257,7 +3391,6 @@ fn resolve_event_source(
     if callfrom.is_none() {
         // Name resolution covers GPU kernels AND cpu custom ops — `vllm::`
         // ops appear as cpu_op events on CPU tracks, so those must link too.
-        let cat = &trace.cats[ev.cat as usize];
         if !(track.gpu || cat == "kernel" || cat == "cpu_op") {
             return (SrcAction::Error(format!(
                 "no source linkage for `{}` ({} events carry none)", name, cat)), None);
@@ -3278,17 +3411,58 @@ fn resolve_event_source(
     }).map(|b| format!(
         "checkout {} is not the trace's build {} - line numbers may be off",
         git_desc.as_deref().unwrap_or("?"), b.id()));
-    let hits = if let Some(cf) = &callfrom {
+    // A generic name (`Kernel`) must not be scanned: it word-matches
+    // unrelated C++ symbols and would hand back a junk list.
+    let generic = source::is_generic_kernel_name(name);
+    let mut hits = if let Some(cf) = &callfrom {
         idx.resolve_callfrom(cf).into_iter().collect::<Vec<_>>()
+    } else if generic {
+        Vec::new()
     } else {
         idx.resolve_kernel(name)
     };
+    // No name-based source: a launched kernel still knows where it was
+    // launched. Follow External id / correlation to the CPU event and use
+    // its op name, else the innermost enclosing python frame. This is what
+    // resolves CuTe DSL JIT kernels, which CUPTI only ever names `Kernel`.
+    let mut via = None;
+    if hits.is_empty() && callfrom.is_none() && (track.gpu || cat == "kernel") {
+        if let Some(link) = launch_link(trace, r.track_idx, r.event_idx) {
+            if let Some(op) = link.op.as_deref() {
+                if !source::is_torch_internal(op) {
+                    hits = idx.resolve_kernel(op);
+                    if !hits.is_empty() { via = Some(op.to_string()); }
+                }
+            }
+            if hits.is_empty() {
+                if let Some(at) = link.at {
+                    if let Some(h) = enclosing_frame(trace, at, idx.as_ref()) {
+                        via = Some(format!("{}:{}", h.rel, h.line));
+                        hits = vec![h];
+                    }
+                }
+            }
+        }
+    }
+    // The launch-site note rides the jump, so a generic `Kernel` event
+    // says where it came from instead of looking like the kernel's def.
+    // A drift warning still matters (launch-site lines drift too), so both
+    // are kept.
+    let warn = match (warn, via) {
+        (Some(w), Some(v)) => Some(format!("{w}; launch site of `{name}`: {v}")),
+        (None, Some(v)) => Some(format!("launch site of `{name}`: {v}")),
+        (w, None) => w,
+    };
     let act = match hits.len() {
-        0 => SrcAction::Error(match source::external_kernel_family(name) {
+        0 => SrcAction::Error(if generic {
+            format!("`{}` is CUPTI's placeholder for a kernel it could not \
+                     symbolicate, and this trace carries no launch correlation \
+                     to resolve it", name)
+        } else { match source::external_kernel_family(name) {
             Some(why) => format!("`{}` is {}", name, why),
             None => format!(
                 "no source found for `{}` in the checkout (aten/CUB/CUTLASS kernels live outside vllm)", name),
-        }),
+        } }),
         1 => SrcAction::Open(hits.into_iter().next().unwrap()),
         _ => SrcAction::List(hits),
     };

@@ -380,6 +380,15 @@ pub fn external_kernel_family(name: &str) -> Option<&'static str> {
     None
 }
 
+/// CUPTI reports a kernel from a module it cannot symbolicate as just
+/// `Kernel` — that is what CuTe DSL's JIT-loaded cubins look like in a
+/// vLLM trace. Scanning that name is worse than useless (it word-matches
+/// unrelated `Kernel(` symbols), so such events are routed to launch-site
+/// resolution through the event's `correlation`.
+pub fn is_generic_kernel_name(name: &str) -> bool {
+    matches!(name.trim(), "Kernel" | "kernel")
+}
+
 /// The build commit a trace was built from, per its `vllm_version`, when
 /// the string actually carries one. That's setuptools-scm's `+g<hex>`
 /// (`0.26.1rc1.dev528+g1a2b3c4d5e6f`) — and ONLY that: a local tag like

@@ -6489,6 +6489,112 @@ fn test_source_index_resolves() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// CUPTI's placeholder name for a JIT-loaded module (CuTe DSL) must be
+/// recognized, real kernel names must not be mistaken for it.
+#[test]
+fn test_generic_kernel_name() {
+    assert!(crate::source::is_generic_kernel_name("Kernel"));
+    assert!(crate::source::is_generic_kernel_name(" Kernel "));
+    assert!(!crate::source::is_generic_kernel_name("Kernel_1"));
+    assert!(!crate::source::is_generic_kernel_name("vectorized_elementwise_kernel"));
+    assert!(!crate::source::is_generic_kernel_name("kernel_cutlass_kernel_x"));
+}
+
+/// Kineto's python frames carry file:line in two spellings, and builtins
+/// carry none.
+#[test]
+fn test_parse_frame_site() {
+    assert_eq!(
+        crate::parse_frame_site("vllm/v1/worker/gpu/model_runner.py(1813): execute_model"),
+        Some(("vllm/v1/worker/gpu/model_runner.py", 1813)));
+    assert_eq!(
+        crate::parse_frame_site("launch(vllm/model_executor/warmup/jit_warmup_triton_helper.py:315)"),
+        Some(("vllm/model_executor/warmup/jit_warmup_triton_helper.py", 315)));
+    assert_eq!(crate::parse_frame_site("<built-in function launch>"), None);
+    assert_eq!(crate::parse_frame_site("<string>(1): <module>"), None);
+}
+
+#[test]
+fn test_rank_tag() {
+    assert_eq!(crate::rank_tag("  Rank 3 stream 19").as_deref(), Some("Rank 3"));
+    assert_eq!(crate::rank_tag("Rank 0 thread 9").as_deref(), Some("Rank 0"));
+    assert_eq!(crate::rank_tag("stream 19"), None);
+}
+
+/// A `Kernel` event resolves through External id / correlation to the CPU
+/// launch: op name first, then the innermost enclosing python frame. The
+/// synthetic trace also has a same-External-id cpu_op on another rank —
+/// merged traces interleave independent counters, and that must not win.
+#[test]
+fn test_launch_link_resolves_generic_kernel() {
+    let root = std::env::temp_dir().join("tv_launch_link_test");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("vllm")).unwrap();
+    std::fs::write(root.join("vllm/launch.py"), "def launch():\n    pass\n").unwrap();
+
+    let mut buf = vec![0u8];
+    let mut add = |s: &str| { let off = buf.len() as u32; buf.extend_from_slice(s.as_bytes()); off };
+    let kernel_args = add("{\"External id\":\"7\",\"correlation\":\"42\"}");
+    let launch_args = add("{\"correlation\":\"42\"}");
+    let op_args = add("{\"External id\":\"7\"}");
+    let other_rank_args = add("{\"External id\":\"7\"}");
+    let raw = Arc::new(ArgsBuf(buf));
+    let names: Vec<String> = ["Kernel", "cuLaunchKernelEx", "vllm::attention", "vllm/launch.py(1): launch"]
+        .iter().map(|s| s.to_string()).collect();
+    let cats: Vec<String> = ["kernel", "cuda_driver", "cpu_op", "python_function"]
+        .iter().map(|s| s.to_string()).collect();
+    let ev = |ts: f64, dur: f64, name: u32, cat: u32, off: u32| Event {
+        ts, dur, name, cat, args_off: off, args_len: 0, depth: 0 };
+    let mk = |label: &str, gpu: bool, events: Vec<Event>| Track {
+        label: label.to_string(), gpu, events, max_depth: 1,
+        prefix_max_dur: vec![1.0], raw_buf_idx: 0 };
+    let trace = Trace {
+        tracks: vec![
+            mk("Rank 0 stream 7", true, vec![ev(100.0, 10.0, 0, 0, kernel_args)]),
+            mk("Rank 0 thread 9", false, vec![
+                ev(0.0, 200.0, 3, 3, 0),              // python frame enclosing it all
+                ev(90.0, 5.0, 1, 1, launch_args),     // cuLaunchKernelEx, correlation 42
+                ev(80.0, 20.0, 2, 2, op_args),        // cpu_op, External id 7
+            ]),
+            // Decoy: same External id, different rank.
+            mk("Rank 1 thread 9", false, vec![ev(80.0, 20.0, 2, 2, other_rank_args)]),
+        ],
+        names, cats, raw_bufs: vec![raw], stats: Vec::new(),
+        max_ts: 210.0, min_ts: 0.0, total_events: 5,
+        device: String::new(), vllm_version: String::new(), dist_rank: 0, dist_world: 0,
+        flow_pairs: Vec::new(), rank_paths: Vec::new(),
+    };
+
+    let link = crate::launch_link(&trace, 0, 0).expect("link");
+    assert_eq!(link.op.as_deref(), Some("vllm::attention"));
+    // Correlation match wins over the External-id event for `at`: the raw
+    // launch call is the finer site (its frames include the op's frames).
+    assert_eq!(link.at, Some((1, 1)));
+
+    let idx = crate::source::SourceIndex::new(root.clone());
+    let hit = crate::enclosing_frame(&trace, link.at.unwrap(), &idx).expect("frame");
+    assert_eq!(hit.rel, "vllm/launch.py");
+    assert_eq!(hit.line, 1);
+
+    // End to end through the real entry point: the op name is scanned
+    // first (no def in the fake checkout), then the frame wins.
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    let mut idx = Some(Box::new(crate::source::SourceIndex::new(root.clone())));
+    let (act, warn) = crate::resolve_event_source(
+        &mut idx, &pane, crate::types::EventRef { track_idx: 0, event_idx: 0 });
+    match act {
+        crate::SrcAction::Open(h) => {
+            assert_eq!(h.rel, "vllm/launch.py");
+            assert_eq!(h.line, 1);
+        }
+        _ => panic!("expected Open"),
+    }
+    assert!(warn.unwrap().contains("launch site"), "warn names the launch-site route");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Real-data validation for the Source tab's resolvers, against a local
 /// vLLM checkout. Gated on env vars so CI never needs the fixtures:
 ///   TV_SOURCE_TRACE=<rank.ktz>  TV_SOURCE_ROOT=<vllm checkout>
@@ -6950,3 +7056,4 @@ fn test_frame_dur_field_is_fixed_width() {
     assert_eq!(fmt_frame_dur(0.0123), " 12.3ms");
     assert_eq!(fmt_frame_dur(1.234), "  1.23s");
 }
+
