@@ -3238,150 +3238,236 @@ pub fn editor_label(editor: &str) -> &str {
     }
 }
 
-/// Brand mark for `editor`, drawn as vector geometry into a `size`-square
-/// box whose top-left corner is (`x`, `y`) - the same no-image-assets
-/// approach as `draw_vllm_logo`. Known CLIs get their own mark; anything
-/// else (a custom command or a path) gets a generic "code" badge.
-pub fn draw_editor_icon(dl: &imgui::DrawListMut, editor: &str, x: f32, y: f32, size: f32) {
-    // Normalized (0..1) box helper: call sites below are written in unit
-    // coordinates so the marks scale with the menu font.
-    let p = |u: f32, v: f32| [x + u * size, y + v * size];
-    let disc = |c: [f32; 2], r: f32, col: ImColor32, segs: i32| {
-        dl.add_circle(c, r * size, col).filled(true).num_segments(segs as u32).build();
-    };
-    match editor {
-        "gram" => {
-            // Gram's app icon: a pale-green tile around a rounded frog
-            // head, with a big pale belly. The eyes are solid dark discs -
-            // the brand icon's white sclera is sub-pixel at 16 px - with a
-            // single light glint each, which still reads as an eye.
-            let head = col32(108, 156, 108, 255);
-            let ink = col32(40, 52, 38, 255);
-            let glint = col32(242, 249, 230, 255);
-            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(203, 227, 176, 255))
-                .filled(true).rounding(size * 0.24).build();
-            dl.add_rect(p(0.145, 0.165), p(0.855, 0.845), head)
-                .filled(true).rounding(size * 0.22).build();
-            disc(p(0.50, 0.615), 0.225, col32(216, 236, 196, 255), 24);
-            for (ex, gx) in [(0.335f32, 0.305f32), (0.665, 0.635)] {
-                disc(p(ex, 0.31), 0.095, ink, 16);
-                disc(p(gx, 0.278), 0.036, glint, 8);
-            }
-        }
-        "code" | "vscode" => {
-            // VS Code's blue folded-ribbon mark. The official 24x24 SVG
-            // outline is concave (the V notch between the chevron's arms),
-            // which ImGui's convex fill cannot draw, so the two halves are
-            // pre-triangulated below (ear-clipped from the SVG path, so the
-            // triangles tile it exactly); the split also gives the fold its
-            // darker body / lighter chevron two-tone.
-            const BODY: [[f32; 2]; 17] = [
-                [16.505, 0.500], [7.045, 9.130], [2.925, 6.002], [1.649, 6.059],
-                [0.327, 7.261], [0.326, 8.740], [3.899, 12.000], [0.326, 15.260],
-                [0.327, 16.739], [1.650, 17.940], [2.926, 17.997], [7.046, 14.869],
-                [16.506, 23.499], [18.210, 23.789], [18.004, 17.448], [10.826, 12.000],
-                [18.004, 6.552],
-            ];
-            const BODY_TRIS: [[usize; 3]; 14] = [
-                [0, 16, 15], [15, 14, 13], [15, 13, 12], [15, 12, 11], [0, 15, 11],
-                [0, 11, 10], [0, 10, 9], [0, 9, 8], [0, 8, 7], [0, 7, 6],
-                [6, 5, 4], [6, 4, 3], [6, 3, 2], [6, 2, 1],
-            ];
-            const CHEVRON: [[f32; 2]; 9] = [
-                [18.004, 6.552], [18.210, 0.210], [23.150, 2.587], [24.000, 3.939],
-                [24.000, 20.060], [23.152, 21.412], [18.210, 23.789], [18.004, 17.448],
-                [10.826, 12.000],
-            ];
-            const CHEVRON_TRIS: [[usize; 3]; 7] = [
-                [0, 1, 2], [0, 2, 3], [8, 0, 3], [8, 3, 4], [4, 5, 6], [4, 6, 7], [4, 7, 8],
-            ];
-            let tri = |tris: &[[usize; 3]], pts: &[[f32; 2]], col: ImColor32| {
-                for t in tris {
-                    let q = |i: usize| p(pts[i][0] / 24.0, pts[i][1] / 24.0);
-                    let (a, b, c) = (q(t[0]), q(t[1]), q(t[2]));
-                    dl.add_triangle(a, b, c, col).filled(true).build();
-                    // Adjacent triangles each anti-alias their shared edge
-                    // to ~50%, which composites into a dark hairline across
-                    // the mark. Stroking every edge in the same colour makes
-                    // that pixel opaque; at 16 px it also adds a little
-                    // welcome weight to the thin ribbon.
-                    dl.add_polyline(vec![a, b, c, a], col).thickness(0.7).build();
+/// Native size of the editor marks, in logical pixels. The sprites are
+/// 16x16, so drawing at exactly this size keeps each sprite pixel on whole
+/// device pixels at both 1x and 2x, which is what makes them crisp.
+pub const EDITOR_ICON_SIZE: f32 = 16.0;
+
+/// One 16x16 pixel-art brand mark, traced from the editor's official app
+/// icon. `rows` are scanlines of palette keys (`.` is transparent); the
+/// palette maps each key to its colour. Drawing goes through the raw pixel
+/// grid instead of vector shapes: at menu size, vector edges land on
+/// half-pixels and read as a blurry smear.
+struct PixelMark {
+    rows: [&'static str; 16],
+    palette: &'static [(u8, ImColor32)],
+}
+
+impl PixelMark {
+    fn draw(&self, dl: &imgui::DrawListMut, x: f32, y: f32, size: f32) {
+        let cell = size / 16.0;
+        for (row_i, row) in self.rows.iter().enumerate() {
+            let keys = row.as_bytes();
+            debug_assert_eq!(keys.len(), 16);
+            let mut start = 0;
+            while start < keys.len() {
+                let key = keys[start];
+                let mut end = start + 1;
+                while end < keys.len() && keys[end] == key {
+                    end += 1;
                 }
-            };
-            tri(&BODY_TRIS, &BODY, col32(0, 101, 169, 255));
-            tri(&CHEVRON_TRIS, &CHEVRON, col32(0, 122, 204, 255));
-        }
-        "cursor" => {
-            // Cursor: near-black tile with a pale isometric cube.
-            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(28, 28, 31, 255))
-                .filled(true).rounding(size * 0.24).build();
-            let ink = col32(232, 234, 240, 255);
-            let hex = [[0.50, 0.16], [0.84, 0.35], [0.84, 0.66],
-                       [0.50, 0.85], [0.16, 0.66], [0.16, 0.35]];
-            dl.add_polyline(hex.iter().map(|&[u, v]| p(u, v)).collect::<Vec<_>>(), ink)
-                .thickness(size * 0.075).build();
-            let hub = p(0.50, 0.50);
-            for [u, v] in [[0.16, 0.35], [0.84, 0.35], [0.50, 0.85]] {
-                dl.add_line(hub, p(u, v), ink).thickness(size * 0.075).build();
+                if key != b'.' {
+                    if let Some(&(_, color)) = self.palette.iter().find(|(k, _)| *k == key) {
+                        // Non-antialiased so adjacent cells in different
+                        // colours meet on a hard edge instead of a halo.
+                        dl.add_rect_filled_multicolor(
+                            [x + start as f32 * cell, y + row_i as f32 * cell],
+                            [x + end as f32 * cell, y + (row_i + 1) as f32 * cell],
+                            color, color, color, color,
+                        );
+                    }
+                }
+                start = end;
             }
-        }
-        "zed" => {
-            // Zed: dark tile with its interlaced Z. The interlacing is
-            // sub-pixel at 16 px, so the mark is a bold two-tone Z with
-            // square ends: the bars are rects and the diagonal tucks under
-            // them, so the corners meet without notches.
-            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(30, 30, 33, 255))
-                .filled(true).rounding(size * 0.24).build();
-            dl.add_line(p(0.70, 0.30), p(0.30, 0.70), col32(226, 226, 226, 255))
-                .thickness(size * 0.115).build();
-            dl.add_rect(p(0.26, 0.245), p(0.74, 0.355), col32(244, 244, 244, 255))
-                .filled(true).build();
-            dl.add_rect(p(0.26, 0.645), p(0.74, 0.755), col32(211, 211, 211, 255))
-                .filled(true).build();
-        }
-        "clion" => {
-            // CLion: JetBrains' pinwheel tile (blue/pink/green wedges)
-            // behind the black product square with a white "CL" and the
-            // JetBrains bar. The wedges are inset so their sharp corners
-            // stay inside the rounded tile.
-            let ink = col32(0, 0, 0, 255);
-            let white = col32(255, 255, 255, 255);
-            let i = 0.07;
-            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(18, 18, 20, 255))
-                .filled(true).rounding(size * 0.22).build();
-            let wedges = [
-                ([[i, 0.52], [i, i], [0.52, i]], col32(0, 154, 229, 255)),
-                ([[0.48, i], [1.0 - i, i], [1.0 - i, 0.48]], col32(255, 49, 140, 255)),
-                ([[1.0 - i, 0.52], [1.0 - i, 1.0 - i], [0.52, 1.0 - i]], col32(0, 217, 128, 255)),
-                ([[1.0 - i, 0.48], [0.48, 1.0 - i], [i, 1.0 - i]], col32(255, 49, 140, 255)),
-            ];
-            for (pts, col) in wedges {
-                dl.add_polyline(pts.iter().map(|&[u, v]| p(u, v)).collect::<Vec<_>>(), col)
-                    .filled(true).build();
-            }
-            dl.add_rect(p(0.16, 0.16), p(0.84, 0.84), ink).filled(true).build();
-            // "C": a solid disc with a rectangular bite out of its right
-            // side (the ring's hole is sub-pixel at this size).
-            disc(p(0.365, 0.395), 0.112, white, 20);
-            dl.add_rect(p(0.365, 0.325), p(0.505, 0.475), ink).filled(true).build();
-            // "L", then the JetBrains bar under the letters.
-            dl.add_rect(p(0.535, 0.275), p(0.605, 0.510), white).filled(true).build();
-            dl.add_rect(p(0.535, 0.445), p(0.735, 0.510), white).filled(true).build();
-            dl.add_rect(p(0.20, 0.60), p(0.50, 0.67), white).filled(true).build();
-        }
-        _ => {
-            // Generic badge for any other editor command.
-            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(58, 58, 64, 255))
-                .filled(true).rounding(size * 0.24).build();
-            let ink = col32(214, 214, 218, 255);
-            let t = size * 0.09;
-            dl.add_line(p(0.42, 0.28), p(0.22, 0.50), ink).thickness(t).build();
-            dl.add_line(p(0.22, 0.50), p(0.42, 0.72), ink).thickness(t).build();
-            dl.add_line(p(0.58, 0.28), p(0.78, 0.50), ink).thickness(t).build();
-            dl.add_line(p(0.78, 0.50), p(0.58, 0.72), ink).thickness(t).build();
-            dl.add_line(p(0.55, 0.26), p(0.45, 0.74), ink).thickness(t * 0.85).build();
         }
     }
+}
+
+/// Gram's official app icon: pale-green tile, frog head with white eyes,
+/// and the big belly.
+const GRAM_MARK: PixelMark = PixelMark {
+    rows: [
+        "..tttttttttttt..",
+        ".ttthhtttthhttt.",
+        "tttthhhhhhhhtttt",
+        "ttteeehhhheeettt",
+        "tthepehhhhepehtt",
+        "tthhhhhhhhhhhhtt",
+        "tthhhhbbbbhhhhtt",
+        "tthhhbbbbbbhhhtt",
+        "tthhbbbbbbbbhhtt",
+        "tthhbbbbbbbbhhtt",
+        "tthhbbbbbbbbhhtt",
+        "tthhbbbbbbbbhhtt",
+        "tthhhbbbbbbhhhtt",
+        "ttthhhbbbbhhhttt",
+        ".tttttttttttttt.",
+        "..tttttttttttt..",
+    ],
+    palette: &[
+        (b't', ImColor32::from_rgba(206, 235, 196, 255)),
+        (b'h', ImColor32::from_rgba(109, 157, 109, 255)),
+        (b'b', ImColor32::from_rgba(221, 243, 208, 255)),
+        (b'e', ImColor32::from_rgba(247, 252, 242, 255)),
+        (b'p', ImColor32::from_rgba(30, 42, 30, 255)),
+    ],
+};
+
+/// VS Code's blue folded ribbon on the dark tile of its official
+/// apple-touch icon. `#` is the body blue, `o` the lighter chevron.
+const VSCODE_MARK: PixelMark = PixelMark {
+    rows: [
+        "..kkkkkkkkkkkk..",
+        ".kkkkkkkkk#ookk.",
+        "kkkkkkkkk##ooook",
+        "kkkkkkkk###ooook",
+        "kk#kkkk####ooook",
+        "k###kk####oooook",
+        "k########ooooook",
+        "kk######oooooook",
+        "kk######oooooook",
+        "k########ooooook",
+        "k###kk####oooook",
+        "kk#kkkk####ooook",
+        "kkkkkkkk###ooook",
+        "kkkkkkkkk##ooook",
+        ".kkkkkkkkk#ookk.",
+        "..kkkkkkkkkkkk..",
+    ],
+    palette: &[
+        (b'k', ImColor32::from_rgba(40, 40, 44, 255)),
+        (b'#', ImColor32::from_rgba(0, 101, 169, 255)),
+        (b'o', ImColor32::from_rgba(0, 122, 204, 255)),
+    ],
+};
+
+/// Zed's official app icon: dark tile with the gradient Z. The interlaced
+/// nested squares are sub-pixel at this size, so the mark is a bold Z.
+const ZED_MARK: PixelMark = PixelMark {
+    rows: [
+        "..kkkkkkkkkkkk..",
+        ".kkkkkkkkkkkkkk.",
+        "kkkkkkkkkkkkkkkk",
+        "kkkkwwwwwwwwkkkk",
+        "kkkkwwwwwwwwkkkk",
+        "kkkkkkkkkmmmkkkk",
+        "kkkkkkkkmmmmkkkk",
+        "kkkkkkkmmmmkkkkk",
+        "kkkkkkmmmmkkkkkk",
+        "kkkkkmmmmkkkkkkk",
+        "kkkkmmmmkkkkkkkk",
+        "kkkksssssssskkkk",
+        "kkkksssssssskkkk",
+        "kkkkkkkkkkkkkkkk",
+        ".kkkkkkkkkkkkkk.",
+        "..kkkkkkkkkkkk..",
+    ],
+    palette: &[
+        (b'k', ImColor32::from_rgba(36, 36, 40, 255)),
+        (b'w', ImColor32::from_rgba(247, 247, 247, 255)),
+        (b'm', ImColor32::from_rgba(226, 226, 226, 255)),
+        (b's', ImColor32::from_rgba(203, 203, 203, 255)),
+    ],
+};
+
+/// CLion's official app icon: blue/pink/green pinwheel tile behind the
+/// black product square, with a white "CL" and the JetBrains bar.
+const CLION_MARK: PixelMark = PixelMark {
+    rows: [
+        "..bbbbbbpppppp..",
+        ".bbbbbbbbpppppp.",
+        "bbbbbbbbpppppppp",
+        "bbbbkkkkkkkkpppp",
+        "bbbbkkkkkkkkpppp",
+        "bbbbkkwwkkwkkppp",
+        "bbbbkwwkkkwkkppp",
+        "bbbbkwwkkkwkkppp",
+        "bbbbkwwkkwwwkppp",
+        "ppppkkkkkkkkgggg",
+        "ppppkwwwwkkkgggg",
+        "ppppkkkkkkkkgggg",
+        "ppppkkkkkkkkgggg",
+        "ppppppppgggggggg",
+        ".ppppppppgggggg.",
+        "..ppppppgggggg..",
+    ],
+    palette: &[
+        (b'b', ImColor32::from_rgba(0, 154, 229, 255)),
+        (b'p', ImColor32::from_rgba(255, 49, 140, 255)),
+        (b'g', ImColor32::from_rgba(0, 216, 134, 255)),
+        (b'k', ImColor32::from_rgba(0, 0, 0, 255)),
+        (b'w', ImColor32::from_rgba(255, 255, 255, 255)),
+    ],
+};
+
+/// Cursor's official mark: near-black tile with the pale isometric cube.
+const CURSOR_MARK: PixelMark = PixelMark {
+    rows: [
+        "..kkkkkkkkkkkk..",
+        ".kkkkkkkkkkkkkk.",
+        "kkkkkwwwwwkkkkkk",
+        "kkkkwwwwwwwkkkkk",
+        "kkwwwwwwwwwwwkkk",
+        "kkmwwwwwwwwwddkk",
+        "kkmmmwwwwwddddkk",
+        "kkmmmmmwwdddddkk",
+        "kkmmmmmmddddddkk",
+        "kkmmmmmmddddddkk",
+        "kkmmmmmmddddddkk",
+        "kkmmmmmmdddddkkk",
+        "kkkkmmmmdddkkkkk",
+        "kkkkkkmmdkkkkkkk",
+        ".kkkkkkkkkkkkkk.",
+        "..kkkkkkkkkkkk..",
+    ],
+    palette: &[
+        (b'k', ImColor32::from_rgba(28, 28, 31, 255)),
+        (b'w', ImColor32::from_rgba(232, 234, 240, 255)),
+        (b'm', ImColor32::from_rgba(184, 188, 200, 255)),
+        (b'd', ImColor32::from_rgba(136, 141, 158, 255)),
+    ],
+};
+
+/// Generic badge for any other editor command: a terminal prompt.
+const GENERIC_MARK: PixelMark = PixelMark {
+    rows: [
+        "..kkkkkkkkkkkk..",
+        ".kkkkkkkkkkkkkk.",
+        "kkkkkkkkkkkkkkkk",
+        "kkkkkkkkkkkkkkkk",
+        "kkwwkkkkkkkkkkkk",
+        "kkkwwkkkkkkkkkkk",
+        "kkkkwwkkkkkkkkkk",
+        "kkkkkwwkkkkkkkkk",
+        "kkkkkwwkkkkkkkkk",
+        "kkkkwwkkkkkkkkkk",
+        "kkkwwkkkkkkkkkkk",
+        "kkwwkkkkkwwwwwkk",
+        "kkkkkkkkkwwwwwkk",
+        "kkkkkkkkkkkkkkkk",
+        ".kkkkkkkkkkkkkk.",
+        "..kkkkkkkkkkkk..",
+    ],
+    palette: &[
+        (b'k', ImColor32::from_rgba(58, 58, 64, 255)),
+        (b'w', ImColor32::from_rgba(214, 214, 218, 255)),
+    ],
+};
+
+/// Brand mark for `editor`, drawn as a 16x16 pixel-art sprite into a
+/// `size`-square box whose top-left corner is (`x`, `y`). Known CLIs get
+/// their official mark; anything else (a custom command or a path) gets a
+/// generic command-prompt badge. No image assets, same as `draw_vllm_logo`.
+pub fn draw_editor_icon(dl: &imgui::DrawListMut, editor: &str, x: f32, y: f32, size: f32) {
+    let mark = match editor {
+        "gram" => &GRAM_MARK,
+        "code" | "vscode" => &VSCODE_MARK,
+        "cursor" => &CURSOR_MARK,
+        "zed" => &ZED_MARK,
+        "clion" => &CLION_MARK,
+        _ => &GENERIC_MARK,
+    };
+    mark.draw(dl, x, y, size);
 }
 
 pub fn device_name_color() -> ImColor32 {

@@ -158,6 +158,13 @@ pub(crate) fn should_show_tab_strip(panes: &[Pane]) -> bool {
     panes.len() > 1 || !panes[0].trace_path.is_empty()
 }
 
+/// Width of one picker row. Shared with the custom-command field so the
+/// field spans the popup instead of sticking out past the editor rows.
+#[cfg(not(target_arch = "wasm32"))]
+fn editor_picker_row_width(ui: &imgui::Ui, label: &str) -> f32 {
+    EDITOR_ICON_SIZE + 8.0 + ui.calc_text_size(label)[0] + 26.0 + 12.0
+}
+
 /// One row of the toolbar's editor picker: the editor's brand mark, its
 /// display name, and a check mark when it's the current choice. The row is
 /// a plain span-width selectable whose label is empty — icon and text are
@@ -168,9 +175,8 @@ pub(crate) fn should_show_tab_strip(panes: &[Pane]) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 fn editor_picker_row(ui: &imgui::Ui, editor: &str, label: &str, selected: bool) -> bool {
     let row_h = ui.text_line_height() + 8.0;
-    let icon_sz = (row_h - 8.0).min(16.0);
-    let text_w = ui.calc_text_size(label)[0];
-    let row_w = icon_sz + 8.0 + text_w + 26.0 + 12.0;
+    let icon_sz = EDITOR_ICON_SIZE;
+    let row_w = editor_picker_row_width(ui, label);
     let clicked = ui.selectable_config(format!("##edrow-{editor}"))
         .selected(selected)
         .size([row_w, row_h])
@@ -1775,14 +1781,14 @@ impl App {
                             // Source" jumps launch. A toolbar entry showing
                             // the current editor's mark; the dropdown
                             // repeats the marks per row so the choice reads
-                            // at a glance (all vector geometry, no image
-                            // assets - see `draw_editor_icon`). The text
-                            // field takes any other editor command, the
-                            // same state the Source setup popup edits.
+                            // at a glance (16x16 pixel-art sprites, no
+                            // image assets - see `draw_editor_icon`). The
+                            // text field takes any other editor command,
+                            // the same state the Source setup popup edits.
                             #[cfg(not(target_arch = "wasm32"))]
                             {
                                 let label = editor_label(&state.src_editor);
-                                let icon_sz = (ui.text_line_height() - 1.0).min(16.0);
+                                let icon_sz = EDITOR_ICON_SIZE;
                                 let text_w = ui.calc_text_size(label)[0];
                                 let btn_w = 7.0 + icon_sz + 6.0 + text_w + 8.0 + 9.0 + 7.0;
                                 let clicked = ui.button_with_size(
@@ -1810,6 +1816,14 @@ impl App {
                                     ui.tooltip_text("Editor used by View Source jumps.\nClick to pick one; any other editor command can be typed in the picker.");
                                 }
                                 if clicked { ui.open_popup("##editorpick"); }
+                                // The custom-command field spans the widest
+                                // editor row, so the popup stays a tidy
+                                // single column instead of growing around a
+                                // field wider than every row above it.
+                                let custom_w = KNOWN_EDITORS
+                                    .iter()
+                                    .map(|e| editor_picker_row_width(ui, editor_label(e)))
+                                    .fold(0.0f32, f32::max);
                                 // The popup belongs to this window's ID
                                 // stack (the menu bar pushes "##menubar"),
                                 // so open and draw it here rather than
@@ -1832,7 +1846,7 @@ impl App {
                                     }
                                     ui.separator();
                                     ui.text_disabled("Other command:");
-                                    ui.set_next_item_width(180.0);
+                                    ui.set_next_item_width(custom_w);
                                     ui.input_text("##editorcustom", &mut state.src_editor)
                                         .hint("code-insiders, nvim, ...")
                                         .build();
