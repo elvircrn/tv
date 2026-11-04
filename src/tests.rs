@@ -6924,3 +6924,16 @@ fn dep_resolution_real() {
     assert!(hits.iter().all(|h| h.rel.starts_with("deps/flashinfer/")),
         "hits must point into the flashinfer checkout: {:?}", hits.iter().map(|h| &h.rel).take(3).collect::<Vec<_>>());
 }
+
+/// The status bar's frame-time field must keep a constant width whichever
+/// digit count the delta happens to have, or everything after it (the "ms"
+/// and the source note) shifts every frame.
+#[test]
+fn test_frame_dur_field_is_fixed_width() {
+    for dt in [0.0001, 0.001, 0.0123, 0.123, 0.9999, 1.0, 1.234, 12.34, 123.4, 999.99] {
+        let s = fmt_frame_dur(dt);
+        assert_eq!(s.chars().count(), 7, "dt={dt} formatted as {s:?}");
+    }
+    assert_eq!(fmt_frame_dur(0.0123), " 12.3ms");
+    assert_eq!(fmt_frame_dur(1.234), "  1.23s");
+}

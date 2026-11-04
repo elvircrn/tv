@@ -100,6 +100,18 @@ fn rank_summary(fname: &str, dist_rank: i32, dist_world: i32) -> String {
     out
 }
 
+/// Status-bar frame-time indicator padded to a fixed 7-cell field (`12.3ms`,
+/// ` 1.23s`), so the unit suffix and everything after it on the bar stay put as
+/// the digit count changes. Millis below a second, seconds above.
+fn fmt_frame_dur(dt: f32) -> String {
+    let ms = dt * 1000.0;
+    if ms < 1000.0 {
+        format!("{:>5.1}ms", ms)
+    } else {
+        format!("{:>6.2}s", ms / 1000.0)
+    }
+}
+
 /// Short label for a pane's tab / "Diff against" entry: the dropped folder's
 /// name, the trace file's basename, or "Untitled" for a pane with nothing
 /// loaded yet. Multi-rank panes store `trace_path` as "N ranks: prefix" (see
@@ -2466,9 +2478,9 @@ impl App {
                     let fname = pane.trace_path.rsplit('/').next().unwrap_or(&pane.trace_path);
                     let ranks = rank_summary(fname, t.dist_rank, t.dist_world);
                     if ranks.is_empty() {
-                        write!(state.buf.fmt, "{} | {} events | {} tracks | {:.1}ms", fname, t.total_events, t.tracks.len(), dt * 1000.0).unwrap();
+                        write!(state.buf.fmt, "{} | {} events | {} tracks | {}", fname, t.total_events, t.tracks.len(), fmt_frame_dur(dt)).unwrap();
                     } else {
-                        write!(state.buf.fmt, "{} | {} | {} events | {} tracks | {:.1}ms", fname, ranks, t.total_events, t.tracks.len(), dt * 1000.0).unwrap();
+                        write!(state.buf.fmt, "{} | {} | {} events | {} tracks | {}", fname, ranks, t.total_events, t.tracks.len(), fmt_frame_dur(dt)).unwrap();
                     }
                     dl.add_text([win_pos[0] + 8.0, cy], col32(153, 153, 153, 255), &state.buf.fmt);
                     // A source-jump outcome rides the status bar's left side —
