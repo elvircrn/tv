@@ -257,6 +257,11 @@ struct App {
     /// opened by a click sat at its provisional size until the mouse
     /// moved, which read as the toolbar being unresponsive.
     popup_open: bool,
+    /// When the one "settle" frame after the current input burst is due
+    /// (see `INPUT_SETTLE`). `about_to_wait` sleeps until then instead of
+    /// indefinitely, so widgets imgui activates during an input frame get
+    /// their follow-up frame even if the mouse stops right afterwards.
+    input_settle: Option<Instant>,
     last_reload: Instant,
     // winit's web backend never resizes the canvas on its own when the
     // browser window/viewport changes — unlike native windows, a <canvas>
@@ -360,6 +365,7 @@ impl App {
             nav_pan_vel: 0.0,
             nav_zoom_vel: 0.0,
             popup_open: false,
+            input_settle: None,
             last_reload: Instant::now(),
             active_touches: std::collections::HashMap::new(),
             primary_touch_id: None,
@@ -408,6 +414,18 @@ impl App {
         self.pending_files.clear();
     }
 }
+
+/// How long after the last input event the settle frame is drawn. imgui
+/// hides a window for one frame when it is created or reactivated (new
+/// tooltips and reopened popups set `HiddenFramesCannotSkipItems`, and
+/// auto-sized popups measure on that frame), so UI requested during an
+/// input frame only becomes visible on the frame after it. Under
+/// `ControlFlow::Wait` that frame waits for the next OS event - e.g. a
+/// tooltip needed a mouse nudge after you stopped on a button. Waiting
+/// just past the last event draws exactly that one follow-up frame. Long
+/// enough that a burst of trackpad moves has finished (each event pushes
+/// the deadline out), short enough not to read as a tooltip delay.
+const INPUT_SETTLE: std::time::Duration = std::time::Duration::from_millis(40);
 
 const NAV_W: u8 = 1;
 const NAV_A: u8 = 2;
@@ -973,6 +991,17 @@ impl ApplicationHandler for App {
                 self.last_mouse_x = x;
             }
 
+            // Leaving the window sends no further CursorMoved, so without
+            // this the item under the cursor stayed hovered - highlight and
+            // tooltip frozen on screen - until the next event. The invalid
+            // position is imgui's own "mouse disappeared" idiom; it also
+            // zeroes MouseDelta for the first frame back so the re-entry
+            // doesn't read as a huge jump (imgui.cpp, the IsMousePosValid
+            // guard above the MouseDelta assignment).
+            WindowEvent::CursorLeft { .. } => {
+                io.add_mouse_pos_event([-f32::MAX, -f32::MAX]);
+            }
+
             WindowEvent::MouseInput { state, button, .. } => {
                 let btn = match button {
                     winit::event::MouseButton::Left => imgui::MouseButton::Left,
@@ -1161,6 +1190,10 @@ impl ApplicationHandler for App {
             _ => return,
         }
 
+        // Every event handled above is input, and each one pushes the settle
+        // frame back: the follow-up is drawn once the burst ends, not
+        // between its events.
+        self.input_settle = Some(Instant::now() + INPUT_SETTLE);
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -1220,6 +1253,17 @@ impl ApplicationHandler for App {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             if let Some(w) = &self.window {
                 w.request_redraw();
+            }
+        } else if let Some(deadline) = self.input_settle {
+            if Instant::now() < deadline {
+                // Wake for the settle frame just after the input stops.
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+            } else {
+                self.input_settle = None;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
             }
         } else {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
