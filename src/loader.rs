@@ -166,16 +166,20 @@ fn assemble_track(
 }
 
 /// Everything a load does once every track is assembled: metadata scans
-/// (over the ktz head/foot text), track ordering, flow pairing, kernel
-/// stats, and the `Trace` itself. Shared by the native path and the wasm
-/// plan's assemble phase.
+/// (over the ktz head/foot text, or — for a JSON trace — the raw JSON
+/// itself when `meta` is `None`), track ordering, flow pairing, kernel
+/// stats, and the `Trace` itself. `raw_buf` is the buffer events' args
+/// offsets index into: the decoder-written compact args text for `.ktz`,
+/// the whole decompressed JSON for a direct JSON load. Shared by the native
+/// path and the wasm plan's assemble phase.
 fn finish_trace(
-    meta: &[u8],
-    args: Vec<u8>,
+    meta: Option<&[u8]>,
+    raw_buf: Arc<ArgsBuf>,
     scan: TraceScan,
     keyed_tracks: Vec<((u64, u64), Track)>,
     t0: &Instant,
 ) -> Result<Trace, String> {
+    let meta: &[u8] = meta.unwrap_or(&raw_buf[..]);
     let TraceScan { names, cats, track_map: _, thread_names: _, mut flow_events, min_ts, mut max_ts, total_events, scan_count } = scan;
     let mut names = names.into_strings();
     let mut cats = cats.into_strings();
@@ -222,11 +226,6 @@ fn finish_trace(
     }
     tlog!("  scan: {:.3}s ({} objects, {} events, {} names)",
         t0.elapsed().as_secs_f64(), scan_count, total_events, names.len());
-
-    // The decoder wrote only the args ranges events actually use (X with a
-    // duration, M thread_name) straight into this buffer — byte 0 is the
-    // reserved "no args" offset — so it already is the compact form.
-    let raw_buf: Arc<ArgsBuf> = Arc::new(ArgsBuf(args));
 
     if min_ts == f64::MAX {
         return Err("no duration events found".into());
@@ -289,6 +288,27 @@ fn finish_trace(
     Ok(Trace { tracks, names, cats, raw_bufs: vec![raw_buf], stats, max_ts, min_ts, total_events, device, vllm_version, dist_rank, dist_world, flow_pairs, rank_paths: Vec::new() })
 }
 
+/// The scan -> assemble -> finish half every decoder shares. `raw_buf` is
+/// the args buffer the decoder's events index into; `meta` is the small
+/// text `finish_trace` scans for metadata, or `None` to scan `raw_buf`
+/// itself (a JSON trace's top-level keys are already in there).
+fn assemble_and_finish(
+    meta: Option<&[u8]>,
+    raw_buf: Arc<ArgsBuf>,
+    mut scan: TraceScan,
+    t0: &Instant,
+) -> Result<Trace, String> {
+    let min_ts = scan.min_ts;
+    let entries = scan.take_track_entries();
+    let cats = &scan.cats;
+    let thread_names = &scan.thread_names;
+    let keyed_tracks: Vec<((u64, u64), Track)> = entries
+        .into_par_iter()
+        .map(|((pid, tid), evs)| ((pid, tid), assemble_track(pid, tid, evs, min_ts, cats, thread_names)))
+        .collect();
+    finish_trace(meta, raw_buf, scan, keyed_tracks, t0)
+}
+
 /// Decode a .ktz file's bytes into a `Trace`: `KtzDecoder` walks the
 /// columnar sections straight into a `KtzTrace` (events, interned
 /// names/cats, args text — no JSON is ever materialized), then the events
@@ -299,35 +319,53 @@ fn build_trace(meta: Vec<u8>, mut ktz: KtzTrace, t0: &Instant) -> Result<Trace, 
     let args = std::mem::take(&mut ktz.args);
     let mut scan = TraceScan::new();
     scan.merge_chunk(ktz);
-    let min_ts = scan.min_ts;
-    let entries = scan.take_track_entries();
-    let cats = &scan.cats;
-    let thread_names = &scan.thread_names;
-    let keyed_tracks: Vec<((u64, u64), Track)> = entries
-        .into_par_iter()
-        .map(|((pid, tid), evs)| ((pid, tid), assemble_track(pid, tid, evs, min_ts, cats, thread_names)))
-        .collect();
-    finish_trace(&meta, args, scan, keyed_tracks, t0)
+    assemble_and_finish(Some(&meta), Arc::new(ArgsBuf(args)), scan, t0)
 }
 
-/// Shared body of every load entry point: sniff the magic (a friendly
-/// error rather than a decoder backtrace for a non-ktz drop), decode, build.
-fn decode_ktz(data: &[u8], counter: &AtomicUsize, t0: &Instant) -> Result<Trace, String> {
-    if !ktz::is_ktz(data) {
-        return Err("unsupported file type - only .ktz traces can be opened (transcode with `ktz c`)".into());
+/// Build a `Trace` from decompressed Chrome/kineto JSON. The raw JSON
+/// becomes the trace's args buffer (events reference their args by offset,
+/// never by copy), which is also what `finish_trace` scans for metadata.
+fn build_json_trace(raw: Vec<u8>, counter: &AtomicUsize, t0: &Instant) -> Result<Trace, String> {
+    let parsed = crate::json_trace::parse(raw, counter)?;
+    let mut scan = TraceScan::new();
+    for chunk in parsed.chunks { scan.merge_chunk(chunk); }
+    let raw_buf = Arc::new(ArgsBuf(parsed.raw));
+    assemble_and_finish(None, raw_buf, scan, t0)
+}
+
+/// Shared body of every load entry point: sniff the container, decode,
+/// build. `.ktz` is the primary format; a gzip stream or a JSON
+/// object/array is a Chrome/kineto trace loaded directly, through the same
+/// ktz-shaped pipeline.
+fn decode_any(data: Vec<u8>, counter: &AtomicUsize, t0: &Instant) -> Result<Trace, String> {
+    if ktz::is_ktz(&data) {
+        let mut dec = KtzDecoder::new(&data)?;
+        let n = dec.n_events();
+        let mut out = KtzTrace::with_events(n);
+        while !dec.step(&mut out, 65_536, counter)? {}
+        let meta = dec.into_head_foot();
+        return build_trace(meta, out, t0);
     }
-    let mut dec = KtzDecoder::new(data)?;
-    let n = dec.n_events();
-    let mut out = KtzTrace::with_events(n);
-    while !dec.step(&mut out, 65_536, counter)? {}
-    let meta = dec.into_head_foot();
-    build_trace(meta, out, t0)
+    if crate::json_trace::is_gzip(&data) {
+        let raw = crate::json_trace::decompress_gz(&data)?;
+        return build_json_trace(raw, counter, t0);
+    }
+    if crate::json_trace::looks_like_json(&data) {
+        return build_json_trace(data, counter, t0);
+    }
+    Err("unsupported file type - expected a .ktz trace or a Chrome/kineto JSON trace (.json, .json.gz)".into())
+}
+
+/// `decode_any` with the dropped file's name prefixed onto errors.
+#[cfg(target_arch = "wasm32")]
+fn decode_any_named(name: &str, data: Vec<u8>, counter: &AtomicUsize, t0: &Instant) -> Result<Trace, String> {
+    decode_any(data, counter, t0).map_err(|e| format!("{name}: {e}"))
 }
 
 pub fn load_trace(path: &str, counter: &Arc<AtomicUsize>) -> Result<Trace, String> {
     let t0 = Instant::now();
     let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    let trace = decode_ktz(&data, counter, &t0).map_err(|e| format!("{path}: {e}"))?;
+    let trace = decode_any(data, counter, &t0).map_err(|e| format!("{path}: {e}"))?;
     let event_bytes: usize = trace.tracks.iter().map(|t| t.events.len() * std::mem::size_of::<Event>()).sum();
     let str_bytes: usize = trace.names.iter().chain(trace.cats.iter()).map(|s| s.len() + std::mem::size_of::<String>()).sum();
     let args_bytes: usize = trace.raw_bufs.iter().map(|b| b.len()).sum();
@@ -349,8 +387,55 @@ pub fn load_trace_progressive(
     }
 }
 
+/// Files a directory walk / folder drop picks up: the primary `.ktz`
+/// container, plus raw Chrome/kineto traces (`.json`, and the
+/// `.pt.trace.json.gz` spelling PyTorch's profiler writes). The name is
+/// only a filter — `decode_any` still sniffs the bytes. Plain `.json`
+/// files additionally have to look like traces (see
+/// `is_json_trace_file`); profile folders also ship `manifest.json` and
+/// friends, which are valid JSON but not traces.
 pub(crate) fn is_trace_file(name: &str) -> bool {
-    name.ends_with(".ktz")
+    name.ends_with(".ktz") || name.ends_with(".json.gz") || name.ends_with(".json")
+}
+
+/// The name-only variant of the folder-walk filter, for the wasm drop walk
+/// (which can't peek at file bytes synchronously): a plain `.json` has to
+/// carry a trace-ish name, so a folder's `manifest.json` isn't opened as a
+/// trace. `.json.gz` needs no check.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn is_trace_file_by_name(name: &str) -> bool {
+    if name.ends_with(".json") {
+        return name.to_ascii_lowercase().contains("trace");
+    }
+    is_trace_file(name)
+}
+
+/// A raw trace transcoded next to itself (`trace.pt.trace.json.gz` ->
+/// `trace.pt.trace.json.gz.ktz`) otherwise opens the folder as two copies
+/// of every rank. When the `.ktz` sibling exists, the folder walk keeps
+/// only it — the columnar container is the primary format.
+fn has_ktz_sibling(path: &std::path::Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) == Some("ktz") { return false; }
+    let mut with_suffix = path.as_os_str().to_owned();
+    with_suffix.push(".ktz");
+    std::path::Path::new(&with_suffix).is_file()
+}
+
+/// Whether a plain (uncompressed) `.json` file found by a directory walk is
+/// a trace. `.json.gz` is unambiguous by extension, so only this case needs
+/// a look. Accepts a trace-shaped filename outright, otherwise peeks at the
+/// head for the `traceEvents` key (every producer we care about writes it
+/// before any multi-megabyte metadata).
+fn is_json_trace_file(path: &std::path::Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.to_ascii_lowercase().contains("trace") { return true; }
+    use std::io::Read;
+    const PEEK: usize = 1 << 20;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut head = vec![0u8; PEEK];
+    let Ok(n) = f.read(&mut head) else { return false };
+    head.truncate(n);
+    crate::parse::find_key(&head, b"traceEvents").is_some()
 }
 
 fn expand_dirs(paths: &[String]) -> Vec<String> {
@@ -371,7 +456,10 @@ fn expand_dirs(paths: &[String]) -> Vec<String> {
                 if ep.is_dir() {
                     dirs.push(ep);
                 } else if let Some(name) = ep.file_name().and_then(|n| n.to_str()) {
-                    if is_trace_file(name) {
+                    let plain_json = name.ends_with(".json");
+                    if is_trace_file(name) && (!plain_json || is_json_trace_file(&ep))
+                        && !has_ktz_sibling(&ep)
+                    {
                         out.push(ep.to_string_lossy().into());
                     }
                 }
@@ -809,6 +897,18 @@ pub(crate) fn wave_count(estimates: &[u64]) -> usize {
 /// past 100x) plus the event-count hint.
 fn estimated_load_heap(path: &str) -> u64 {
     let file = std::fs::metadata(path).map(|m| m.len()).unwrap_or(96 << 20);
+    if path.ends_with(".gz") {
+        // A direct JSON trace keeps its whole decompressed text as the args
+        // buffer, so that text is the retained payload — read the exact size
+        // from the gzip trailer rather than guessing from the compressed
+        // bytes. The extra quarter is the Event/track side.
+        let raw = crate::json_trace::gz_uncompressed_size(path)
+            .unwrap_or_else(|| file.saturating_mul(25));
+        return raw.saturating_add(raw / 4);
+    }
+    if path.ends_with(".json") {
+        return file.saturating_add(file / 4);
+    }
     let payload = crate::ktz::payload_size_hint(path)
         .unwrap_or_else(|| file.saturating_mul(256));
     payload.saturating_add(
@@ -885,19 +985,13 @@ pub fn load_trace_from_bytes_progressive(
     tx: &std::sync::mpsc::Sender<Result<Trace, String>>,
 ) {
     let t0 = Instant::now();
-    match decode_ktz_named(name, &raw_input, counter, &t0) {
+    match decode_any_named(name, raw_input, counter, &t0) {
         Ok(trace) => {
             tlog!("  ready: {:.3}s ({} tracks)", t0.elapsed().as_secs_f64(), trace.tracks.len());
             let _ = tx.send(Ok(trace));
         }
         Err(e) => { let _ = tx.send(Err(e)); }
     }
-}
-
-/// `decode_ktz` with the dropped file's name prefixed onto errors.
-#[cfg(target_arch = "wasm32")]
-fn decode_ktz_named(name: &str, data: &[u8], counter: &Arc<AtomicUsize>, t0: &Instant) -> Result<Trace, String> {
-    decode_ktz(data, counter, t0).map_err(|e| format!("{name}: {e}"))
 }
 
 /// wasm equivalent of `detect_rank_groups`'s grouping logic (the part after
@@ -948,7 +1042,7 @@ pub fn load_multi_from_bytes_progressive(
     let t0 = Instant::now();
 
     let results: Vec<(usize, Result<Trace, String>)> = rank_named_bytes.into_par_iter()
-        .map(|(rank, name, bytes)| (rank, decode_ktz_named(&name, &bytes, counter, &t0)))
+        .map(|(rank, name, bytes)| (rank, decode_any_named(&name, bytes, counter, &t0)))
         .collect();
 
     let mut traces = Vec::new();
@@ -1092,8 +1186,16 @@ impl WasmParsePlan {
     pub fn prepare(name: &str, raw_input: Vec<u8>, counter: &Arc<AtomicUsize>) -> Prepared {
         let t0 = Instant::now();
         if !crate::ktz::is_ktz(&raw_input) {
+            // A direct JSON trace has no resumable decoder: its args offsets
+            // index the whole decompressed text, so the text must exist in
+            // full before any event can be assembled. Decode it in one
+            // prepare step (the same blocking shape as a .ktz header/frame
+            // decompression) and hand the finished trace straight back.
+            if crate::json_trace::is_gzip(&raw_input) || crate::json_trace::looks_like_json(&raw_input) {
+                return Prepared::Done(decode_any_named(name, raw_input, counter, &t0));
+            }
             return Prepared::Done(Err(format!(
-                "{name}: unsupported file type - only .ktz traces can be opened (transcode with `ktz c`)"
+                "{name}: unsupported file type - expected a .ktz trace or a Chrome/kineto JSON trace (.json, .json.gz)"
             )));
         }
         let dec = match KtzDecoder::new(&raw_input) {
@@ -1116,6 +1218,26 @@ impl WasmParsePlan {
             counter: counter.clone(),
             t0,
         }))
+    }
+
+    /// A plan that is born finished — a direct JSON rank, which `prepare`
+    /// decodes synchronously and has nothing left to step.
+    fn from_result(result: Result<Trace, String>, counter: &Arc<AtomicUsize>, t0: Instant) -> Self {
+        Self {
+            phase: PlanPhase::Done,
+            name: String::new(),
+            dec: None,
+            out: KtzTrace::with_events(0),
+            n_events: 0,
+            meta: Vec::new(),
+            args: Vec::new(),
+            scan: TraceScan::new(),
+            track_entries: Vec::new(),
+            keyed_tracks: Vec::new(),
+            result: Some(result),
+            counter: counter.clone(),
+            t0,
+        }
     }
 
     pub fn is_done(&self) -> bool {
@@ -1193,7 +1315,9 @@ impl WasmParsePlan {
         let args = std::mem::take(&mut self.args);
         let keyed_tracks = std::mem::take(&mut self.keyed_tracks);
         let meta = std::mem::take(&mut self.meta);
-        self.result = Some(finish_trace(&meta, args, scan, keyed_tracks, &self.t0));
+        self.result = Some(finish_trace(
+            Some(&meta), Arc::new(ArgsBuf(args)), scan, keyed_tracks, &self.t0,
+        ));
         self.phase = PlanPhase::Done;
         true
     }
@@ -1257,7 +1381,7 @@ impl WasmMultiParsePlan {
             match WasmParsePlan::prepare(&name, bytes, counter) {
                 Prepared::Plan(SteppedParse::Single(p)) => plans.push((rank, p)),
                 Prepared::Plan(SteppedParse::Multi(_)) => unreachable!("single prepare cannot return a multi plan"),
-                Prepared::Done(Ok(_)) => unreachable!("ktz-only prepare always steps"),
+                Prepared::Done(Ok(t)) => plans.push((rank, WasmParsePlan::from_result(Ok(t), counter, t0))),
                 Prepared::Done(Err(e)) => tlog!("  rank {rank}: {e}"),
             }
         }

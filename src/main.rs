@@ -31,6 +31,7 @@ mod editor_marks;
 mod diff;
 mod time;
 mod ktz;
+mod json_trace;
 // wasm: nothing in here is reachable (the Source tab is native-only), so
 // the types are dead code on that target.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -649,7 +650,7 @@ async fn file_from_entry(entry: &web_sys::FileSystemFileEntry) -> Option<web_sys
 
 /// Recursively walks a dropped `FileSystemEntry` (a file, or a folder that
 /// may itself contain rank files and/or subfolders), collecting (name,
-/// bytes) for every trace-like (.ktz) file found.
+/// bytes) for every trace-like (.ktz, .json, .json.gz) file found.
 /// Boxed because async fns can't recurse directly — the resulting future's
 /// size would depend on its own size.
 #[cfg(target_arch = "wasm32")]
@@ -660,7 +661,7 @@ fn walk_dropped_entry(entry: web_sys::FileSystemEntry) -> std::pin::Pin<Box<dyn 
             let file_entry: web_sys::FileSystemFileEntry = entry.unchecked_into();
             let Some(file) = file_from_entry(&file_entry).await else { return Vec::new() };
             let name = file.name();
-            if !crate::loader::is_trace_file(&name) { return Vec::new(); }
+            if !crate::loader::is_trace_file_by_name(&name) { return Vec::new(); }
             let Ok(buf) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await else { return Vec::new() };
             vec![(name, js_sys::Uint8Array::new(&buf).to_vec())]
         } else if entry.is_directory() {
@@ -813,7 +814,7 @@ impl ApplicationHandler for App {
                             }
                             for file in flat_files {
                                 let name = file.name();
-                                if !crate::loader::is_trace_file(&name) { continue; }
+                                if !crate::loader::is_trace_file_by_name(&name) { continue; }
                                 let Ok(buf) = wasm_bindgen_futures::JsFuture::from(file.array_buffer()).await else { continue };
                                 files.push((name, js_sys::Uint8Array::new(&buf).to_vec()));
                             }
@@ -1922,9 +1923,9 @@ impl App {
                         #[cfg(target_arch = "wasm32")]
                         let placeholder = self.pending_download_progress.borrow().as_ref()
                             .map(download_progress_text)
-                            .unwrap_or_else(|| "Drop a trace file here, or: tv <file.ktz>".to_string());
+                            .unwrap_or_else(|| "Drop a trace file here, or: tv <trace.ktz | trace.json.gz>".to_string());
                         #[cfg(not(target_arch = "wasm32"))]
-                        let placeholder = "Drop a trace file here, or: tv <file.ktz>".to_string();
+                        let placeholder = "Drop a trace file here, or: tv <trace.ktz | trace.json.gz>".to_string();
                         ui.text(&placeholder);
                     }
                     if let Some(e) = &pane.error {

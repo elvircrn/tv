@@ -41,12 +41,21 @@ raw-window-metal = "1"
 core-graphics-types = "0.2"
 # .ktz container's zstd frames (the real C library via zstd-sys).
 zstd = "0.13"
+# Direct Chrome/kineto trace loading (loader.rs + json_trace.rs): gzip
+# decompression. libdeflater is the fast whole-buffer path for the common
+# .pt.trace.json.gz case; flate2 is the correctness fallback (multi-member
+# streams, odd trailers) and the wasm path.
+flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
+libdeflater = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Plain imgui-sys (stb_truetype rasterizer, no freetype) — freetype needs a
 # C toolchain/sysroot for the target, and wasm doesn't read the SF Mono font
 # from disk anyway (see renderer_web.rs: DefaultFontData).
 imgui-sys = "0.12"
+# gzip for dropped/picked .json.gz traces. Pure-Rust backend so the browser
+# build needs no C toolchain (native uses libdeflater + zlib-ng instead).
+flate2 = { version = "1", features = ["rust_backend"], default-features = false }
 # Decode-only counterpart to native's `zstd` (which wraps the real C library
 # via zstd-sys — needs a C toolchain to cross-compile to wasm32, unlike this).
 # The web build only ever needs to *read* .ktz zstd frames, and a pure-Rust

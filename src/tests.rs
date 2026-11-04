@@ -996,17 +996,86 @@ fn test_load_trace_no_events() {
 }
 
 #[test]
-fn test_load_trace_rejects_non_ktz() {
+fn test_load_trace_rejects_unknown_format() {
     let dir = std::env::temp_dir().join("tv_test_nonktz");
     let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("trace.json");
-    std::fs::write(&path, "{\"traceEvents\": []}").unwrap();
+    let path = dir.join("trace.txt");
+    std::fs::write(&path, "not a trace").unwrap();
 
     let err = match load_trace(path.to_str().unwrap(), &test_counter()) {
         Err(e) => e,
-        Ok(_) => panic!("a non-ktz file must not load"),
+        Ok(_) => panic!("a non-trace file must not load"),
     };
-    assert!(err.contains("only .ktz"), "unexpected error: {err}");
+    assert!(err.contains("unsupported file type"), "unexpected error: {err}");
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A minimal Chrome/kineto trace with the shapes the loader treats
+/// specially: an X event with args, a kernel X event, an M thread_name, an
+/// s/f flow pair, and all three metadata keys finish_trace scans for.
+const JSON_TRACE: &str = r#"{
+"traceEvents": [
+{"ph":"M","pid":1,"tid":1,"name":"thread_name","args":{"name":"Worker 1"}},
+{"ph":"X","pid":1,"tid":1,"name":"matmul","cat":"cpu_op","ts":100.0,"dur":50.0,"args":{"op":"mm"}},
+{"ph":"X","pid":2,"tid":2,"name":"kern_a","cat":"kernel","ts":100.0,"dur":80.0},
+{"ph":"s","id":7,"pid":1,"tid":1,"ts":110.0},
+{"ph":"f","id":7,"pid":2,"tid":2,"ts":120.0}
+],
+"deviceProperties": [{"name": "NVIDIA A100-SXM4-80GB"}],
+"vllm_version": "0.26.1rc1.dev528+gf8d03e774",
+"distributedInfo": {"rank": 3, "world_size": 8}
+}"#;
+
+fn assert_json_trace(trace: &Trace) {
+    assert_eq!(trace.total_events, 2);
+    assert_eq!(trace.device, "NVIDIA A100-SXM4-80GB");
+    assert_eq!(trace.vllm_version, "0.26.1rc1.dev528+gf8d03e774");
+    assert_eq!((trace.dist_rank, trace.dist_world), (3, 8));
+
+    let gpu = trace.tracks.iter().find(|t| t.label == "GPU 2").expect("kernel track");
+    assert!(gpu.gpu);
+    assert_eq!(gpu.events.len(), 1);
+    let cpu = trace.tracks.iter().find(|t| t.label == "Worker 1").expect("named CPU track");
+    assert!(!cpu.gpu);
+    assert_eq!(cpu.events.len(), 1);
+
+    let ev = &cpu.events[0];
+    assert_eq!(trace.names[ev.name as usize], "matmul");
+    assert_eq!(trace.cats[ev.cat as usize], "cpu_op");
+    let raw = &trace.raw_bufs[cpu.raw_buf_idx as usize];
+    let args = &raw[ev.args_off as usize..(ev.args_off + ev.args_len as u32) as usize];
+    assert_eq!(std::str::from_utf8(args).unwrap(), r#"{"op":"mm"}"#);
+
+    // The s/f pair links the CPU event's span to the GPU one, both ways.
+    assert_eq!(trace.flow_pairs.len(), 2);
+}
+
+#[test]
+fn test_load_json_trace() {
+    let dir = std::env::temp_dir().join("tv_test_json");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("rank0.1793789232773663817.pt.trace.json");
+    std::fs::write(&path, JSON_TRACE).unwrap();
+
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
+    assert_json_trace(&trace);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn test_load_json_gz_trace() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join("tv_test_json_gz");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("rank0.1793789232773663817.pt.trace.json.gz");
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(JSON_TRACE.as_bytes()).unwrap();
+    std::fs::write(&path, enc.finish().unwrap()).unwrap();
+
+    let trace = load_trace(path.to_str().unwrap(), &test_counter()).unwrap();
+    assert_json_trace(&trace);
 
     std::fs::remove_file(&path).ok();
 }
@@ -1972,10 +2041,44 @@ fn test_detect_rank_groups_isolates_directories() {
 fn test_is_trace_file() {
     assert!(crate::loader::is_trace_file("foo.pt.trace.json.ktz"));
     assert!(crate::loader::is_trace_file("foo.ktz"));
-    assert!(!crate::loader::is_trace_file("foo.json"));
-    assert!(!crate::loader::is_trace_file("foo.json.gz"));
+    assert!(crate::loader::is_trace_file("foo.json"));
+    assert!(crate::loader::is_trace_file("foo.pt.trace.json.gz"));
     assert!(!crate::loader::is_trace_file("foo.txt"));
     assert!(!crate::loader::is_trace_file("foo.csv"));
+    assert!(!crate::loader::is_trace_file("foo.tar.gz"));
+}
+
+#[test]
+fn test_detect_rank_groups_expands_json_gz_directory() {
+    // A profile folder full of raw torch traces: the folder walk must pick
+    // up .pt.trace.json.gz files and group their ranks exactly like .ktz.
+    let base = std::env::temp_dir().join("tv_test_json_gz_dir");
+    let dir = base.join("vllm-qwen3-4b-0");
+    std::fs::create_dir_all(&dir).unwrap();
+    for ep in 0..2 {
+        std::fs::write(
+            dir.join(format!("dp0_pp0_tp0_dcp0_ep{ep}_rank0.123.pt.trace.json.gz")),
+            b"",
+        ).unwrap();
+    }
+    // A transcoded copy beside the raw file must replace it, not open as a
+    // duplicate rank.
+    std::fs::write(
+        dir.join("dp0_pp0_tp0_dcp0_ep0_rank0.123.pt.trace.json.gz.ktz"),
+        b"",
+    ).unwrap();
+
+    let (groups, standalone) = detect_rank_groups(&[dir.to_str().unwrap().to_string()]);
+    assert_eq!(groups.len(), 1, "the folder's rank files must form one group");
+    assert_eq!(groups[0].0.len(), 2);
+    assert!(standalone.is_empty());
+    let names: Vec<String> = groups[0].0.iter()
+        .map(|(_, p)| std::path::Path::new(p).file_name().unwrap().to_string_lossy().into())
+        .collect();
+    assert_eq!(names[0], "dp0_pp0_tp0_dcp0_ep0_rank0.123.pt.trace.json.gz.ktz");
+    assert_eq!(names[1], "dp0_pp0_tp0_dcp0_ep1_rank0.123.pt.trace.json.gz");
+
+    std::fs::remove_dir_all(&base).ok();
 }
 
 // --- merge_traces ---
