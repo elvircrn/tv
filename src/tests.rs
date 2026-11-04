@@ -7214,3 +7214,58 @@ fn test_src_popup_id_scope() {
     assert!(shown_at_base, "base-scope open shows the picker");
 }
 
+
+/// A prebuilt trtllm-gen cubin has no body in the checkout, so even with a
+/// launch correlation the jump must not claim the launch frame is the
+/// kernel: the answer is the family explanation (where the launcher and the
+/// real source live), not an open.
+#[test]
+fn test_prebuilt_cubin_reports_family_not_launch_frame() {
+    let root = std::env::temp_dir().join("tv_cubin_family_test");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("vllm")).unwrap();
+    std::fs::write(root.join("vllm/model_runner.py"), "def execute():\n    pass\n").unwrap();
+
+    let mut buf = vec![0u8];
+    let mut add = |s: &str| { let off = buf.len() as u32; buf.extend_from_slice(s.as_bytes()); off };
+    let corr_args = add("{\"correlation\":\"9\"}");
+    let raw = Arc::new(ArgsBuf(buf));
+    let names: Vec<String> = [
+        "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1VarSeqQ64Kv128PersistentKeepsAbForGen",
+        "cuLaunchKernel", "vllm/model_runner.py(1): execute",
+    ].iter().map(|s| s.to_string()).collect();
+    let cats: Vec<String> = ["kernel", "cuda_driver", "python_function"]
+        .iter().map(|s| s.to_string()).collect();
+    let ev = |ts: f64, dur: f64, name: u32, cat: u32, off: u32| Event {
+        ts, dur, name, cat, args_off: off, args_len: 0, depth: 0 };
+    let mk = |label: &str, gpu: bool, events: Vec<Event>| Track {
+        label: label.to_string(), gpu, events, max_depth: 1,
+        prefix_max_dur: vec![1.0], raw_buf_idx: 0 };
+    let trace = Trace {
+        tracks: vec![
+            mk("stream 19", true, vec![ev(100.0, 10.0, 0, 0, corr_args)]),
+            mk("thread 19", false, vec![
+                ev(90.0, 30.0, 2, 2, 0),           // enclosing python frame
+                ev(95.0, 5.0, 1, 1, corr_args),    // cuLaunchKernel
+            ]),
+        ],
+        names, cats, raw_bufs: vec![raw], stats: Vec::new(),
+        max_ts: 210.0, min_ts: 0.0, total_events: 3,
+        device: String::new(), vllm_version: String::new(), dist_rank: 0, dist_world: 0,
+        flow_pairs: Vec::new(), rank_paths: Vec::new(),
+    };
+
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    let mut idx = Some(Box::new(crate::source::SourceIndex::new(root.clone())));
+    let (act, _) = crate::resolve_event_source(
+        &mut idx, &pane, crate::types::EventRef { track_idx: 0, event_idx: 0 });
+    match act {
+        crate::SrcAction::Error(e) => {
+            assert!(e.contains("trtllm-gen"), "explains the cubin family: {e}");
+        }
+        _ => panic!("expected the family explanation, not a jump"),
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
