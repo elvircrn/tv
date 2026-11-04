@@ -6620,6 +6620,19 @@ fn test_is_torch_internal() {
     assert!(!is_torch_internal("vllm::unified_attention_with_output"));
 }
 
+/// The trtllm-gen FMHA symbol from a 0936 trace: a prebuilt cubin, so the
+/// no-hit path must explain the family instead of reporting a generic miss.
+#[test]
+fn test_external_kernel_family() {
+    use crate::source::external_kernel_family;
+    assert!(external_kernel_family(
+        "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1VarSeqQ64Kv128PersistentKeepsAbForGen").is_some());
+    assert!(external_kernel_family(
+        "fmhaSm100aKernel_QE4m3KvE2m1OE4m3H128PagedKvCausalP32VarSeqQ128Kv128PersistentContext").is_some());
+    assert!(external_kernel_family("vllm::unified_attention_with_output").is_none());
+    assert!(external_kernel_family("mhc_pre_big_fuse_with_norm_tilelang_kernel").is_none());
+}
+
 #[test]
 fn test_open_in_editor_missing_binary() {
     // A bogus editor must produce a readable error naming the command,

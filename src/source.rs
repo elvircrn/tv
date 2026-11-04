@@ -358,6 +358,28 @@ pub fn is_torch_internal(name: &str) -> bool {
         || n.starts_with("cub::") || n.starts_with("cutlass")
 }
 
+/// Kernel families the checkout *launches* but never contains: the trace
+/// symbol is the name of a prebuilt cubin registered by a dependency, so no
+/// amount of scanning finds it. `Some(explanation to show)` when `name`
+/// belongs to one; `None` otherwise.
+///
+/// The motivating case is the TRT-LLM trtllm-gen FMHA cubins
+/// (`fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDense...`): flashinfer ships
+/// the cubin (flashinfer-cubin) and the launcher that selects it
+/// (`csrc/trtllm_fmha_kernel_launcher.cu`), while the kernel body is generated
+/// upstream in NVIDIA TensorRT-LLM. Grepping the checkout can only ever miss,
+/// so the miss should say why instead of looking like a resolver bug.
+pub fn external_kernel_family(name: &str) -> Option<&'static str> {
+    let n = name.trim();
+    if n.starts_with("fmhaSm") && n.contains("Kernel_") {
+        return Some(
+            "a prebuilt trtllm-gen FMHA cubin - flashinfer ships the cubin \
+             and its launcher (csrc/trtllm_fmha_kernel_launcher.cu), the kernel \
+             source is in TensorRT-LLM");
+    }
+    None
+}
+
 /// The build commit a trace was built from, per its `vllm_version`, when
 /// the string actually carries one. That's setuptools-scm's `+g<hex>`
 /// (`0.26.1rc1.dev528+g1a2b3c4d5e6f`) — and ONLY that: a local tag like

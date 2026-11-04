@@ -3284,8 +3284,11 @@ fn resolve_event_source(
         idx.resolve_kernel(name)
     };
     let act = match hits.len() {
-        0 => SrcAction::Error(format!(
-            "no source found for `{}` in the checkout (aten/CUB/CUTLASS kernels live outside vllm)", name)),
+        0 => SrcAction::Error(match source::external_kernel_family(name) {
+            Some(why) => format!("`{}` is {}", name, why),
+            None => format!(
+                "no source found for `{}` in the checkout (aten/CUB/CUTLASS kernels live outside vllm)", name),
+        }),
         1 => SrcAction::Open(hits.into_iter().next().unwrap()),
         _ => SrcAction::List(hits),
     };
