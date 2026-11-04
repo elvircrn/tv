@@ -6727,6 +6727,40 @@ fn test_dev_inference_helpers() {
 }
 
 #[test]
+fn test_parse_dep_pins() {
+    use crate::source::parse_dep_pins;
+    let dir = std::env::temp_dir().join("tv_pin_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Both conventions: ${VAR} refs resolved through set() lines, and
+    // direct bare-word arguments.
+    std::fs::write(dir.join("deepgemm.cmake"), r#"
+      set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/vllm-project/DeepGEMM.git")
+      set(_DEEPGEMM_UPSTREAM_TAG "5cdb145704ec4672ecf4b61441599521ce635df6")
+      FetchContent_Populate(deepgemm
+        GIT_REPOSITORY "${_DEEPGEMM_UPSTREAM_REPO}"
+        GIT_TAG "${_DEEPGEMM_UPSTREAM_TAG}")
+    "#).unwrap();
+    std::fs::write(dir.join("flashmla.cmake"), r#"
+      FetchContent_Declare(flashmla
+        GIT_REPOSITORY https://github.com/vllm-project/FlashMLA
+        GIT_TAG 847ef308bb7a6828c8117301f5a5a84a095a90e8)
+    "#).unwrap();
+    // No git pin (tarball download): contributes nothing.
+    std::fs::write(dir.join("triton_kernels.cmake"), r#"
+      set(TRITON_KERNELS_URL "https://github.com/triton-lang/tar.gz/v3.5.1")
+    "#).unwrap();
+    let pins = parse_dep_pins(&dir);
+    assert_eq!(pins.len(), 2, "{pins:?}");
+    assert_eq!(pins[0].name, "deepgemm");
+    assert_eq!(pins[0].url, "https://github.com/vllm-project/DeepGEMM.git");
+    assert_eq!(pins[0].tag, "5cdb145704ec4672ecf4b61441599521ce635df6");
+    assert_eq!(pins[1].name, "flashmla");
+    assert_eq!(pins[1].url, "https://github.com/vllm-project/FlashMLA");
+    assert_eq!(pins[1].tag, "847ef308bb7a6828c8117301f5a5a84a095a90e8");
+}
+
+#[test]
 fn test_encode_uri_path() {
     use crate::source::encode_uri_path;
     assert_eq!(encode_uri_path("/Users/x/vllm/a.py"), "/Users/x/vllm/a.py");
@@ -6788,4 +6822,25 @@ fn infer_dev_build_real() {
     assert!(desc.contains("-573-g"), "describe must carry the distance: {desc}");
     assert!(wt.join("vllm").is_dir());
     assert_eq!(wt, std::path::Path::new("/tmp/vllm-40941f2c4b"));
+}
+
+/// The CMake-pinned deps land in <worktree>/deps/ and the scanner resolves
+/// kernels that live outside the vllm tree — the 0936 traces' mega-moe
+/// deep_gemm kernel being the motivating case.
+#[test]
+#[ignore]
+fn dep_resolution_real() {
+    if std::env::var("TV_NET").map(|v| v != "1").unwrap_or(true) { return; }
+    let (wt, _) = crate::source::materialize_build(
+        &crate::source::BuildRef::Commit("40941f2c4b".into()))
+        .expect("materialize failed");
+    assert!(wt.join("deps/deepgemm/deep_gemm/include").is_dir(),
+        "pinned deep_gemm must be fetched into deps/");
+    let mut idx = crate::source::SourceIndex::new(wt.clone());
+    // The trace's demangled name, trimmed to what kernel_base_name sees.
+    let hits = idx.resolve_kernel(
+        "void deep_gemm::sm100_fp8_fp4_mega_moe_impl<9600u, 5120u, 2304u>(void*, int*)");
+    assert!(!hits.is_empty(), "deep_gemm mega-moe kernel must resolve in deps/deepgemm");
+    assert!(hits.iter().all(|h| h.rel.starts_with("deps/deepgemm/")),
+        "hits must point into the dep checkout: {:?}", hits.iter().map(|h| &h.rel).take(3).collect::<Vec<_>>());
 }

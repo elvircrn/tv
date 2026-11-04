@@ -479,32 +479,44 @@ const BUILD_REMOTES: [&str; 2] = [
     "https://github.com/vllm-project/vllm",
 ];
 
+/// Resolve a commit prefix against one repo via the GitHub API: full sha
+/// on success. Also doubles as the existence check — a nightly pipeline
+/// stamp (`+llmd.cfee12e...`) 404s in every repo, and that's how tv tells
+/// "real commit" from "stamp that matches no repo".
+fn api_resolve_sha(repo_slug: &str, hex: &str) -> Result<String, String> {
+    let url = format!("https://api.github.com/repos/{repo_slug}/commits/{hex}");
+    let out = std::process::Command::new("curl")
+        .args(["-s", "-m", "15", &url])
+        .output()
+        .map_err(|e| format!("couldn't run curl: {e}"))?;
+    let body = String::from_utf8_lossy(&out.stdout).into_owned();
+    if let Some(full) = extract_json_string(&body, "sha") {
+        if full.len() == 40 && full.starts_with(hex) {
+            return Ok(full);
+        }
+        return Err(format!("{hex} not found in {repo_slug}"));
+    }
+    if body.contains("No commit found") {
+        return Err(format!("{hex} is not a commit in {repo_slug}"));
+    }
+    if body.contains("rate limit") {
+        return Err("github api rate limited - try again in a minute".into());
+    }
+    Err(format!("couldn't resolve {hex} in {repo_slug} via the github api (network?)"))
+}
+
 /// Resolve an abbreviated commit sha to its full form plus the remote that
 /// has it. GitHub's fetch protocol only accepts full shas, but the REST API
-/// resolves prefixes — which also doubles as the existence check: a nightly
-/// pipeline stamp (`+llmd.cfee12e...`) 404s in every repo, and that's how
-/// tv tells "real commit" from "stamp that matches no repo".
+/// resolves prefixes.
 fn resolve_full_sha(hex: &str) -> Result<(String, &'static str), String> {
     let mut not_found = false;
     for remote in BUILD_REMOTES {
         let repo = remote.trim_start_matches("https://github.com/");
-        let url = format!("https://api.github.com/repos/{repo}/commits/{hex}");
-        let out = std::process::Command::new("curl")
-            .args(["-s", "-m", "15", &url])
-            .output()
-            .map_err(|e| format!("couldn't run curl: {e}"))?;
-        let body = String::from_utf8_lossy(&out.stdout).into_owned();
-        if let Some(full) = extract_json_string(&body, "sha") {
-            if full.len() == 40 && full.starts_with(hex) {
-                return Ok((full, remote));
-            }
-            continue;
+        match api_resolve_sha(repo, hex) {
+            Ok(full) => return Ok((full, remote)),
+            Err(e) if e.contains("is not a commit") => { not_found = true; }
+            Err(_) => {} // Network error / garbage: try the next remote.
         }
-        if body.contains("No commit found") { not_found = true; continue; }
-        if body.contains("rate limit") {
-            return Err("github api rate limited - try again in a minute or set a checkout manually".into());
-        }
-        // Network error / garbage: try the next remote, remember nothing.
     }
     if not_found {
         return Err(format!(
@@ -593,10 +605,12 @@ fn infer_dev_commit(cache: &Path, base: &str, dist: usize) -> Result<String, Str
 /// Materialize the exact tree a trace was built from, as cheaply as the
 /// network allows: a blobless depth-1 fetch (commit + trees only, no file
 /// contents) into a persistent object cache (`~/.cache/tv/vllm.git`), then
-/// a sparse worktree at `/tmp/vllm-<short>` holding only `vllm/` and
-/// `csrc/` — the two trees source resolution scans — so the lazy blob
-/// fetch during checkout downloads just those, not docs/, tests/, or
-/// examples/. Returns the worktree path plus its `git describe` (the full
+/// a sparse worktree at `/tmp/vllm-<short>` holding only `vllm/`, `csrc/`
+/// and `cmake/` — the trees source resolution scans, plus where the
+/// dependency pins live — so the lazy blob fetch during checkout downloads
+/// just those, not docs/, tests/, or examples/. The CMake-pinned deps
+/// (deep_gemm and friends) are fetched into `<worktree>/deps/` alongside.
+/// Returns the worktree path plus its `git describe` (the full
 /// sha when tags weren't fetched, which still contains the abbreviated
 /// hex, so the drift check passes). Reuses an existing worktree for the
 /// same ref. Network: one api call (commits only, and only when the cache
@@ -655,15 +669,22 @@ pub fn materialize_build(build: &BuildRef) -> Result<(PathBuf, String), String> 
         git(Some(&cache), &["worktree", "prune"])?;
         git(Some(&cache), &["worktree", "add", "--no-checkout",
             &wt.to_string_lossy(), &checkout_ref])?;
-        // Sparse: only the trees resolution scans. If the local git is too
-        // old for `sparse-checkout`, fall back to a full checkout (more
-        // blobs, same correctness).
-        if git(Some(&wt), &["sparse-checkout", "set", "vllm", "csrc"]).is_ok() {
+        // Sparse: only the trees resolution scans (plus cmake/, where the
+        // dependency pins live). If the local git is too old for
+        // `sparse-checkout`, fall back to a full checkout (more blobs,
+        // same correctness).
+        if git(Some(&wt), &["sparse-checkout", "set", "vllm", "csrc", "cmake"]).is_ok() {
             git(Some(&wt), &["reset", "--hard"])?;
         } else {
             git(Some(&wt), &["checkout", "--detach", &checkout_ref])?;
         }
     }
+    // The CMake-pinned deps (deep_gemm, DeepSelect, FlashMLA,
+    // flash-attention, ...) land in <wt>/deps/, where the scanner walks
+    // them like any other source: kernels outside the vllm tree resolve
+    // against the exact pinned source the binary was built with.
+    // Best-effort — a failed dep never fails the build.
+    materialize_deps(&wt);
     // --abbrev=40 so a sha fallback is the full commit: the drift check
     // compares the version string's 12-18 char hex against this, and a
     // 7-char abbreviation can't contain it.
@@ -694,6 +715,148 @@ fn fetch_tag(cache: &Path, tag: &str) -> Result<(), String> {
         }
     }
     Err(format!("tag {tag} not found in any remote ({last})"))
+}
+
+// ================================================== cmake-pinned dependencies
+
+/// A dependency vLLM pins via CMake FetchContent, parsed out of
+/// `cmake/external_projects/*.cmake`: deep_gemm, DeepSelect, FlashMLA,
+/// flash-attention, ... Their kernels show up in traces under their own
+/// namespaces (`deep_gemm::sm100_fp8_fp4_mega_moe_impl<...>`) and resolve
+/// nowhere in the vllm tree, because vllm pins them at build time rather
+/// than vendoring them.
+#[derive(Debug)]
+pub struct DepPin {
+    /// Directory name under `<worktree>/deps/` (the cmake file's stem).
+    pub name: String,
+    /// Clone URL, always github so far.
+    pub url: String,
+    /// Pinned ref: a full sha in every pin seen, but tags work too.
+    pub tag: String,
+}
+
+/// The value token after a cmake keyword: `"quoted"` (possibly
+/// `"${VAR}"`) or bare up to whitespace/`)`.
+fn cmake_token(s: &str) -> Option<&str> {
+    let s = s.trim_start();
+    if let Some(rest) = s.strip_prefix('"') {
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    } else {
+        let end = s.find(|c: char| c.is_whitespace() || c == ')').unwrap_or(s.len());
+        Some(&s[..end])
+    }
+}
+
+/// Parse the FetchContent pins out of `cmake/external_projects/*.cmake`.
+/// Two conventions in the wild, sometimes both in one file: direct
+/// `GIT_REPOSITORY <url>` / `GIT_TAG <ref>` arguments, and
+/// `set(_X_UPSTREAM_REPO "...")` variables referenced from them as
+/// `"${_X_UPSTREAM_REPO}"`. Files with no git pin (tarball downloads,
+/// e.g. triton_kernels) contribute nothing. Repo is paired with the first
+/// GIT_TAG following it.
+pub(crate) fn parse_dep_pins(dir: &Path) -> Vec<DepPin> {
+    let mut out: Vec<DepPin> = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return out };
+    let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "cmake"))
+        .collect();
+    files.sort();
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(&f) else { continue };
+        // set(VAR "value") lines, for ${VAR} references.
+        let mut vars = HashMap::new();
+        for line in text.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("set(") else { continue };
+            let Some((k, v)) = rest.split_once(|c: char| c.is_whitespace() || c == '(') else { continue };
+            if let Some(v) = cmake_token(v) {
+                vars.insert(k.trim().to_string(), v.to_string());
+            }
+        }
+        let resolve = |tok: &str| -> String {
+            tok.strip_prefix("${").and_then(|r| r.strip_suffix('}'))
+                .and_then(|name| vars.get(name).cloned())
+                .unwrap_or_else(|| tok.to_string())
+        };
+        // (byte position, value) so each repo pairs with the next tag.
+        let mut repos: Vec<(usize, String)> = Vec::new();
+        let mut tags: Vec<(usize, String)> = Vec::new();
+        for (pos, _) in text.match_indices("GIT_REPOSITORY") {
+            if let Some(v) = cmake_token(&text[pos + "GIT_REPOSITORY".len()..]) {
+                repos.push((pos, resolve(v)));
+            }
+        }
+        for (pos, _) in text.match_indices("GIT_TAG") {
+            if let Some(v) = cmake_token(&text[pos + "GIT_TAG".len()..]) {
+                tags.push((pos, resolve(v)));
+            }
+        }
+        let Some(name) = f.file_stem().map(|s| s.to_string_lossy().into_owned()) else { continue };
+        for (rpos, url) in repos {
+            if !url.starts_with("https://github.com/") { continue; }
+            let Some(tag) = tags.iter().find(|(tpos, _)| *tpos > rpos).map(|(_, t)| t.clone()) else { continue };
+            if tag.is_empty() || out.iter().any(|p| p.url == url && p.tag == tag) { continue; }
+            out.push(DepPin { name: name.clone(), url, tag });
+        }
+    }
+    out
+}
+
+/// Fetch the CMake-pinned dependencies into `<worktree>/deps/<name>`,
+/// where the source scanner walks them like any other tree — kernels
+/// that live outside vllm (`deep_gemm::...`, flash-attention, ...)
+/// resolve to the exact pinned source the binary was built against.
+/// Each dep is its own shallow blobless repo at the pin; dep failures
+/// are logged and skipped, since a missing dep costs a few unresolvable
+/// kernels, not the whole build. Parallel: they're independent network
+/// fetches. Returns the pin count (fetched or already present).
+fn materialize_deps(wt: &Path) -> usize {
+    // The pins live under cmake/, which the sparse checkout must include
+    // (a no-op re-set when it already does).
+    let _ = git(Some(wt), &["sparse-checkout", "set", "vllm", "csrc", "cmake"]);
+    let pins = parse_dep_pins(&wt.join("cmake/external_projects"));
+    let deps = wt.join("deps");
+    if std::fs::create_dir_all(&deps).is_err() { return 0; }
+    std::thread::scope(|s| {
+        for pin in &pins {
+            s.spawn(|| {
+                let dir = deps.join(&pin.name);
+                // Already at the pin? (Pin is usually a full sha; accept a
+                // prefix so abbreviated pins reuse too.)
+                let at_pin = git(Some(&dir), &["rev-parse", "HEAD"])
+                    .is_ok_and(|h| h == pin.tag || h.starts_with(&pin.tag));
+                if at_pin { return; }
+                let _ = std::fs::remove_dir_all(&dir);
+                if let Err(e) = fetch_dep(&dir, pin) {
+                    crate::tlog!("dep {}: {e}", pin.name);
+                }
+            });
+        }
+    });
+    pins.len()
+}
+
+/// One dep: fresh shallow repo at the pin. The pin is a full sha in
+/// every vllm pin seen, which fetches directly; abbreviated shas go
+/// through the API, tag names through the tag refspec.
+fn fetch_dep(dir: &Path, pin: &DepPin) -> Result<(), String> {
+    let dir_s = dir.to_string_lossy().into_owned();
+    git(None, &["init", "-q", &dir_s])?;
+    git(Some(dir), &["remote", "add", "origin", &pin.url])?;
+    let fetch = |r: &str| git(Some(dir), &["fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", r]);
+    if fetch(&pin.tag).is_err() {
+        let hexish = pin.tag.len() >= 7 && pin.tag.chars().all(|c| c.is_ascii_hexdigit());
+        if hexish {
+            let slug = pin.url.trim_start_matches("https://github.com/").trim_end_matches(".git");
+            fetch(&api_resolve_sha(slug, &pin.tag)?)?;
+        } else {
+            let spec = format!("refs/tags/{0}:refs/tags/{0}", pin.tag);
+            git(Some(dir), &["fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", &spec])?;
+        }
+    }
+    // checkout triggers the promisor's lazy blob fetch for the files.
+    git(Some(dir), &["checkout", "-q", "--detach", "FETCH_HEAD"]).map(|_| ())
 }
 
 /// The machine's default vLLM checkout, if one exists: `~/vllm` that looks
