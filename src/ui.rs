@@ -3222,7 +3222,7 @@ pub fn draw_lock_icon(dl: &imgui::DrawListMut, cx: f32, cy: f32, fit: bool) {
 /// Editors the toolbar's picker offers a one-click row for. Each has launch
 /// arguments wired in `source::open_in_editor`; anything else can still be
 /// typed as a custom command.
-pub const KNOWN_EDITORS: [&str; 3] = ["gram", "code", "zed"];
+pub const KNOWN_EDITORS: [&str; 4] = ["gram", "code", "zed", "clion"];
 
 /// Display name for a known editor CLI (the picker's row labels). A custom
 /// command is shown verbatim, which is also what the toolbar button shows.
@@ -3232,6 +3232,7 @@ pub fn editor_label(editor: &str) -> &str {
         "code" | "vscode" => "VS Code",
         "cursor" => "Cursor",
         "zed" => "Zed",
+        "clion" => "CLion",
         "" => "Editor",
         other => other,
     }
@@ -3245,26 +3246,34 @@ pub fn draw_editor_icon(dl: &imgui::DrawListMut, editor: &str, x: f32, y: f32, s
     // Normalized (0..1) box helper: call sites below are written in unit
     // coordinates so the marks scale with the menu font.
     let p = |u: f32, v: f32| [x + u * size, y + v * size];
+    let disc = |c: [f32; 2], r: f32, col: ImColor32, segs: i32| {
+        dl.add_circle(c, r * size, col).filled(true).num_segments(segs as u32).build();
+    };
     match editor {
         "gram" => {
-            // Gram's app icon: pale-green rounded tile holding a darker
-            // frog head (two eyes) over a pale circular belly.
-            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(176, 208, 156, 255))
+            // Gram's app icon: a pale-green tile around a rounded frog
+            // head, with a big pale belly. The eyes are solid dark discs -
+            // the brand icon's white sclera is sub-pixel at 16 px - with a
+            // single light glint each, which still reads as an eye.
+            let head = col32(108, 156, 108, 255);
+            let ink = col32(40, 52, 38, 255);
+            let glint = col32(242, 249, 230, 255);
+            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(203, 227, 176, 255))
                 .filled(true).rounding(size * 0.24).build();
-            dl.add_rect(p(0.14, 0.14), p(0.86, 0.86), col32(122, 160, 99, 255))
-                .filled(true).rounding(size * 0.18).build();
-            dl.add_circle(p(0.50, 0.63), size * 0.24, col32(205, 226, 188, 255))
-                .filled(true).num_segments(16).build();
-            dl.add_circle(p(0.34, 0.32), size * 0.075, col32(55, 65, 48, 255))
-                .filled(true).num_segments(8).build();
-            dl.add_circle(p(0.66, 0.32), size * 0.075, col32(55, 65, 48, 255))
-                .filled(true).num_segments(8).build();
+            dl.add_rect(p(0.145, 0.165), p(0.855, 0.845), head)
+                .filled(true).rounding(size * 0.22).build();
+            disc(p(0.50, 0.615), 0.225, col32(216, 236, 196, 255), 24);
+            for (ex, gx) in [(0.335f32, 0.305f32), (0.665, 0.635)] {
+                disc(p(ex, 0.31), 0.095, ink, 16);
+                disc(p(gx, 0.278), 0.036, glint, 8);
+            }
         }
         "code" | "vscode" => {
             // VS Code's blue folded-ribbon mark. The official 24x24 SVG
             // outline is concave (the V notch between the chevron's arms),
             // which ImGui's convex fill cannot draw, so the two halves are
-            // pre-triangulated below; the split also gives the fold its
+            // pre-triangulated below (ear-clipped from the SVG path, so the
+            // triangles tile it exactly); the split also gives the fold its
             // darker body / lighter chevron two-tone.
             const BODY: [[f32; 2]; 17] = [
                 [16.505, 0.500], [7.045, 9.130], [2.925, 6.002], [1.649, 6.059],
@@ -3273,10 +3282,10 @@ pub fn draw_editor_icon(dl: &imgui::DrawListMut, editor: &str, x: f32, y: f32, s
                 [16.506, 23.499], [18.210, 23.789], [18.004, 17.448], [10.826, 12.000],
                 [18.004, 6.552],
             ];
-            const BODY_TRIS: [[usize; 3]; 15] = [
+            const BODY_TRIS: [[usize; 3]; 14] = [
                 [0, 16, 15], [15, 14, 13], [15, 13, 12], [15, 12, 11], [0, 15, 11],
                 [0, 11, 10], [0, 10, 9], [0, 9, 8], [0, 8, 7], [0, 7, 6],
-                [6, 5, 4], [6, 4, 3], [6, 3, 2], [6, 2, 1], [6, 1, 0],
+                [6, 5, 4], [6, 4, 3], [6, 3, 2], [6, 2, 1],
             ];
             const CHEVRON: [[f32; 2]; 9] = [
                 [18.004, 6.552], [18.210, 0.210], [23.150, 2.587], [24.000, 3.939],
@@ -3289,7 +3298,14 @@ pub fn draw_editor_icon(dl: &imgui::DrawListMut, editor: &str, x: f32, y: f32, s
             let tri = |tris: &[[usize; 3]], pts: &[[f32; 2]], col: ImColor32| {
                 for t in tris {
                     let q = |i: usize| p(pts[i][0] / 24.0, pts[i][1] / 24.0);
-                    dl.add_triangle(q(t[0]), q(t[1]), q(t[2]), col).filled(true).build();
+                    let (a, b, c) = (q(t[0]), q(t[1]), q(t[2]));
+                    dl.add_triangle(a, b, c, col).filled(true).build();
+                    // Adjacent triangles each anti-alias their shared edge
+                    // to ~50%, which composites into a dark hairline across
+                    // the mark. Stroking every edge in the same colour makes
+                    // that pixel opaque; at 16 px it also adds a little
+                    // welcome weight to the thin ribbon.
+                    dl.add_polyline(vec![a, b, c, a], col).thickness(0.7).build();
                 }
             };
             tri(&BODY_TRIS, &BODY, col32(0, 101, 169, 255));
@@ -3310,14 +3326,48 @@ pub fn draw_editor_icon(dl: &imgui::DrawListMut, editor: &str, x: f32, y: f32, s
             }
         }
         "zed" => {
-            // Zed: dark tile with a bright Z.
+            // Zed: dark tile with its interlaced Z. The interlacing is
+            // sub-pixel at 16 px, so the mark is a bold two-tone Z with
+            // square ends: the bars are rects and the diagonal tucks under
+            // them, so the corners meet without notches.
             dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(30, 30, 33, 255))
                 .filled(true).rounding(size * 0.24).build();
-            let ink = col32(235, 235, 235, 255);
-            let t = size * 0.11;
-            dl.add_line(p(0.27, 0.28), p(0.73, 0.28), ink).thickness(t).build();
-            dl.add_line(p(0.73, 0.30), p(0.27, 0.70), ink).thickness(t).build();
-            dl.add_line(p(0.27, 0.72), p(0.73, 0.72), ink).thickness(t).build();
+            dl.add_line(p(0.70, 0.30), p(0.30, 0.70), col32(226, 226, 226, 255))
+                .thickness(size * 0.115).build();
+            dl.add_rect(p(0.26, 0.245), p(0.74, 0.355), col32(244, 244, 244, 255))
+                .filled(true).build();
+            dl.add_rect(p(0.26, 0.645), p(0.74, 0.755), col32(211, 211, 211, 255))
+                .filled(true).build();
+        }
+        "clion" => {
+            // CLion: JetBrains' pinwheel tile (blue/pink/green wedges)
+            // behind the black product square with a white "CL" and the
+            // JetBrains bar. The wedges are inset so their sharp corners
+            // stay inside the rounded tile.
+            let ink = col32(0, 0, 0, 255);
+            let white = col32(255, 255, 255, 255);
+            let i = 0.07;
+            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(18, 18, 20, 255))
+                .filled(true).rounding(size * 0.22).build();
+            let wedges = [
+                ([[i, 0.52], [i, i], [0.52, i]], col32(0, 154, 229, 255)),
+                ([[0.48, i], [1.0 - i, i], [1.0 - i, 0.48]], col32(255, 49, 140, 255)),
+                ([[1.0 - i, 0.52], [1.0 - i, 1.0 - i], [0.52, 1.0 - i]], col32(0, 217, 128, 255)),
+                ([[1.0 - i, 0.48], [0.48, 1.0 - i], [i, 1.0 - i]], col32(255, 49, 140, 255)),
+            ];
+            for (pts, col) in wedges {
+                dl.add_polyline(pts.iter().map(|&[u, v]| p(u, v)).collect::<Vec<_>>(), col)
+                    .filled(true).build();
+            }
+            dl.add_rect(p(0.16, 0.16), p(0.84, 0.84), ink).filled(true).build();
+            // "C": a solid disc with a rectangular bite out of its right
+            // side (the ring's hole is sub-pixel at this size).
+            disc(p(0.365, 0.395), 0.112, white, 20);
+            dl.add_rect(p(0.365, 0.325), p(0.505, 0.475), ink).filled(true).build();
+            // "L", then the JetBrains bar under the letters.
+            dl.add_rect(p(0.535, 0.275), p(0.605, 0.510), white).filled(true).build();
+            dl.add_rect(p(0.535, 0.445), p(0.735, 0.510), white).filled(true).build();
+            dl.add_rect(p(0.20, 0.60), p(0.50, 0.67), white).filled(true).build();
         }
         _ => {
             // Generic badge for any other editor command.
