@@ -367,6 +367,8 @@ impl App {
                 src_build: String::new(),
                 #[cfg(not(target_arch = "wasm32"))]
                 src_popup: None,
+                #[cfg(not(target_arch = "wasm32"))]
+                src_notice: None,
             },
             last_frame: Instant::now(),
             scale_factor: 1.0,
@@ -1523,7 +1525,8 @@ impl App {
                 if pi < state.panes.len() && state.panes[pi].has_trace() {
                     let (act, warn) = resolve_event_source(&mut state.src_idx, &state.panes[pi], r);
                     let pane = &mut state.panes[pi];
-                    apply_src_action(&mut state.src_popup, &mut pane.src_msg, &mut pane.src_hits,
+                    apply_src_action(&mut state.src_popup, &mut state.src_notice,
+                        &mut pane.src_msg, &mut pane.src_hits,
                         &state.src_editor, act, warn);
                 }
             }
@@ -2485,11 +2488,13 @@ impl App {
                         write!(state.buf.fmt, "{} | {} | {} events | {} tracks | {}", fname, ranks, t.total_events, t.tracks.len(), fmt_frame_dur(dt)).unwrap();
                     }
                     dl.add_text([win_pos[0] + 8.0, cy], col32(153, 153, 153, 255), &state.buf.fmt);
-                    // A source-jump outcome rides the status bar's left side —
-                    // the one feedback place for the right-click View Source
-                    // gesture: green where it landed, yellow when the
-                    // checkout drifts from the trace's build, red why it
-                    // didn't land at all.
+                    // A successful source jump (and its drift warning) rides
+                    // the status bar's left side: green where it landed,
+                    // yellow when the checkout drifts from the trace's
+                    // build. "Why it did not land" explanations are too long
+                    // for this row - they would overlap the version/device
+                    // text on the right - so those go to the dismissible
+                    // ##src_notice popup instead.
                     if let Some((note, e)) = &pane.src_msg {
                         let left_w = ui.calc_text_size(&state.buf.fmt)[0];
                         let msg = e.lines().next().unwrap_or(e);
@@ -2544,9 +2549,11 @@ impl App {
         mark!("status", t_section);
         // ---- Source cross-reference popups ----
         // No Source tab and no per-event button: the one gesture is
-        // right-click -> View Source, the one feedback place is the status
-        // bar. These popups exist only when a jump needs them (or the
-        // status-bar version text was clicked).
+        // right-click -> View Source. Successful jumps report in the
+        // status bar; everything a jump needs along the way (a checkout, a
+        // disambiguation list, or a paragraph explaining why it could not
+        // land) gets a popup here. These also exist when the status-bar
+        // version text is clicked.
         #[cfg(not(target_arch = "wasm32"))]
         {
             // Open any popup a jump requested at this scope — the one the
@@ -2554,6 +2561,7 @@ impl App {
             match state.src_popup.take() {
                 Some(SrcPopup::Setup) => ui.open_popup("##src_setup"),
                 Some(SrcPopup::Hits) => ui.open_popup("##src_hits"),
+                Some(SrcPopup::Message) => ui.open_popup("##src_notice"),
                 None => {}
             }
             ui.popup("##src_setup", || {
@@ -2669,6 +2677,34 @@ impl App {
                         Ok(()) => state.panes[ai].src_msg =
                             Some((SrcNote::Ok, format!("opened {}:{}", h.rel, h.line))),
                     }
+                }
+            });
+            // Why a jump could not land (prebuilt cubin, graph replay,
+            // torch op, ...): an explanation paragraph, not a status-bar
+            // fragment. Opened at the mouse so it appears where the
+            // right-click happened, auto-sized, and dismissible by the
+            // button or by clicking anywhere outside - the popup is not
+            // modal and never blocks the canvas.
+            ui.popup("##src_notice", || {
+                let Some((note, text)) = state.src_notice.clone() else {
+                    ui.close_current_popup();
+                    return;
+                };
+                let color = match note {
+                    SrcNote::Ok => [0.55, 0.78, 0.59, 1.0],
+                    SrcNote::Warn => [0.88, 0.72, 0.31, 1.0],
+                    SrcNote::Err => [0.86, 0.35, 0.35, 1.0],
+                };
+                let wrap_w = (display[0] - 80.0).clamp(240.0, 460.0);
+                {
+                    let _wrap = ui.push_text_wrap_pos_with_pos(wrap_w);
+                    let _col = ui.push_style_color(imgui::StyleColor::Text, color);
+                    ui.text_wrapped(&text);
+                }
+                ui.separator();
+                if ui.button("Dismiss") {
+                    state.src_notice = None;
+                    ui.close_current_popup();
                 }
             });
         }
@@ -2919,6 +2955,7 @@ impl App {
                                         let pane = &mut state.panes[ai];
                                         apply_src_action(
                                             &mut state.src_popup,
+                                            &mut state.src_notice,
                                             &mut pane.src_msg, &mut pane.src_hits,
                                             &state.src_editor, act, warn);
                                     }
@@ -3210,9 +3247,10 @@ impl App {
 /// linkage; `apply_src_action` turns it into UI effects.
 #[cfg(not(target_arch = "wasm32"))]
 enum SrcAction {
-    /// Surface this message in the Source tab's error line.
+    /// The jump failed and this explanation says why; `apply_src_action`
+    /// puts it in the dismissible `##src_notice` popup.
     Error(String),
-    /// No jump to make, but the status bar should explain why (e.g. the
+    /// No jump to make, but the popup should explain why (e.g. the
     /// kernel executes from a CUDA graph captured before profiling began).
     Note(String),
     /// Exactly one hit: launch the editor at it.
@@ -3524,17 +3562,18 @@ fn resolve_event_source(
 }
 
 /// Apply a resolution: open the editor, request the multi-hit picker
-/// popup, request the setup popup (no checkout yet), or park the outcome
-/// in `src_msg` for the status bar. `pending` is the frame's popup-open
-/// request slot rather than the `Ui`: this runs inside the kernel
-/// context-menu popup (or before any window exists), where an
-/// `open_popup` would hash an id the real popup's scope cannot match.
-/// Takes the affected Pane fields individually, not `&mut Pane` — the
-/// context-menu call site holds a shared borrow of the pane's trace
-/// across it.
+/// popup, request the setup popup (no checkout yet), show the dismissible
+/// "why it did not jump" popup, or park the outcome in `src_msg` for the
+/// status bar. `pending` is the frame's popup-open request slot rather
+/// than the `Ui`: this runs inside the kernel context-menu popup (or
+/// before any window exists), where an `open_popup` would hash an id the
+/// real popup's scope cannot match. Takes the affected Pane fields
+/// individually, not `&mut Pane` — the context-menu call site holds a
+/// shared borrow of the pane's trace across it.
 #[cfg(not(target_arch = "wasm32"))]
 fn apply_src_action(
     pending: &mut Option<SrcPopup>,
+    notice: &mut Option<(SrcNote, String)>,
     msg: &mut Option<(SrcNote, String)>,
     hits: &mut Vec<source::SourceHit>,
     editor: &str,
@@ -3542,10 +3581,22 @@ fn apply_src_action(
     warn: Option<String>,
 ) {
     match act {
-        SrcAction::Error(e) => *msg = Some((SrcNote::Err, e)),
-        SrcAction::Note(n) => *msg = Some((SrcNote::Warn, n)),
+        // Why-no-jump explanations are paragraphs: they get a popup the
+        // user can dismiss, not a status-bar line that overlaps the
+        // version/device text on the right.
+        SrcAction::Error(e) => {
+            *notice = Some((SrcNote::Err, e));
+            *pending = Some(SrcPopup::Message);
+        }
+        SrcAction::Note(n) => {
+            *notice = Some((SrcNote::Warn, n));
+            *pending = Some(SrcPopup::Message);
+        }
         SrcAction::Open(h) => match source::open_in_editor(editor, &h) {
-            Err(e) => *msg = Some((SrcNote::Err, e)),
+            Err(e) => {
+                *notice = Some((SrcNote::Err, e));
+                *pending = Some(SrcPopup::Message);
+            }
             // Where the jump landed, or the drift warning when the
             // checkout isn't the trace's build (the jump did happen).
             Ok(()) => *msg = Some(match warn {

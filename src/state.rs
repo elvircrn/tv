@@ -2197,6 +2197,14 @@ pub struct AppState {
     /// here and let that scope do the open.
     #[cfg(not(target_arch = "wasm32"))]
     pub src_popup: Option<SrcPopup>,
+    /// Why a source jump could not land (prebuilt cubin, CUDA graph
+    /// replay, ...). These explanations are paragraphs, so they get
+    /// their own dismissible popup instead of being crammed into the
+    /// status bar next to the trace's version and device. Kept here (not
+    /// on the Pane) because the popup outlives the action by several
+    /// frames, until the user dismisses it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub src_notice: Option<(SrcNote, String)>,
 }
 
 /// Which source cross-reference popup a jump wants opened; see
@@ -2206,6 +2214,9 @@ pub struct AppState {
 pub enum SrcPopup {
     Setup,
     Hits,
+    /// The dismissible "why this did not jump" popup; its text lives in
+    /// [`AppState::src_notice`].
+    Message,
 }
 
 /// One background exact-build clone, spawned by a View Source jump.

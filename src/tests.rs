@@ -154,6 +154,8 @@ fn make_state(trace: Trace) -> AppState {
         src_build: String::new(),
         #[cfg(not(target_arch = "wasm32"))]
         src_popup: None,
+        #[cfg(not(target_arch = "wasm32"))]
+        src_notice: None,
     }
 }
 
@@ -7167,19 +7169,41 @@ fn test_src_action_requests_popup() {
         line: 7, rel: "vllm/foo.cu".to_string(),
     };
     let mut pending = None;
+    let mut notice = None;
     let mut msg = None;
     let mut hits = Vec::new();
-    crate::apply_src_action(&mut pending, &mut msg, &mut hits, "true",
+    crate::apply_src_action(&mut pending, &mut notice, &mut msg, &mut hits, "true",
         crate::SrcAction::List(vec![hit]), None);
     assert_eq!(pending, Some(SrcPopup::Hits));
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].line, 7);
 
     let mut pending = None;
-    crate::apply_src_action(&mut pending, &mut msg, &mut hits, "true",
+    crate::apply_src_action(&mut pending, &mut notice, &mut msg, &mut hits, "true",
         crate::SrcAction::NeedCheckout, None);
     assert_eq!(pending, Some(SrcPopup::Setup));
     assert!(msg.is_none());
+
+    // A "why it did not jump" explanation is a paragraph: it requests the
+    // dismissible notice popup and stays out of the status bar, where it
+    // would overlap the version/device text.
+    let mut pending = None;
+    let mut notice = None;
+    let mut msg = None;
+    crate::apply_src_action(&mut pending, &mut notice, &mut msg, &mut hits, "true",
+        crate::SrcAction::Error("prebuilt cubin".into()), None);
+    assert_eq!(pending, Some(SrcPopup::Message));
+    assert!(msg.is_none());
+    assert_eq!(notice.as_ref().map(|(_, t)| t.as_str()), Some("prebuilt cubin"));
+
+    let mut pending = None;
+    let mut notice = None;
+    let mut msg = None;
+    crate::apply_src_action(&mut pending, &mut notice, &mut msg, &mut hits, "true",
+        crate::SrcAction::Note("graph replay".into()), None);
+    assert_eq!(pending, Some(SrcPopup::Message));
+    assert!(msg.is_none());
+    assert_eq!(notice.as_ref().map(|(_, t)| t.as_str()), Some("graph replay"));
 }
 
 /// The id-scope property the request slot exists for. Opening `##src_hits`
