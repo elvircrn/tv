@@ -3477,7 +3477,12 @@ fn resolve_event_source(
             return (SrcAction::Error(format!(
                 "no source linkage for `{}` ({} events carry none)", name, cat)), None);
         }
-        if source::is_torch_internal(name) {
+        // A CPU-side torch op has no launch to follow; its source really is
+        // in pytorch. A GPU kernel with an aten/CUB name is different:
+        // the kernel belongs to pytorch, but the launch site recorded in the
+        // trace names the vLLM/flashinfer line that issued it, which is the
+        // useful identification. Let those fall through to launch_link.
+        if source::is_torch_internal(name) && !(track.gpu || cat == "kernel") {
             return (SrcAction::Error(format!(
                 "`{}` is a torch op - its source lives in pytorch, not the vllm checkout", name)), None);
         }
@@ -3494,11 +3499,15 @@ fn resolve_event_source(
         "checkout {} is not the trace's build {} - line numbers may be off",
         git_desc.as_deref().unwrap_or("?"), b.id()));
     // A generic name (`Kernel`) must not be scanned: it word-matches
-    // unrelated C++ symbols and would hand back a junk list.
+    // unrelated C++ symbols and would hand back a junk list. Torch-internal
+    // names are skipped for the same reason (the body is in pytorch; a
+    // textual match is a different function), but their GPU events still
+    // go through launch-site resolution below.
     let generic = source::is_generic_kernel_name(name);
+    let torched = source::is_torch_internal(name);
     let mut hits = if let Some(cf) = &callfrom {
         idx.resolve_callfrom(cf).into_iter().collect::<Vec<_>>()
-    } else if generic {
+    } else if generic || torched {
         Vec::new()
     } else {
         idx.resolve_kernel(name)
@@ -3506,15 +3515,19 @@ fn resolve_event_source(
     // No name-based source: a launched kernel still knows where it was
     // launched. Follow External id / correlation to the CPU event and use
     // its op name, else the innermost enclosing python frame. This is what
-    // resolves CuTe DSL JIT kernels, which CUPTI only ever names `Kernel`.
+    // resolves CuTe DSL JIT kernels, which CUPTI only ever names `Kernel`,
+    // and aten kernels whose useful answer is the vLLM/flashinfer line
+    // that launched them.
     let mut via = None;
     // Set when the only CPU frame the trace has is a CUDA graph replay.
     let mut replay_note = None;
-    // Prebuilt cubins (trtllm-gen FMHA) have no body in any checkout, so a
-    // launch-site jump could only land on the replay/launcher frame and
-    // claim it is the kernel. Let the no-hit path name the family instead.
+    // Prebuilt cubins (trtllm-gen FMHA) have no body in any checkout, but
+    // the launch link is exact when the trace recorded the launch call, so
+    // it still resolves to the launcher (labelled as a launch site, never
+    // as the kernel's definition). No link at all falls back to the family
+    // explanation.
     let external = source::external_kernel_family(name).is_some();
-    if hits.is_empty() && callfrom.is_none() && !external && (track.gpu || cat == "kernel") {
+    if hits.is_empty() && callfrom.is_none() && (track.gpu || cat == "kernel") {
         if let Some(link) = launch_link(trace, r.track_idx, r.event_idx) {
             if let Some(op) = link.op.as_deref() {
                 if !source::is_torch_internal(op) {
@@ -3534,10 +3547,16 @@ fn resolve_event_source(
                     if link.graph {
                         let site = enclosing_frame(trace, at, idx.as_ref())
                             .map(|h| format!(" `{}:{}`", h.rel, h.line));
-                        replay_note = Some(format!(
+                        let replay = format!(
                             "`{}` runs from a captured CUDA graph: this trace \
                              records only the replay{} - the capture site is \
-                             not in the trace", name, site.unwrap_or_default()));
+                             not in the trace", name, site.unwrap_or_default());
+                        replay_note = Some(match source::external_kernel_family(name) {
+                            // Still say what the cubin is: a replay note
+                            // alone would leave the family unexplained.
+                            Some(why) => format!("`{}` is {}. {}", name, why, replay),
+                            None => replay,
+                        });
                     } else if let Some(h) = enclosing_frame(trace, at, idx.as_ref()) {
                         via = Some(format!("{}:{}", h.rel, h.line));
                         hits = vec![h];
@@ -3549,10 +3568,20 @@ fn resolve_event_source(
     // The launch-site note rides the jump, so a generic `Kernel` event
     // says where it came from instead of looking like the kernel's def.
     // A drift warning still matters (launch-site lines drift too), so both
-    // are kept.
+    // are kept. Prebuilt/torch names are excluded from the message: they
+    // are long and the status bar must not run into the version text, and
+    // the label already says what kind of site this is.
+    let site = if external {
+        "launch site (prebuilt cubin)"
+    } else if torched {
+        "launch site (torch kernel)"
+    } else {
+        "launch site"
+    };
+    let site = if external || torched { site.to_string() } else { format!("{site} of `{name}`") };
     let warn = match (warn, via) {
-        (Some(w), Some(v)) => Some(format!("{w}; launch site of `{name}`: {v}")),
-        (None, Some(v)) => Some(format!("launch site of `{name}`: {v}")),
+        (Some(w), Some(v)) => Some(format!("{w}; {site}: {v}")),
+        (None, Some(v)) => Some(format!("{site}: {v}")),
         (w, None) => w,
     };
     let act = if let Some(n) = replay_note {
@@ -3560,14 +3589,21 @@ fn resolve_event_source(
     } else {
         match hits.len() {
             0 => SrcAction::Error(if generic {
-                format!("`{}` is CUPTI's placeholder for a kernel it could not \
-                         symbolicate, and this trace carries no launch correlation \
-                         to resolve it", name)
-            } else { match source::external_kernel_family(name) {
-                Some(why) => format!("`{}` is {}", name, why),
-                None => format!(
-                    "no source found for `{}` in the checkout (aten/CUB/CUTLASS kernels live outside vllm)", name),
-            } }),
+                format!(
+                    "`{}` is CUPTI's placeholder for a kernel it could not \
+                     symbolicate, and this trace carries no launch correlation \
+                     to resolve it", name)
+            } else if torched {
+                format!(
+                    "`{}` is a torch op - its source lives in pytorch, not the \
+                     vllm checkout", name)
+            } else {
+                match source::external_kernel_family(name) {
+                    Some(why) => format!("`{}` is {}", name, why),
+                    None => format!(
+                        "no source found for `{}` in the checkout (aten/CUB/CUTLASS kernels live outside vllm)", name),
+                }
+            }),
             1 => SrcAction::Open(hits.into_iter().next().unwrap()),
             _ => SrcAction::List(hits),
         }

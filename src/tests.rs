@@ -7239,12 +7239,12 @@ fn test_src_popup_id_scope() {
 }
 
 
-/// A prebuilt trtllm-gen cubin has no body in the checkout, so even with a
-/// launch correlation the jump must not claim the launch frame is the
-/// kernel: the answer is the family explanation (where the launcher and the
-/// real source live), not an open.
+/// A prebuilt trtllm-gen cubin has no body in the checkout, but when the
+/// trace recorded the launch call, its correlation gives the exact line that
+/// launched it. That is a real answer (labelled as a launch site, never as
+/// the kernel's definition), so the jump lands there.
 #[test]
-fn test_prebuilt_cubin_reports_family_not_launch_frame() {
+fn test_prebuilt_cubin_resolves_launch_site() {
     let root = std::env::temp_dir().join("tv_cubin_family_test");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("vllm")).unwrap();
@@ -7282,6 +7282,54 @@ fn test_prebuilt_cubin_reports_family_not_launch_frame() {
     let mut pane = Pane::new();
     pane.trace = Some(trace);
     let mut idx = Some(Box::new(crate::source::SourceIndex::new(root.clone())));
+    let (act, warn) = crate::resolve_event_source(
+        &mut idx, &pane, crate::types::EventRef { track_idx: 0, event_idx: 0 });
+    match act {
+        crate::SrcAction::Open(h) => {
+            assert_eq!(h.line, 1);
+            assert!(h.rel.ends_with("model_runner.py"), "launches in the vllm tree: {}", h.rel);
+        }
+        other => panic!("expected the exact launch site, got {}", match other {
+            crate::SrcAction::Error(e) => format!("Error({e})"),
+            crate::SrcAction::Note(n) => format!("Note({n})"),
+            _ => "another action".to_string(),
+        }),
+    }
+    let warn = warn.expect("launch-site message");
+    assert!(warn.contains("prebuilt cubin"), "labels the site as prebuilt: {warn}");
+    assert!(warn.contains("model_runner.py:1"), "names the exact line: {warn}");
+    // The long kernel name must stay out of the status-bar message.
+    assert!(!warn.contains("fmhaSm100fKernel"), "message stays short: {warn}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Without a launch correlation there is nothing to follow: a prebuilt cubin
+/// must say what family it belongs to instead of pretending it resolved.
+#[test]
+fn test_prebuilt_cubin_without_link_explains_family() {
+    let names: Vec<String> = vec![
+        "fmhaSm100fKernel_QkvE4m3OBfloat16H512PagedKvDenseDynamicTokenSparseP1VarSeqQ64Kv128PersistentKeepsAbForGen".to_string(),
+    ];
+    let cats: Vec<String> = ["kernel"].iter().map(|s| s.to_string()).collect();
+    let ev = |ts: f64, dur: f64, name: u32, cat: u32| Event {
+        ts, dur, name, cat, args_off: 0, args_len: 0, depth: 0 };
+    let trace = Trace {
+        tracks: vec![Track {
+            label: "stream 19".to_string(), gpu: true,
+            events: vec![ev(100.0, 10.0, 0, 0)], max_depth: 1,
+            prefix_max_dur: vec![1.0], raw_buf_idx: 0 }],
+        names, cats, raw_bufs: vec![Arc::new(ArgsBuf(vec![0u8]))], stats: Vec::new(),
+        max_ts: 210.0, min_ts: 0.0, total_events: 1,
+        device: String::new(), vllm_version: String::new(), dist_rank: 0, dist_world: 0,
+        flow_pairs: Vec::new(), rank_paths: Vec::new(),
+    };
+
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    let root = std::env::temp_dir().join("tv_cubin_no_link_test");
+    std::fs::create_dir_all(&root).unwrap();
+    let mut idx = Some(Box::new(crate::source::SourceIndex::new(root.clone())));
     let (act, _) = crate::resolve_event_source(
         &mut idx, &pane, crate::types::EventRef { track_idx: 0, event_idx: 0 });
     match act {
@@ -7290,6 +7338,59 @@ fn test_prebuilt_cubin_reports_family_not_launch_frame() {
         }
         _ => panic!("expected the family explanation, not a jump"),
     }
+    std::fs::remove_dir_all(&root).ok();
+}
 
+/// An aten GPU kernel has no body in the checkout, but its launch correlation
+/// names the vLLM line that launched it - the answer neighbours can only
+/// guess at.
+#[test]
+fn test_torch_kernel_resolves_launch_site() {
+    let root = std::env::temp_dir().join("tv_torch_launch_test");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("flashinfer")).unwrap();
+    std::fs::write(root.join("flashinfer/utils.py"), "def counter():\n    pass\n").unwrap();
+
+    let mut buf = vec![0u8];
+    let mut add = |s: &str| { let off = buf.len() as u32; buf.extend_from_slice(s.as_bytes()); off };
+    let corr_args = add("{\"correlation\":\"7\"}");
+    let raw = Arc::new(ArgsBuf(buf));
+    let names: Vec<String> = [
+        "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>, false>(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+        "cudaLaunchKernel", "flashinfer/utils.py(1): counter",
+    ].iter().map(|s| s.to_string()).collect();
+    let cats: Vec<String> = ["kernel", "cuda_runtime", "python_function"]
+        .iter().map(|s| s.to_string()).collect();
+    let ev = |ts: f64, dur: f64, name: u32, cat: u32, off: u32| Event {
+        ts, dur, name, cat, args_off: off, args_len: 0, depth: 0 };
+    let mk = |label: &str, gpu: bool, events: Vec<Event>| Track {
+        label: label.to_string(), gpu, events, max_depth: 1,
+        prefix_max_dur: vec![1.0], raw_buf_idx: 0 };
+    let trace = Trace {
+        tracks: vec![
+            mk("stream 19", true, vec![ev(100.0, 10.0, 0, 0, corr_args)]),
+            mk("thread 19", false, vec![
+                ev(90.0, 30.0, 2, 2, 0),
+                ev(95.0, 5.0, 1, 1, corr_args),
+            ]),
+        ],
+        names, cats, raw_bufs: vec![raw], stats: Vec::new(),
+        max_ts: 210.0, min_ts: 0.0, total_events: 3,
+        device: String::new(), vllm_version: String::new(), dist_rank: 0, dist_world: 0,
+        flow_pairs: Vec::new(), rank_paths: Vec::new(),
+    };
+
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    let mut idx = Some(Box::new(crate::source::SourceIndex::new(root.clone())));
+    let (act, warn) = crate::resolve_event_source(
+        &mut idx, &pane, crate::types::EventRef { track_idx: 0, event_idx: 0 });
+    match act {
+        crate::SrcAction::Open(h) => assert_eq!(h.line, 1),
+        _ => panic!("expected the exact launch site for the aten kernel"),
+    }
+    let warn = warn.expect("launch-site message");
+    assert!(warn.contains("torch kernel"), "labels the site: {warn}");
+    assert!(!warn.contains("at::native"), "message stays short: {warn}");
     std::fs::remove_dir_all(&root).ok();
 }
