@@ -7394,3 +7394,35 @@ fn test_torch_kernel_resolves_launch_site() {
     assert!(!warn.contains("at::native"), "message stays short: {warn}");
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// The editor marks are generated data, so a bad row length or a key missing
+/// from its palette would render as a transparent hole (or panic in debug).
+/// Sweep every mark the picker can show, aliases included.
+#[test]
+fn editor_marks_are_well_formed() {
+    for editor in ["gram", "code", "vscode", "cursor", "zed", "clion", "nvim"] {
+        let mark = crate::editor_marks::mark_for(editor);
+        for sprite in [&mark.hi, &mark.lo] {
+            let grid = sprite.rows.len();
+            assert!(grid == 16 || grid == 32, "{editor}: grid {grid}");
+            assert!(
+                sprite.rows.iter().all(|row| row.len() == grid),
+                "{editor}: not every row is {grid} wide"
+            );
+            for row in sprite.rows {
+                for key in row.bytes().filter(|key| *key != b'.') {
+                    assert!(key.is_ascii(), "{editor}: non-ASCII key");
+                    assert!(
+                        sprite.palette.iter().any(|(k, _)| *k == key),
+                        "{editor}: key {} missing from palette",
+                        key as char
+                    );
+                }
+            }
+        }
+    }
+    assert!(std::ptr::eq(
+        crate::editor_marks::mark_for("code"),
+        crate::editor_marks::mark_for("vscode")
+    ));
+}

@@ -27,6 +27,7 @@ mod wasm_libc_shims;
 mod loader;
 mod state;
 mod ui;
+mod editor_marks;
 mod diff;
 mod time;
 mod ktz;
@@ -186,7 +187,8 @@ fn editor_picker_row(ui: &imgui::Ui, editor: &str, label: &str, selected: bool) 
     let cy = (rmin[1] + rmax[1]) * 0.5;
     let text_y = cy - ui.text_line_height() * 0.5;
     let dl = ui.get_window_draw_list();
-    draw_editor_icon(&dl, editor, rmin[0] + 6.0, cy - icon_sz * 0.5, icon_sz);
+    draw_editor_icon(&dl, editor, rmin[0] + 6.0, cy - icon_sz * 0.5, icon_sz,
+                     ui.io().display_framebuffer_scale[0]);
     let text_col = if selected { col32(255, 255, 255, 255) } else { col32(220, 220, 220, 255) };
     dl.add_text([rmin[0] + 6.0 + icon_sz + 8.0, text_y], text_col, label);
     if selected {
@@ -1781,8 +1783,9 @@ impl App {
                             // Source" jumps launch. A toolbar entry showing
                             // the current editor's mark; the dropdown
                             // repeats the marks per row so the choice reads
-                            // at a glance (16x16 pixel-art sprites, no
-                            // image assets - see `draw_editor_icon`). The
+                            // at a glance (each editor's official app icon,
+                            // rasterized to pixel art - no image assets, see
+                            // `draw_editor_icon`). The
                             // text field takes any other editor command,
                             // the same state the Source setup popup edits.
                             #[cfg(not(target_arch = "wasm32"))]
@@ -1799,7 +1802,8 @@ impl App {
                                 {
                                     let dl = ui.get_window_draw_list();
                                     draw_editor_icon(&dl, &state.src_editor,
-                                        rmin[0] + 7.0, cy - icon_sz * 0.5, icon_sz);
+                                        rmin[0] + 7.0, cy - icon_sz * 0.5, icon_sz,
+                                        ui.io().display_framebuffer_scale[0]);
                                     dl.add_text(
                                         [rmin[0] + 7.0 + icon_sz + 6.0,
                                          cy - ui.text_line_height() * 0.5],
@@ -1848,7 +1852,7 @@ impl App {
                                     ui.text_disabled("Other command:");
                                     ui.set_next_item_width(custom_w);
                                     ui.input_text("##editorcustom", &mut state.src_editor)
-                                        .hint("code-insiders, nvim, ...")
+                                        .hint("any command")
                                         .build();
                                 });
                             }

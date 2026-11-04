@@ -3238,236 +3238,29 @@ pub fn editor_label(editor: &str) -> &str {
     }
 }
 
-/// Native size of the editor marks, in logical pixels. The sprites are
-/// 16x16, so drawing at exactly this size keeps each sprite pixel on whole
-/// device pixels at both 1x and 2x, which is what makes them crisp.
+/// Native size of the editor marks, in logical pixels. A 32x32 mark is
+/// drawn at this size, so on a Retina framebuffer each sprite pixel is
+/// exactly one device pixel.
 pub const EDITOR_ICON_SIZE: f32 = 16.0;
 
-/// One 16x16 pixel-art brand mark, traced from the editor's official app
-/// icon. `rows` are scanlines of palette keys (`.` is transparent); the
-/// palette maps each key to its colour. Drawing goes through the raw pixel
-/// grid instead of vector shapes: at menu size, vector edges land on
-/// half-pixels and read as a blurry smear.
-struct PixelMark {
-    rows: [&'static str; 16],
-    palette: &'static [(u8, ImColor32)],
-}
-
-impl PixelMark {
-    fn draw(&self, dl: &imgui::DrawListMut, x: f32, y: f32, size: f32) {
-        let cell = size / 16.0;
-        for (row_i, row) in self.rows.iter().enumerate() {
-            let keys = row.as_bytes();
-            debug_assert_eq!(keys.len(), 16);
-            let mut start = 0;
-            while start < keys.len() {
-                let key = keys[start];
-                let mut end = start + 1;
-                while end < keys.len() && keys[end] == key {
-                    end += 1;
-                }
-                if key != b'.' {
-                    if let Some(&(_, color)) = self.palette.iter().find(|(k, _)| *k == key) {
-                        // Non-antialiased so adjacent cells in different
-                        // colours meet on a hard edge instead of a halo.
-                        dl.add_rect_filled_multicolor(
-                            [x + start as f32 * cell, y + row_i as f32 * cell],
-                            [x + end as f32 * cell, y + (row_i + 1) as f32 * cell],
-                            color, color, color, color,
-                        );
-                    }
-                }
-                start = end;
-            }
-        }
-    }
-}
-
-/// Gram's official app icon: pale-green tile, frog head with white eyes,
-/// and the big belly.
-const GRAM_MARK: PixelMark = PixelMark {
-    rows: [
-        "..tttttttttttt..",
-        ".ttthhtttthhttt.",
-        "tttthhhhhhhhtttt",
-        "ttteeehhhheeettt",
-        "tthepehhhhepehtt",
-        "tthhhhhhhhhhhhtt",
-        "tthhhhbbbbhhhhtt",
-        "tthhhbbbbbbhhhtt",
-        "tthhbbbbbbbbhhtt",
-        "tthhbbbbbbbbhhtt",
-        "tthhbbbbbbbbhhtt",
-        "tthhbbbbbbbbhhtt",
-        "tthhhbbbbbbhhhtt",
-        "ttthhhbbbbhhhttt",
-        ".tttttttttttttt.",
-        "..tttttttttttt..",
-    ],
-    palette: &[
-        (b't', ImColor32::from_rgba(206, 235, 196, 255)),
-        (b'h', ImColor32::from_rgba(109, 157, 109, 255)),
-        (b'b', ImColor32::from_rgba(221, 243, 208, 255)),
-        (b'e', ImColor32::from_rgba(247, 252, 242, 255)),
-        (b'p', ImColor32::from_rgba(30, 42, 30, 255)),
-    ],
-};
-
-/// VS Code's blue folded ribbon on the dark tile of its official
-/// apple-touch icon. `#` is the body blue, `o` the lighter chevron.
-const VSCODE_MARK: PixelMark = PixelMark {
-    rows: [
-        "..kkkkkkkkkkkk..",
-        ".kkkkkkkkk#ookk.",
-        "kkkkkkkkk##ooook",
-        "kkkkkkkk###ooook",
-        "kk#kkkk####ooook",
-        "k###kk####oooook",
-        "k########ooooook",
-        "kk######oooooook",
-        "kk######oooooook",
-        "k########ooooook",
-        "k###kk####oooook",
-        "kk#kkkk####ooook",
-        "kkkkkkkk###ooook",
-        "kkkkkkkkk##ooook",
-        ".kkkkkkkkk#ookk.",
-        "..kkkkkkkkkkkk..",
-    ],
-    palette: &[
-        (b'k', ImColor32::from_rgba(40, 40, 44, 255)),
-        (b'#', ImColor32::from_rgba(0, 101, 169, 255)),
-        (b'o', ImColor32::from_rgba(0, 122, 204, 255)),
-    ],
-};
-
-/// Zed's official app icon: dark tile with the gradient Z. The interlaced
-/// nested squares are sub-pixel at this size, so the mark is a bold Z.
-const ZED_MARK: PixelMark = PixelMark {
-    rows: [
-        "..kkkkkkkkkkkk..",
-        ".kkkkkkkkkkkkkk.",
-        "kkkkkkkkkkkkkkkk",
-        "kkkkwwwwwwwwkkkk",
-        "kkkkwwwwwwwwkkkk",
-        "kkkkkkkkkmmmkkkk",
-        "kkkkkkkkmmmmkkkk",
-        "kkkkkkkmmmmkkkkk",
-        "kkkkkkmmmmkkkkkk",
-        "kkkkkmmmmkkkkkkk",
-        "kkkkmmmmkkkkkkkk",
-        "kkkksssssssskkkk",
-        "kkkksssssssskkkk",
-        "kkkkkkkkkkkkkkkk",
-        ".kkkkkkkkkkkkkk.",
-        "..kkkkkkkkkkkk..",
-    ],
-    palette: &[
-        (b'k', ImColor32::from_rgba(36, 36, 40, 255)),
-        (b'w', ImColor32::from_rgba(247, 247, 247, 255)),
-        (b'm', ImColor32::from_rgba(226, 226, 226, 255)),
-        (b's', ImColor32::from_rgba(203, 203, 203, 255)),
-    ],
-};
-
-/// CLion's official app icon: blue/pink/green pinwheel tile behind the
-/// black product square, with a white "CL" and the JetBrains bar.
-const CLION_MARK: PixelMark = PixelMark {
-    rows: [
-        "..bbbbbbpppppp..",
-        ".bbbbbbbbpppppp.",
-        "bbbbbbbbpppppppp",
-        "bbbbkkkkkkkkpppp",
-        "bbbbkkkkkkkkpppp",
-        "bbbbkkwwkkwkkppp",
-        "bbbbkwwkkkwkkppp",
-        "bbbbkwwkkkwkkppp",
-        "bbbbkwwkkwwwkppp",
-        "ppppkkkkkkkkgggg",
-        "ppppkwwwwkkkgggg",
-        "ppppkkkkkkkkgggg",
-        "ppppkkkkkkkkgggg",
-        "ppppppppgggggggg",
-        ".ppppppppgggggg.",
-        "..ppppppgggggg..",
-    ],
-    palette: &[
-        (b'b', ImColor32::from_rgba(0, 154, 229, 255)),
-        (b'p', ImColor32::from_rgba(255, 49, 140, 255)),
-        (b'g', ImColor32::from_rgba(0, 216, 134, 255)),
-        (b'k', ImColor32::from_rgba(0, 0, 0, 255)),
-        (b'w', ImColor32::from_rgba(255, 255, 255, 255)),
-    ],
-};
-
-/// Cursor's official mark: near-black tile with the pale isometric cube.
-const CURSOR_MARK: PixelMark = PixelMark {
-    rows: [
-        "..kkkkkkkkkkkk..",
-        ".kkkkkkkkkkkkkk.",
-        "kkkkkwwwwwkkkkkk",
-        "kkkkwwwwwwwkkkkk",
-        "kkwwwwwwwwwwwkkk",
-        "kkmwwwwwwwwwddkk",
-        "kkmmmwwwwwddddkk",
-        "kkmmmmmwwdddddkk",
-        "kkmmmmmmddddddkk",
-        "kkmmmmmmddddddkk",
-        "kkmmmmmmddddddkk",
-        "kkmmmmmmdddddkkk",
-        "kkkkmmmmdddkkkkk",
-        "kkkkkkmmdkkkkkkk",
-        ".kkkkkkkkkkkkkk.",
-        "..kkkkkkkkkkkk..",
-    ],
-    palette: &[
-        (b'k', ImColor32::from_rgba(28, 28, 31, 255)),
-        (b'w', ImColor32::from_rgba(232, 234, 240, 255)),
-        (b'm', ImColor32::from_rgba(184, 188, 200, 255)),
-        (b'd', ImColor32::from_rgba(136, 141, 158, 255)),
-    ],
-};
-
-/// Generic badge for any other editor command: a terminal prompt.
-const GENERIC_MARK: PixelMark = PixelMark {
-    rows: [
-        "..kkkkkkkkkkkk..",
-        ".kkkkkkkkkkkkkk.",
-        "kkkkkkkkkkkkkkkk",
-        "kkkkkkkkkkkkkkkk",
-        "kkwwkkkkkkkkkkkk",
-        "kkkwwkkkkkkkkkkk",
-        "kkkkwwkkkkkkkkkk",
-        "kkkkkwwkkkkkkkkk",
-        "kkkkkwwkkkkkkkkk",
-        "kkkkwwkkkkkkkkkk",
-        "kkkwwkkkkkkkkkkk",
-        "kkwwkkkkkwwwwwkk",
-        "kkkkkkkkkwwwwwkk",
-        "kkkkkkkkkkkkkkkk",
-        ".kkkkkkkkkkkkkk.",
-        "..kkkkkkkkkkkk..",
-    ],
-    palette: &[
-        (b'k', ImColor32::from_rgba(58, 58, 64, 255)),
-        (b'w', ImColor32::from_rgba(214, 214, 218, 255)),
-    ],
-};
-
-/// Brand mark for `editor`, drawn as a 16x16 pixel-art sprite into a
-/// `size`-square box whose top-left corner is (`x`, `y`). Known CLIs get
-/// their official mark; anything else (a custom command or a path) gets a
-/// generic command-prompt badge. No image assets, same as `draw_vllm_logo`.
-pub fn draw_editor_icon(dl: &imgui::DrawListMut, editor: &str, x: f32, y: f32, size: f32) {
-    let mark = match editor {
-        "gram" => &GRAM_MARK,
-        "code" | "vscode" => &VSCODE_MARK,
-        "cursor" => &CURSOR_MARK,
-        "zed" => &ZED_MARK,
-        "clion" => &CLION_MARK,
-        _ => &GENERIC_MARK,
-    };
-    mark.draw(dl, x, y, size);
+/// Brand mark for `editor`: the editor's official app icon, rasterized at
+/// 32x32 for Retina and 16x16 for 1x, drawn into a `size`-square box whose
+/// top-left corner is (`x`, `y`). Known CLIs get their official mark;
+/// anything else (a custom command or a path) gets a generic command-prompt
+/// badge. `fb_scale` is `ui.io().display_framebuffer_scale[0]`, used to
+/// snap every sprite cell to whole device pixels. No image assets, same as
+/// `draw_vllm_logo`.
+pub fn draw_editor_icon(
+    dl: &imgui::DrawListMut,
+    editor: &str,
+    x: f32,
+    y: f32,
+    size: f32,
+    fb_scale: f32,
+) {
+    let mark = crate::editor_marks::mark_for(editor);
+    let sprite = if fb_scale >= 2.0 { &mark.hi } else { &mark.lo };
+    sprite.draw(dl, x, y, size, fb_scale);
 }
 
 pub fn device_name_color() -> ImColor32 {
