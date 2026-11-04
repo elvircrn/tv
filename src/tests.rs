@@ -152,6 +152,8 @@ fn make_state(trace: Trace) -> AppState {
         src_clone_fail: None,
         src_pinned: false,
         src_build: String::new(),
+        #[cfg(not(target_arch = "wasm32"))]
+        src_popup: None,
     }
 }
 
@@ -7122,5 +7124,93 @@ fn test_frame_dur_field_is_fixed_width() {
     }
     assert_eq!(fmt_frame_dur(0.0123), " 12.3ms");
     assert_eq!(fmt_frame_dur(1.234), "  1.23s");
+}
+
+
+
+/// A demangled kernel name can match its definition AND every call site.
+/// The picker must put the definition first: for deep_gemm's
+/// `sm100_mqa_logits`, the body lives in `impls/sm100_mqa_logits.cuh` while
+/// the first match in a parallel file walk could be a call in an api
+/// header. Fake tree mirrors that layout.
+#[test]
+fn test_scan_ranks_definition_first() {
+    let root = std::env::temp_dir().join("tv_scan_rank_test");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("deps/k/impls")).unwrap();
+    std::fs::create_dir_all(root.join("deps/k/csrc")).unwrap();
+    std::fs::write(root.join("deps/k/csrc/api.hpp"),
+        "void use() {\n    sm100_mqa_logits(config, q, kv);\n}\n").unwrap();
+    std::fs::write(root.join("deps/k/impls/sm100_mqa_logits.cuh"),
+        "void sm100_mqa_logits(const uint32_t n, const uint32_t k) {\n}\n").unwrap();
+
+    let mut idx = crate::source::SourceIndex::new(root.clone());
+    let hits = idx.resolve_kernel(
+        "void deep_gemm::sm100_mqa_logits<32u, 128u>(unsigned int, unsigned int)");
+    let rels: Vec<&str> = hits.iter().map(|h| h.rel.as_str()).collect();
+    assert_eq!(rels, ["deps/k/impls/sm100_mqa_logits.cuh", "deps/k/csrc/api.hpp"]);
+    assert_eq!(hits[0].line, 1, "the definition line, not the call site");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `apply_src_action` must not open a popup itself: it runs inside the
+/// kernel context-menu popup, where ImGui scopes the id to that popup's
+/// window. It requests the popup instead, and the popup's own scope opens
+/// it. The headless check below is the reason: an id hashed under a nested
+/// window never matches the `BeginPopup` at the base scope.
+#[test]
+fn test_src_action_requests_popup() {
+    use crate::state::SrcPopup;
+    let hit = crate::source::SourceHit {
+        path: std::path::PathBuf::from("/x/vllm/foo.cu"),
+        line: 7, rel: "vllm/foo.cu".to_string(),
+    };
+    let mut pending = None;
+    let mut msg = None;
+    let mut hits = Vec::new();
+    crate::apply_src_action(&mut pending, &mut msg, &mut hits, "true",
+        crate::SrcAction::List(vec![hit]), None);
+    assert_eq!(pending, Some(SrcPopup::Hits));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].line, 7);
+
+    let mut pending = None;
+    crate::apply_src_action(&mut pending, &mut msg, &mut hits, "true",
+        crate::SrcAction::NeedCheckout, None);
+    assert_eq!(pending, Some(SrcPopup::Setup));
+    assert!(msg.is_none());
+}
+
+/// The id-scope property the request slot exists for. Opening `##src_hits`
+/// from inside another window hashes an id that the base-scope
+/// `popup("##src_hits")` does not see; opening at the base scope (what the
+/// request slot arranges) does show.
+#[test]
+fn test_src_popup_id_scope() {
+    let _imgui_ctx = IMGUI_CTX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut imgui = imgui::Context::create();
+    imgui.io_mut().display_size = [800.0, 600.0];
+    imgui.fonts().build_rgba32_texture();
+
+    let mut shown_from_nested = false;
+    {
+        let ui = imgui.new_frame();
+        ui.window("##ctxmenu").build(|| {
+            ui.open_popup("##src_hits");
+        });
+        ui.popup("##src_hits", || { shown_from_nested = true; });
+    }
+    imgui.render();
+    assert!(!shown_from_nested, "nested-scope open must not match the base scope");
+
+    let mut shown_at_base = false;
+    {
+        let ui = imgui.new_frame();
+        ui.open_popup("##src_hits");
+        ui.popup("##src_hits", || { shown_at_base = true; });
+    }
+    imgui.render();
+    assert!(shown_at_base, "base-scope open shows the picker");
 }
 

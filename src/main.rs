@@ -365,6 +365,8 @@ impl App {
                 src_clone_fail: None,
                 src_pinned: false,
                 src_build: String::new(),
+                #[cfg(not(target_arch = "wasm32"))]
+                src_popup: None,
             },
             last_frame: Instant::now(),
             scale_factor: 1.0,
@@ -1521,7 +1523,7 @@ impl App {
                 if pi < state.panes.len() && state.panes[pi].has_trace() {
                     let (act, warn) = resolve_event_source(&mut state.src_idx, &state.panes[pi], r);
                     let pane = &mut state.panes[pi];
-                    apply_src_action(ui, &mut pane.src_msg, &mut pane.src_hits,
+                    apply_src_action(&mut state.src_popup, &mut pane.src_msg, &mut pane.src_hits,
                         &state.src_editor, act, warn);
                 }
             }
@@ -2525,7 +2527,7 @@ impl App {
                             ui.set_cursor_screen_pos([right_x, cy]);
                             ui.invisible_button("##srcver", ver_size);
                             if ui.is_item_clicked() {
-                                ui.open_popup("##src_setup");
+                                state.src_popup = Some(SrcPopup::Setup);
                             }
                             if ui.is_item_hovered() {
                                 ui.tooltip_text("source cross-reference setup");
@@ -2547,6 +2549,13 @@ impl App {
         // status-bar version text was clicked).
         #[cfg(not(target_arch = "wasm32"))]
         {
+            // Open any popup a jump requested at this scope — the one the
+            // popups below are begun at. See AppState::src_popup.
+            match state.src_popup.take() {
+                Some(SrcPopup::Setup) => ui.open_popup("##src_setup"),
+                Some(SrcPopup::Hits) => ui.open_popup("##src_hits"),
+                None => {}
+            }
             ui.popup("##src_setup", || {
                 ui.text("Source cross-reference");
                 ui.separator();
@@ -2636,7 +2645,7 @@ impl App {
                     .hint("editor")
                     .build();
                 if ui.is_item_hovered() {
-                    ui.tooltip_text("Editor command for View Source jumps. Gram, VS Code, Cursor and\nZed are wired for file:line positioning; anything else is launched\nwith `-g file:line`. Pick a known one from the toolbar's editor button.");
+                    ui.tooltip_text("Editor command for View Source jumps. Gram, VS Code, Cursor,\nCLion and Zed are wired for file:line positioning; anything else is\nlaunched with `-g file:line`. Pick a known one from the toolbar's editor button.");
                 }
             });
             // Multi-hit picker: a name that resolved to more than one
@@ -2909,7 +2918,7 @@ impl App {
                                             &mut state.src_idx, &state.panes[ai], r);
                                         let pane = &mut state.panes[ai];
                                         apply_src_action(
-                                            ui,
+                                            &mut state.src_popup,
                                             &mut pane.src_msg, &mut pane.src_hits,
                                             &state.src_editor, act, warn);
                                     }
@@ -3449,7 +3458,11 @@ fn resolve_event_source(
     let mut via = None;
     // Set when the only CPU frame the trace has is a CUDA graph replay.
     let mut replay_note = None;
-    if hits.is_empty() && callfrom.is_none() && (track.gpu || cat == "kernel") {
+    // Prebuilt cubins (trtllm-gen FMHA) have no body in any checkout, so a
+    // launch-site jump could only land on the replay/launcher frame and
+    // claim it is the kernel. Let the no-hit path name the family instead.
+    let external = source::external_kernel_family(name).is_some();
+    if hits.is_empty() && callfrom.is_none() && !external && (track.gpu || cat == "kernel") {
         if let Some(link) = launch_link(trace, r.track_idx, r.event_idx) {
             if let Some(op) = link.op.as_deref() {
                 if !source::is_torch_internal(op) {
@@ -3510,14 +3523,18 @@ fn resolve_event_source(
     (act, warn)
 }
 
-/// Apply a resolution: open the editor, open the multi-hit picker popup,
-/// open the setup popup (no checkout yet), or park the outcome in
-/// `src_msg` for the status bar. Takes the affected Pane fields
-/// individually, not `&mut Pane` — the context-menu call site holds a
-/// shared borrow of the pane's trace across it.
+/// Apply a resolution: open the editor, request the multi-hit picker
+/// popup, request the setup popup (no checkout yet), or park the outcome
+/// in `src_msg` for the status bar. `pending` is the frame's popup-open
+/// request slot rather than the `Ui`: this runs inside the kernel
+/// context-menu popup (or before any window exists), where an
+/// `open_popup` would hash an id the real popup's scope cannot match.
+/// Takes the affected Pane fields individually, not `&mut Pane` — the
+/// context-menu call site holds a shared borrow of the pane's trace
+/// across it.
 #[cfg(not(target_arch = "wasm32"))]
 fn apply_src_action(
-    ui: &imgui::Ui,
+    pending: &mut Option<SrcPopup>,
     msg: &mut Option<(SrcNote, String)>,
     hits: &mut Vec<source::SourceHit>,
     editor: &str,
@@ -3538,11 +3555,11 @@ fn apply_src_action(
         },
         SrcAction::List(hs) => {
             *hits = hs;
-            ui.open_popup("##src_hits");
+            *pending = Some(SrcPopup::Hits);
             *msg = warn.map(|w| (SrcNote::Warn, w));
         }
         // No checkout yet: the setup popup is where one gets set up.
-        SrcAction::NeedCheckout => ui.open_popup("##src_setup"),
+        SrcAction::NeedCheckout => *pending = Some(SrcPopup::Setup),
     }
 }
 

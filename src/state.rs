@@ -2188,6 +2188,24 @@ pub struct AppState {
     /// (commit sha or tag), for traces whose version carries a pipeline
     /// stamp that matches no repo.
     pub src_build: String,
+    /// A source popup to open at the next popup-drawing scope. ImGui popup
+    /// ids are scoped to the window they are opened from, so a jump
+    /// triggered inside the kernel context-menu popup (or before any
+    /// window exists, on a clone rejump) must not call `open_popup`
+    /// itself — the `##src_hits`/`##src_setup` popups are begun at the
+    /// frame's base window scope and would never match that id. Request
+    /// here and let that scope do the open.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub src_popup: Option<SrcPopup>,
+}
+
+/// Which source cross-reference popup a jump wants opened; see
+/// [`AppState::src_popup`].
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SrcPopup {
+    Setup,
+    Hits,
 }
 
 /// One background exact-build clone, spawned by a View Source jump.

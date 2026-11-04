@@ -188,8 +188,18 @@ impl SourceIndex {
     /// matters — without it `vectorized(` matches inside
     /// `scaled_fp8_conversion_vectorized(`). Walk + read are parallel
     /// across files; python hits sort ahead of C hits because triton and
-    /// tilelang kernels ARE python defs. Capped at 16 so a generic name
-    /// can't produce an unbounded list.
+    /// tilelang kernels ARE python defs.
+    ///
+    /// A C-family match can be a call site (`sm100_mqa_logits(config, ...)`)
+    /// or the definition (`void sm100_mqa_logits(const uint32_t ...)`), and
+    /// the picker must offer the definition first: the whole point of the
+    /// jump is the kernel's body, and the files are collected in parallel so
+    /// without a rank the order is arbitrary. Definitions (a match at column
+    /// 0 or after a declaration keyword) sort ahead of call sites, and CUDA
+    /// sources (.cu/.cuh) ahead of headers, where the host-side launcher of
+    /// a JIT kernel usually lives.
+    ///
+    /// Capped at 16 so a generic name can't produce an unbounded list.
     #[cfg(not(target_arch = "wasm32"))]
     fn scan(&self, name: &str) -> Vec<SourceHit> {
         use rayon::prelude::*;
@@ -198,34 +208,41 @@ impl SourceIndex {
         let c_needle: Vec<u8> = format!("{name}(").into_bytes();
         let mut files = Vec::new();
         self.collect_files(&self.root, &mut files);
-        let (py, c): (Vec<SourceHit>, Vec<SourceHit>) = files
+        // (rank, line) before the path is known, (rank, SourceHit) after.
+        let (py, c): (Vec<SourceHit>, Vec<(u8, SourceHit)>) = files
             .par_iter()
             .filter_map(|path| {
                 let Ok(text) = std::fs::read(path) else { return None };
-                let needle = match Lang::of_path(path) {
-                    Some(Lang::Py) => &py_needle,
-                    _ => &c_needle,
-                };
+                let py = Lang::of_path(path) == Some(Lang::Py);
+                let needle = if py { &py_needle } else { &c_needle };
+                let cuda = path.extension().and_then(|e| e.to_str())
+                    .is_some_and(|e| e == "cu" || e == "cuh");
                 let mut out = Vec::new();
                 // Line-by-line: a definition never spans lines.
                 for (i, line) in text.split(|&b| b == b'\n').enumerate() {
                     if find_def(line, needle) {
-                        out.push((i + 1) as u32);
+                        let rank = if py { 0 }
+                            else { (!is_c_decl(line) as u8) * 2 + (!cuda as u8) };
+                        out.push((rank, (i + 1) as u32));
                     }
                 }
-                if out.is_empty() { None } else { Some((path, out)) }
+                if out.is_empty() { None } else { Some((path, py, out)) }
             })
-            .map(|(path, lines)| {
-                let py = Lang::of_path(path) == Some(Lang::Py);
-                let hits: Vec<SourceHit> = lines.into_iter()
-                    .map(|l| self.hit(path.clone(), l)).collect();
-                if py { (hits, Vec::new()) } else { (Vec::new(), hits) }
+            .map(|(path, py, lines)| {
+                let hits: Vec<(u8, SourceHit)> = lines.into_iter()
+                    .map(|(r, l)| (r, self.hit(path.clone(), l))).collect();
+                if py { (hits.into_iter().map(|(_, h)| h).collect(), Vec::new()) }
+                else { (Vec::new(), hits) }
             })
             .reduce(|| (Vec::new(), Vec::new()), |(mut pa, mut ca), (pb, cb)| {
                 pa.extend(pb); ca.extend(cb); (pa, ca)
             });
+        let mut c = c;
+        c.sort_by(|(ra, a), (rb, b)| {
+            ra.cmp(rb).then_with(|| a.rel.cmp(&b.rel)).then(a.line.cmp(&b.line))
+        });
         let mut hits = py;
-        hits.extend(c);
+        hits.extend(c.into_iter().map(|(_, h)| h));
         hits.truncate(16);
         let elapsed = t0.elapsed().as_secs_f64();
         if elapsed > 0.25 {
@@ -344,6 +361,31 @@ fn find_def(line: &[u8], needle: &[u8]) -> bool {
     false
 }
 
+/// Does this C-family line look like a declaration of the matched symbol
+/// rather than a use of it? Definitions sit at column 0 (the repo style
+/// outside nested scopes) or start with a declaration keyword; call sites
+/// are indented and start with the call itself (`sm100_mqa_logits(config`,
+/// `m.foo(`, ...). Only used to order the picker, never to drop a hit —
+/// the heuristic can be wrong, but the definition sorting first is what
+/// makes the first row the kernel's body.
+fn is_c_decl(line: &[u8]) -> bool {
+    let start = match line.iter().position(|c| !c.is_ascii_whitespace()) {
+        Some(i) => i,
+        None => return false,
+    };
+    if start == 0 { return true; }
+    let rest = &line[start..];
+    const KEYWORDS: [&[u8]; 14] = [
+        b"void", b"static", b"inline", b"extern", b"auto", b"const",
+        b"template", b"struct", b"class", b"__global__", b"__device__",
+        b"__host__", b"__forceinline__", b"CUTLASS_DEVICE",
+    ];
+    KEYWORDS.iter().any(|kw| {
+        rest.starts_with(kw)
+            && rest.get(kw.len()).is_some_and(|c| !c.is_ascii_alphanumeric() && *c != b'_')
+    })
+}
+
 // ============================================================== editor jump
 
 /// torch/CUB/CUTLASS-namespace names: their source lives in pytorch, not
@@ -422,6 +464,15 @@ fn editor_candidates(editor: &str) -> Vec<String> {
             cands.push("/usr/local/bin/gram".into());
             cands.push("/Applications/Gram.app/Contents/MacOS/cli".into());
         }
+        "clion" => {
+            cands.push("/usr/local/bin/clion".into());
+            cands.push("/opt/homebrew/bin/clion".into());
+            if let Ok(home) = std::env::var("HOME") {
+                cands.push(format!(
+                    "{home}/Library/Application Support/JetBrains/Toolbox/scripts/clion"));
+            }
+            cands.push("/Applications/CLion.app/Contents/MacOS/clion".into());
+        }
         _ => {}
     }
     cands
@@ -444,11 +495,11 @@ pub(crate) fn encode_uri_path(p: &str) -> String {
 
 /// Open `path:line` in the user's editor. `editor` is the editor's CLI
 /// command ("gram", "code", "cursor", ...); Gram and Zed take
-/// `file:line` directly, the rest take `-g file:line`. VS Code is
-/// special: `-g` positions the cursor only on a fresh open — when the
-/// file is already open in a window it just focuses the tab and leaves
-/// the cursor where it was — so `code` jumps via the
-/// `vscode://file/<path>:<line>` protocol URL instead, whose handler
+/// `file:line` directly, CLion takes `--line <n> <path>`, and the rest
+/// take `-g file:line`. VS Code is special: `-g` positions the cursor only
+/// on a fresh open — when the file is already open in a window it just
+/// focuses the tab and leaves the cursor where it was — so `code` jumps via
+/// the `vscode://file/<path>:<line>` protocol URL instead, whose handler
 /// applies the selection to an open editor too.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_in_editor(editor: &str, hit: &SourceHit) -> Result<(), String> {
@@ -460,6 +511,9 @@ pub fn open_in_editor(editor: &str, hit: &SourceHit) -> Result<(), String> {
         } else if editor == "code" {
             c.args(["--open-url",
                 &format!("vscode://file/{}:{}", encode_uri_path(&hit.path.display().to_string()), hit.line)]);
+        } else if editor == "clion" {
+            // JetBrains launchers take the line as a separate flag, then the path.
+            c.arg("--line").arg(hit.line.to_string()).arg(&hit.path);
         } else {
             c.arg("-g").arg(&loc);
         }
