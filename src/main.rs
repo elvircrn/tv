@@ -2150,8 +2150,14 @@ impl App {
                                 } else {
                                     ui.text_colored([0.5, 0.5, 0.5, 1.0], label);
                                 }
+                                // Top-left corner of the tab, like the
+                                // controls row in the non-empty case. Not
+                                // `draw_hidden_clear`: its `same_line` would
+                                // snap the indicator to the right edge of
+                                // the big hint above instead, top-aligned
+                                // against a 2x line.
                                 ui.set_cursor_pos(cur);
-                                draw_hidden_clear(&ui, 16.0, &mut pane.hidden_names, &mut state.buf.fmt);
+                                draw_hidden_clear_here(&ui, &mut pane.hidden_names, &mut state.buf.fmt);
                             }
                         }
 

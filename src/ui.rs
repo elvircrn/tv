@@ -491,11 +491,24 @@ pub(crate) fn kernel_occ_limit(trace: &Trace, track_idx: u32, event_idx: u32) ->
 /// Lives beside the Selection table's "Hide Selected" so all hide/unhide
 /// controls sit together instead of being scattered into the toolbar.
 pub fn draw_hidden_clear(ui: &imgui::Ui, spacing: f32, hidden_names: &mut BitSet, fmt: &mut String) {
+    if hidden_names.count_ones() == 0 {
+        return;
+    }
+    ui.same_line_with_spacing(0.0, spacing);
+    draw_hidden_clear_here(ui, hidden_names, fmt);
+}
+
+/// The same indicator at the cursor as it already stands, for callers that
+/// positioned it themselves. `draw_hidden_clear` can't be used there:
+/// `same_line` pulls the cursor back to the previous item's line (its right
+/// edge, in fact), so after something as large as the Selection tab's big
+/// centred hint the indicator landed beside it, top-aligned against a 2x
+/// line and looking detached from the rest of the chrome.
+pub fn draw_hidden_clear_here(ui: &imgui::Ui, hidden_names: &mut BitSet, fmt: &mut String) {
     let n_hidden = hidden_names.count_ones();
     if n_hidden == 0 {
         return;
     }
-    ui.same_line_with_spacing(0.0, spacing);
     fmt.clear();
     write!(fmt, "{} hidden", n_hidden).unwrap();
     // Align with the Clear button this shares its line with (plain text sits
