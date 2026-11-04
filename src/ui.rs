@@ -3206,6 +3206,121 @@ pub fn draw_lock_icon(dl: &imgui::DrawListMut, cx: f32, cy: f32, fit: bool) {
     .build();
 }
 
+/// Editors the toolbar's picker offers a one-click row for. Each has launch
+/// arguments wired in `source::open_in_editor`; anything else can still be
+/// typed as a custom command.
+pub const KNOWN_EDITORS: [&str; 3] = ["gram", "code", "zed"];
+
+/// Display name for a known editor CLI (the picker's row labels). A custom
+/// command is shown verbatim, which is also what the toolbar button shows.
+pub fn editor_label(editor: &str) -> &str {
+    match editor {
+        "gram" => "Gram",
+        "code" | "vscode" => "VS Code",
+        "cursor" => "Cursor",
+        "zed" => "Zed",
+        "" => "Editor",
+        other => other,
+    }
+}
+
+/// Brand mark for `editor`, drawn as vector geometry into a `size`-square
+/// box whose top-left corner is (`x`, `y`) - the same no-image-assets
+/// approach as `draw_vllm_logo`. Known CLIs get their own mark; anything
+/// else (a custom command or a path) gets a generic "code" badge.
+pub fn draw_editor_icon(dl: &imgui::DrawListMut, editor: &str, x: f32, y: f32, size: f32) {
+    // Normalized (0..1) box helper: call sites below are written in unit
+    // coordinates so the marks scale with the menu font.
+    let p = |u: f32, v: f32| [x + u * size, y + v * size];
+    match editor {
+        "gram" => {
+            // Gram's app icon: pale-green rounded tile holding a darker
+            // frog head (two eyes) over a pale circular belly.
+            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(176, 208, 156, 255))
+                .filled(true).rounding(size * 0.24).build();
+            dl.add_rect(p(0.14, 0.14), p(0.86, 0.86), col32(122, 160, 99, 255))
+                .filled(true).rounding(size * 0.18).build();
+            dl.add_circle(p(0.50, 0.63), size * 0.24, col32(205, 226, 188, 255))
+                .filled(true).num_segments(16).build();
+            dl.add_circle(p(0.34, 0.32), size * 0.075, col32(55, 65, 48, 255))
+                .filled(true).num_segments(8).build();
+            dl.add_circle(p(0.66, 0.32), size * 0.075, col32(55, 65, 48, 255))
+                .filled(true).num_segments(8).build();
+        }
+        "code" | "vscode" => {
+            // VS Code's blue folded-ribbon mark. The official 24x24 SVG
+            // outline is concave (the V notch between the chevron's arms),
+            // which ImGui's convex fill cannot draw, so the two halves are
+            // pre-triangulated below; the split also gives the fold its
+            // darker body / lighter chevron two-tone.
+            const BODY: [[f32; 2]; 17] = [
+                [16.505, 0.500], [7.045, 9.130], [2.925, 6.002], [1.649, 6.059],
+                [0.327, 7.261], [0.326, 8.740], [3.899, 12.000], [0.326, 15.260],
+                [0.327, 16.739], [1.650, 17.940], [2.926, 17.997], [7.046, 14.869],
+                [16.506, 23.499], [18.210, 23.789], [18.004, 17.448], [10.826, 12.000],
+                [18.004, 6.552],
+            ];
+            const BODY_TRIS: [[usize; 3]; 15] = [
+                [0, 16, 15], [15, 14, 13], [15, 13, 12], [15, 12, 11], [0, 15, 11],
+                [0, 11, 10], [0, 10, 9], [0, 9, 8], [0, 8, 7], [0, 7, 6],
+                [6, 5, 4], [6, 4, 3], [6, 3, 2], [6, 2, 1], [6, 1, 0],
+            ];
+            const CHEVRON: [[f32; 2]; 9] = [
+                [18.004, 6.552], [18.210, 0.210], [23.150, 2.587], [24.000, 3.939],
+                [24.000, 20.060], [23.152, 21.412], [18.210, 23.789], [18.004, 17.448],
+                [10.826, 12.000],
+            ];
+            const CHEVRON_TRIS: [[usize; 3]; 7] = [
+                [0, 1, 2], [0, 2, 3], [8, 0, 3], [8, 3, 4], [4, 5, 6], [4, 6, 7], [4, 7, 8],
+            ];
+            let tri = |tris: &[[usize; 3]], pts: &[[f32; 2]], col: ImColor32| {
+                for t in tris {
+                    let q = |i: usize| p(pts[i][0] / 24.0, pts[i][1] / 24.0);
+                    dl.add_triangle(q(t[0]), q(t[1]), q(t[2]), col).filled(true).build();
+                }
+            };
+            tri(&BODY_TRIS, &BODY, col32(0, 101, 169, 255));
+            tri(&CHEVRON_TRIS, &CHEVRON, col32(0, 122, 204, 255));
+        }
+        "cursor" => {
+            // Cursor: near-black tile with a pale isometric cube.
+            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(28, 28, 31, 255))
+                .filled(true).rounding(size * 0.24).build();
+            let ink = col32(232, 234, 240, 255);
+            let hex = [[0.50, 0.16], [0.84, 0.35], [0.84, 0.66],
+                       [0.50, 0.85], [0.16, 0.66], [0.16, 0.35]];
+            dl.add_polyline(hex.iter().map(|&[u, v]| p(u, v)).collect::<Vec<_>>(), ink)
+                .thickness(size * 0.075).build();
+            let hub = p(0.50, 0.50);
+            for [u, v] in [[0.16, 0.35], [0.84, 0.35], [0.50, 0.85]] {
+                dl.add_line(hub, p(u, v), ink).thickness(size * 0.075).build();
+            }
+        }
+        "zed" => {
+            // Zed: dark tile with a bright Z.
+            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(30, 30, 33, 255))
+                .filled(true).rounding(size * 0.24).build();
+            let ink = col32(235, 235, 235, 255);
+            let t = size * 0.11;
+            dl.add_line(p(0.27, 0.28), p(0.73, 0.28), ink).thickness(t).build();
+            dl.add_line(p(0.73, 0.30), p(0.27, 0.70), ink).thickness(t).build();
+            dl.add_line(p(0.27, 0.72), p(0.73, 0.72), ink).thickness(t).build();
+        }
+        _ => {
+            // Generic badge for any other editor command.
+            dl.add_rect(p(0.0, 0.0), p(1.0, 1.0), col32(58, 58, 64, 255))
+                .filled(true).rounding(size * 0.24).build();
+            let ink = col32(214, 214, 218, 255);
+            let t = size * 0.09;
+            dl.add_line(p(0.42, 0.28), p(0.22, 0.50), ink).thickness(t).build();
+            dl.add_line(p(0.22, 0.50), p(0.42, 0.72), ink).thickness(t).build();
+            dl.add_line(p(0.58, 0.28), p(0.78, 0.50), ink).thickness(t).build();
+            dl.add_line(p(0.78, 0.50), p(0.58, 0.72), ink).thickness(t).build();
+            dl.add_line(p(0.55, 0.26), p(0.45, 0.74), ink).thickness(t * 0.85).build();
+        }
+    }
+}
+
 pub fn device_name_color() -> ImColor32 {
     ImColor32::from_rgba(118, 185, 0, 255)
 }

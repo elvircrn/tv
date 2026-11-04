@@ -146,6 +146,41 @@ pub(crate) fn should_show_tab_strip(panes: &[Pane]) -> bool {
     panes.len() > 1 || !panes[0].trace_path.is_empty()
 }
 
+/// One row of the toolbar's editor picker: the editor's brand mark, its
+/// display name, and a check mark when it's the current choice. The row is
+/// a plain span-width selectable whose label is empty — icon and text are
+/// then drawn at exact pixel offsets, so they line up identically whatever
+/// the font's space advance is (reserving room with leading spaces in the
+/// label, the usual trick, drifts between SF Mono and DejaVu). Returns true
+/// when the row was clicked.
+#[cfg(not(target_arch = "wasm32"))]
+fn editor_picker_row(ui: &imgui::Ui, editor: &str, label: &str, selected: bool) -> bool {
+    let row_h = ui.text_line_height() + 8.0;
+    let icon_sz = (row_h - 8.0).min(16.0);
+    let text_w = ui.calc_text_size(label)[0];
+    let row_w = icon_sz + 8.0 + text_w + 26.0 + 12.0;
+    let clicked = ui.selectable_config(format!("##edrow-{editor}"))
+        .selected(selected)
+        .size([row_w, row_h])
+        .build();
+    let rmin = ui.item_rect_min();
+    let rmax = ui.item_rect_max();
+    let cy = (rmin[1] + rmax[1]) * 0.5;
+    let text_y = cy - ui.text_line_height() * 0.5;
+    let dl = ui.get_window_draw_list();
+    draw_editor_icon(&dl, editor, rmin[0] + 6.0, cy - icon_sz * 0.5, icon_sz);
+    let text_col = if selected { col32(255, 255, 255, 255) } else { col32(220, 220, 220, 255) };
+    dl.add_text([rmin[0] + 6.0 + icon_sz + 8.0, text_y], text_col, label);
+    if selected {
+        let cx = rmin[0] + row_w - 16.0;
+        let c = col32(120, 200, 255, 255);
+        dl.add_line([cx - 3.5, cy], [cx - 0.5, cy + 3.0], c).thickness(1.8).build();
+        dl.add_line([cx - 0.5, cy + 3.0], [cx + 4.0, cy - 3.5], c).thickness(1.8).build();
+    }
+    drop(dl);
+    clicked
+}
+
 /// Wires up a freshly-opened pane's `reload_dir` when its files came from a
 /// directory argument (CLI or drop) — `dir` is `None` for bare file
 /// arguments, which have nothing to watch.
@@ -215,6 +250,13 @@ struct App {
     last_pinch_dist: Option<f32>,
     nav_pan_vel: f64,
     nav_zoom_vel: f64,
+    /// Any imgui popup/menu open at the end of the last frame. Feeds
+    /// `about_to_wait`'s Poll decision: imgui auto-resizes a newly opened
+    /// popup over its first frames (AutoFitFramesX/Y), and this loop
+    /// otherwise sleeps until the next OS event - so without this a menu
+    /// opened by a click sat at its provisional size until the mouse
+    /// moved, which read as the toolbar being unresponsive.
+    popup_open: bool,
     last_reload: Instant,
     // winit's web backend never resizes the canvas on its own when the
     // browser window/viewport changes — unlike native windows, a <canvas>
@@ -293,7 +335,7 @@ impl App {
                 diff_pane_indices: None,
                 kernel_ctx_menu: None,
                 src_path,
-                src_editor: "code".to_string(),
+                src_editor: "gram".to_string(),
                 src_idx,
                 #[cfg(not(target_arch = "wasm32"))]
                 src_clone: None,
@@ -317,6 +359,7 @@ impl App {
             nav_keys: 0,
             nav_pan_vel: 0.0,
             nav_zoom_vel: 0.0,
+            popup_open: false,
             last_reload: Instant::now(),
             active_touches: std::collections::HashMap::new(),
             primary_touch_id: None,
@@ -1170,6 +1213,7 @@ impl ApplicationHandler for App {
             || self.nav_zoom_vel.abs() > 1e-6
             || any_watching
             || awaiting_real_size
+            || self.popup_open
             || self.state.panes.iter().any(|p| p.view.anim.is_some())
             || src_cloning;
         if needs_poll {
@@ -1652,6 +1696,74 @@ impl App {
                                     ui.separator();
                                     ui.text("Drop file         Open trace");
                                     ui.text("Drop folder       Merge multi-rank traces");
+                                });
+                            }
+
+                            // ---- Editor picker: which CLI the "View
+                            // Source" jumps launch. A toolbar entry showing
+                            // the current editor's mark; the dropdown
+                            // repeats the marks per row so the choice reads
+                            // at a glance (all vector geometry, no image
+                            // assets - see `draw_editor_icon`). The text
+                            // field takes any other editor command, the
+                            // same state the Source setup popup edits.
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                let label = editor_label(&state.src_editor);
+                                let icon_sz = (ui.text_line_height() - 1.0).min(16.0);
+                                let text_w = ui.calc_text_size(label)[0];
+                                let btn_w = 7.0 + icon_sz + 6.0 + text_w + 8.0 + 9.0 + 7.0;
+                                let clicked = ui.button_with_size(
+                                    "##editorpick", [btn_w, ui.frame_height()]);
+                                let rmin = ui.item_rect_min();
+                                let rmax = ui.item_rect_max();
+                                let cy = (rmin[1] + rmax[1]) * 0.5;
+                                {
+                                    let dl = ui.get_window_draw_list();
+                                    draw_editor_icon(&dl, &state.src_editor,
+                                        rmin[0] + 7.0, cy - icon_sz * 0.5, icon_sz);
+                                    dl.add_text(
+                                        [rmin[0] + 7.0 + icon_sz + 6.0,
+                                         cy - ui.text_line_height() * 0.5],
+                                        col32(228, 228, 228, 255), label);
+                                    // Down chevron: "this opens a picker".
+                                    let ax = rmax[0] - 10.0;
+                                    let ac = col32(166, 166, 166, 255);
+                                    dl.add_line([ax - 3.5, cy - 1.5], [ax, cy + 2.0], ac)
+                                        .thickness(1.4).build();
+                                    dl.add_line([ax, cy + 2.0], [ax + 3.5, cy - 1.5], ac)
+                                        .thickness(1.4).build();
+                                }
+                                if ui.is_item_hovered() {
+                                    ui.tooltip_text("Editor used by View Source jumps.\nClick to pick one; any other editor command can be typed in the picker.");
+                                }
+                                if clicked { ui.open_popup("##editorpick"); }
+                                // The popup belongs to this window's ID
+                                // stack (the menu bar pushes "##menubar"),
+                                // so open and draw it here rather than
+                                // outside; anchoring it under the button
+                                // beats ImGui's default "at the mouse".
+                                unsafe {
+                                    imgui_sys::igSetNextWindowPos(
+                                        [rmin[0], rmax[1] + 2.0].into(),
+                                        Condition::Appearing as i32,
+                                        [0.0, 0.0].into(),
+                                    );
+                                }
+                                ui.popup("##editorpick", || {
+                                    for e in KNOWN_EDITORS {
+                                        if editor_picker_row(ui, e, editor_label(e),
+                                                             state.src_editor == e)
+                                        {
+                                            state.src_editor = e.to_string();
+                                        }
+                                    }
+                                    ui.separator();
+                                    ui.text_disabled("Other command:");
+                                    ui.set_next_item_width(180.0);
+                                    ui.input_text("##editorcustom", &mut state.src_editor)
+                                        .hint("code-insiders, nvim, ...")
+                                        .build();
                                 });
                             }
 
@@ -2443,12 +2555,16 @@ impl App {
                         format!("fetching exact vllm build {} ...", bid)));
                     ui.close_current_popup();
                 }
+                // The known-editor quick-pick lives in the toolbar's editor
+                // button; this field is for any other CLI (and always
+                // reflects that button's current choice).
                 ui.set_next_item_width(90.0);
                 ui.input_text("##srceditor", &mut state.src_editor)
                     .hint("editor")
                     .build();
-                ui.same_line();
-                ui.text_disabled("editor command (code, cursor, zed)");
+                if ui.is_item_hovered() {
+                    ui.tooltip_text("Editor command for View Source jumps. Gram, VS Code, Cursor and\nZed are wired for file:line positioning; anything else is launched\nwith `-g file:line`. Pick a known one from the toolbar's editor button.");
+                }
             });
             // Multi-hit picker: a name that resolved to more than one
             // definition lists them; click a row to open file:line.
@@ -2986,6 +3102,17 @@ impl App {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.render(draw_data);
         }
+        // Read after render(): the popup stack is still valid until the
+        // next `new_frame`. Null id + AnyPopup* is the "is anything open"
+        // form (see `IsPopupOpen` - it never dereferences the string id
+        // when AnyPopupId is set). `about_to_wait` turns this into Poll so
+        // an open menu gets the frames its auto-resize needs.
+        self.popup_open = unsafe {
+            imgui_sys::igIsPopupOpen(
+                std::ptr::null(),
+                (imgui_sys::ImGuiPopupFlags_AnyPopupId | imgui_sys::ImGuiPopupFlags_AnyPopupLevel) as i32,
+            )
+        };
         mark!("render", t_section);
         // mark!'s trailing reassignment is dead on the final call — read
         // t_section once so the macro can stay uniform across call sites.

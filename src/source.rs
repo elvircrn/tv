@@ -375,15 +375,23 @@ pub fn trace_build_commit(vllm_version: &str) -> Option<&str> {
 fn editor_candidates(editor: &str) -> Vec<String> {
     if editor.contains('/') { return vec![editor.to_string()]; }
     let mut cands = vec![editor.to_string()];
-    if editor == "code" {
-        // A GUI-launched app doesn't inherit the shell's PATH, so a bare
-        // `code` fails even when the CLI is installed; try the usual spots.
-        cands.push("/usr/local/bin/code".into());
-        cands.push("/opt/homebrew/bin/code".into());
-        if let Ok(home) = std::env::var("HOME") {
-            cands.push(format!("{home}/.vscode/bin/code"));
+    // A GUI-launched app doesn't inherit the shell's PATH, so a bare
+    // command fails even when the CLI is installed; try the usual spots.
+    match editor {
+        "code" => {
+            cands.push("/usr/local/bin/code".into());
+            cands.push("/opt/homebrew/bin/code".into());
+            if let Ok(home) = std::env::var("HOME") {
+                cands.push(format!("{home}/.vscode/bin/code"));
+            }
+            cands.push("/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code".into());
         }
-        cands.push("/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code".into());
+        "gram" => {
+            cands.push("/opt/homebrew/bin/gram".into());
+            cands.push("/usr/local/bin/gram".into());
+            cands.push("/Applications/Gram.app/Contents/MacOS/cli".into());
+        }
+        _ => {}
     }
     cands
 }
@@ -404,18 +412,19 @@ pub(crate) fn encode_uri_path(p: &str) -> String {
 }
 
 /// Open `path:line` in the user's editor. `editor` is the editor's CLI
-/// command ("code", "cursor", ...); Zed takes `file:line` directly, the
-/// rest take `-g file:line`. VS Code is special: `-g` positions the
-/// cursor only on a fresh open — when the file is already open in a
-/// window it just focuses the tab and leaves the cursor where it was —
-/// so `code` jumps via the `vscode://file/<path>:<line>` protocol URL
-/// instead, whose handler applies the selection to an open editor too.
+/// command ("gram", "code", "cursor", ...); Gram and Zed take
+/// `file:line` directly, the rest take `-g file:line`. VS Code is
+/// special: `-g` positions the cursor only on a fresh open — when the
+/// file is already open in a window it just focuses the tab and leaves
+/// the cursor where it was — so `code` jumps via the
+/// `vscode://file/<path>:<line>` protocol URL instead, whose handler
+/// applies the selection to an open editor too.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn open_in_editor(editor: &str, hit: &SourceHit) -> Result<(), String> {
     let loc = format!("{}:{}", hit.path.display(), hit.line);
     for exe in editor_candidates(editor) {
         let mut c = std::process::Command::new(&exe);
-        if editor == "zed" {
+        if editor == "zed" || editor == "gram" {
             c.arg(&loc);
         } else if editor == "code" {
             c.args(["--open-url",
