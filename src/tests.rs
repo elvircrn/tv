@@ -6761,6 +6761,77 @@ fn test_parse_dep_pins() {
 }
 
 #[test]
+fn test_parse_pip_pins() {
+    use crate::source::parse_pip_pins;
+    let dir = std::env::temp_dir().join("tv_pip_pin_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("cuda.txt"), "\
+torch==2.14.0
+flashinfer-python==0.7.2.post1
+tilelang==0.1.12
+flashinfer-python>=0.2 # range, pins nothing
+# full comment line
+nvtx==0.2.15 ; platform_system == \"Linux\"
+quack-kernels==0.6.5  # no known repo
+").unwrap();
+    let pins = parse_pip_pins(&dir.join("cuda.txt"));
+    assert_eq!(pins.len(), 1, "{pins:?}");
+    assert_eq!(pins[0].name, "flashinfer");
+    assert_eq!(pins[0].url, "https://github.com/flashinfer-ai/flashinfer");
+    assert_eq!(pins[0].tag, "v0.7.2.post1");
+    // Missing file: no pins, no panic.
+    assert!(parse_pip_pins(&dir.join("absent.txt")).is_empty());
+}
+
+#[test]
+fn test_resolve_cute_kernel() {
+    use crate::source::SourceIndex;
+    let root = std::env::temp_dir().join("tv_cute_test");
+    let _ = std::fs::remove_dir_all(&root);
+    let cute = root.join("vllm/model_executor/kernels/linear/cute_dsl");
+    std::fs::create_dir_all(&cute).unwrap();
+    // Shorter flattened prefixes (`vllmmodel`, the package __init__)
+    // must lose to the longest match.
+    std::fs::write(root.join("vllm/model.py"), "def decoy(a):\n    return a\n").unwrap();
+    std::fs::write(cute.join("__init__.py"), "").unwrap();
+    std::fs::write(cute.join("_ll_bf16_splitk.py"),
+        "x = 1\ndef LLBf16SplitK(a, b):\n    return a\n").unwrap();
+    // A dep checkout matches on its in-repo path, not deps/<name>/...
+    let fi = root.join("deps/flashinfer/flashinfer/gemm/kernels");
+    std::fs::create_dir_all(&fi).unwrap();
+    std::fs::write(fi.join("dense_blockscaled_gemm_sm100_splitk.py"),
+        "# header\nclass Sm100BlockScaledSplitKGemmKernel:\n    pass\n").unwrap();
+
+    let mut idx = SourceIndex::new(root.clone());
+    // In-tree cute-dsl kernel: flattened path + entry symbol.
+    let hits = idx.resolve_kernel(
+        "kernel_cutlass_kernel_vllmmodel_executorkernelslinearcute_dsl_ll_bf16_splitkLLBf16SplitK_object_at_0x1");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].rel, "vllm/model_executor/kernels/linear/cute_dsl/_ll_bf16_splitk.py");
+    assert_eq!(hits[0].line, 2);
+
+    // Flashinfer dep kernel: file picked by in-repo flattened path, line
+    // by the class name (no def with parens exists).
+    let hits = idx.resolve_kernel(
+        "kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100_splitkSm100BlockScaledSplitKGemmKernel_object_at_0x1");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].rel, "deps/flashinfer/flashinfer/gemm/kernels/dense_blockscaled_gemm_sm100_splitk.py");
+    assert_eq!(hits[0].line, 2);
+
+    // Unknown symbol after a known module: file hit at line 1 rather
+    // than nothing — the file is the value, the line is a fallback.
+    let hits = idx.resolve_kernel(
+        "kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100_splitkSomethingElse_object_at_0x1");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].line, 1);
+
+    // No path match at all.
+    assert!(idx.resolve_kernel(
+        "kernel_cutlass_kernel_nosuchmoduledoesnotexistAnySymbol_object_at_0x1").is_empty());
+}
+
+#[test]
 fn test_encode_uri_path() {
     use crate::source::encode_uri_path;
     assert_eq!(encode_uri_path("/Users/x/vllm/a.py"), "/Users/x/vllm/a.py");
@@ -6843,4 +6914,13 @@ fn dep_resolution_real() {
     assert!(!hits.is_empty(), "deep_gemm mega-moe kernel must resolve in deps/deepgemm");
     assert!(hits.iter().all(|h| h.rel.starts_with("deps/deepgemm/")),
         "hits must point into the dep checkout: {:?}", hits.iter().map(|h| &h.rel).take(3).collect::<Vec<_>>());
+    // flashinfer: pinned in requirements/cuda.txt, fetched at that tag,
+    // and its cute-dsl kernel names resolve through the flattened path.
+    assert!(wt.join("deps/flashinfer/flashinfer/gemm/kernels").is_dir(),
+        "pinned flashinfer must be fetched into deps/");
+    let hits = idx.resolve_kernel(
+        "kernel_cutlass_kernel_flashinfergemmkernelsdense_blockscaled_gemm_sm100_splitkSm100BlockScaledSplitKGemmKernel_object_at_0x1");
+    assert!(!hits.is_empty(), "flashinfer cute-dsl kernel must resolve in deps/flashinfer");
+    assert!(hits.iter().all(|h| h.rel.starts_with("deps/flashinfer/")),
+        "hits must point into the flashinfer checkout: {:?}", hits.iter().map(|h| &h.rel).take(3).collect::<Vec<_>>());
 }

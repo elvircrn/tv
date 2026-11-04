@@ -151,6 +151,19 @@ impl SourceIndex {
     /// substring-matched a different function and sent the viewer to a
     /// confidently wrong line. Up to two drops.
     pub fn resolve_kernel(&mut self, kernel: &str) -> Vec<SourceHit> {
+        // Cute-dsl JIT kernels (cutlass Python DSL) reach the trace as
+        // `kernel_cutlass_kernel_<flattened module path><Symbol>_object_at_...`
+        // — the whole name is one flattened identifier, so the plain
+        // base-name grep below can't see them. Resolve by path prefix.
+        if let Some(rest) = kernel.strip_prefix("kernel_cutlass_kernel_") {
+            let rest = rest.split("_object_at_").next().unwrap_or(rest);
+            if !rest.is_empty() {
+                if let Some(v) = self.memo.get(kernel) { return v.clone(); }
+                let hits = self.scan_cute(rest);
+                self.memo.insert(kernel.to_string(), hits.clone());
+                return hits;
+            }
+        }
         let mut base = kernel_base_name(kernel);
         if base.is_empty() { return Vec::new(); }
         for attempt in 0..3 {
@@ -227,6 +240,69 @@ impl SourceIndex {
     /// that drives it is native-only, so it's never reached.)
     #[cfg(target_arch = "wasm32")]
     fn scan(&self, _name: &str) -> Vec<SourceHit> { Vec::new() }
+
+    /// Cute-dsl resolution for `kernel_cutlass_kernel_<flat><Symbol>`:
+    /// `<flat>` is the defining module's in-repo path with the extension
+    /// and separators dropped (`flashinfer/gemm/kernels/x.py` ->
+    /// `flashinfergemmkernelsx`), `<Symbol>` the kernel entry name.
+    /// Match files by longest flattened-path prefix, then locate the
+    /// symbol inside. No file is read until the file match is decided,
+    /// so this costs one directory walk plus a couple of reads.
+    /// Dep files match on their in-repo path: the on-disk
+    /// `deps/flashinfer/flashinfer/gemm/...` matches `flashinfergemm...`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn scan_cute(&self, mangled: &str) -> Vec<SourceHit> {
+        let mut files = Vec::new();
+        self.collect_files(&self.root, &mut files);
+        let mut best: Vec<(usize, PathBuf)> = Vec::new(); // (flat len, path)
+        for path in files {
+            let Ok(rel) = path.strip_prefix(&self.root) else { continue };
+            // The flattened name carries the module path without the
+            // extension: strip it before dropping the separators.
+            let rel = rel.with_extension("");
+            let rel = rel.to_string_lossy();
+            // Dep checkouts sit under deps/<name>/; the mangled name
+            // carries the repo-internal path, so drop that prefix.
+            let in_repo = match rel.split_once('/') {
+                Some(("deps", rest)) if rest.contains('/') => {
+                    &rest[rest.find('/').unwrap() + 1..]
+                }
+                _ => &rel,
+            };
+            let flat = in_repo.replace('/', "");
+            if !flat.is_empty() && mangled.starts_with(&flat) {
+                let len = flat.len();
+                match best.first() {
+                    Some((l, _)) if *l > len => {}
+                    Some((l, _)) if *l == len => best.push((len, path)),
+                    _ => best = vec![(len, path)],
+                }
+            }
+        }
+        let sym = best.first().map(|(l, _)| &mangled[*l..]).unwrap_or("");
+        best.iter()
+            .filter_map(|(_, path)| {
+                let Ok(text) = std::fs::read(path) else { return None };
+                let needle: Vec<u8> = format!("{sym}(").into_bytes();
+                let mut line = 0;
+                for (i, l) in text.split(|&b| b == b'\n').enumerate() {
+                    if find_def(l, &needle) { line = (i + 1) as u32; break; }
+                }
+                if line == 0 {
+                    // Not a def (a class, or the entry is generated):
+                    // first textual occurrence, else the file itself.
+                    let hay = String::from_utf8_lossy(&text);
+                    line = hay.lines().position(|l| l.contains(sym))
+                        .map_or(1, |i| (i + 1) as u32);
+                }
+                Some(self.hit(path.clone(), line))
+            })
+            .collect()
+    }
+
+    /// wasm stub, same deal as scan's.
+    #[cfg(target_arch = "wasm32")]
+    fn scan_cute(&self, _mangled: &str) -> Vec<SourceHit> { Vec::new() }
 
     /// Recursive collect of the python + C-family files under `dir`.
     /// Re-walked per scan (the walk is cheap; the reads dominate) so a
@@ -727,7 +803,8 @@ fn fetch_tag(cache: &Path, tag: &str) -> Result<(), String> {
 /// than vendoring them.
 #[derive(Debug)]
 pub struct DepPin {
-    /// Directory name under `<worktree>/deps/` (the cmake file's stem).
+    /// Directory name under `<worktree>/deps/` (the cmake file's stem,
+    /// or the short name from the pip table).
     pub name: String,
     /// Clone URL, always github so far.
     pub url: String,
@@ -803,6 +880,44 @@ pub(crate) fn parse_dep_pins(dir: &Path) -> Vec<DepPin> {
     out
 }
 
+/// pip packages we know a github repo for: package name -> (dep dir
+/// name, clone URL). Their kernels appear in traces under the repo's
+/// own path namespace, and vllm pins the exact version in
+/// requirements/cuda.txt, so the checkout is recoverable like the CMake
+/// pins. Add rows as traces show kernels from other pinned pips.
+fn pip_github_repo(pkg: &str) -> Option<(&'static str, &'static str)> {
+    match pkg {
+        // The flashinfer cute-dsl kernels (`kernel_cutlass_kernel_
+        // flashinfergemmkernels...`) are the biggest dep kernel family
+        // in EP/MoE traces.
+        "flashinfer-python" =>
+            Some(("flashinfer", "https://github.com/flashinfer-ai/flashinfer")),
+        _ => None,
+    }
+}
+
+/// Exact `pkg==version` pins from a requirements file, for packages in
+/// the table above. Version ranges (`>=`), URLs (` @ `) and environment
+/// markers pin nothing exact, so those lines contribute nothing.
+pub(crate) fn parse_pip_pins(file: &Path) -> Vec<DepPin> {
+    let Ok(text) = std::fs::read_to_string(file) else { return Vec::new() };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        // Strip comment, then environment marker; both are `#`/`;`-out.
+        let line = line.split('#').next().unwrap_or(line);
+        let line = line.split(';').next().unwrap_or(line).trim();
+        let Some((pkg, ver)) = line.split_once("==") else { continue };
+        let (pkg, ver) = (pkg.trim(), ver.trim());
+        if ver.is_empty() { continue; }
+        if let Some((name, url)) = pip_github_repo(pkg) {
+            out.push(DepPin {
+                name: name.to_string(), url: url.to_string(), tag: format!("v{ver}"),
+            });
+        }
+    }
+    out
+}
+
 /// Fetch the CMake-pinned dependencies into `<worktree>/deps/<name>`,
 /// where the source scanner walks them like any other tree — kernels
 /// that live outside vllm (`deep_gemm::...`, flash-attention, ...)
@@ -812,20 +927,27 @@ pub(crate) fn parse_dep_pins(dir: &Path) -> Vec<DepPin> {
 /// kernels, not the whole build. Parallel: they're independent network
 /// fetches. Returns the pin count (fetched or already present).
 fn materialize_deps(wt: &Path) -> usize {
-    // The pins live under cmake/, which the sparse checkout must include
-    // (a no-op re-set when it already does).
-    let _ = git(Some(wt), &["sparse-checkout", "set", "vllm", "csrc", "cmake"]);
-    let pins = parse_dep_pins(&wt.join("cmake/external_projects"));
+    // The pins live under cmake/ and requirements/, which the sparse
+    // checkout must include (a no-op re-set when it already does).
+    let _ = git(Some(wt), &["sparse-checkout", "set", "vllm", "csrc", "cmake", "requirements"]);
+    let mut pins = parse_dep_pins(&wt.join("cmake/external_projects"));
+    pins.extend(parse_pip_pins(&wt.join("requirements/cuda.txt")));
     let deps = wt.join("deps");
     if std::fs::create_dir_all(&deps).is_err() { return 0; }
     std::thread::scope(|s| {
         for pin in &pins {
             s.spawn(|| {
                 let dir = deps.join(&pin.name);
-                // Already at the pin? (Pin is usually a full sha; accept a
-                // prefix so abbreviated pins reuse too.)
+                // Already at the pin? Shas compare directly (prefix so
+                // abbreviated pins reuse too); tags through their local
+                // ref, which fetch_dep writes for exactly this check.
                 let at_pin = git(Some(&dir), &["rev-parse", "HEAD"])
-                    .is_ok_and(|h| h == pin.tag || h.starts_with(&pin.tag));
+                    .is_ok_and(|h| {
+                        h == pin.tag || h.starts_with(&pin.tag)
+                            || git(Some(&dir), &["rev-parse",
+                                    &format!("refs/tags/{}^{{}}", pin.tag)])
+                                .is_ok_and(|t| t == h)
+                    });
                 if at_pin { return; }
                 let _ = std::fs::remove_dir_all(&dir);
                 if let Err(e) = fetch_dep(&dir, pin) {
@@ -837,23 +959,25 @@ fn materialize_deps(wt: &Path) -> usize {
     pins.len()
 }
 
-/// One dep: fresh shallow repo at the pin. The pin is a full sha in
-/// every vllm pin seen, which fetches directly; abbreviated shas go
-/// through the API, tag names through the tag refspec.
+/// One dep: fresh shallow repo at the pin. Sha pins (every vllm CMake
+/// pin so far) fetch directly, abbreviated shas go through the API, tag
+/// names (pip pins like flashinfer's `v0.7.2.post1`) through the tag
+/// refspec — which also leaves the local ref behind for the at-pin
+/// reuse check in materialize_deps.
 fn fetch_dep(dir: &Path, pin: &DepPin) -> Result<(), String> {
     let dir_s = dir.to_string_lossy().into_owned();
     git(None, &["init", "-q", &dir_s])?;
     git(Some(dir), &["remote", "add", "origin", &pin.url])?;
     let fetch = |r: &str| git(Some(dir), &["fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", r]);
-    if fetch(&pin.tag).is_err() {
-        let hexish = pin.tag.len() >= 7 && pin.tag.chars().all(|c| c.is_ascii_hexdigit());
-        if hexish {
+    let hexish = pin.tag.len() >= 7 && pin.tag.chars().all(|c| c.is_ascii_hexdigit());
+    if hexish {
+        if fetch(&pin.tag).is_err() {
             let slug = pin.url.trim_start_matches("https://github.com/").trim_end_matches(".git");
             fetch(&api_resolve_sha(slug, &pin.tag)?)?;
-        } else {
-            let spec = format!("refs/tags/{0}:refs/tags/{0}", pin.tag);
-            git(Some(dir), &["fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", &spec])?;
         }
+    } else {
+        let spec = format!("refs/tags/{0}:refs/tags/{0}", pin.tag);
+        git(Some(dir), &["fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", &spec])?;
     }
     // checkout triggers the promisor's lazy blob fetch for the files.
     git(Some(dir), &["checkout", "-q", "--detach", "FETCH_HEAD"]).map(|_| ())
