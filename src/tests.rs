@@ -6595,6 +6595,73 @@ fn test_launch_link_resolves_generic_kernel() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// A kernel replayed from a captured CUDA graph has no External id and its
+/// correlation points at the `cudaGraphLaunch`, not at any per-kernel CPU
+/// call. The replay frame is not the kernel's source, so resolution must
+/// explain instead of jumping there. Correlation ids are also reused over a
+/// long trace, so a match that starts AFTER the kernel (and an older one
+/// from before the real launch) must not win.
+#[test]
+fn test_launch_link_graph_replay_is_not_a_source() {
+    let root = std::env::temp_dir().join("tv_launch_link_graph_test");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("vllm")).unwrap();
+    std::fs::write(root.join("vllm/launch.py"), "def replay():\n    pass\n").unwrap();
+
+    let mut buf = vec![0u8];
+    let mut add = |s: &str| { let off = buf.len() as u32; buf.extend_from_slice(s.as_bytes()); off };
+    let kernel_args = add("{\"correlation\":\"42\"}");
+    let corr_args = add("{\"correlation\":\"42\"}");
+    let raw = Arc::new(ArgsBuf(buf));
+    let names: Vec<String> = [
+        "void flash::flash_fwd_splitkv_kernel<128, 64, 128>(flash::Flash_fwd_params)",
+        "cudaGraphLaunch", "aten::slice", "vllm/launch.py(1): replay", "aten::view",
+    ].iter().map(|s| s.to_string()).collect();
+    let cats: Vec<String> = ["kernel", "cuda_driver", "cpu_op", "python_function"]
+        .iter().map(|s| s.to_string()).collect();
+    let ev = |ts: f64, dur: f64, name: u32, cat: u32, off: u32| Event {
+        ts, dur, name, cat, args_off: off, args_len: 0, depth: 0 };
+    let mk = |label: &str, gpu: bool, events: Vec<Event>| Track {
+        label: label.to_string(), gpu, events, max_depth: 1,
+        prefix_max_dur: vec![1.0], raw_buf_idx: 0 };
+    let trace = Trace {
+        tracks: vec![
+            mk("stream 7", true, vec![ev(100.0, 10.0, 0, 0, kernel_args)]),
+            mk("thread 7", false, vec![
+                ev(40.0, 70.0, 3, 3, 0),           // replay frame, encloses the launch
+                ev(50.0, 10.0, 1, 1, corr_args),   // cudaGraphLaunch, correlation 42
+                ev(10.0, 2.0, 4, 2, corr_args),    // stale reuse BEFORE the launch
+                ev(200.0, 2.0, 2, 2, corr_args),   // reuse AFTER the kernel
+            ]),
+        ],
+        names, cats, raw_bufs: vec![raw], stats: Vec::new(),
+        max_ts: 210.0, min_ts: 0.0, total_events: 5,
+        device: String::new(), vllm_version: String::new(), dist_rank: 0, dist_world: 0,
+        flow_pairs: Vec::new(), rank_paths: Vec::new(),
+    };
+
+    let link = crate::launch_link(&trace, 0, 0).expect("link");
+    assert_eq!(link.op, None);
+    // Only preceding events qualify, and the latest of those is the launch.
+    assert_eq!(link.at, Some((1, 1)));
+    assert!(link.graph, "cudaGraphLaunch is a replay, not a launch site");
+
+    let mut pane = Pane::new();
+    pane.trace = Some(trace);
+    let mut idx = Some(Box::new(crate::source::SourceIndex::new(root.clone())));
+    let (act, _) = crate::resolve_event_source(
+        &mut idx, &pane, crate::types::EventRef { track_idx: 0, event_idx: 0 });
+    match act {
+        crate::SrcAction::Note(n) => {
+            assert!(n.contains("captured CUDA graph"), "note explains the replay: {n}");
+            assert!(n.contains("vllm/launch.py:1"), "note names the replay site: {n}");
+        }
+        _ => panic!("expected Note, got a jump to the replay frame"),
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Real-data validation for the Source tab's resolvers, against a local
 /// vLLM checkout. Gated on env vars so CI never needs the fixtures:
 ///   TV_SOURCE_TRACE=<rank.ktz>  TV_SOURCE_ROOT=<vllm checkout>

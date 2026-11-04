@@ -3203,6 +3203,9 @@ impl App {
 enum SrcAction {
     /// Surface this message in the Source tab's error line.
     Error(String),
+    /// No jump to make, but the status bar should explain why (e.g. the
+    /// kernel executes from a CUDA graph captured before profiling began).
+    Note(String),
     /// Exactly one hit: launch the editor at it.
     Open(source::SourceHit),
     /// Several hits: list them in the Source tab and switch to it.
@@ -3216,10 +3219,14 @@ enum SrcAction {
 /// (the RecordFunction that launched the kernel, e.g. `vllm::foo`), and
 /// `at` is the (track, event) of the CPU launch event itself, whose
 /// enclosing python frames name the file:line that issued the launch.
+/// `graph` marks `at` as a CUDA graph replay: captured kernels run without
+/// any per-kernel CPU call, so the only frame kineto recorded is the
+/// replay site, which is not where the kernel was written or launched.
 #[cfg(not(target_arch = "wasm32"))]
 struct LaunchLink {
     op: Option<String>,
     at: Option<(u32, u32)>,
+    graph: bool,
 }
 
 /// Follow a kernel's `External id` / `correlation` args to its CPU-side
@@ -3256,7 +3263,13 @@ fn launch_link(trace: &Trace, track_idx: u32, event_idx: u32) -> Option<LaunchLi
     // counters, so a match from another rank's tracks is a false positive.
     // Prefer the same "Rank N" prefix when the kernel track carries one.
     let want_rank = rank_tag(&track.label);
-    let mut link = LaunchLink { op: None, at: None };
+    let mut op: Option<String> = None;
+    let mut op_at = None;
+    // Correlation ids are reused over a long trace, so many events can carry
+    // the kernel's id. Only events that STARTED before the kernel can have
+    // launched it; among those, the latest one is the launch (an earlier
+    // reuse belongs to an unrelated op that ran before).
+    let mut corr_at: Option<(f64, (u32, u32), bool)> = None;
     let mut other_strs = InternTable::new();
     let mut other_pairs = Vec::new();
     for (tj, tjr) in trace.tracks.iter().enumerate() {
@@ -3266,6 +3279,7 @@ fn launch_link(trace: &Trace, track_idx: u32, event_idx: u32) -> Option<LaunchLi
         }
         let traw = &trace.raw_bufs[tjr.raw_buf_idx as usize];
         for (ej, e2) in tjr.events.iter().enumerate() {
+            if e2.ts > ev.ts { continue; }
             let cat = &trace.cats[e2.cat as usize];
             if !(cat == "cpu_op" || cat == "cuda_driver" || cat == "cuda_runtime") { continue; }
             if e2.args_off == 0 { continue; }
@@ -3277,16 +3291,23 @@ fn launch_link(trace: &Trace, track_idx: u32, event_idx: u32) -> Option<LaunchLi
             for &[k, v] in &other_pairs {
                 let (key, val) = (other_strs.str(k), other_strs.str(v));
                 if key == "External id" && extid.as_deref() == Some(val) {
-                    link.op = Some(trace.names[e2.name as usize].clone());
-                    link.at.get_or_insert((tj as u32, ej as u32));
+                    if op.is_none() {
+                        op = Some(trace.names[e2.name as usize].clone());
+                        op_at = Some((tj as u32, ej as u32));
+                    }
                 } else if key == "correlation" && corr.as_deref() == Some(val) {
-                    link.at = Some((tj as u32, ej as u32));
+                    if corr_at.map_or(true, |(ts, _, _)| e2.ts >= ts) {
+                        let graph = trace.names[e2.name as usize].contains("GraphLaunch");
+                        corr_at = Some((e2.ts, (tj as u32, ej as u32), graph));
+                    }
                 }
             }
-            if link.op.is_some() && link.at.is_some() { return Some(link); }
         }
     }
-    (link.op.is_some() || link.at.is_some()).then_some(link)
+    let at = corr_at.map(|(_, p, _)| p).or(op_at);
+    let graph = corr_at.is_some_and(|(_, _, g)| g);
+    if op.is_none() && at.is_none() { return None; }
+    Some(LaunchLink { op, at, graph })
 }
 
 /// `"  Rank 3 stream 19"` -> `Some("Rank 3")`; used to keep a merged
@@ -3426,6 +3447,8 @@ fn resolve_event_source(
     // its op name, else the innermost enclosing python frame. This is what
     // resolves CuTe DSL JIT kernels, which CUPTI only ever names `Kernel`.
     let mut via = None;
+    // Set when the only CPU frame the trace has is a CUDA graph replay.
+    let mut replay_note = None;
     if hits.is_empty() && callfrom.is_none() && (track.gpu || cat == "kernel") {
         if let Some(link) = launch_link(trace, r.track_idx, r.event_idx) {
             if let Some(op) = link.op.as_deref() {
@@ -3436,7 +3459,21 @@ fn resolve_event_source(
             }
             if hits.is_empty() {
                 if let Some(at) = link.at {
-                    if let Some(h) = enclosing_frame(trace, at, idx.as_ref()) {
+                    // A captured kernel has no CPU call of its own: the
+                    // correlation points at the cudaGraphLaunch that
+                    // replayed the graph, whose innermost frame is vLLM's
+                    // replay helper. Jumping there would claim the kernel
+                    // was issued from cuda_graph.py, which is never the
+                    // real site and usually not even vLLM code - so say
+                    // where the replay was instead of lying with a jump.
+                    if link.graph {
+                        let site = enclosing_frame(trace, at, idx.as_ref())
+                            .map(|h| format!(" `{}:{}`", h.rel, h.line));
+                        replay_note = Some(format!(
+                            "`{}` runs from a captured CUDA graph: this trace \
+                             records only the replay{} - the capture site is \
+                             not in the trace", name, site.unwrap_or_default()));
+                    } else if let Some(h) = enclosing_frame(trace, at, idx.as_ref()) {
                         via = Some(format!("{}:{}", h.rel, h.line));
                         hits = vec![h];
                     }
@@ -3453,18 +3490,22 @@ fn resolve_event_source(
         (None, Some(v)) => Some(format!("launch site of `{name}`: {v}")),
         (w, None) => w,
     };
-    let act = match hits.len() {
-        0 => SrcAction::Error(if generic {
-            format!("`{}` is CUPTI's placeholder for a kernel it could not \
-                     symbolicate, and this trace carries no launch correlation \
-                     to resolve it", name)
-        } else { match source::external_kernel_family(name) {
-            Some(why) => format!("`{}` is {}", name, why),
-            None => format!(
-                "no source found for `{}` in the checkout (aten/CUB/CUTLASS kernels live outside vllm)", name),
-        } }),
-        1 => SrcAction::Open(hits.into_iter().next().unwrap()),
-        _ => SrcAction::List(hits),
+    let act = if let Some(n) = replay_note {
+        SrcAction::Note(n)
+    } else {
+        match hits.len() {
+            0 => SrcAction::Error(if generic {
+                format!("`{}` is CUPTI's placeholder for a kernel it could not \
+                         symbolicate, and this trace carries no launch correlation \
+                         to resolve it", name)
+            } else { match source::external_kernel_family(name) {
+                Some(why) => format!("`{}` is {}", name, why),
+                None => format!(
+                    "no source found for `{}` in the checkout (aten/CUB/CUTLASS kernels live outside vllm)", name),
+            } }),
+            1 => SrcAction::Open(hits.into_iter().next().unwrap()),
+            _ => SrcAction::List(hits),
+        }
     };
     (act, warn)
 }
@@ -3485,6 +3526,7 @@ fn apply_src_action(
 ) {
     match act {
         SrcAction::Error(e) => *msg = Some((SrcNote::Err, e)),
+        SrcAction::Note(n) => *msg = Some((SrcNote::Warn, n)),
         SrcAction::Open(h) => match source::open_in_editor(editor, &h) {
             Err(e) => *msg = Some((SrcNote::Err, e)),
             // Where the jump landed, or the drift warning when the
