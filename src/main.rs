@@ -261,7 +261,10 @@ struct App {
     /// (see `INPUT_SETTLE`). `about_to_wait` sleeps until then instead of
     /// indefinitely, so widgets imgui activates during an input frame get
     /// their follow-up frame even if the mouse stops right afterwards.
-    input_settle: Option<Instant>,
+    /// Native only (and `std`'s Instant, which is what winit's WaitUntil
+    /// takes): the browser drives the wasm loop with its own frame clock.
+    #[cfg(not(target_arch = "wasm32"))]
+    input_settle: Option<std::time::Instant>,
     last_reload: Instant,
     // winit's web backend never resizes the canvas on its own when the
     // browser window/viewport changes — unlike native windows, a <canvas>
@@ -365,6 +368,7 @@ impl App {
             nav_pan_vel: 0.0,
             nav_zoom_vel: 0.0,
             popup_open: false,
+            #[cfg(not(target_arch = "wasm32"))]
             input_settle: None,
             last_reload: Instant::now(),
             active_touches: std::collections::HashMap::new(),
@@ -425,6 +429,7 @@ impl App {
 /// just past the last event draws exactly that one follow-up frame. Long
 /// enough that a burst of trackpad moves has finished (each event pushes
 /// the deadline out), short enough not to read as a tooltip delay.
+#[cfg(not(target_arch = "wasm32"))]
 const INPUT_SETTLE: std::time::Duration = std::time::Duration::from_millis(40);
 
 const NAV_W: u8 = 1;
@@ -1192,8 +1197,12 @@ impl ApplicationHandler for App {
 
         // Every event handled above is input, and each one pushes the settle
         // frame back: the follow-up is drawn once the burst ends, not
-        // between its events.
-        self.input_settle = Some(Instant::now() + INPUT_SETTLE);
+        // between its events. `std`'s Instant because that is the one
+        // `ControlFlow::WaitUntil` compares against.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.input_settle = Some(std::time::Instant::now() + INPUT_SETTLE);
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -1254,18 +1263,20 @@ impl ApplicationHandler for App {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
-        } else if let Some(deadline) = self.input_settle {
-            if Instant::now() < deadline {
-                // Wake for the settle frame just after the input stops.
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
-            } else {
+        } else {
+            // Wake for the settle frame just after the input stops, then
+            // draw it and go back to sleeping until the next event.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(deadline) = self.input_settle {
+                if std::time::Instant::now() < deadline {
+                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+                    return;
+                }
                 self.input_settle = None;
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
             }
-        } else {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
         }
     }
